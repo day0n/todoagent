@@ -1094,6 +1094,18 @@ export class Store {
     return raw ? this.toTask(raw as Row) : null;
   }
 
+  /**
+   * The card driving a run, if one started it.
+   *
+   * Reverse lookup rather than a taskId threaded through the pipeline: a run can
+   * also be started directly, so the link has to be optional in that direction.
+   * This is what lets the board reflect what the pipeline did.
+   */
+  getTaskByRunId(runId: string): Task | null {
+    const raw = this.db.prepare(`SELECT * FROM task WHERE run_id=? LIMIT 1`).get(runId);
+    return raw ? this.toTask(raw as Row) : null;
+  }
+
   updateTask(
     id: string,
     patch: Partial<Pick<Task, "title" | "status" | "assigneeKind" | "assigneeId" | "runId">>,

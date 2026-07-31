@@ -399,7 +399,18 @@ app.post("/api/runs/:id/approve-plan", (c) => {
     .catch((err: unknown) => {
       console.error(`[run ${id}] resume failed:`, err);
     })
-    .finally(() => active.delete(id));
+    .finally(() => {
+      active.delete(id);
+      /*
+       * The card is synced here too, and this is the path that matters most.
+       *
+       * The plan gate is ON by default, so a run started from a card parks almost
+       * immediately and finishes through THIS resume rather than through `launch`.
+       * Wiring only `launch` would leave every normally-completing card stuck at
+       * in_progress — the common case, not an edge one.
+       */
+      syncTaskFromRun(id);
+    });
 
   return c.json({ ok: true });
 });
@@ -455,7 +466,13 @@ app.post("/api/runs/:id/resolve", async (c) => {
         endedAt: new Date().toISOString(),
       });
     })
-    .finally(() => active.delete(id));
+    .finally(() => {
+      active.delete(id);
+      // The third and last path a run can reach a terminal state through. All
+      // three sync, because a card that only tracks some of them is worse than
+      // one that tracks none: it would be right often enough to be trusted.
+      syncTaskFromRun(id);
+    });
 
   return c.json({ ok: true, resumed: true });
 });
@@ -947,7 +964,130 @@ app.patch("/api/tasks/:id", async (c) => {
   return c.json(store.getTask(task.id));
 });
 
+const TaskRunBody = z.object({
+  budgetTokens: z.number().int().min(0).max(200_000_000).default(2_000_000),
+  soloMode: z.boolean().default(false),
+  autoApprovePlan: z.boolean().default(false),
+});
+
+/**
+ * Starts a pipeline run for a board card.
+ *
+ * This is the seam between the two halves of the product: chat and the board are
+ * where work is described, the pipeline is what does it. `task.run_id` existed in
+ * the schema from the start and nothing ever set it, so the board was decorative
+ * — cards could be moved by hand but never executed.
+ */
+app.post("/api/tasks/:id/run", async (c) => {
+  const task = store.getTask(c.req.param("id"));
+  if (!task) return c.json({ error: "unknown task" }, 404);
+
+  const parsed = TaskRunBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+
+  const channel = store.getChannel(task.channelId);
+  if (!channel) return c.json({ error: "the card's channel is gone" }, 409);
+
+  /*
+   * A channel with no repository cannot execute anything.
+   *
+   * Refused rather than attempted: the pipeline isolates each subtask in a git
+   * worktree, so with no repo every run fails at the first step. The composer
+   * already says this when the card is created; this is the enforcement.
+   */
+  if (channel.projectId === null) {
+    return c.json(
+      { error: "此频道未关联仓库，任务无法执行。把任务放到关联了仓库的频道里。" },
+      400,
+    );
+  }
+  // Captured after the null check so the closure below keeps the narrowing; TS
+  // widens a property back to `string | null` inside a callback.
+  const projectId = channel.projectId;
+  const project = store.getProject(projectId);
+  if (!project) return c.json({ error: "the channel's project is gone" }, 409);
+
+  // Same repository lock as a direct run: two runs merging into one branch
+  // interleave and corrupt the result, which the user cannot undo.
+  const busy = projectBusyWith(channel.projectId);
+  if (busy !== null) {
+    return c.json(
+      { error: `another run is already working in this repository (run ${busy})`, busyRunId: busy },
+      409,
+    );
+  }
+
+  // An already-running card must not start a second run: the first would keep
+  // going with nothing pointing at it, and the card would track only the second.
+  if (task.runId !== null) {
+    const existing = store.getRun(task.runId);
+    if (existing !== null && (existing.status === "running" || existing.status === "blocked_on_human")) {
+      return c.json({ error: "这张卡已经在执行了", runId: task.runId }, 409);
+    }
+  }
+
+  /*
+   * The goal is the source message when there is one, not the card title.
+   *
+   * A card title is deliberately trimmed to the message's first line, and the
+   * detail — constraints, examples, what "done" means — is in the rest of the
+   * text. Feeding the title alone to the planner would throw that away at the
+   * exact moment it matters most.
+   */
+  const source = task.sourceMessageId === null ? null : store.getMessage(task.sourceMessageId);
+  const goal = source !== null && source.body.trim() !== "" ? source.body : task.title;
+
+  // One transaction: a run whose card was never updated would execute with
+  // nothing on the board pointing at it.
+  const run = store.tx(() => {
+    const created = store.createRun({
+      projectId: channel.projectId as string,
+      goal,
+      acceptance: null,
+      budgetTokens: parsed.data.budgetTokens,
+      soloMode: parsed.data.soloMode,
+    });
+    store.updateTask(task.id, { runId: created.id, status: "in_progress" });
+    return created;
+  });
+
+  launch(run.id, parsed.data.autoApprovePlan);
+  return c.json({ run, task: store.getTask(task.id) }, 201);
+});
+
 // ── Launch ──────────────────────────────────────────────────
+
+/**
+ * Moves a card to match its run's outcome.
+ *
+ * A no-op for runs started directly, which have no card. The mapping is
+ * deliberate:
+ *
+ *   completed → in_review, never done. The pipeline's own review is agents
+ *     checking each other; a person still has to look at the merged branch.
+ *     Auto-completing would claim an approval nobody gave.
+ *   failed / cancelled / budget_exceeded → todo. Leaving it in_progress would
+ *     say work is happening when nothing is running. `run_id` is preserved, so
+ *     the card still links to the attempt that failed.
+ */
+function syncTaskFromRun(runId: string): void {
+  const task = store.getTaskByRunId(runId);
+  if (!task) return;
+  const run = store.getRun(runId);
+  if (!run) return;
+
+  const next =
+    run.status === "completed"
+      ? "in_review"
+      : run.status === "failed" || run.status === "cancelled" || run.status === "budget_exceeded"
+        ? "todo"
+        : null;
+
+  // `running` and `blocked_on_human` leave the card alone: it is already
+  // in_progress, and a gate is surfaced on the run page rather than the board.
+  if (next === null || task.status === next) return;
+  store.updateTask(task.id, { status: next });
+}
 
 function launch(runId: string, autoApprovePlan: boolean): void {
   const controller = new AbortController();
@@ -964,7 +1104,16 @@ function launch(runId: string, autoApprovePlan: boolean): void {
         endedAt: new Date().toISOString(),
       });
     })
-    .finally(() => active.delete(runId));
+    .finally(() => {
+      active.delete(runId);
+      /*
+       * In `finally`, so a crash moves the card too.
+       *
+       * `catch` has already written `status: failed` by the time this runs, so the
+       * sync sees the real outcome rather than a stale `running`.
+       */
+      syncTaskFromRun(runId);
+    });
 }
 
 // Before accepting traffic: resolve rows left `running` by a previous process,

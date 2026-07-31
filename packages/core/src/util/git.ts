@@ -9,6 +9,54 @@ export interface GitResult {
   stderr: string;
 }
 
+/**
+ * Serialises worktree metadata changes, per repository.
+ *
+ * `git worktree add` scans `.git/worktrees/*` while registering the new entry, so
+ * two concurrent adds can have one reading a registration the other has created
+ * but not finished writing. Git reports that as a fatal error and the whole add
+ * fails:
+ *
+ *   fatal: could not read .git/worktrees/agent-8/commondir: Undefined error: 0
+ *
+ * Measured on this machine: 16 concurrent adds over 12 rounds produced 1 failure
+ * in 192 (0.5%), while 2 concurrent over 60 rounds produced none — so it needs
+ * real concurrency to show up, which is exactly what this system does. The
+ * pipeline runs subtasks through `mapLimit(subtasks, maxConcurrent, …)` and every
+ * one of them creates a worktree, with a default concurrency of 6.
+ *
+ * It first appeared as a flaky test, and treating it as one would have been the
+ * wrong call: the same race makes a parallel subtask fail to START in production,
+ * randomly, in the feature this product is built around.
+ *
+ * Per repository rather than global, since separate repos have independent
+ * `.git/worktrees` directories and serialising across them would be pure loss.
+ * `remove` and `prune` mutate the same directory, so they take the lock too.
+ *
+ * The cost is small and bounded: an add takes tens of milliseconds, so six of
+ * them serialise in well under a second, once, at the start of a stage. The AGENTS
+ * still run fully in parallel — that is the parallelism that matters.
+ */
+const worktreeLocks = new Map<string, Promise<void>>();
+
+function withWorktreeLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T> {
+  const previous = worktreeLocks.get(repoPath) ?? Promise.resolve();
+  // Chained onto both outcomes: one failed operation must not wedge the queue
+  // behind it, which would be a worse bug than the race being fixed.
+  const run = previous.then(fn, fn);
+
+  const tail: Promise<void> = run.then(
+    () => {
+      if (worktreeLocks.get(repoPath) === tail) worktreeLocks.delete(repoPath);
+    },
+    () => {
+      if (worktreeLocks.get(repoPath) === tail) worktreeLocks.delete(repoPath);
+    },
+  );
+  worktreeLocks.set(repoPath, tail);
+  return run;
+}
+
 /** Runs a git command. Never throws on a nonzero exit — callers inspect `code`. */
 export function git(args: string[], cwd: string): Promise<GitResult> {
   return new Promise((resolve) => {
@@ -101,7 +149,10 @@ export async function createWorktree(
   const root = await mkdtemp(join(tmpdir(), "council-wt-"));
   const path = join(root, safe || "work");
 
-  const add = await git(["worktree", "add", "-b", branch, path, baseRef], repoPath);
+  // Only the git call is serialised; mkdtemp above is per-caller and safe.
+  const add = await withWorktreeLock(repoPath, () =>
+    git(["worktree", "add", "-b", branch, path, baseRef], repoPath),
+  );
   if (add.code !== 0) {
     await rm(root, { recursive: true, force: true });
     throw new Error(`git worktree add failed: ${add.stderr.trim() || add.stdout.trim()}`);
@@ -115,7 +166,11 @@ export async function createWorktree(
       if (disposed) return;
       disposed = true;
       // --force because the agent will have left uncommitted edits behind.
-      await git(["worktree", "remove", "--force", path], repoPath);
+      // Locked as well: removal rewrites the same .git/worktrees directory that a
+      // concurrent add is scanning, so it can break that add just as easily.
+      await withWorktreeLock(repoPath, () =>
+        git(["worktree", "remove", "--force", path], repoPath),
+      );
       await rm(root, { recursive: true, force: true });
     },
     async deleteBranch() {
@@ -136,7 +191,9 @@ export async function createWorktree(
  * exists, so a live worktree cannot be affected.
  */
 export async function pruneWorktrees(repoPath: string): Promise<void> {
-  await git(["worktree", "prune"], repoPath);
+  // The third mutator of .git/worktrees, so it takes the same lock. Pruning while
+  // an add is registering is the same race read from the other side.
+  await withWorktreeLock(repoPath, () => git(["worktree", "prune"], repoPath));
 }
 
 /**
