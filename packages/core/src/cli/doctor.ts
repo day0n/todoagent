@@ -27,13 +27,35 @@ interface ProbeResult {
   output: string;
   error: string | null;
   ms: number;
+  /**
+   * How many events the adapter's parser produced, and of what kinds.
+   *
+   * Reported because "completed with zero events" is a distinct failure that
+   * looks like success from the outside: the transport worked, the process
+   * exited cleanly, and the PARSER understood nothing. Two runtimes — gemini and
+   * grok — had never executed against their real CLIs at all, so their parsers
+   * had only unit coverage, and that is exactly the state this distinguishes.
+   */
+  events: number;
+  types: string[];
 }
 
 async function probe(kind: RuntimeKind, cwd: string): Promise<ProbeResult> {
   const adapter = getAdapter(kind);
   const detected = await adapter.detect();
   if (!detected) {
-    return { kind, installed: false, version: "", probed: false, ok: false, output: "", error: "not on PATH", ms: 0 };
+    return {
+      kind,
+      installed: false,
+      version: "",
+      probed: false,
+      ok: false,
+      output: "",
+      error: "not on PATH",
+      ms: 0,
+      events: 0,
+      types: [],
+    };
   }
 
   const started = Date.now();
@@ -45,8 +67,12 @@ async function probe(kind: RuntimeKind, cwd: string): Promise<ProbeResult> {
     });
     // The stream must be drained or the adapter's queue grows unbounded.
     const seen: string[] = [];
+    const types = new Set<string>();
+    let events = 0;
     const drain = (async () => {
       for await (const ev of run.events) {
+        events++;
+        types.add(ev.type);
         if (ev.type === "text") seen.push(ev.content);
       }
     })();
@@ -62,6 +88,8 @@ async function probe(kind: RuntimeKind, cwd: string): Promise<ProbeResult> {
       output: text.slice(0, 200),
       error: result.error,
       ms: Date.now() - started,
+      events,
+      types: [...types].sort(),
     };
   } catch (err) {
     return {
@@ -73,6 +101,8 @@ async function probe(kind: RuntimeKind, cwd: string): Promise<ProbeResult> {
       output: "",
       error: err instanceof Error ? err.message : String(err),
       ms: Date.now() - started,
+      events: 0,
+      types: [],
     };
   }
 }
@@ -124,8 +154,15 @@ async function main(): Promise<void> {
     process.stdout.write(`  ${pad(kind, 10)} ... `);
     const r = await probe(kind, dir);
     results.push(r);
-    if (r.ok) console.log(`OK   ${(r.ms / 1000).toFixed(1)}s  "${r.output.slice(0, 60)}"`);
-    else console.log(`FAIL ${(r.ms / 1000).toFixed(1)}s  ${(r.error ?? "no output").slice(0, 160)}`);
+    if (r.ok) {
+      // The event count is shown, not just stored: it is the only way to see that
+      // a turn "worked" while the parser understood nothing of it.
+      console.log(
+        `OK   ${(r.ms / 1000).toFixed(1)}s  ${r.events} event(s)  "${r.output.slice(0, 50)}"`,
+      );
+    } else {
+      console.log(`FAIL ${(r.ms / 1000).toFixed(1)}s  ${(r.error ?? "no output").slice(0, 160)}`);
+    }
   }
 
   await rm(dir, { recursive: true, force: true });
@@ -133,6 +170,21 @@ async function main(): Promise<void> {
   const ok = results.filter((r) => r.ok);
   console.log(`\n${ok.length}/${results.length} runtime(s) completed a turn.`);
   if (ok.length > 0) console.log(`Usable: ${ok.map((r) => r.kind).join(", ")}`);
+
+  /*
+   * Reported separately from failure, because it is not one.
+   *
+   * A runtime that returns text with zero events means the transport works and the
+   * PARSER understood nothing on the way through — which looks like success from
+   * outside and is the one degradation this whole command exists to expose.
+   */
+  const silent = ok.filter((r) => r.events === 0);
+  if (silent.length > 0) {
+    console.log(
+      `\nCompleted but emitted NO events (parser suspect): ${silent.map((r) => r.kind).join(", ")}`,
+    );
+  }
+
   const failed = results.filter((r) => !r.ok);
   if (failed.length > 0) {
     console.log("\nFailures:");

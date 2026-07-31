@@ -69,7 +69,7 @@ test("transient: auth and setup failures are NOT retried", () => {
 test("transient: the credential errors the adapters really emit are not retried", () => {
   /*
    * Verbatim from gemini.ts and cursor.ts, obtained by running the real CLIs
-   * (scripts/probe-adapters.mjs) rather than by reading the source and guessing.
+   * (`pnpm runtimes --probe`) rather than by reading the source and guessing.
    *
    * Neither was recognised by the original deny-list: `unauthenticated` does not
    * match "not authenticated", and `authentication` is not a substring of
