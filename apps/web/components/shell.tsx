@@ -1,10 +1,11 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "../lib/api.ts";
-import type { Channel, DetectedRuntime, Expert, RuntimeKind } from "../lib/types.ts";
+import { api, ApiError } from "../lib/api.ts";
+import type { Channel, DetectedRuntime, Expert, Project, RuntimeKind } from "../lib/types.ts";
+import { ErrorBox } from "./atoms.tsx";
 
 /**
  * The workspace shell: an icon rail, a channel sidebar, and one panel.
@@ -36,19 +37,31 @@ const RUNTIME_TONE: Record<RuntimeKind, { bg: string; fg: string }> = {
 
 export function WorkspaceShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
+  // Used only after creating a channel, to open the thing that was just made.
+  const router = useRouter();
   const [channels, setChannels] = useState<Channel[]>([]);
   const [experts, setExperts] = useState<Expert[]>([]);
   const [runtimes, setRuntimes] = useState<DetectedRuntime[]>([]);
+  /** Only needed by the new-channel dialog: a channel's repo decides whether its
+   *  tasks can execute at all. */
+  const [projects, setProjects] = useState<Project[]>([]);
   const [offline, setOffline] = useState(false);
   const [loaded, setLoaded] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [creating, setCreating] = useState<null | "channel" | "dm">(null);
 
   const load = useCallback(async () => {
     try {
-      const [ch, ex, rt] = await Promise.all([api.channels(), api.experts(), api.runtimes()]);
+      const [ch, ex, rt, ps] = await Promise.all([
+        api.channels(),
+        api.experts(),
+        api.runtimes(),
+        api.projects(),
+      ]);
       setChannels(ch);
       setExperts(ex);
       setRuntimes(rt.detected);
+      setProjects(ps);
       setOffline(false);
     } catch {
       // The engine is a separate local process, so "not running" is the most
@@ -69,6 +82,16 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
   // the section headers cannot disagree with the rows underneath them.
   const rooms = channels.filter((c) => c.kind === "channel");
   const dms = channels.filter((c) => c.kind === "dm");
+  /*
+   * Agents with no DM yet.
+   *
+   * The `+` on the DM section appears only when this is non-empty. `seed` already
+   * creates one DM per detected runtime, and the engine does NOT enforce
+   * uniqueness on `dmExpertId` — so offering the action unconditionally would
+   * happily produce two conversations with the same agent, indistinguishable in
+   * the sidebar.
+   */
+  const dmlessExperts = experts.filter((e) => !dms.some((c) => c.dmExpertId === e.id));
 
   return (
     <div className="flex h-full">
@@ -116,7 +139,13 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
         </div>
 
         <div className="flex-1 overflow-y-auto px-2 py-3">
-          <Section title="频道" count={rooms.length}>
+          <Section
+            title="频道"
+            count={rooms.length}
+            // Hidden while the engine is unreachable: the dialog's first act would
+            // be a request that cannot succeed.
+            {...(offline ? {} : { onAdd: () => setCreating("channel"), addLabel: "新建频道" })}
+          >
             {offline ? (
               <Hint>引擎未启动</Hint>
             ) : !loaded ? (
@@ -156,7 +185,14 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
             does not report one, and inventing a name would be worse than naming
             the thing accurately.
           */}
-          <Section title="私信" count={dms.length}>
+          <Section
+            title="私信"
+            count={dms.length}
+            // Only when there is somebody left to open one with — see dmlessExperts.
+            {...(offline || dmlessExperts.length === 0
+              ? {}
+              : { onAdd: () => setCreating("dm"), addLabel: "新建私信" })}
+          >
             {dms.length === 0 ? (
               <Hint>{offline ? "—" : "运行 pnpm seed 建立团队"}</Hint>
             ) : (
@@ -213,6 +249,200 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
       {/* ── Panel ──
           Owns its own scroll region so the rail and sidebar stay put. */}
       <main className="flex min-w-0 flex-1 flex-col overflow-y-auto">{children}</main>
+
+      {/* Mounted at the shell root, not inside the aside — the sidebar is 15rem
+          wide and a dialog inside it would be clipped to that. */}
+      {creating !== null ? (
+        <NewChannelDialog
+          mode={creating}
+          projects={projects}
+          experts={dmlessExperts}
+          onClose={() => setCreating(null)}
+          onCreated={(id) => {
+            setCreating(null);
+            // Reload before navigating, so the sidebar already lists the new
+            // channel when its page appears.
+            void load().then(() => router.push(`/channels/${id}`));
+          }}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+/**
+ * Creates a channel or a DM.
+ *
+ * Both endpoints existed and had engine tests from the start, and nothing in the
+ * UI ever called them — channels could only be created by `pnpm seed`. The
+ * reference product has a `+` on each sidebar section, and without one this app
+ * cannot add a second project's channel at all.
+ *
+ * One dialog for both because the shapes barely differ: a channel is a name plus an
+ * optional repo, a DM is a choice of agent. Two components would duplicate the
+ * submit, error and busy handling for one differing field.
+ */
+function NewChannelDialog({
+  mode,
+  projects,
+  experts,
+  onClose,
+  onCreated,
+}: {
+  mode: "channel" | "dm";
+  projects: Project[];
+  /** Only agents without a DM yet — see `dmlessExperts`. */
+  experts: Expert[];
+  onClose: () => void;
+  onCreated: (channelId: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [purpose, setPurpose] = useState("");
+  const [projectId, setProjectId] = useState("");
+  const [expertId, setExpertId] = useState(experts[0]?.id ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const isDm = mode === "dm";
+  const canSubmit = isDm ? expertId !== "" : name.trim() !== "";
+
+  const submit = async (): Promise<void> => {
+    if (!canSubmit || busy) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const created = isDm
+        ? await api.createChannel({
+            // A DM is named after its agent, so the sidebar row reads as a person
+            // rather than as a room.
+            name: experts.find((e) => e.id === expertId)?.name ?? "DM",
+            kind: "dm",
+            dmExpertId: expertId,
+          })
+        : await api.createChannel({
+            name: name.trim(),
+            purpose: purpose.trim(),
+            // Empty means no repository. A legitimate state: the channel can hold
+            // cards but nothing can execute them, which the composer already says.
+            projectId: projectId === "" ? null : projectId,
+          });
+      onCreated(created.id);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div
+      className="absolute inset-0 z-40 grid place-items-center bg-fg/20 p-4"
+      role="dialog"
+      aria-modal="true"
+      aria-label={isDm ? "新建私信" : "新建频道"}
+      onKeyDown={(e) => {
+        if (e.key === "Escape") onClose();
+      }}
+    >
+      <div className="card w-full max-w-md p-4">
+        <div className="mb-3 flex items-center justify-between">
+          <h2 className="t-md">{isDm ? "新建私信" : "新建频道"}</h2>
+          <button
+            type="button"
+            className="btn btn-icon btn-sm btn-ghost"
+            onClick={onClose}
+            aria-label="关闭"
+          >
+            ✕
+          </button>
+        </div>
+
+        {error !== null ? (
+          <div className="mb-3">
+            <ErrorBox message={error} />
+          </div>
+        ) : null}
+
+        {isDm ? (
+          <label className="block">
+            <span className="t-label">和谁对话</span>
+            <select
+              className="field mt-1"
+              value={expertId}
+              onChange={(e) => setExpertId(e.target.value)}
+              autoFocus
+            >
+              {experts.map((e) => (
+                <option key={e.id} value={e.id}>
+                  {e.name} — {e.runtimeKind}
+                </option>
+              ))}
+            </select>
+          </label>
+        ) : (
+          <div className="space-y-3">
+            <label className="block">
+              <span className="t-label">频道名</span>
+              <input
+                className="field mt-1"
+                value={name}
+                onChange={(e) => setName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    void submit();
+                  }
+                }}
+                placeholder="例如：web"
+                autoFocus
+              />
+            </label>
+
+            <label className="block">
+              <span className="t-label">仓库（可选）</span>
+              <select
+                className="field mt-1"
+                value={projectId}
+                onChange={(e) => setProjectId(e.target.value)}
+              >
+                <option value="">不关联仓库 — 任务无法执行</option>
+                {projects.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name} — {p.repoPath}
+                  </option>
+                ))}
+              </select>
+              <span className="t-meta mt-1 block">
+                没有仓库的频道可以聊天和记任务，但流水线跑不起来。
+              </span>
+            </label>
+
+            <label className="block">
+              <span className="t-label">用途（可选）</span>
+              <input
+                className="field mt-1"
+                value={purpose}
+                onChange={(e) => setPurpose(e.target.value)}
+                placeholder="这个频道用来做什么"
+              />
+            </label>
+          </div>
+        )}
+
+        <div className="mt-4 flex items-center gap-2">
+          <button type="button" className="btn btn-sm ml-auto" onClick={onClose}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="btn btn-primary btn-sm"
+            onClick={() => void submit()}
+            disabled={!canSubmit || busy}
+          >
+            {busy ? "创建中…" : "创建"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -248,10 +478,15 @@ function RailIcon({
 function Section({
   title,
   count,
+  onAdd,
+  addLabel,
   children,
 }: {
   title: string;
   count?: number;
+  /** Renders a `+` in the header. Omitted where there is nothing to create. */
+  onAdd?: () => void;
+  addLabel?: string;
   children: React.ReactNode;
 }) {
   return (
@@ -260,6 +495,17 @@ function Section({
         {title}
         {count !== undefined && count > 0 ? (
           <span className="font-normal text-subtle-fg">{count}</span>
+        ) : null}
+        {onAdd ? (
+          <button
+            type="button"
+            onClick={onAdd}
+            className="ml-auto grid h-4 w-4 place-items-center rounded text-[13px] leading-none text-subtle-fg transition-colors hover:bg-surface-2 hover:text-fg"
+            title={addLabel}
+            aria-label={addLabel}
+          >
+            +
+          </button>
         ) : null}
       </h2>
       <div className="space-y-px">{children}</div>
