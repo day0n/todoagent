@@ -177,6 +177,18 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
                   ? `${live.expertName || "专家"} 正在执行 ${live.currentTool}`
                   : `${live.expertName || "专家"} 思考中`}
               </Badge>
+            ) : live.retrying !== null ? (
+              /*
+                A retry spawns a NEW attempt with its own id, so without this the
+                user sees a bare failure and then an unrelated-looking new card —
+                the system reads as flailing when it is actually recovering.
+
+                Amber rather than red: the turn did fail, but the outcome is not
+                decided yet, and red would claim it was.
+              */
+              <Badge tone="warn" dot>
+                {`${live.expertName || "专家"} 失败，重试中 ${live.retrying.attempt}/${live.retrying.of}`}
+              </Badge>
             ) : (
               <Badge tone={tone}>
                 {`${live.expertName || "专家"} ${live.status === "done" ? "完成" : "失败"}`}

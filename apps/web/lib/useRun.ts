@@ -18,6 +18,15 @@ export interface LiveAttempt {
   toolCount: number;
   status: "running" | "done" | "failed";
   error: string | null;
+  /**
+   * Set when this failure was transient and another attempt followed.
+   *
+   * A retry spawns a NEW attempt with a new id, so without this the user sees a
+   * failed card and then an unrelated-looking new one — the system reads as
+   * flailing when it is in fact recovering. The engine emits `attempt:retrying`
+   * against the FAILED attempt's id precisely so this card can say so.
+   */
+  retrying: { attempt: number; of: number } | null;
 }
 
 export interface VerifyReport {
@@ -216,6 +225,34 @@ export function useRun(runId: string): RunState {
                 toolCount: 0,
                 status: "running",
                 error: null,
+                retrying: null,
+              });
+              return map;
+            });
+            return;
+          }
+
+          /*
+           * A transient failure that is being retried.
+           *
+           * Emitted against the FAILED attempt's id, so it lands on the card the
+           * user is already looking at rather than appearing as a new one. The
+           * attempt row is left `failed` — it did fail — but the card can now say
+           * that another try follows, instead of leaving a bare failure next to a
+           * mysterious new card.
+           */
+          case "attempt:retrying": {
+            if (ev.attemptId === null) return;
+            setLive((prev) => {
+              const cur = prev.get(ev.attemptId as string);
+              if (!cur) return prev;
+              const map = new Map(prev);
+              map.set(cur.attemptId, {
+                ...cur,
+                retrying: {
+                  attempt: typeof p["attempt"] === "number" ? p["attempt"] : 1,
+                  of: typeof p["of"] === "number" ? p["of"] : 1,
+                },
               });
               return map;
             });
