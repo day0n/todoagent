@@ -481,6 +481,20 @@ test("pipeline: every reviewer failing is not approval", async () => {
     const events = h.store.eventsAfter(h.runId, 0, 5000);
     const unreviewed = events.find((e) => e.type === "subtask:unreviewed");
     assert.ok(unreviewed, "the run must record that this was never reviewed");
+
+    /*
+     * The 503 was RETRIED before being given up on.
+     *
+     * Asserted rather than inferred from wall-clock: the earlier evidence was this
+     * test slowing from 1.4s to 6.1s, which matches two reviewers each backing off
+     * 1.5s then 3s — but timing is not proof, and a future change that quietly
+     * bypasses `runOneWithRetry` would keep passing on duration alone.
+     */
+    const retries = events.filter((e) => e.type === "attempt:retrying");
+    assert.ok(
+      retries.length > 0,
+      "a transient 503 must be retried, not accepted as a dead reviewer on first failure",
+    );
     assert.ok(
       !events.some((e) => e.type === "subtask:accepted"),
       "nothing may be recorded as accepted when no review happened",

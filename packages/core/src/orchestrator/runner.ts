@@ -4,12 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { z } from "zod";
 import { getAdapter } from "../adapters/index.ts";
-import type { AgentEvent } from "../adapters/types.ts";
+import type { AgentEvent, AgentResultStatus } from "../adapters/types.ts";
 import type { Store } from "../db/index.ts";
 import type { Attempt, Expert } from "../types.ts";
 import type { Semaphore } from "../util/concurrency.ts";
 import { bus } from "./bus.ts";
 import { repairPrompt, tryParse } from "./structured.ts";
+import { MAX_TRANSIENT_RETRIES, isTransientFailure, retryDelayMs } from "./transient.ts";
 
 export class BudgetExceededError extends Error {
   readonly spent: number;
@@ -55,6 +56,16 @@ export interface RunOneOptions {
 export interface RunOneResult {
   attemptId: string;
   ok: boolean;
+  /**
+   * The adapter's own verdict, not just `ok`.
+   *
+   * Surfaced because `failed`, `timeout` and `cancelled` warrant different
+   * handling and the distinction was being discarded here. Retry logic must not
+   * infer it from the error text: a timeout says "idle watchdog" only by
+   * convention, and matching on prose to decide whether to respawn a process is
+   * the kind of coupling that breaks silently.
+   */
+  status: AgentResultStatus;
   output: string;
   error: string | null;
   sessionId: string | null;
@@ -91,6 +102,27 @@ export function boundPayload(payload: unknown): unknown {
     return out;
   }
   return payload;
+}
+
+/**
+ * Waits, but gives up immediately if the run is cancelled.
+ *
+ * A plain `setTimeout` would keep a cancelled run alive for the whole backoff —
+ * up to twelve seconds of a user having pressed Stop and nothing happening. The
+ * listener is removed in both exits so a long-lived signal does not accumulate
+ * one per retry.
+ */
+function delay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted === true) return Promise.resolve();
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+  });
 }
 
 /** Persists an event and broadcasts it. Order matters: durability, then fan-out. */
@@ -240,6 +272,7 @@ export async function runOne(opts: RunOneOptions): Promise<RunOneResult> {
     return {
       attemptId: attempt.id,
       ok: result.status === "completed",
+      status: result.status,
       output: result.output,
       error: result.error,
       sessionId: result.sessionId,
@@ -248,6 +281,41 @@ export async function runOne(opts: RunOneOptions): Promise<RunOneResult> {
     // Released even on a throw, or one failed turn would shrink the pool for the
     // rest of the run.
     opts.slots?.release();
+  }
+}
+
+/**
+ * `runOne`, with a bounded retry for failures that are worth retrying.
+ *
+ * A wrapper rather than logic inside `runOne`, because `runOne` acquires the
+ * concurrency slot and releases it before returning — so the backoff here happens
+ * with the slot FREE. Sleeping inside the slot would let one provider outage park
+ * every worker in a delay and idle the whole pool.
+ *
+ * This is what call sites should use. `runOne` stays the raw single-attempt
+ * primitive: it owns the slot, the attempt row and the budget check, and those
+ * must happen once per spawn, not once per logical turn.
+ */
+export async function runOneWithRetry(opts: RunOneOptions): Promise<RunOneResult> {
+  let retries = 0;
+  for (;;) {
+    const res = await runOne(opts);
+    if (res.ok) return res;
+    if (retries >= MAX_TRANSIENT_RETRIES) return res;
+    if (!isTransientFailure(res.status, res.error)) return res;
+
+    retries++;
+    record(opts.store, opts.runId, res.attemptId, "attempt:retrying", {
+      attempt: retries,
+      of: MAX_TRANSIENT_RETRIES,
+      kind: opts.kind,
+      expertName: opts.expert.name,
+      reason: res.error,
+    });
+    await delay(retryDelayMs(retries), opts.signal);
+    // Cancelled while waiting: return the failure rather than spawning again. The
+    // delay resolves early on abort, so this is the common path after a Stop.
+    if (opts.signal?.aborted === true) return res;
   }
 }
 
@@ -283,7 +351,10 @@ export async function runStructured<T>(
 
   try {
     for (let i = 0; i < maxAttempts; i++) {
-      const res = await runOne({
+      // `runOneWithRetry`, not `runOne`: a structured turn is as exposed to a 503
+      // as a draft is, and this is what makes the comment in the failure branch
+      // below true rather than aspirational.
+      const res = await runOneWithRetry({
         ...opts,
         prompt,
         ...(schemaPath ? { outputSchemaPath: schemaPath } : {}),
@@ -292,8 +363,16 @@ export async function runStructured<T>(
 
       if (!res.ok) {
         lastError = res.error ?? "agent failed";
-        // A failed run is not a parse problem — retrying the same prompt against a
-        // broken runtime just burns budget.
+        /*
+         * No retry here: `runOneWithRetry` above has already exhausted the
+         * transient ones. Reaching this point means the failure is deterministic —
+         * not logged in, no such executable, a rejected request — and repeating the
+         * same prompt against it only postpones the honest error.
+         *
+         * Keeping the two budgets separate matters: a transient retry must not
+         * consume a PARSE attempt, or one 503 would leave a reviewer two tries to
+         * produce valid JSON instead of three.
+         */
         break;
       }
 

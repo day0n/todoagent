@@ -41,7 +41,7 @@ import {
   verifyPrompt,
   type ReworkContext,
 } from "./prompts.ts";
-import { BudgetExceededError, recordEvent, runOne, runStructured } from "./runner.ts";
+import { BudgetExceededError, recordEvent, runOneWithRetry, runStructured } from "./runner.ts";
 
 /** Hard caps. There is deliberately no "until they agree" condition anywhere. */
 export const MAX_ROUNDS = 2;
@@ -373,7 +373,7 @@ async function runSolo(ctx: Ctx): Promise<void> {
   const expert = pick(ctx.roster, "maker") ?? ctx.roster[0]?.expert;
   if (!expert) throw new Error("no expert available for solo mode");
 
-  const res = await runOne({
+  const res = await runOneWithRetry({
     store: ctx.store,
     runId: ctx.run.id,
     expert,
@@ -406,7 +406,7 @@ async function runSolo(ctx: Ctx): Promise<void> {
     pick(ctx.roster, "verifier") ??
     expert;
 
-  const check = await runOne({
+  const check = await runOneWithRetry({
     store: ctx.store,
     runId: ctx.run.id,
     expert: verifier,
@@ -759,7 +759,7 @@ async function runSubTask(
     for (;;) {
       // ── draft / rework ──
       setPhaseSafe(ctx, "draft");
-      const draft = await runOne({
+      const draft = await runOneWithRetry({
         store: ctx.store,
         runId: ctx.run.id,
         expert: author,
@@ -1300,7 +1300,7 @@ export async function runDiscussion(
       const history = ctx.store.listDiscussion(ctx.run.id).filter((m) => m.subTaskId === subTask.id);
       let res;
       try {
-        res = await runOne({
+        res = await runOneWithRetry({
           store: ctx.store,
           runId: ctx.run.id,
           expert: speaker,
@@ -1420,7 +1420,7 @@ async function phaseVerify(ctx: Ctx, ledger: MergeLedger): Promise<void> {
       : "",
   ].join("\n");
 
-  const res = await runOne({
+  const res = await runOneWithRetry({
     store: ctx.store,
     runId: ctx.run.id,
     expert: verifier,
