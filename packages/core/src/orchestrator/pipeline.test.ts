@@ -91,6 +91,15 @@ function fakeAgentScript(
   format: "claude" | "codex",
   artifactDir: string,
 ): string {
+  /**
+   * The doomed subtask's title, used to fail one draft and not the other.
+   *
+   * Targeted by TITLE because the draft prompt carries `YOUR SUBTASK: <title>`,
+   * which is the only thing distinguishing two concurrent draft invocations of the
+   * same fake binary.
+   */
+  const DOOMED = "Add the doomed file";
+
   const plan = {
     summary: "one step",
     subtasks: [
@@ -103,6 +112,21 @@ function fakeAgentScript(
         stage: 0,
         dependsOn: [],
       },
+      // A second subtask exists only for the partial-failure scenario: one
+      // survivor plus one casualty is what distinguishes "partial" from "total".
+      ...(behaviour === "partial-failure"
+        ? [
+            {
+              id: "b",
+              title: DOOMED,
+              brief: "this one's agent will fail",
+              acceptance: "never met",
+              capability: "general",
+              stage: 0,
+              dependsOn: [],
+            },
+          ]
+        : []),
     ],
   };
   const repro = {
@@ -121,6 +145,19 @@ function fakeAgentScript(
 
   const config = {
     plan: JSON.stringify(plan),
+    /**
+     * Which subtask's draft should die, or "" for none.
+     *
+     * `partial-failure` kills the second of two, leaving one survivor whose work
+     * still merges. `total-failure` kills the only one, so nothing merges — the
+     * two cases have to report differently, and that distinction is the point.
+     */
+    doomed:
+      behaviour === "partial-failure"
+        ? DOOMED
+        : behaviour === "total-failure"
+          ? "Add the file"
+          : "",
     review: JSON.stringify(reviewFor(behaviour)),
     rebuttal: JSON.stringify({
       responses: [{ reviewId: "IGNORED", decision: "reject", reason: "I disagree" }],
@@ -219,6 +256,19 @@ ${emitFn}
 if (prompt.includes("decompose the goal")) {
   emit(C.plan);
 } else if (prompt.includes("You are working as part of a team on one subtask")) {
+  /*
+   * A non-zero exit with no output, which is what a provider outage looks like
+   * from here. The real case that prompted this: cursor-agent exited 1 with
+   * "Error: [unavailable] HTTP 503" in its stderr tail.
+   *
+   * No backticks in this comment: it lives INSIDE the template literal that builds
+   * this script, so one would close the template early. That is what broke the
+   * first version of this edit.
+   */
+  if (C.doomed && prompt.includes("YOUR SUBTASK: " + C.doomed)) {
+    process.stderr.write("Error: [unavailable] HTTP 503\\n");
+    process.exit(1);
+  }
   writeFileSync("note.txt", "hello from the maker\\n");
   emit("created note.txt");
 } else if (prompt.includes("You are reviewing another agent")) {
@@ -372,6 +422,76 @@ test("pipeline: a clean review completes without discussion or rework", async ()
     // The work must actually be reachable, not just reported.
     const files = await git(["ls-files"], h.repo);
     assert.ok(files.stdout.includes("note.txt"), "the maker's file merged into main");
+  } finally {
+    await h.dispose();
+  }
+});
+
+test("pipeline: a partial failure is reported as partial, not as success", async () => {
+  const h = await setup("partial-failure");
+  try {
+    /*
+     * Reproduced against real CLIs before this test existed. A Cursor 503 killed
+     * two of three subtasks and the run still reported:
+     *
+     *   status=completed  error=NULL
+     *
+     * which moves the board card to 待复核. The user is then asked to review work
+     * missing most of what they asked for, with nothing anywhere saying so — and in
+     * that run the surviving output actively contradicted the goal, since one
+     * module got the new error convention and the other kept the old one.
+     *
+     * `finishRun` wrote `completed` without ever looking at the subtasks.
+     */
+    const outcome = await runPipeline({ store: h.store, runId: h.runId, ...PIPELINE_OPTS });
+
+    const subtasks = h.store.listSubTasks(h.runId);
+    const failed = subtasks.filter((s) => s.status === "failed");
+    assert.equal(subtasks.length, 2, "the fixture plans one survivor and one casualty");
+    assert.equal(failed.length, 1, "exactly one draft was killed");
+
+    // Still `completed`: the survivor merged real work, so there is something to
+    // review, and `failed` would send the card back to 待办 and bury it.
+    assert.equal(outcome.status, "completed");
+
+    // But the loss has to be stated. This is the whole fix.
+    assert.ok(outcome.error !== null, "a partial result must not report error=null");
+    assert.match(outcome.error ?? "", /1\/2/, "says how much was lost");
+    assert.ok(
+      (outcome.error ?? "").includes(failed[0]?.title ?? " "),
+      `names the failed subtask; got: ${outcome.error}`,
+    );
+
+    // Persisted, not just returned — the UI reads the row.
+    assert.equal(h.store.getRun(h.runId)?.error, outcome.error);
+
+    // And the survivor's work genuinely landed.
+    const files = await git(["ls-files"], h.repo);
+    assert.ok(files.stdout.includes("note.txt"), "the surviving subtask still merged");
+  } finally {
+    await h.dispose();
+  }
+});
+
+test("pipeline: a total failure is reported as failed, not completed", async () => {
+  const h = await setup("total-failure");
+  try {
+    // "Completed with an error" only makes sense when something completed. With
+    // nothing merged there is nothing to review, so sending the card back to 待办
+    // is the accurate outcome rather than a hidden one.
+    const outcome = await runPipeline({ store: h.store, runId: h.runId, ...PIPELINE_OPTS });
+
+    const subtasks = h.store.listSubTasks(h.runId);
+    assert.equal(subtasks.length, 1);
+    assert.equal(subtasks[0]?.status, "failed");
+
+    assert.equal(outcome.status, "failed", `expected failed, got ${outcome.status}`);
+    assert.ok(outcome.error !== null);
+    assert.equal(h.store.getRun(h.runId)?.status, "failed");
+
+    // Nothing merged, so main is untouched.
+    const files = await git(["ls-files"], h.repo);
+    assert.ok(!files.stdout.includes("note.txt"), "a failed draft must not merge");
   } finally {
     await h.dispose();
   }

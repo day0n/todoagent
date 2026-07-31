@@ -1399,9 +1399,48 @@ function finishRun(
     log(ctx, "run:cancelled", {});
     return { status: "cancelled", error: null };
   }
-  store.updateRun(runId, { status: "completed", endedAt: new Date().toISOString() });
-  log(ctx, "run:completed", {});
-  return { status: "completed", error: null };
+  /*
+   * A partial result is reported as partial.
+   *
+   * This used to write `completed` unconditionally, without ever looking at the
+   * subtasks — so a run where a subtask died reported success with `error: null`.
+   * Observed for real: a Cursor 503 killed one of three subtasks, and the run was
+   * still on course to declare itself completed, which moves the board card to
+   * 待复核. The user would then be asked to review work that is missing a third of
+   * what they asked for, with nothing anywhere saying so. Exactly the class of
+   * failure that looks like success.
+   *
+   * A PARTIAL failure stays `completed` with an error attached: the surviving
+   * subtasks merged real work, so there is something to review, and `failed`
+   * would send the board card back to 待办 and bury it. The UI renders `error`
+   * for any non-running run (runs/[id]/page.tsx:213), so the warning shows up
+   * next to the result it qualifies.
+   *
+   * A TOTAL failure is `failed`. "Completed with an error" only makes sense when
+   * something completed — with nothing merged there is nothing to review, and
+   * sending the card back to 待办 is then the accurate outcome rather than a
+   * hidden one.
+   */
+  const all = store.listSubTasks(runId);
+  const failed = all.filter((s) => s.status === "failed");
+  const error =
+    failed.length === 0
+      ? null
+      : `${failed.length}/${all.length} 个子任务失败，产出不完整：${failed
+          .map((s) => s.title)
+          .join("；")}`;
+
+  // `all.length > 0` matters: solo mode creates no subtasks, and an empty list
+  // would otherwise satisfy "every subtask failed" and fail every solo run.
+  const total = all.length > 0 && failed.length === all.length;
+  const status: Run["status"] = total ? "failed" : "completed";
+
+  store.updateRun(runId, { status, endedAt: new Date().toISOString(), error });
+  log(ctx, total ? "run:failed" : "run:completed", {
+    failedSubtasks: failed.length,
+    totalSubtasks: all.length,
+  });
+  return { status, error };
 }
 
 /**
