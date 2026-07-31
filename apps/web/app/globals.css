@@ -1,124 +1,126 @@
 @import "tailwindcss";
 
 /**
- * Neo-brutalist design system, matching Raft.
+ * Design system: white, quiet, shadcn/ui-flavoured.
  *
- * Every value here was EXTRACTED from app.raft.build's compiled stylesheet via
- * browser automation, not guessed from a screenshot. The tokens below are what
- * their app actually computes:
+ * The token values below were extracted from niuzj.org's computed `:root` — a
+ * Next.js + Tailwind + shadcn/ui site on the zinc ramp with Geist Sans. That is
+ * the reference for how this app should feel: white surfaces, 1px zinc
+ * hairlines, small radii, restrained colour used only where it carries meaning.
  *
- *   body            #ffffff, text rgb(20,17,17), Space Grotesk 16px
- *   button/input    border 2px solid black, border-radius 0
- *   shadow          rgb(20,17,17) 2px 2px 0 0   ← hard, zero blur
- *   font-weight     700 on buttons, labels, headings
- *   --color-brutal-yellow  #ffd440   (aliased as --color-soft-signal)
- *   --color-brutal-pink    #fe7da8   (aliased as --accent-*)
- *   panel header    h-panel-header = 62px, border-b-2 border-black
+ * This replaces a neo-brutalist system (2px black borders, zero-blur offset
+ * shadows, Space Grotesk 700) copied from Raft's own UI. Raft's product logic is
+ * still the model — the look deliberately is not.
  *
- * This replaces a dark, soft-shadowed, rounded system that was wrong on every
- * axis. The style is not decoration: hard edges and offset shadows mean depth is
- * conveyed by geometry rather than blur, so nothing is ambiguous at any zoom.
+ * Light only, by request. There is no theme toggle and no dark block: a local
+ * tool with one intended appearance is simpler to reason about than one that
+ * silently restyles itself, and every colour below is chosen for contrast on
+ * white specifically.
+ *
+ * Colour discipline, since this UI shows a lot of parallel machine output at
+ * once: greys carry all structure, and hue is reserved for state a person must
+ * act on (a blocker, a gate, a failure). If everything is coloured, the one red
+ * row that matters stops being visible.
  */
 
 @theme {
-  /* ── Core ───────────────────────────────────────────────────
-     Warm near-black rather than pure black — the value their app computes for
-     body text and for every border and shadow. */
-  --color-ink: #141111;
-  --color-paper: #ffffff;
+  /* ── Neutral ramp (zinc) ───────────────────────────────────── */
+  --color-bg: #ffffff;
+  --color-fg: #09090b;
+  --color-surface: #fafafa;
+  --color-surface-2: #f4f4f5;
+  --color-muted: #f4f4f5;
+  --color-muted-fg: #71717b;
+  --color-subtle-fg: #9f9fa9;
+  --color-line: #e4e4e7;
+  --color-line-strong: #d4d4d8;
 
-  /* Greys are only for de-emphasised text and inert fills. Structure comes from
-     black borders, never from a grey step. */
-  --color-mute: #6b6565;
-  --color-faint: #f4f2f2;
-  --color-faint-2: #e8e5e5;
+  /* ── Accent and semantics ──────────────────────────────────── */
+  /* The reference site's link blue, used as this app's single primary accent. */
+  --color-accent: #1447e6;
+  --color-accent-fg: #ffffff;
+  --color-accent-soft: #eef2ff;
 
-  /* ── Brand ──────────────────────────────────────────────────
-     Their four brutal hues. Yellow is the "signal" surface (headers, active
-     state), pink is the accent (primary action), purple and cyan tag things. */
-  --color-signal: #ffd440;
-  --color-signal-soft: oklch(97.5% 0.027 85.64);
-  --color-accent: #fe7da8;
-  --color-accent-soft: oklch(93.6% 0.034 2.02);
-  --color-grape: oklch(78.3% 0.078 294.55);
-  --color-grape-soft: oklch(94% 0.03 294);
-  --color-aqua: oklch(78.3% 0.135 219.2);
-  --color-aqua-soft: oklch(94.5% 0.033 226.27);
+  --color-ok: #00863c;
+  --color-ok-soft: #e7f8ee;
+  --color-warn: #a35200;
+  --color-warn-soft: #fdf3e7;
+  --color-bad: #c8000f;
+  --color-bad-soft: #fdecee;
+  --color-info: #0074b8;
+  --color-info-soft: #e8f4fd;
+  --color-grape: #6d3fd4;
+  --color-grape-soft: #f1ecfd;
 
-  /* ── Semantic ───────────────────────────────────────────────
-     Chosen to sit on white at 700 weight, which is where most of this UI lives. */
-  --color-ok: oklch(52.7% 0.154 150.069);
-  --color-ok-soft: oklch(94% 0.05 150);
-  --color-warn: oklch(55.5% 0.163 48.998);
-  --color-warn-soft: oklch(95% 0.05 60);
-  --color-bad: oklch(50.5% 0.213 27.518);
-  --color-bad-soft: oklch(94% 0.04 20);
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", Menlo, monospace;
 
-  --font-sans: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  --radius: 0.5rem;
+  --radius-sm: 0.375rem;
 
-  /* Panel chrome height, measured from their rendered header. */
-  --h-panel: 62px;
-  --w-rail: 15rem;
+  /* Chrome metrics. 56px matches the reference site's --header-height. */
+  --h-header: 56px;
+  --w-rail: 3.25rem;
+  --w-sidebar: 15rem;
 }
 
 @layer base {
-  * {
-    border-color: var(--color-ink);
-  }
-
   html {
+    /* Pins form controls and scrollbars to light rendering, so a person on a
+       dark OS gets the same UI rather than half-inverted native widgets. */
     color-scheme: light;
     scrollbar-gutter: stable;
   }
 
   body {
-    background-color: var(--color-paper);
-    color: var(--color-ink);
+    background-color: var(--color-bg);
+    color: var(--color-fg);
     font-family: var(--font-sans);
     font-size: 0.875rem;
     line-height: 1.55;
     -webkit-font-smoothing: antialiased;
-    /* Live token counts and durations sit in dense rows; proportional digits make
-       them jitter as values change. */
+    text-rendering: optimizeLegibility;
+    /* Token counts and durations update in place in dense rows; proportional
+       digits make them jitter as the numbers change. */
     font-variant-numeric: tabular-nums;
   }
 
-  /* Headings are heavy and tight — the defining move of this style. */
   h1,
   h2,
   h3 {
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    line-height: 1.2;
+    font-weight: 600;
+    letter-spacing: -0.014em;
+    line-height: 1.25;
   }
 
   ::selection {
-    background: var(--color-signal);
-    color: var(--color-ink);
+    background: color-mix(in oklab, var(--color-accent) 20%, transparent);
   }
 
-  /* A blocky scrollbar rather than a soft pill, so it belongs to the system. */
+  /* A thin, self-effacing scrollbar — transcripts and event logs scroll a lot,
+     and a heavy track competes with the content for attention. */
   ::-webkit-scrollbar {
-    width: 12px;
-    height: 12px;
+    width: 10px;
+    height: 10px;
   }
   ::-webkit-scrollbar-track {
-    background: var(--color-faint);
-    border-left: 2px solid var(--color-ink);
+    background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: var(--color-ink);
-    border: 3px solid var(--color-faint);
+    background: var(--color-line-strong);
+    border: 3px solid transparent;
+    background-clip: content-box;
+    border-radius: 9999px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: var(--color-mute);
+    background: var(--color-subtle-fg);
+    background-clip: content-box;
   }
 
-  /* Focus is a hard offset ring; this app is driven from the keyboard a lot. */
   :focus-visible {
-    outline: 3px solid var(--color-accent);
+    outline: 2px solid var(--color-accent);
     outline-offset: 1px;
+    border-radius: 2px;
   }
 
   textarea,
@@ -127,146 +129,163 @@
   button {
     font: inherit;
     font-variant-numeric: inherit;
+    color: inherit;
+  }
+
+  /* Let long agent identifiers and repo paths break rather than force a
+     horizontal scrollbar on the whole panel. */
+  .break-anywhere {
+    overflow-wrap: anywhere;
   }
 }
 
 @layer components {
   /* ── Surfaces ───────────────────────────────────────────────
-     A "card" is a white box with a 2px black border and a hard offset shadow.
-     Depth is geometric: the shadow is a solid duplicate, never a blur. */
-  .brut {
-    background: var(--color-paper);
-    border: 2px solid var(--color-ink);
-    box-shadow: 2px 2px 0 0 var(--color-ink);
+     One hairline plus an almost-invisible shadow. Elevation is conveyed by the
+     border; the shadow only keeps a card from looking pasted on. */
+  .card {
+    background: var(--color-bg);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius);
+    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.04);
   }
 
-  /* A heavier lift for things that must read as foreground: gates, dialogs. */
-  .brut-lift {
-    background: var(--color-paper);
-    border: 2px solid var(--color-ink);
-    box-shadow: 4px 4px 0 0 var(--color-ink);
-  }
-
-  /* Flat panel: bordered but not floating. For rails, headers, inline rows. */
-  .brut-flat {
-    background: var(--color-paper);
-    border: 2px solid var(--color-ink);
-  }
-
-  /* Recessed area for transcripts and code. Grey fill, no shadow. */
-  .brut-inset {
-    background: var(--color-faint);
-    border: 2px solid var(--color-ink);
-  }
-
-  /* Interactive card. Press moves it INTO its own shadow — the canonical
-     brutalist affordance, and far more legible than an opacity change. */
-  .brut-press {
-    background: var(--color-paper);
-    border: 2px solid var(--color-ink);
-    box-shadow: 2px 2px 0 0 var(--color-ink);
+  /* Interactive card. The lift is small on purpose: a list of these should not
+     flutter as the pointer crosses it. */
+  .card-hover {
+    background: var(--color-bg);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius);
+    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.04);
     transition:
-      transform 90ms steps(2, end),
-      box-shadow 90ms steps(2, end),
-      background-color 90ms ease;
+      border-color 120ms ease,
+      box-shadow 120ms ease,
+      background-color 120ms ease;
   }
-  .brut-press:hover {
-    background: var(--color-signal-soft);
+  .card-hover:hover {
+    border-color: var(--color-line-strong);
+    box-shadow: 0 2px 8px -2px rgb(0 0 0 / 0.08);
   }
-  .brut-press:active {
-    transform: translate(2px, 2px);
-    box-shadow: 0 0 0 0 var(--color-ink);
+
+  /* Panel: bordered, not floating. Rails, headers, inline rows. */
+  .panel {
+    background: var(--color-bg);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius);
+  }
+
+  /* Recessed area for transcripts, diffs, code. */
+  .inset {
+    background: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius);
   }
 
   /* ── Buttons ────────────────────────────────────────────────
-     700 weight, square, black border, hard shadow — matching their computed
-     button styles exactly. */
+     Medium weight, small radius, hairline border. The pressed state is a 1px
+     nudge — enough to feel, not enough to shift layout. */
   .btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 0.375rem;
-    padding: 0.4375rem 0.75rem;
-    font-size: 0.875rem;
-    font-weight: 700;
+    height: 2rem;
+    padding-inline: 0.75rem;
+    font-size: 0.8125rem;
+    font-weight: 500;
     white-space: nowrap;
-    color: var(--color-ink);
-    background: var(--color-paper);
-    border: 2px solid var(--color-ink);
-    box-shadow: 2px 2px 0 0 var(--color-ink);
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--color-line);
+    background: var(--color-bg);
     transition:
-      transform 90ms steps(2, end),
-      box-shadow 90ms steps(2, end),
-      background-color 90ms ease;
+      background-color 120ms ease,
+      border-color 120ms ease,
+      transform 60ms ease;
   }
   .btn:hover:not(:disabled) {
-    background: var(--color-faint);
+    background: var(--color-surface-2);
+    border-color: var(--color-line-strong);
   }
   .btn:active:not(:disabled) {
-    transform: translate(2px, 2px);
-    box-shadow: 0 0 0 0 var(--color-ink);
+    transform: translateY(1px);
   }
   .btn:disabled {
-    background: var(--color-faint-2);
-    color: var(--color-mute);
-    box-shadow: 2px 2px 0 0 var(--color-mute);
-    border-color: var(--color-mute);
+    opacity: 0.5;
     cursor: not-allowed;
   }
 
   .btn-primary {
     background: var(--color-accent);
+    color: var(--color-accent-fg);
+    border-color: transparent;
   }
   .btn-primary:hover:not(:disabled) {
-    background: oklch(80.8% 0.116 0.76);
+    background: color-mix(in oklab, var(--color-accent) 88%, black);
+    border-color: transparent;
   }
 
-  .btn-signal {
-    background: var(--color-signal);
+  .btn-danger {
+    background: var(--color-bg);
+    color: var(--color-bad);
+    border-color: color-mix(in oklab, var(--color-bad) 30%, var(--color-line));
   }
-  .btn-signal:hover:not(:disabled) {
-    background: oklch(91.3% 0.103 88.02);
+  .btn-danger:hover:not(:disabled) {
+    background: var(--color-bad-soft);
+    border-color: var(--color-bad);
   }
 
   /* Borderless, for tertiary actions where a full box would be noise. */
-  .btn-bare {
+  .btn-ghost {
     border-color: transparent;
-    box-shadow: none;
     background: transparent;
-    font-weight: 600;
   }
-  .btn-bare:hover:not(:disabled) {
-    background: var(--color-faint);
+  .btn-ghost:hover:not(:disabled) {
+    background: var(--color-surface-2);
     border-color: transparent;
-  }
-  .btn-bare:active:not(:disabled) {
-    transform: none;
-    box-shadow: none;
   }
 
   .btn-sm {
-    padding: 0.25rem 0.5rem;
+    height: 1.625rem;
+    padding-inline: 0.5rem;
     font-size: 0.75rem;
+    gap: 0.25rem;
   }
 
-  /* ── Inputs ─────────────────────────────────────────────────
-     Transparent fill and a black box, as theirs compute. */
+  /* Square icon button, for rail and header affordances. */
+  .btn-icon {
+    width: 2rem;
+    padding-inline: 0;
+    flex-shrink: 0;
+  }
+  .btn-icon.btn-sm {
+    width: 1.625rem;
+  }
+
+  /* ── Inputs ─────────────────────────────────────────────────── */
   .field {
     width: 100%;
-    background: transparent;
-    color: var(--color-ink);
-    border: 2px solid var(--color-ink);
-    box-shadow: 2px 2px 0 0 var(--color-ink);
-    padding: 0.5rem;
-    transition: box-shadow 90ms steps(2, end);
+    background: var(--color-bg);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-sm);
+    padding: 0.4375rem 0.625rem;
+    transition:
+      border-color 120ms ease,
+      box-shadow 120ms ease;
   }
   .field::placeholder {
-    color: var(--color-mute);
+    color: var(--color-subtle-fg);
   }
   .field:focus {
     outline: none;
-    /* Deepens rather than glows — a soft ring would break the language. */
-    box-shadow: 4px 4px 0 0 var(--color-accent);
+    border-color: var(--color-accent);
+    /* A soft ring rather than a hard outline, so a focused field reads as active
+       without the surrounding layout appearing to jump. */
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-accent) 15%, transparent);
+  }
+  .field:disabled {
+    background: var(--color-surface);
+    color: var(--color-muted-fg);
+    cursor: not-allowed;
   }
 
   select.field {
@@ -283,54 +302,53 @@
   }
 
   /* ── Tags ───────────────────────────────────────────────────
-     Square, bordered, 700 weight. Meaning is carried by fill colour on a black
-     outline, so a tag never dissolves into the page. */
+     Soft tinted fill, no border. Meaning comes from a low-chroma wash plus the
+     saturated text colour on top of it. */
   .tag {
     display: inline-flex;
     align-items: center;
     gap: 0.25rem;
-    padding: 0.0625rem 0.3125rem;
+    padding: 0.0625rem 0.375rem;
     font-size: 0.6875rem;
-    font-weight: 700;
-    line-height: 1.4;
+    font-weight: 500;
+    line-height: 1.5;
     white-space: nowrap;
-    border: 2px solid var(--color-ink);
-    background: var(--color-paper);
+    border-radius: 0.25rem;
+    background: var(--color-muted);
+    color: var(--color-muted-fg);
   }
 
-  /* ── Typography ─────────────────────────────────────────────
-     A real scale. The previous system had everything between 11 and 13px, so
-     nothing had rank. */
+  /* ── Typography ─────────────────────────────────────────────── */
   .t-hero {
-    font-size: 1.75rem;
-    font-weight: 700;
-    letter-spacing: -0.028em;
-    line-height: 1.15;
+    font-size: 1.5rem;
+    font-weight: 600;
+    letter-spacing: -0.021em;
+    line-height: 1.2;
   }
   .t-lg {
-    font-size: 1.25rem;
-    font-weight: 700;
-    letter-spacing: -0.022em;
+    font-size: 1.125rem;
+    font-weight: 600;
+    letter-spacing: -0.017em;
   }
   .t-md {
-    font-size: 1rem;
-    font-weight: 700;
-    letter-spacing: -0.014em;
+    font-size: 0.9375rem;
+    font-weight: 600;
+    letter-spacing: -0.011em;
   }
 
-  /* Uppercase section label — wide tracking is what makes it read as a label
+  /* Uppercase section label. Wide tracking is what makes it read as a label
      rather than as shrunken body copy. */
   .t-label {
     font-size: 0.6875rem;
-    font-weight: 700;
-    letter-spacing: 0.09em;
+    font-weight: 600;
+    letter-spacing: 0.055em;
     text-transform: uppercase;
-    color: var(--color-mute);
+    color: var(--color-muted-fg);
   }
 
   .t-meta {
     font-size: 0.78125rem;
-    color: var(--color-mute);
+    color: var(--color-muted-fg);
   }
 
   .mono {
@@ -340,86 +358,119 @@
     font-variant-ligatures: none;
   }
 
-  /* ── Chrome ─────────────────────────────────────────────────
-     The yellow panel header, matching their measured 62px and bottom rule. */
-  .panel-header {
+  /* ── Chrome ─────────────────────────────────────────────────── */
+  .app-header {
     display: flex;
-    height: var(--h-panel);
+    height: var(--h-header);
     flex-shrink: 0;
     align-items: center;
-    gap: 0.75rem;
-    border-bottom: 2px solid var(--color-ink);
-    background: var(--color-signal);
+    gap: 0.625rem;
+    border-bottom: 1px solid var(--color-line);
     padding-inline: 1rem;
   }
 
   .rule {
-    border-bottom: 2px solid var(--color-ink);
+    border-bottom: 1px solid var(--color-line);
   }
 
-  .divide-hard > * + * {
-    border-top: 2px solid var(--color-ink);
+  .divide-soft > * + * {
+    border-top: 1px solid var(--color-line);
+  }
+
+  /* Sidebar row. Active state is a filled surface, not a coloured bar — the
+     accent stays reserved for things that need action. */
+  .nav-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    width: 100%;
+    padding: 0.3125rem 0.5rem;
+    border-radius: var(--radius-sm);
+    font-size: 0.8125rem;
+    color: var(--color-fg);
+    transition:
+      background-color 120ms ease,
+      color 120ms ease;
+  }
+  .nav-row:hover {
+    background: var(--color-surface-2);
+  }
+  .nav-row[data-active="true"] {
+    background: var(--color-surface-2);
+    font-weight: 550;
   }
 }
 
 @layer utilities {
-  /* Live indicator: a hard blink, not a soft fade — consistent with the style. */
-  @keyframes blink-hard {
+  /* Live indicator: a soft breath, not a hard blink. Several of these can be on
+     screen while agents run in parallel, so it must not be aggressive. */
+  @keyframes pulse-soft {
     0%,
-    49% {
+    100% {
       opacity: 1;
     }
-    50%,
-    100% {
-      opacity: 0.25;
+    50% {
+      opacity: 0.35;
     }
   }
-  .blink {
-    animation: blink-hard 1.1s steps(1, end) infinite;
+  .pulse {
+    animation: pulse-soft 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
   }
 
-  @keyframes pop {
+  @keyframes rise {
     from {
       opacity: 0;
-      transform: translateY(4px);
+      transform: translateY(3px);
     }
     to {
       opacity: 1;
       transform: none;
     }
   }
-  .pop {
-    animation: pop 140ms steps(3, end);
+  .rise {
+    animation: rise 180ms ease-out;
   }
 
-  /* Indeterminate progress for a running phase. */
-  @keyframes march {
+  /* Indeterminate progress for a phase that is running with no known total. */
+  @keyframes slide {
+    from {
+      transform: translateX(-100%);
+    }
     to {
-      background-position: 16px 0;
+      transform: translateX(300%);
     }
   }
-  .marching {
-    background-image: repeating-linear-gradient(
-      -45deg,
-      var(--color-ink) 0 3px,
-      transparent 3px 8px
-    );
-    animation: march 700ms linear infinite;
+  .indeterminate::after {
+    content: "";
+    position: absolute;
+    inset-block: 0;
+    left: 0;
+    width: 33%;
+    background: var(--color-accent);
+    border-radius: 9999px;
+    animation: slide 1.4s ease-in-out infinite;
   }
 
   .text-balance {
     text-wrap: balance;
   }
 
+  /* Fades the top edge of a scrolling transcript so cut-off text reads as
+     "there is more above" rather than as a hard crop. */
+  .fade-top {
+    mask-image: linear-gradient(to bottom, transparent, black 1.5rem);
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    .blink,
-    .pop,
-    .marching {
+    .pulse,
+    .rise,
+    .indeterminate::after {
       animation: none;
     }
     .btn,
-    .brut-press,
-    .field {
+    .card-hover,
+    .field,
+    .nav-row {
       transition: none;
     }
   }

@@ -25,7 +25,7 @@ export function ReviewPanel({
 
   if (scoped.length === 0) {
     return (
-      <p className="meta">
+      <p className="t-meta">
         还没有评审意见。
         {subtask === null ? "" : " 这个子任务的产出会被另外两位专家独立评审。"}
       </p>
@@ -47,7 +47,7 @@ export function ReviewPanel({
           hint="交给测试判定。红灯说明问题真实存在，绿灯说明提出者判断有误 —— 一个能复现的用例胜过三轮争论。"
         >
           {checkable.length === 0 ? (
-            <p className="meta">（无）</p>
+            <p className="t-meta">（无）</p>
           ) : (
             checkable.map((r) => <FindingCard key={r.id} review={r} />)
           )}
@@ -56,11 +56,11 @@ export function ReviewPanel({
         <Column
           title="需要人判断的分歧"
           count={judgment.length}
-          tone="think"
+          tone="grape"
           hint="审美、取舍、命名这类问题没有客观判据，只有这类才值得占用你的注意力。"
         >
           {judgment.length === 0 ? (
-            <p className="meta">（无）</p>
+            <p className="t-meta">（无）</p>
           ) : (
             judgment.map((r) => <FindingCard key={r.id} review={r} />)
           )}
@@ -90,21 +90,21 @@ function Column({
 }: {
   title: string;
   count: number;
-  tone: "info" | "think";
+  tone: "info" | "grape";
   hint: string;
   children: React.ReactNode;
 }) {
-  const color = tone === "info" ? "var(--color-info)" : "var(--color-think)";
+  const color = tone === "info" ? "var(--color-info)" : "var(--color-grape)";
   return (
     <section>
       <div className="mb-2 flex items-center gap-2.5">
         {/* A coloured rule instead of a badge: it groups the column without adding
             another pill to a screen that already has plenty. */}
         <span aria-hidden className="h-3.5 w-[3px] shrink-0 rounded-full" style={{ background: color }} />
-        <h3 className="title-md">{title}</h3>
-        <span className="meta font-medium">{count}</span>
+        <h3 className="t-md">{title}</h3>
+        <span className="t-meta font-medium">{count}</span>
       </div>
-      <p className="mb-3 max-w-[46ch] text-balance meta">{hint}</p>
+      <p className="mb-3 max-w-[46ch] text-balance t-meta">{hint}</p>
       <div className="space-y-2.5">{children}</div>
     </section>
   );
@@ -119,7 +119,7 @@ function FindingCard({ review }: { review: Review }) {
   const settled = review.reproOutcome === "refuted";
 
   return (
-    <div className="surface p-3.5" style={settled ? { opacity: 0.5 } : undefined}>
+    <div className="card p-3.5" style={settled ? { opacity: 0.5 } : undefined}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1.5">
         <SeverityBadge
           severity={review.severity}
@@ -169,8 +169,8 @@ function FindingCard({ review }: { review: Review }) {
 function Detail({ label, children }: { label: string; children: string }) {
   return (
     <div>
-      <span className="label">{label}</span>
-      <pre className="surface-inset mono mt-1.5 max-h-56 overflow-y-auto whitespace-pre-wrap break-words p-2.5 text-[var(--color-fg-muted)]">
+      <span className="t-label">{label}</span>
+      <pre className="inset mono mt-1.5 max-h-56 overflow-y-auto whitespace-pre-wrap break-words p-2.5 text-[var(--color-muted-fg)]">
         {children}
       </pre>
     </div>
@@ -183,10 +183,10 @@ function VerdictCard({ adjudication }: { adjudication: Adjudication }) {
       ? { tone: "ok" as const, label: "通过" }
       : adjudication.verdict === "rework"
         ? { tone: "warn" as const, label: "返工" }
-        : { tone: "think" as const, label: "上抛给人" };
+        : { tone: "grape" as const, label: "上抛给人" };
 
   return (
-    <div className="surface p-3.5">
+    <div className="card p-3.5">
       <div className="flex items-center gap-2.5">
         <Badge tone={spec.tone} solid>
           {spec.label}
@@ -200,10 +200,10 @@ function VerdictCard({ adjudication }: { adjudication: Adjudication }) {
           className="mt-3 rounded-[var(--radius-md)] border p-3"
           style={{
             borderColor: "color-mix(in oklch, var(--color-accent) 30%, transparent)",
-            background: "var(--color-accent-dim)",
+            background: "var(--color-accent-soft)",
           }}
         >
-          <span className="label">你的决定</span>
+          <span className="t-label">你的决定</span>
           <p className="mt-1">{adjudication.humanDecision}</p>
         </div>
       ) : null}
@@ -233,7 +233,7 @@ export function DiscussionThread({
   return (
     <section>
       <SectionHeader title="专家讨论" count={scoped.length} />
-      <p className="mb-4 max-w-[62ch] text-balance meta">
+      <p className="mb-4 max-w-[62ch] text-balance t-meta">
         只对测试无法判定的点展开，最多两轮。没有「直到达成一致」这种终止条件 —— 那不是可判定的。
       </p>
 
@@ -241,14 +241,14 @@ export function DiscussionThread({
         {rounds.map((round) => (
           <div key={round}>
             <div className="mb-2 flex items-center gap-2.5">
-              <span className="label">第 {round} 轮</span>
+              <span className="t-label">第 {round} 轮</span>
               <span aria-hidden className="h-px flex-1" style={{ background: "var(--color-line)" }} />
             </div>
             <div className="space-y-2.5">
               {scoped
                 .filter((m) => m.round === round)
                 .map((m) => (
-                  <div key={m.id} className="surface p-3.5">
+                  <div key={m.id} className="card p-3.5">
                     <span className="text-[0.8125rem] font-semibold">{m.authorName ?? "专家"}</span>
                     <p className="mt-1.5 whitespace-pre-wrap body-muted">{m.body}</p>
                   </div>
@@ -285,17 +285,17 @@ export function EscalationGate({
       }}
     >
       <h3
-        className="flex items-center gap-2 title-md"
+        className="flex items-center gap-2 t-md"
         style={{ color: "var(--color-warn)" }}
       >
         <span aria-hidden>◆</span>
         需要你裁决
       </h3>
-      <p className="mt-1.5 meta">以下分歧没有客观判据，只能由你来定。</p>
+      <p className="mt-1.5 t-meta">以下分歧没有客观判据，只能由你来定。</p>
 
       <div className="mt-4 space-y-3.5">
         {open.map((a) => (
-          <div key={a.id} className="surface-inset p-3.5">
+          <div key={a.id} className="inset p-3.5">
             <p className="body-muted">{a.rationale}</p>
             <textarea
               className="input mt-2.5 min-h-[4.5rem] resize-y"

@@ -51,7 +51,7 @@ export function PhaseRail({
               style={
                 isCurrent
                   ? {
-                      background: "var(--color-accent-dim)",
+                      background: "var(--color-accent-soft)",
                       border: "1px solid color-mix(in oklch, var(--color-accent) 42%, transparent)",
                     }
                   : {
@@ -70,7 +70,7 @@ export function PhaseRail({
                       ? { background: "var(--color-accent)", color: "var(--color-accent-fg)" }
                       : {
                           border: "1px solid var(--color-line-strong)",
-                          color: "var(--color-fg-subtle)",
+                          color: "var(--color-subtle-fg)",
                         }
                 }
               >
@@ -82,8 +82,8 @@ export function PhaseRail({
                   color: isCurrent
                     ? "var(--color-fg)"
                     : isPast
-                      ? "var(--color-fg-muted)"
-                      : "var(--color-fg-subtle)",
+                      ? "var(--color-muted-fg)"
+                      : "var(--color-subtle-fg)",
                 }}
               >
                 {PHASE_LABEL[phase]}
@@ -140,7 +140,7 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
   };
 
   const running = live.status === "running";
-  const tone = live.status === "failed" ? "danger" : running ? "info" : "ok";
+  const tone = live.status === "failed" ? "bad" : running ? "info" : "ok";
 
   return (
     <div
@@ -190,7 +190,7 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
         <button
           type="button"
           className="flex w-full items-center gap-1.5 border-b px-3.5 py-1.5 text-left text-[0.75rem] transition-colors hover:bg-[oklch(1_0_0/4%)]"
-          style={{ borderColor: "var(--color-line)", color: "var(--color-think)" }}
+          style={{ borderColor: "var(--color-line)", color: "var(--color-grape)" }}
           onClick={() => setShowThinking((v) => !v)}
           aria-expanded={showThinking}
         >
@@ -206,12 +206,12 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
         ref={scroller}
         onScroll={onScroll}
         className={`max-h-[19rem] overflow-y-auto px-3.5 py-3 ${running ? "fade-bottom" : ""}`}
-        style={{ background: "var(--color-surface-sunken)" }}
+        style={{ background: "var(--color-surface)" }}
       >
         {showThinking && live.thinking.length > 0 ? (
           <pre
             className="mono mb-3 whitespace-pre-wrap break-words border-l-2 pl-3 opacity-70"
-            style={{ borderColor: "var(--color-think)", color: "var(--color-fg-muted)" }}
+            style={{ borderColor: "var(--color-grape)", color: "var(--color-muted-fg)" }}
           >
             {live.thinking}
           </pre>
@@ -220,13 +220,13 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
         {live.text.length > 0 ? (
           <pre className="mono whitespace-pre-wrap break-words">{live.text}</pre>
         ) : running ? (
-          <p className="meta">等待输出…</p>
+          <p className="t-meta">等待输出…</p>
         ) : (
-          <p className="meta">（无文本输出）</p>
+          <p className="t-meta">（无文本输出）</p>
         )}
 
         {live.error !== null ? (
-          <p className="mt-2.5 text-[0.8125rem]" style={{ color: "var(--color-danger)" }}>
+          <p className="mt-2.5 text-[0.8125rem]" style={{ color: "var(--color-bad)" }}>
             {live.error}
           </p>
         ) : null}
@@ -271,7 +271,7 @@ export function StageBoard({
         return (
           <div key={stage}>
             <div className="mb-2.5 flex flex-wrap items-center gap-x-2.5 gap-y-1">
-              <span className="label">第 {stage + 1} 批</span>
+              <span className="t-label">第 {stage + 1} 批</span>
               <Meta>{inStage.length} 个子任务并行</Meta>
               {cleared ? (
                 <Badge tone="ok">屏障已通过</Badge>
@@ -291,13 +291,13 @@ export function StageBoard({
                     key={s.id}
                     type="button"
                     onClick={() => onSelect(selected ? null : s.id)}
-                    className="card-link p-3.5 text-left"
+                    className="card-hover p-3.5 text-left"
                     style={
                       selected
                         ? {
                             borderColor: "var(--color-accent)",
                             background:
-                              "color-mix(in oklch, var(--color-accent) 7%, var(--color-surface-raised))",
+                              "color-mix(in oklch, var(--color-accent) 7%, var(--color-bg))",
                           }
                         : undefined
                     }
@@ -307,10 +307,10 @@ export function StageBoard({
                       <p className="text-[0.875rem] font-medium leading-snug">{s.title}</p>
                       <SubTaskBadge status={s.status} />
                     </div>
-                    <p className="mt-2 line-clamp-2 meta">{s.brief}</p>
+                    <p className="mt-2 line-clamp-2 t-meta">{s.brief}</p>
                     <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1">
                       {s.assigneeName ? (
-                        <span className="text-[0.75rem] font-medium text-[var(--color-fg-muted)]">
+                        <span className="text-[0.75rem] font-medium text-[var(--color-muted-fg)]">
                           {s.assigneeName}
                         </span>
                       ) : null}

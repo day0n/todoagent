@@ -2,40 +2,27 @@ import type { Phase, RunStatus, RuntimeKind, SubTaskStatus } from "../lib/types.
 import { PHASE_LABEL, STATUS_LABEL } from "../lib/types.ts";
 
 /**
- * Semantic tones, expressed as brutalist fills.
+ * Semantic tones.
  *
- * In this style a tag is a black-outlined box with a solid fill, so a tone is a
- * BACKGROUND rather than a text colour. Ink stays constant for contrast — the fills
- * are all light enough to carry 700-weight near-black text, which is what keeps the
- * palette legible without a second thought.
+ * A tone is a PAIR: a low-chroma wash plus the saturated ink that sits on it.
+ * That is what lets a badge stay legible without a border, and it keeps colour
+ * cheap enough that a dense page is not a fruit salad.
+ *
+ * Colour discipline matters here more than in most UIs: this app shows several
+ * agents' parallel output at once, so hue is reserved for state a person acts on
+ * — a blocker, a gate, a failure. Structure is carried by greys.
  */
-export type Tone = "ok" | "warn" | "bad" | "info" | "grape" | "mute" | "accent" | "signal";
+export type Tone = "ok" | "warn" | "bad" | "info" | "grape" | "accent" | "mute";
 
-const FILL: Record<Tone, string> = {
-  ok: "var(--color-ok-soft)",
-  warn: "var(--color-warn-soft)",
-  bad: "var(--color-bad-soft)",
-  info: "var(--color-aqua-soft)",
-  grape: "var(--color-grape-soft)",
-  mute: "var(--color-faint)",
-  accent: "var(--color-accent-soft)",
-  signal: "var(--color-signal-soft)",
+const TONE: Record<Tone, { bg: string; fg: string }> = {
+  ok: { bg: "var(--color-ok-soft)", fg: "var(--color-ok)" },
+  warn: { bg: "var(--color-warn-soft)", fg: "var(--color-warn)" },
+  bad: { bg: "var(--color-bad-soft)", fg: "var(--color-bad)" },
+  info: { bg: "var(--color-info-soft)", fg: "var(--color-info)" },
+  grape: { bg: "var(--color-grape-soft)", fg: "var(--color-grape)" },
+  accent: { bg: "var(--color-accent-soft)", fg: "var(--color-accent)" },
+  mute: { bg: "var(--color-muted)", fg: "var(--color-muted-fg)" },
 };
-
-/** The saturated version, for a tag that must interrupt. */
-const SOLID: Record<Tone, string> = {
-  ok: "var(--color-ok)",
-  warn: "var(--color-warn)",
-  bad: "var(--color-bad)",
-  info: "var(--color-aqua)",
-  grape: "var(--color-grape)",
-  mute: "var(--color-faint-2)",
-  accent: "var(--color-accent)",
-  signal: "var(--color-signal)",
-};
-
-/** Solid dark fills need light text; the light ones do not. */
-const NEEDS_LIGHT_TEXT = new Set<Tone>(["ok", "warn", "bad"]);
 
 export function Badge({
   children,
@@ -46,28 +33,25 @@ export function Badge({
 }: {
   children: React.ReactNode;
   tone?: Tone;
+  /** Inverts to a filled chip. For the one verdict in a row that must interrupt. */
   solid?: boolean;
   title?: string;
-  /** Adds a blinking square — for a live state where fill alone is too static. */
+  /** Adds a breathing dot — for a live state where a static fill reads as stale. */
   dot?: boolean;
 }) {
+  const t = TONE[tone] ?? TONE.mute;
   return (
     <span
       className="tag"
       title={title}
       style={
-        solid
-          ? {
-              background: SOLID[tone],
-              color: NEEDS_LIGHT_TEXT.has(tone) ? "var(--color-paper)" : "var(--color-ink)",
-            }
-          : { background: FILL[tone] }
+        solid ? { background: t.fg, color: "var(--color-bg)" } : { background: t.bg, color: t.fg }
       }
     >
       {dot ? (
         <span
           aria-hidden
-          className="blink inline-block h-1.5 w-1.5 shrink-0"
+          className="pulse inline-block h-1.5 w-1.5 shrink-0 rounded-full"
           style={{ background: "currentColor" }}
         />
       ) : null}
@@ -76,7 +60,7 @@ export function Badge({
   );
 }
 
-/** Plain metadata. Used instead of a tag for anything that is not a state. */
+/** Plain metadata. Used instead of a badge for anything that is not a state. */
 export function Meta({ children, title }: { children: React.ReactNode; title?: string }) {
   return (
     <span className="t-meta" title={title}>
@@ -87,15 +71,17 @@ export function Meta({ children, title }: { children: React.ReactNode; title?: s
 
 export function Dot() {
   return (
-    <span aria-hidden className="text-mute opacity-50">
-      /
+    <span aria-hidden className="select-none text-subtle-fg">
+      ·
     </span>
   );
 }
 
 const STATUS_TONE: Record<RunStatus, Tone> = {
   running: "info",
-  blocked_on_human: "signal",
+  // Amber, because this is the one state whose entire meaning is "a person must
+  // act before anything else happens".
+  blocked_on_human: "warn",
   completed: "ok",
   failed: "bad",
   cancelled: "mute",
@@ -113,7 +99,9 @@ export function StatusBadge({ status }: { status: RunStatus }) {
 const SUBTASK: Record<SubTaskStatus, { tone: Tone; label: string }> = {
   todo: { tone: "mute", label: "待开始" },
   running: { tone: "info", label: "进行中" },
-  in_review: { tone: "signal", label: "待复核" },
+  // Purple keeps "waiting on review" distinct from both "running" and "needs
+  // you" — three different kinds of not-done that are easy to conflate.
+  in_review: { tone: "grape", label: "待复核" },
   reworking: { tone: "warn", label: "返工中" },
   done: { tone: "ok", label: "已完成" },
   blocked: { tone: "warn", label: "已阻塞" },
@@ -130,18 +118,23 @@ export function SubTaskBadge({ status }: { status: SubTaskStatus }) {
 }
 
 /**
- * A member's mark: a filled square plus their name.
+ * A member's mark: a small tinted tile plus their name.
  *
- * A square, not a circle — there is not a single rounded corner in this system. Each
- * vendor keeps a stable hue so a wall of parallel output is scannable by author
- * without reading names.
+ * Each vendor keeps a stable hue so a wall of parallel output is scannable by
+ * author without reading names. The tile is an avatar shape rather than a status
+ * pill on purpose — it sits beside status badges constantly, and identity must
+ * not be mistaken for state.
+ *
+ * No cast on this map: an exhaustive Record is what catches a missing or
+ * misspelled runtime at compile time, which is the only reason it is typed
+ * rather than a plain object.
  */
-const RUNTIME_FILL: Record<RuntimeKind, Tone> = {
-  claude: "accent",
+const RUNTIME_TONE: Record<RuntimeKind, Tone> = {
+  claude: "warn",
   codex: "ok",
   cursor: "info",
   gemini: "grape",
-  kiro: "signal",
+  kiro: "accent",
   grok: "bad",
 };
 
@@ -154,15 +147,19 @@ export function RuntimeMark({
   name?: string;
   showKind?: boolean;
 }) {
+  const t = TONE[RUNTIME_TONE[kind] ?? "mute"] ?? TONE.mute;
+  const label = name ?? kind;
   return (
-    <span className="inline-flex items-center gap-1.5" title={`runtime: ${kind}`}>
+    <span className="inline-flex min-w-0 items-center gap-1.5" title={`runtime: ${kind}`}>
       <span
         aria-hidden
-        className="inline-block h-3.5 w-3.5 shrink-0 border-2 border-ink"
-        style={{ background: SOLID[RUNTIME_FILL[kind] ?? "mute"] }}
-      />
-      <span className="text-[0.8125rem] font-bold">{name ?? kind}</span>
-      {showKind && name ? <span className="t-meta">{kind}</span> : null}
+        className="grid h-4 w-4 shrink-0 place-items-center rounded-[4px] text-[9px] font-semibold uppercase"
+        style={{ background: t.bg, color: t.fg }}
+      >
+        {label.slice(0, 1)}
+      </span>
+      <span className="truncate text-[0.8125rem] font-medium">{label}</span>
+      {showKind && name ? <span className="t-meta shrink-0">{kind}</span> : null}
     </span>
   );
 }
@@ -170,7 +167,7 @@ export function RuntimeMark({
 /**
  * A finding's severity and how it was settled.
  *
- * The verdict tag is `solid` deliberately: "reproduced" versus "refuted" is the
+ * The verdict chip is `solid` deliberately: "reproduced" versus "refuted" is the
  * difference between a real defect and a reviewer being wrong, and it is the one
  * place in this UI where colour carries the meaning rather than decorating it.
  */
@@ -221,15 +218,17 @@ export function SeverityBadge({
 }
 
 export function PhaseBadge({ phase }: { phase: Phase }) {
-  return <Badge tone="signal">{PHASE_LABEL[phase] ?? phase}</Badge>;
+  return <Badge tone="accent">{PHASE_LABEL[phase] ?? phase}</Badge>;
 }
 
 export function Spinner({ label }: { label?: string }) {
   return (
-    <span className="inline-flex items-center gap-2.5 font-semibold">
-      {/* A square that blinks rather than a spinning ring — a smooth circle would be
-          the only curved, continuously-animated thing on the page. */}
-      <span aria-hidden className="blink inline-block h-3 w-3 border-2 border-ink bg-signal" />
+    <span className="inline-flex items-center gap-2 text-muted-fg">
+      <span
+        aria-hidden
+        className="inline-block h-3.5 w-3.5 shrink-0 animate-spin rounded-full border-2 border-line"
+        style={{ borderTopColor: "var(--color-accent)" }}
+      />
       {label ?? "加载中"}
     </span>
   );
@@ -237,12 +236,18 @@ export function Spinner({ label }: { label?: string }) {
 
 export function ErrorBox({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
-    <div role="alert" className="brut pop p-3.5" style={{ background: "var(--color-bad-soft)" }}>
-      <div className="t-md flex items-center gap-2">
-        <span aria-hidden>!</span>
+    <div
+      role="alert"
+      className="rise rounded-[var(--radius)] border p-3"
+      style={{
+        background: "var(--color-bad-soft)",
+        borderColor: "color-mix(in oklab, var(--color-bad) 26%, transparent)",
+      }}
+    >
+      <div className="font-medium" style={{ color: "var(--color-bad)" }}>
         出错了
       </div>
-      <p className="mt-1.5 whitespace-pre-wrap">{message}</p>
+      <p className="mt-1 break-anywhere whitespace-pre-wrap">{message}</p>
       {onRetry ? (
         <button type="button" className="btn btn-sm mt-2.5" onClick={onRetry}>
           重试
@@ -262,17 +267,17 @@ export function Empty({
   icon?: React.ReactNode;
 }) {
   return (
-    <div className="brut-inset grid place-items-center px-6 py-12 text-center">
+    <div className="grid place-items-center px-6 py-14 text-center">
       {icon ? (
         <div
           aria-hidden
-          className="mb-3 grid h-9 w-9 place-items-center border-2 border-ink bg-paper text-base font-bold"
+          className="mb-3 grid h-9 w-9 place-items-center rounded-[var(--radius-sm)] border border-line bg-surface text-muted-fg"
         >
           {icon}
         </div>
       ) : null}
-      <p className="font-bold">{title}</p>
-      {hint ? <p className="t-meta mt-1.5 max-w-md text-balance">{hint}</p> : null}
+      <p className="font-medium">{title}</p>
+      {hint ? <p className="t-meta mt-1 max-w-md text-balance">{hint}</p> : null}
     </div>
   );
 }
@@ -280,10 +285,10 @@ export function Empty({
 /**
  * Budget meter.
  *
- * A segmented bar rather than a smooth gradient: this style has no soft fills, and
- * discrete blocks also make "roughly how much is left" readable at a glance. Amber
- * past 70%, red past 90% — the ceiling is a hard stop, so it should look like one
- * before it arrives.
+ * A single thin bar rather than segments: the exact figure lives in the title and
+ * the adjacent text, so the bar's only job is "roughly how close to the wall".
+ * Amber past 70%, red past 90% — the ceiling is a hard stop that kills a run, so
+ * it should look like one before it arrives rather than after.
  */
 export function BudgetMeter({
   spent,
@@ -297,12 +302,10 @@ export function BudgetMeter({
   if (budget <= 0) return null;
   const pct = Math.min(100, Math.round((spent / budget) * 100));
   const tone: Tone = pct >= 90 ? "bad" : pct >= 70 ? "warn" : "ok";
-  const SEGMENTS = 10;
-  const lit = Math.max(1, Math.round((pct / 100) * SEGMENTS));
 
   return (
     <div
-      className={`flex gap-0.5 ${className}`}
+      className={`h-1 w-full overflow-hidden rounded-full bg-muted ${className}`}
       title={`${spent.toLocaleString()} / ${budget.toLocaleString()} tokens (${pct}%)`}
       role="progressbar"
       aria-valuenow={pct}
@@ -310,14 +313,10 @@ export function BudgetMeter({
       aria-valuemax={100}
       aria-label="预算用量"
     >
-      {Array.from({ length: SEGMENTS }, (_, i) => (
-        <span
-          key={i}
-          aria-hidden
-          className="h-2 flex-1 border-2 border-ink"
-          style={{ background: i < lit ? SOLID[tone] : "var(--color-paper)" }}
-        />
-      ))}
+      <div
+        className="h-full rounded-full transition-[width] duration-500 ease-out"
+        style={{ width: `${Math.max(pct, 1.5)}%`, background: TONE[tone].fg }}
+      />
     </div>
   );
 }
@@ -334,13 +333,9 @@ export function SectionHeader({
   right?: React.ReactNode;
 }) {
   return (
-    <div className="mb-3 flex flex-wrap items-baseline gap-x-2.5 gap-y-1">
+    <div className="mb-3 flex flex-wrap items-baseline gap-x-2 gap-y-1">
       <h2 className="t-md">{title}</h2>
-      {count !== undefined && count > 0 ? (
-        <span className="tag" style={{ background: "var(--color-faint)" }}>
-          {count}
-        </span>
-      ) : null}
+      {count !== undefined && count > 0 ? <span className="tag">{count}</span> : null}
       {hint ? <span className="t-meta">{hint}</span> : null}
       {right ? <div className="ml-auto">{right}</div> : null}
     </div>

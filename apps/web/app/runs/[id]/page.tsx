@@ -108,7 +108,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
 
   if (detail === null) {
     return (
-      <div className="surface mt-12 p-6">
+      <div className="card mt-12 p-6">
         <Spinner label="加载委托" />
       </div>
     );
@@ -133,7 +133,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
         </Link>
 
         <div className="min-w-0 flex-1">
-          <h1 className="title-lg text-balance">{run.goal}</h1>
+          <h1 className="t-lg text-balance">{run.goal}</h1>
 
           <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1.5">
             <StatusBadge status={run.status} />
@@ -194,8 +194,8 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
       </div>
 
       {run.acceptance !== null && run.acceptance.length > 0 ? (
-        <div className="surface-inset mt-4 px-3.5 py-2.5">
-          <span className="label">验收标准</span>
+        <div className="inset mt-4 px-3.5 py-2.5">
+          <span className="t-label">验收标准</span>
           <p className="mt-1 body-muted">{run.acceptance}</p>
         </div>
       ) : null}
@@ -298,7 +298,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
               style={
                 isSelected
                   ? { borderColor: "var(--color-accent)", color: "var(--color-fg)" }
-                  : { borderColor: "transparent", color: "var(--color-fg-subtle)" }
+                  : { borderColor: "transparent", color: "var(--color-subtle-fg)" }
               }
             >
               {TAB_LABEL[key]}
@@ -306,8 +306,8 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
                 <span
                   className="rounded-[0.3125rem] px-1.5 text-[0.6875rem] font-semibold tabular-nums"
                   style={{
-                    background: isSelected ? "var(--color-accent-dim)" : "var(--color-surface-raised)",
-                    color: isSelected ? "var(--color-accent)" : "var(--color-fg-subtle)",
+                    background: isSelected ? "var(--color-accent-soft)" : "var(--color-bg)",
+                    color: isSelected ? "var(--color-accent)" : "var(--color-subtle-fg)",
                   }}
                 >
                   {count}
@@ -317,7 +317,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
                 <span
                   aria-label={`${blockers} 个未解决的阻塞项`}
                   className="h-1.5 w-1.5 rounded-full"
-                  style={{ background: "var(--color-danger)" }}
+                  style={{ background: "var(--color-bad)" }}
                 />
               ) : null}
             </button>
@@ -455,13 +455,13 @@ function PlanGate({
         boxShadow: "var(--shadow-md), var(--highlight)",
       }}
     >
-      <h2 className="flex items-center gap-2 title-md">
+      <h2 className="flex items-center gap-2 t-md">
         <span aria-hidden style={{ color: "var(--color-accent)" }}>
           ◆
         </span>
         确认拆解方案
       </h2>
-      <p className="mt-1.5 max-w-[62ch] text-balance meta">
+      <p className="mt-1.5 max-w-[62ch] text-balance t-meta">
         同一批里的子任务会在各自独立的 worktree 中并行执行，互相看不到对方的产出。后一批开始前，前一批的产出会先合并进来。
       </p>
 
@@ -469,14 +469,14 @@ function PlanGate({
         {stages.map((stage) => (
           <div key={stage}>
             <div className="mb-2 flex items-center gap-2.5">
-              <span className="label">第 {stage + 1} 批</span>
+              <span className="t-label">第 {stage + 1} 批</span>
               <Meta>{subtasks.filter((s) => s.stage === stage).length} 个并行</Meta>
             </div>
             <ol className="space-y-2">
               {subtasks
                 .filter((s) => s.stage === stage)
                 .map((s) => (
-                  <li key={s.id} className="surface-inset p-3">
+                  <li key={s.id} className="inset p-3">
                     <div className="flex flex-wrap items-start justify-between gap-2">
                       <p className="font-medium leading-snug">{s.title}</p>
                       <div className="flex shrink-0 flex-wrap gap-1.5">
@@ -485,7 +485,7 @@ function PlanGate({
                       </div>
                     </div>
                     <p className="mt-1.5 body-muted">{s.brief}</p>
-                    {s.acceptance ? <p className="mt-1.5 meta">验收：{s.acceptance}</p> : null}
+                    {s.acceptance ? <p className="mt-1.5 t-meta">验收：{s.acceptance}</p> : null}
                   </li>
                 ))}
             </ol>
@@ -522,17 +522,17 @@ function MergeAndVerify({
             background: "color-mix(in oklch, var(--color-warn) 5%, var(--color-surface))",
           }}
         >
-          <h3 className="title-md" style={{ color: "var(--color-warn)" }}>
+          <h3 className="t-md" style={{ color: "var(--color-warn)" }}>
             有产出留给你处理
           </h3>
-          <p className="mt-1.5 max-w-[62ch] text-balance meta">
+          <p className="mt-1.5 max-w-[62ch] text-balance t-meta">
             没有自动解决 —— 机器随手挑一边正是这套系统要避免的那类静默损坏。
           </p>
 
           {conflicts.length > 0 ? (
             <div className="mt-3">
-              <span className="label">合并冲突</span>
-              <ul className="mono mt-1.5 space-y-1 text-[var(--color-fg-muted)]">
+              <span className="t-label">合并冲突</span>
+              <ul className="mono mt-1.5 space-y-1 text-[var(--color-muted-fg)]">
                 {conflicts.map((c) => (
                   <li key={c}>{c}</li>
                 ))}
@@ -542,8 +542,8 @@ function MergeAndVerify({
 
           {unmergeable.length > 0 ? (
             <div className="mt-3">
-              <span className="label">未合并（评审未通过或没有分支）</span>
-              <ul className="mono mt-1.5 space-y-1 text-[var(--color-fg-muted)]">
+              <span className="t-label">未合并（评审未通过或没有分支）</span>
+              <ul className="mono mt-1.5 space-y-1 text-[var(--color-muted-fg)]">
                 {unmergeable.map((u) => (
                   <li key={u}>{u}</li>
                 ))}
@@ -554,12 +554,12 @@ function MergeAndVerify({
       ) : null}
 
       {report !== null ? (
-        <div className="surface p-4">
+        <div className="card p-4">
           <div className="flex items-center gap-2.5">
-            <h3 className="title-md">验证报告</h3>
-            <Badge tone={report.ok ? "ok" : "danger"}>{report.ok ? "已执行" : "执行失败"}</Badge>
+            <h3 className="t-md">验证报告</h3>
+            <Badge tone={report.ok ? "ok" : "bad"}>{report.ok ? "已执行" : "执行失败"}</Badge>
           </div>
-          <pre className="surface-inset mono mt-3 max-h-[22rem] overflow-y-auto whitespace-pre-wrap break-words p-3 text-[var(--color-fg-muted)]">
+          <pre className="inset mono mt-3 max-h-[22rem] overflow-y-auto whitespace-pre-wrap break-words p-3 text-[var(--color-muted-fg)]">
             {report.text}
           </pre>
         </div>
@@ -597,23 +597,23 @@ function EventLog({ rows }: { rows: LogRow[] }) {
         />
         <Meta>{visible.length} 条</Meta>
       </div>
-      <p className="mb-3 meta">逐字输出不在这里 —— 它属于上方每位专家的实时卡片。</p>
+      <p className="mb-3 t-meta">逐字输出不在这里 —— 它属于上方每位专家的实时卡片。</p>
 
       {visible.length === 0 ? (
         <Empty icon="○" title="没有匹配的事件" />
       ) : (
-        <div className="surface divide-line overflow-hidden">
+        <div className="card divide-line overflow-hidden">
           {visible.map((ev) => (
             <details key={ev.id} className="group">
               <summary className="flex cursor-pointer items-center gap-2.5 px-3.5 py-2 transition-colors duration-150 hover:bg-[oklch(1_0_0/4%)]">
-                <span className="mono shrink-0 text-[var(--color-fg-subtle)]">
+                <span className="mono shrink-0 text-[var(--color-subtle-fg)]">
                   {new Date(ev.createdAt).toLocaleTimeString("zh-CN", { hour12: false })}
                 </span>
                 <span className="mono font-medium">{ev.type}</span>
               </summary>
               <pre
-                className="mono max-h-72 overflow-auto px-3.5 py-2.5 text-[var(--color-fg-muted)]"
-                style={{ background: "var(--color-surface-sunken)" }}
+                className="mono max-h-72 overflow-auto px-3.5 py-2.5 text-[var(--color-muted-fg)]"
+                style={{ background: "var(--color-surface)" }}
               >
                 {JSON.stringify(ev.payload, null, 2)}
               </pre>

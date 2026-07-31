@@ -101,9 +101,9 @@ export default function HomePage() {
           交代一件事，一支本地专家团队会拆解它、并行执行、互相评审，最后交回被审查过的结果。
         </p>
 
-        <div className="surface-hero mt-7 p-1.5">
+        <div className="card mt-7 p-1.5">
           <textarea
-            className="min-h-[7.5rem] w-full resize-y bg-transparent px-3.5 pt-3 text-[0.9375rem] leading-relaxed outline-none placeholder:text-[var(--color-fg-subtle)]"
+            className="min-h-[7.5rem] w-full resize-y bg-transparent px-3.5 pt-3 text-[0.9375rem] leading-relaxed outline-none placeholder:text-[var(--color-subtle-fg)]"
             placeholder="例如：给设置页加深色模式，跟系统偏好同步，切换时不要闪白屏"
             value={goal}
             onChange={(e) => setGoal(e.target.value)}
@@ -118,7 +118,7 @@ export default function HomePage() {
             {projects !== null && projects.length > 0 ? (
               <select
                 className="input btn-sm w-auto"
-                style={{ background: "var(--color-surface-sunken)" }}
+                style={{ background: "var(--color-surface)" }}
                 value={projectId}
                 onChange={(e) => setProjectId(e.target.value)}
                 aria-label="目标仓库"
@@ -147,7 +147,7 @@ export default function HomePage() {
             {autoApprove ? <Meta>自动通过拆解</Meta> : null}
 
             <div className="ml-auto flex items-center gap-2.5">
-              <kbd className="hidden meta sm:block">⌘↵</kbd>
+              <kbd className="hidden t-meta sm:block">⌘↵</kbd>
               <button
                 type="button"
                 className="btn btn-primary"
@@ -165,7 +165,7 @@ export default function HomePage() {
               style={{ borderColor: "var(--color-line)" }}
             >
               <label className="block">
-                <span className="label">验收标准（可选）</span>
+                <span className="t-label">验收标准（可选）</span>
                 <textarea
                   className="input mt-2 min-h-[4.5rem] resize-y"
                   placeholder="怎样算做完了？写具体一点，评审者会照这个检查。"
@@ -177,7 +177,7 @@ export default function HomePage() {
               <div className="grid gap-5 sm:grid-cols-2">
                 <div>
                   <div className="flex items-baseline justify-between">
-                    <span className="label">预算上限</span>
+                    <span className="t-label">预算上限</span>
                     <span className="text-[0.8125rem] font-medium tabular-nums">{budgetM}M</span>
                   </div>
                   <input
@@ -190,7 +190,7 @@ export default function HomePage() {
                     className="mt-2.5 w-full accent-[var(--color-accent)]"
                     aria-label="预算上限（百万 token）"
                   />
-                  <p className="mt-1.5 meta">硬上限。超出即停，并把中间产物交给你。</p>
+                  <p className="mt-1.5 t-meta">硬上限。超出即停，并把中间产物交给你。</p>
                 </div>
 
                 <div className="space-y-3">
@@ -213,7 +213,7 @@ export default function HomePage() {
         </div>
 
         {activeProject ? (
-          <p className="mono mt-2.5 truncate px-1 text-[var(--color-fg-subtle)]">
+          <p className="mono mt-2.5 truncate px-1 text-[var(--color-subtle-fg)]">
             {activeProject.repoPath}
           </p>
         ) : null}
@@ -241,7 +241,7 @@ export default function HomePage() {
 
         <div className="space-y-2.5">
           {loading ? (
-            <div className="surface p-5">
+            <div className="card p-5">
               <Spinner />
             </div>
           ) : runs !== null && runs.length === 0 ? (
@@ -276,7 +276,7 @@ function Toggle({
       />
       <span>
         <span className="block text-[0.8125rem] font-medium">{title}</span>
-        <span className="mt-0.5 block meta">{hint}</span>
+        <span className="mt-0.5 block t-meta">{hint}</span>
       </span>
     </label>
   );
@@ -287,7 +287,7 @@ function RunRow({ run }: { run: Run }) {
   return (
     <Link
       href={`/runs/${run.id}`}
-      className="card-link p-4"
+      className="card-hover p-4"
       style={
         needsYou
           ? {
@@ -346,7 +346,7 @@ function RunRow({ run }: { run: Run }) {
       {run.error !== null && run.status === "failed" ? (
         <p
           className="mt-2.5 line-clamp-2 text-[0.8125rem]"
-          style={{ color: "var(--color-danger)" }}
+          style={{ color: "var(--color-bad)" }}
         >
           {run.error}
         </p>
