@@ -1,6 +1,7 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { findMentions, segmentBody } from "@council/core/mentions";
 import { api, ApiError, fmtRelative } from "../lib/api.ts";
 import type { Channel, Expert, Message, MessageWithThread } from "../lib/types.ts";
 import { Empty, ErrorBox, RuntimeMark, Spinner } from "./atoms.tsx";
@@ -145,7 +146,7 @@ export function Chat({
         onRetry={retry}
         onReload={() => void load()}
       />
-      <Composer channel={channel} onSend={send} />
+      <Composer channel={channel} experts={experts} onSend={send} />
     </div>
   );
 }
@@ -229,7 +230,7 @@ function Stream({
             ))}
             {pending.map((p) => (
               <li key={p.key}>
-                <PendingRow item={p} onRetry={() => onRetry(p.key)} />
+                <PendingRow item={p} experts={experts} onRetry={() => onRetry(p.key)} />
               </li>
             ))}
           </ol>
@@ -243,6 +244,41 @@ function Stream({
 function authorOf(message: Message, experts: Expert[]): Expert | null {
   if (message.authorKind !== "expert" || message.authorId === null) return null;
   return experts.find((e) => e.id === message.authorId) ?? null;
+}
+
+/**
+ * A message body with its mentions marked.
+ *
+ * Uses the engine's own parser rather than a regex of its own. That is the whole
+ * point of `mentions.ts` being dependency-free: a second implementation here
+ * would drift, and the failure would be a name shown as a mention that the router
+ * does not actually route to — which is invisible until nobody answers.
+ *
+ * Only mentions of a KNOWN expert are marked, so `@nobody` renders as the plain
+ * text it behaves as.
+ */
+function Body({ text, experts, className }: { text: string; experts: Expert[]; className: string }) {
+  const segments = useMemo(() => segmentBody(text, experts), [text, experts]);
+
+  return (
+    <p className={className}>
+      {segments.map((seg, i) =>
+        seg.kind === "mention" ? (
+          <span
+            // eslint-disable-next-line react/no-array-index-key -- segments are positional
+            key={i}
+            className="rounded-[3px] px-0.5 font-medium"
+            style={{ background: "var(--color-accent-soft)", color: "var(--color-accent)" }}
+          >
+            {seg.text}
+          </span>
+        ) : (
+          // eslint-disable-next-line react/no-array-index-key -- segments are positional
+          <span key={i}>{seg.text}</span>
+        ),
+      )}
+    </p>
+  );
 }
 
 function Row({
@@ -285,7 +321,11 @@ function Row({
         {expert ? <span className="t-meta">{expert.runtimeKind}</span> : null}
       </div>
 
-      <p className="mt-1 break-anywhere whitespace-pre-wrap">{message.body}</p>
+      <Body
+        text={message.body}
+        experts={experts}
+        className="mt-1 break-anywhere whitespace-pre-wrap"
+      />
 
       {message.replyCount > 0 ? (
         <button
@@ -307,7 +347,15 @@ function Row({
   );
 }
 
-function PendingRow({ item, onRetry }: { item: Pending; onRetry: () => void }) {
+function PendingRow({
+  item,
+  experts,
+  onRetry,
+}: {
+  item: Pending;
+  experts: Expert[];
+  onRetry: () => void;
+}) {
   return (
     <div className={item.failed ? "" : "opacity-60"}>
       <div className="flex items-baseline gap-2">
@@ -323,7 +371,13 @@ function PendingRow({ item, onRetry }: { item: Pending; onRetry: () => void }) {
         <span className="t-meta">{item.failed ? "发送失败" : "发送中…"}</span>
         {item.asTask ? <span className="tag">任务</span> : null}
       </div>
-      <p className="mt-1 break-anywhere whitespace-pre-wrap">{item.body}</p>
+      {/* Same rendering as an acknowledged message, so nothing shifts or
+          re-highlights when the engine confirms it. */}
+      <Body
+        text={item.body}
+        experts={experts}
+        className="mt-1 break-anywhere whitespace-pre-wrap"
+      />
       {item.failed ? (
         <button type="button" className="btn btn-sm mt-1.5" onClick={onRetry}>
           重试
@@ -382,7 +436,11 @@ function Thread({ rootId, experts }: { rootId: string; experts: Expert[] }) {
                     {fmtRelative(r.createdAt)}
                   </time>
                 </div>
-                <p className="mt-0.5 break-anywhere whitespace-pre-wrap">{r.body}</p>
+                <Body
+                  text={r.body}
+                  experts={experts}
+                  className="mt-0.5 break-anywhere whitespace-pre-wrap"
+                />
               </li>
             );
           })}
@@ -394,14 +452,34 @@ function Thread({ rootId, experts }: { rootId: string; experts: Expert[] }) {
 
 function Composer({
   channel,
+  experts,
   onSend,
 }: {
   channel: Channel;
+  experts: Expert[];
   onSend: (body: string, asTask: boolean) => void;
 }) {
   const [text, setText] = useState("");
   const [asTask, setAsTask] = useState(false);
   const box = useRef<HTMLTextAreaElement>(null);
+
+  /*
+   * Who this message will actually reach.
+   *
+   * Computed with the ENGINE's parser, so what is shown here is what the router
+   * will do — not a second opinion from a regex that happens to live in the
+   * browser.
+   *
+   * This exists because the routing rule fails silently in the one direction that
+   * matters: a channel message with no recognised mention is answered by NOBODY,
+   * so a typo'd name produces no reply, no error, and nothing to look at. A DM
+   * always reaches its agent, so it needs no such warning.
+   */
+  const mentioned = useMemo(
+    () => findMentions(text, experts).map((m) => m.name),
+    [text, experts],
+  );
+  const unaddressed = channel.kind === "channel" && text.trim().length > 0 && mentioned.length === 0;
 
   const submit = (): void => {
     const body = text.trim();
@@ -454,6 +532,18 @@ function Composer({
             */}
             {asTask && channel.projectId === null ? (
               <span className="t-meta">此频道未关联仓库，任务无法执行</span>
+            ) : null}
+
+            {/*
+              Both directions are shown, because the positive case is what makes a
+              typo visible: naming @Atals produces no "将回复" line, which is the
+              only signal available before sending. Silence afterwards looks
+              identical to an agent still thinking.
+            */}
+            {unaddressed ? (
+              <span className="t-meta">没有 @ 任何人，不会有 agent 回复</span>
+            ) : mentioned.length > 0 ? (
+              <span className="t-meta">将回复：{mentioned.join("、")}</span>
             ) : null}
 
             <div className="ml-auto flex items-center gap-2">
