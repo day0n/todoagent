@@ -1,3 +1,4 @@
+import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono } from "hono";
@@ -8,6 +9,7 @@ import {
   approvePlanAndContinue,
   bus,
   defaultDbPath,
+  deliverMessage,
   detectAll,
   isGitRepo,
   resolveEscalationAndContinue,
@@ -755,8 +757,76 @@ app.post("/api/channels/:id/messages", async (c) => {
     return { message, task };
   });
 
+  /*
+   * Replies are delivered in the BACKGROUND, after this response is sent.
+   *
+   * Awaiting them here would hold the POST open for as long as the agents take —
+   * up to six turns at two minutes each — so the composer would appear frozen
+   * while its own message had already been stored. The client polls the stream,
+   * so replies simply appear, which is also what happens when an agent answers
+   * something somebody else said.
+   */
+  deliverInBackground(channel.id, created.message.id);
+
   return c.json(created, 201);
 });
+
+/**
+ * In-flight chat deliveries, so shutdown can cancel them.
+ *
+ * Keyed by message id: without this, SIGTERM would leave agent CLIs orphaned and
+ * still writing replies into a database whose owner has exited.
+ */
+const deliveries = new Map<string, AbortController>();
+
+function deliverInBackground(channelId: string, messageId: string): void {
+  const channel = store.getChannel(channelId);
+  const message = store.getMessage(messageId);
+  if (!channel || !message) return;
+
+  /*
+   * The agent runs in the channel's repository when it has one, so it can read
+   * the code it is being asked about. With no project there is no repo, and the
+   * engine's own working directory would be an arbitrary place the user never
+   * chose — so an isolated temp directory is used instead.
+   *
+   * This is NOT a sandbox. Every adapter runs its CLI with tool confirmation
+   * bypassed, so a reply CAN edit files in that repo; the prompt asks it not to.
+   * Work that should change code goes through the pipeline, where each subtask
+   * gets its own worktree and nothing merges without review.
+   */
+  const project = channel.projectId === null ? null : store.getProject(channel.projectId);
+  const cwd = project?.repoPath ?? tmpdir();
+
+  const controller = new AbortController();
+  deliveries.set(messageId, controller);
+
+  void deliverMessage({
+    store,
+    message,
+    channel,
+    experts: store.listExperts(),
+    cwd,
+    signal: controller.signal,
+  })
+    .then((res) => {
+      if (res.posted.length > 0 || res.failed.length > 0 || res.truncated) {
+        console.log(
+          `[chat ${channel.name}] ${res.posted.length} reply(ies)` +
+            (res.failed.length > 0
+              ? `, ${res.failed.length} failed: ${res.failed.map((f) => `${f.expertName} (${f.error})`).join("; ")}`
+              : "") +
+            (res.truncated ? ", truncated at the turn ceiling" : ""),
+        );
+      }
+    })
+    .catch((err: unknown) => {
+      // A failed delivery must not take the process down: the user's own message
+      // is already stored, and this is work happening on their behalf afterwards.
+      console.error(`[chat ${channel.name}] delivery crashed:`, err);
+    })
+    .finally(() => deliveries.delete(messageId));
+}
 
 /** First line of a message, trimmed to a board-card length. */
 function taskTitleFrom(body: string): string {
@@ -911,6 +981,9 @@ serve({ fetch: app.fetch, port: PORT, hostname: "127.0.0.1" }, (info) => {
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     for (const [, controller] of active) controller.abort();
+    // Chat deliveries too: they hold live CLI processes that would otherwise keep
+    // writing replies into a database whose owner has already exited.
+    for (const [, controller] of deliveries) controller.abort();
     store.close();
     process.exit(0);
   });

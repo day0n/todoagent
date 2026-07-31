@@ -25,6 +25,25 @@ export {
   type RosterEntry,
   type StagedTask,
 } from "./orchestrator/pipeline.ts";
+export {
+  MAX_AGENT_CHAIN,
+  REPLY_IDLE_MS,
+  REPLY_TIMEOUT_MS,
+  chatLoad,
+  deliverMessage,
+  replyToMessage,
+  type DeliverResult,
+  type ReplyOptions,
+  type ReplyResult,
+} from "./chat.ts";
+export {
+  findMentions,
+  resolveResponders,
+  segmentBody,
+  type BodySegment,
+  type Mention,
+  type Mentionable,
+} from "./mentions.ts";
 export { extractJson, tryParse } from "./orchestrator/structured.ts";
 export { zodToJsonSchema } from "./util/jsonschema.ts";
 export { which } from "./util/which.ts";

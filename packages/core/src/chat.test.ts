@@ -4,7 +4,13 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Store } from "./db/index.ts";
-import { MAX_AGENT_CHAIN, chatLoad, replyToMessage } from "./chat.ts";
+import {
+  MAX_AGENT_CHAIN,
+  MAX_DELIVERY_TURNS,
+  chatLoad,
+  deliverMessage,
+  replyToMessage,
+} from "./chat.ts";
 import type { Channel, Expert, Message } from "./types.ts";
 
 /**
@@ -63,7 +69,10 @@ process.exit(3);
  *   empty    — succeeds with no output, which a real CLI can do
  *   fail     — exits non-zero
  */
-function fakeClaude(mode: "echo" | "mention" | "empty" | "fail", mentionName = ""): string {
+function fakeClaude(
+  mode: "echo" | "mention" | "empty" | "fail" | "pingpong",
+  mentionName = "",
+): string {
   return `#!/usr/bin/env node
 const argv = process.argv.slice(2);
 // claude passes the prompt via -p; taking the longest entry also covers a
@@ -91,6 +100,14 @@ if (mode === "fail") {
   emit("");
 } else if (mode === "mention") {
   emit(who + " 说：这个得问 @${mentionName}");
+} else if (mode === "pingpong") {
+  // Mentions whichever of the pair is NOT the speaker, so this genuinely bounces
+  // A → B → A. The plain "mention" mode cannot: it names one fixed agent, and a
+  // self-mention is filtered by the router, so the chain dies after one hop and
+  // the depth guard is never exercised.
+  const pair = ${JSON.stringify(mentionName)}.split(",");
+  const other = pair.find((n) => n !== who) || pair[0];
+  emit(who + " 说：交给 @" + other);
 } else {
   emit(who + " 回复：收到");
 }
@@ -115,7 +132,7 @@ interface Fixture {
  * fake agent — would be very hard to trace back here.
  */
 async function fixture(
-  mode: "echo" | "mention" | "empty" | "fail" = "echo",
+  mode: "echo" | "mention" | "empty" | "fail" | "pingpong" = "echo",
   mentionName = "",
 ): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "council-chat-"));
@@ -203,6 +220,28 @@ function reply(f: Fixture, channel: Channel, message: Message) {
     channel,
     experts: f.store.listExperts(),
     cwd: f.cwd,
+  });
+}
+
+function deliver(f: Fixture, channel: Channel, message: Message) {
+  return deliverMessage({
+    store: f.store,
+    message,
+    channel,
+    experts: f.store.listExperts(),
+    cwd: f.cwd,
+  });
+}
+
+/** Another expert on the faked runtime, so it resolves to the stub. */
+function addExpert(f: Fixture, name: string): Expert {
+  return f.store.createExpert({
+    name,
+    description: "",
+    runtimeKind: "claude",
+    model: null,
+    systemPrompt: "",
+    capabilities: [],
   });
 }
 
@@ -356,6 +395,92 @@ test("routing: an agent is never made to answer its own message", async () => {
     const res = await reply(f, f.dm, say(f, f.dm, "我是 Atlas", { author: f.atlas }));
     assert.equal(res.skipped, "no_responder");
     assert.equal(res.posted.length, 0);
+  } finally {
+    await f.dispose();
+  }
+});
+
+// ── Cascade (agent → agent) ─────────────────────────────────
+
+test("cascade: a reply that mentions another agent actually reaches them", async () => {
+  // The fake always answers with "@Probe", so Atlas handing off must pull Probe in.
+  const f = await fixture("mention", "Probe");
+  try {
+    const res = await deliver(f, f.channel, say(f, f.channel, "@Atlas 你看看"));
+
+    /*
+     * This is the agent-to-agent half of the feature. `replyToMessage` alone
+     * answers ONE message, so Atlas replying "这个得问 @Probe" stopped there and
+     * Probe was never asked — which makes the prompt's instruction to hand work
+     * off by name a lie.
+     */
+    assert.deepEqual(
+      res.posted.map((m) => m.authorId),
+      [f.atlas.id, f.probe.id],
+      "Atlas answers, then the Probe it named answers too",
+    );
+    // Probe's own reply names Probe, and a self-mention is filtered, so the
+    // branch ends on its own rather than by hitting a ceiling.
+    assert.equal(res.truncated, false);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("cascade: a ping-pong between two agents is bounded", async () => {
+  // Each reply names the OTHER one, so nothing stops this except the guards.
+  const f = await fixture("pingpong", "Atlas,Probe");
+  try {
+    const res = await deliver(f, f.channel, say(f, f.channel, "@Atlas 开始"));
+
+    const turns = res.posted.length + res.failed.length;
+    assert.ok(turns > 1, "the cascade must actually bounce, or this proves nothing");
+    assert.ok(
+      turns <= MAX_DELIVERY_TURNS,
+      `expected at most ${MAX_DELIVERY_TURNS} turns, got ${turns}`,
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("cascade: the turn ceiling holds for one message naming many agents", async () => {
+  const f = await fixture();
+  try {
+    /*
+     * Regression test for a hole in the ceiling I found while reviewing it.
+     *
+     * `MAX_DELIVERY_TURNS` was only consulted BETWEEN queued messages, while the
+     * responder loop inside one call answers every mention in that message. So a
+     * single line naming eight agents spawned eight CLIs and overshot a six-turn
+     * limit before control ever returned to the check. Depth and breadth are
+     * different bounds, and only depth was enforced.
+     */
+    const extra = ["Vera", "Wren", "Xu", "Yuki", "Zane", "Nia"].map((n) => addExpert(f, n));
+    const everyone = [f.atlas, f.probe, ...extra];
+    const body = everyone.map((e) => `@${e.name}`).join(" ") + " 都说一下";
+
+    const res = await deliver(f, f.channel, say(f, f.channel, body));
+
+    const turns = res.posted.length + res.failed.length;
+    assert.equal(everyone.length, 8, "the fixture must exceed the ceiling for this to bite");
+    assert.ok(
+      turns <= MAX_DELIVERY_TURNS,
+      `expected at most ${MAX_DELIVERY_TURNS} turns, got ${turns}`,
+    );
+    assert.equal(res.truncated, true, "declining work must be reported, not silent");
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("cascade: a message nobody is addressed in spends nothing", async () => {
+  const f = await fixture();
+  try {
+    const res = await deliver(f, f.channel, say(f, f.channel, "自言自语"));
+    assert.deepEqual(res.posted, []);
+    assert.deepEqual(res.failed, []);
+    assert.equal(res.truncated, false);
   } finally {
     await f.dispose();
   }

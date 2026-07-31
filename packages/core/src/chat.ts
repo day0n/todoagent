@@ -24,6 +24,17 @@ import type { Channel, Expert, Message } from "./types.ts";
 import { Semaphore, defaultConcurrency } from "./util/concurrency.ts";
 
 /**
+ * Hard ceiling on agent turns per delivered message.
+ *
+ * A backstop independent of the chain guard, which bounds DEPTH but not BREADTH:
+ * one message can mention three agents, and each of their replies can mention
+ * more, so a depth-3 chain still permits a wide tree. This caps the whole
+ * cascade — every turn is a real CLI process, so the bound has to be on total
+ * work, not on one path through it.
+ */
+export const MAX_DELIVERY_TURNS = 6;
+
+/**
  * How many agent messages may precede a reply before routing stops.
  *
  * The failure this prevents is not hypothetical: agents are instructed to
@@ -79,6 +90,15 @@ export interface ReplyOptions {
    */
   cwd: string;
   signal?: AbortSignal;
+  /**
+   * Ceiling on agent turns this single call may spend. Omitted means unlimited.
+   *
+   * Needed because the responder loop runs EVERY mentioned agent within one
+   * call. Without it, `deliverMessage`'s budget was only consulted between
+   * queued messages, so one message naming eight agents spawned eight CLIs and
+   * blew past a six-turn ceiling before the check was ever reached.
+   */
+  maxTurns?: number;
 }
 
 export interface ReplyResult {
@@ -88,6 +108,8 @@ export interface ReplyResult {
   failed: Array<{ expertId: string; expertName: string; error: string }>;
   /** Set when routing declined to answer at all, with why. */
   skipped: "no_responder" | "chain_limit" | "author_is_expert_in_channel" | null;
+  /** Set when `maxTurns` stopped this call with responders still unanswered. */
+  truncated: boolean;
 }
 
 /**
@@ -99,7 +121,7 @@ export interface ReplyResult {
  */
 export async function replyToMessage(opts: ReplyOptions): Promise<ReplyResult> {
   const { store, message, channel, experts, cwd } = opts;
-  const empty: ReplyResult = { posted: [], failed: [], skipped: null };
+  const empty: ReplyResult = { posted: [], failed: [], skipped: null, truncated: false };
 
   const responders = resolveResponders({
     body: message.body,
@@ -136,10 +158,25 @@ export async function replyToMessage(opts: ReplyOptions): Promise<ReplyResult> {
    * it. Parallel replies would be N independent answers to the same prompt, so
    * paying several vendors would buy nothing.
    */
+  let truncated = false;
+
   for (const expertId of responders) {
     const expert = experts.find((e) => e.id === expertId);
     if (!expert) continue;
     if (opts.signal?.aborted === true) break;
+
+    /*
+     * Checked per responder, not per message.
+     *
+     * A failed turn counts: it still cost a spawn, so a roster of broken CLIs
+     * must not buy unlimited attempts. `truncated` is set only when responders
+     * remain, so it means "work was declined" rather than "we stopped exactly at
+     * the limit".
+     */
+    if (opts.maxTurns !== undefined && posted.length + failed.length >= opts.maxTurns) {
+      truncated = true;
+      break;
+    }
 
     try {
       const body = await runTurn({
@@ -175,7 +212,80 @@ export async function replyToMessage(opts: ReplyOptions): Promise<ReplyResult> {
     }
   }
 
-  return { posted, failed, skipped: null };
+  return { posted, failed, skipped: null, truncated };
+}
+
+export interface DeliverResult {
+  /** Every reply written across the whole cascade, in the order produced. */
+  posted: Message[];
+  failed: Array<{ expertId: string; expertName: string; error: string }>;
+  /** Set when the turn ceiling stopped the cascade with work still queued. */
+  truncated: boolean;
+}
+
+/**
+ * Delivers a message and follows every hand-off it causes.
+ *
+ * This is the agent-to-agent half of the feature, and without it the rest is
+ * decoration: `replyToMessage` answers ONE message, so Atlas replying "这个得问
+ * @Probe" produced a reply that mentioned Probe and then stopped. Probe was never
+ * asked. The prompt tells agents to hand work off by name, so not following that
+ * mention makes the instruction a lie.
+ *
+ * Breadth-first, so a message mentioning three agents gets all three answers
+ * before any of their follow-ups are pursued — the direct answers to what a
+ * person asked matter more than a tangent between two agents.
+ *
+ * Two independent bounds apply, because they stop different things:
+ *   - `MAX_AGENT_CHAIN`, inside `replyToMessage`, bounds DEPTH along one thread.
+ *   - `MAX_DELIVERY_TURNS`, here, bounds TOTAL turns. A depth-3 limit still
+ *     permits a wide tree, and every node in it is a real CLI process.
+ */
+export async function deliverMessage(opts: ReplyOptions): Promise<DeliverResult> {
+  const posted: Message[] = [];
+  const failed: DeliverResult["failed"] = [];
+  const queue: Message[] = [opts.message];
+  let turns = 0;
+  let truncated = false;
+
+  while (queue.length > 0) {
+    const next = queue.shift();
+    if (next === undefined) break;
+    if (opts.signal?.aborted === true) break;
+    // Checked after dequeuing, so `truncated` means "there was work left that we
+    // declined to do" rather than "we happened to stop at the limit".
+    if (turns >= MAX_DELIVERY_TURNS) {
+      truncated = true;
+      break;
+    }
+
+    /*
+     * The REMAINING budget is handed down, not the total.
+     *
+     * This is the half that makes the ceiling real. Checking `turns` only between
+     * queued messages left the inner loop free to answer every mention in one
+     * message, so a single line naming eight agents spawned eight CLIs and
+     * overshot a six-turn limit before control ever came back here.
+     */
+    const res = await replyToMessage({
+      ...opts,
+      message: next,
+      maxTurns: MAX_DELIVERY_TURNS - turns,
+    });
+
+    // Failures count against the ceiling too: a broken CLI still costs a spawn,
+    // and a roster of failing agents must not buy unlimited attempts.
+    turns += res.posted.length + res.failed.length;
+    posted.push(...res.posted);
+    failed.push(...res.failed);
+    if (res.truncated) truncated = true;
+
+    // Each reply may itself address somebody. A branch ends naturally when a
+    // reply mentions nobody, or when the chain guard refuses it.
+    queue.push(...res.posted);
+  }
+
+  return { posted, failed, truncated };
 }
 
 /**
