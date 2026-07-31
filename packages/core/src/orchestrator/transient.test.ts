@@ -66,6 +66,46 @@ test("transient: auth and setup failures are NOT retried", () => {
   }
 });
 
+test("transient: the credential errors the adapters really emit are not retried", () => {
+  /*
+   * Verbatim from gemini.ts and cursor.ts, obtained by running the real CLIs
+   * (scripts/probe-adapters.mjs) rather than by reading the source and guessing.
+   *
+   * Neither was recognised by the original deny-list: `unauthenticated` does not
+   * match "not authenticated", and `authentication` is not a substring of
+   * "authenticated". Both were classified correctly only by falling through to the
+   * default — right answer, no reasoning behind it.
+   *
+   * The third case is why that mattered. cursor appends up to 200 chars of raw
+   * stderr to its message, so an auth failure carrying an incidental "try again"
+   * hit the TRANSIENT list and was retried three times — for a problem only a
+   * human running `cursor-agent login` can fix.
+   */
+  const real = [
+    "gemini has no credentials — set GEMINI_API_KEY (or sign in) before using this runtime.",
+    "cursor-agent is not authenticated — run `cursor-agent login`.",
+    "cursor-agent is not authenticated — run `cursor-agent login`. (connection reset by peer, please try again)",
+  ];
+  for (const error of real) {
+    assert.equal(isTransientFailure("failed", error), false, `must not retry: ${error}`);
+  }
+});
+
+test("transient: widening the deny-list did not swallow genuine transients", () => {
+  // Adding "login", "sign in" and "authenticate" risks matching an unrelated
+  // message, so the transient side is re-checked explicitly.
+  for (const error of [
+    "HTTP 503 Service Unavailable",
+    "claude exited 1: rate limit exceeded, retry after 2s",
+    "read ECONNRESET",
+    "socket hang up",
+    "gemini exited 1: fetch failed",
+    "overloaded_error: the model is overloaded",
+  ]) {
+    assert.equal(isTransientFailure("failed", error), true, `must still retry: ${error}`);
+  }
+});
+
 test("transient: a deterministic signal beats a transient one in the same message", () => {
   /*
    * Real messages carry both. A gateway that returns 401 inside a "service

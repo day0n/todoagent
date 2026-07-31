@@ -29,15 +29,40 @@ import type { AgentResultStatus } from "../adapters/types.ts";
  * grant a permission — so retrying only postpones telling them.
  */
 const DETERMINISTIC = [
-  // Auth. Every vendor words this differently.
+  /*
+   * Auth. Every vendor words this differently, and the list below is taken from
+   * what the adapters ACTUALLY emit rather than from guesses:
+   *
+   *   gemini.ts  "gemini has no credentials — set GEMINI_API_KEY (or sign in) …"
+   *   cursor.ts  "cursor-agent is not authenticated — run `cursor-agent login`. (…)"
+   *
+   * Neither was recognised at first. `unauthenticated` does not match "not
+   * authenticated", and `authentication` is not a substring of "authenticated" —
+   * so both were classified correctly only by falling through to the default.
+   *
+   * That was a real hazard, not a stylistic one. cursor appends up to 200 chars of
+   * raw stderr to its message, so an auth failure carrying an incidental "try
+   * again" matched the transient list and got retried three times — for a problem
+   * only a human running `cursor-agent login` can fix. Verified with the verbatim
+   * string before and after this change.
+   */
   "not logged in",
+  "not authenticated",
+  "no credentials",
   "unauthorized",
   "unauthenticated",
   "authentication",
+  "authenticate",
   "invalid api key",
   "invalid_api_key",
   "no api key",
   "api key not found",
+  "api_key",
+  // The remediation instruction is itself a reliable deterministic signal: a CLI
+  // telling you to log in will keep telling you that until you do.
+  "login",
+  "log in",
+  "sign in",
   "forbidden",
   "http 401",
   "http 403",
