@@ -193,7 +193,7 @@ function VerdictCard({ adjudication }: { adjudication: Adjudication }) {
         </Badge>
         <Meta>第 {adjudication.round} 轮</Meta>
       </div>
-      <p className="mt-2.5 body-muted">{adjudication.rationale}</p>
+      <p className="mt-2.5 t-meta">{adjudication.rationale}</p>
 
       {adjudication.humanDecision !== null ? (
         <div
@@ -250,7 +250,7 @@ export function DiscussionThread({
                 .map((m) => (
                   <div key={m.id} className="card p-3.5">
                     <span className="text-[0.8125rem] font-semibold">{m.authorName ?? "专家"}</span>
-                    <p className="mt-1.5 whitespace-pre-wrap body-muted">{m.body}</p>
+                    <p className="mt-1.5 whitespace-pre-wrap t-meta">{m.body}</p>
                   </div>
                 ))}
             </div>
@@ -281,7 +281,7 @@ export function EscalationGate({
       style={{
         borderColor: "color-mix(in oklch, var(--color-warn) 38%, transparent)",
         background: "color-mix(in oklch, var(--color-warn) 6%, var(--color-surface))",
-        boxShadow: "var(--shadow-md), var(--highlight)",
+        boxShadow: "var(--shadow-md)",
       }}
     >
       <h3
@@ -296,9 +296,9 @@ export function EscalationGate({
       <div className="mt-4 space-y-3.5">
         {open.map((a) => (
           <div key={a.id} className="inset p-3.5">
-            <p className="body-muted">{a.rationale}</p>
+            <p className="t-meta">{a.rationale}</p>
             <textarea
-              className="input mt-2.5 min-h-[4.5rem] resize-y"
+              className="field mt-2.5 min-h-[4.5rem] resize-y"
               placeholder="你的决定，以及理由。会写进这次委托的记录，并直接交给 agent 执行。"
               value={drafts[a.id] ?? ""}
               onChange={(e) => setDrafts((d) => ({ ...d, [a.id]: e.target.value }))}

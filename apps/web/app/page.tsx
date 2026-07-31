@@ -96,8 +96,8 @@ export default function HomePage() {
     <div className="mx-auto w-full max-w-[760px]">
       {/* ── Composer ── */}
       <section className="pt-14">
-        <h1 className="title-xl text-balance">你想完成什么？</h1>
-        <p className="mt-2.5 max-w-[52ch] text-balance body-muted">
+        <h1 className="t-hero text-balance">你想完成什么？</h1>
+        <p className="mt-2.5 max-w-[52ch] text-balance t-meta">
           交代一件事，一支本地专家团队会拆解它、并行执行、互相评审，最后交回被审查过的结果。
         </p>
 
@@ -117,7 +117,7 @@ export default function HomePage() {
           <div className="flex flex-wrap items-center gap-2 px-2 pb-1.5 pt-1">
             {projects !== null && projects.length > 0 ? (
               <select
-                className="input btn-sm w-auto"
+                className="field btn-sm w-auto"
                 style={{ background: "var(--color-surface)" }}
                 value={projectId}
                 onChange={(e) => setProjectId(e.target.value)}
@@ -167,7 +167,7 @@ export default function HomePage() {
               <label className="block">
                 <span className="t-label">验收标准（可选）</span>
                 <textarea
-                  className="input mt-2 min-h-[4.5rem] resize-y"
+                  className="field mt-2 min-h-[4.5rem] resize-y"
                   placeholder="怎样算做完了？写具体一点，评审者会照这个检查。"
                   value={acceptance}
                   onChange={(e) => setAcceptance(e.target.value)}

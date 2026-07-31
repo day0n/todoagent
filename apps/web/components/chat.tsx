@@ -295,7 +295,9 @@ function Row({
   const expert = authorOf(message, experts);
 
   return (
-    <div className="group">
+    // No `group` class: nothing here uses a `group-*` variant, so it compiled to
+    // a marker with no consumers.
+    <div>
       <div className="flex items-baseline gap-2">
         {expert ? (
           <RuntimeMark kind={expert.runtimeKind} name={expert.name} />

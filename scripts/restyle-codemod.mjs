@@ -40,6 +40,19 @@ const CLASS_MAP = new Map(
     "title-md": "t-md",
     "title-lg": "t-lg",
     "title-hero": "t-hero",
+    /*
+     * Found later, by diffing every class used against the COMPILED stylesheet.
+     *
+     * These four were in the original design system, my first survey of old class
+     * names missed them, and nothing failed: an undefined class is not an error,
+     * it simply styles nothing. `title-xl` still rendered large (browser default
+     * h1), `body-muted` still rendered text, and the check I trusted only looked
+     * at `--color-*` custom properties.
+     */
+    "title-xl": "t-hero",
+    "body-muted": "t-meta",
+    input: "field",
+    sweep: "indeterminate",
 
     // Buttons
     "btn-bare": "btn-ghost",

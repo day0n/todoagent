@@ -106,7 +106,7 @@ function AttemptRow({
         type="button"
         onClick={toggle}
         aria-expanded={open}
-        className="flex w-full flex-wrap items-center gap-x-2.5 gap-y-1 px-3.5 py-2.5 text-left transition-colors duration-150 hover:bg-[oklch(1_0_0/4%)]"
+        className="flex w-full flex-wrap items-center gap-x-2.5 gap-y-1 px-3.5 py-2.5 text-left transition-colors duration-150 hover:bg-surface-2"
       >
         <span aria-hidden className="w-3 shrink-0 text-[0.625rem] text-[var(--color-subtle-fg)]">
           {open ? "▾" : "▸"}

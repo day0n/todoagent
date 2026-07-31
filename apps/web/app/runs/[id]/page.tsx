@@ -196,7 +196,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
       {run.acceptance !== null && run.acceptance.length > 0 ? (
         <div className="inset mt-4 px-3.5 py-2.5">
           <span className="t-label">验收标准</span>
-          <p className="mt-1 body-muted">{run.acceptance}</p>
+          <p className="mt-1 t-meta">{run.acceptance}</p>
         </div>
       ) : null}
 
@@ -452,7 +452,7 @@ function PlanGate({
       style={{
         borderColor: "color-mix(in oklch, var(--color-accent) 45%, transparent)",
         background: "color-mix(in oklch, var(--color-accent) 6%, var(--color-surface))",
-        boxShadow: "var(--shadow-md), var(--highlight)",
+        boxShadow: "var(--shadow-md)",
       }}
     >
       <h2 className="flex items-center gap-2 t-md">
@@ -484,7 +484,7 @@ function PlanGate({
                         {s.capability ? <Meta>{s.capability}</Meta> : null}
                       </div>
                     </div>
-                    <p className="mt-1.5 body-muted">{s.brief}</p>
+                    <p className="mt-1.5 t-meta">{s.brief}</p>
                     {s.acceptance ? <p className="mt-1.5 t-meta">验收：{s.acceptance}</p> : null}
                   </li>
                 ))}
@@ -588,7 +588,7 @@ function EventLog({ rows }: { rows: LogRow[] }) {
     <div>
       <div className="mb-3 flex flex-wrap items-center gap-2.5">
         <input
-          className="input btn-sm w-auto flex-1"
+          className="field btn-sm w-auto flex-1"
           style={{ minWidth: "12rem" }}
           placeholder="过滤事件…"
           value={filter}
@@ -604,8 +604,10 @@ function EventLog({ rows }: { rows: LogRow[] }) {
       ) : (
         <div className="card divide-line overflow-hidden">
           {visible.map((ev) => (
-            <details key={ev.id} className="group">
-              <summary className="flex cursor-pointer items-center gap-2.5 px-3.5 py-2 transition-colors duration-150 hover:bg-[oklch(1_0_0/4%)]">
+            // No `group` class: nothing in this app uses a `group-*` variant, so
+            // it compiled to a marker with no consumers.
+            <details key={ev.id}>
+              <summary className="flex cursor-pointer items-center gap-2.5 px-3.5 py-2 transition-colors duration-150 hover:bg-surface-2">
                 <span className="mono shrink-0 text-[var(--color-subtle-fg)]">
                   {new Date(ev.createdAt).toLocaleTimeString("zh-CN", { hour12: false })}
                 </span>

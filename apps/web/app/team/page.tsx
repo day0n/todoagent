@@ -88,8 +88,8 @@ export default function TeamPage() {
   return (
     <div className="mx-auto w-full max-w-[880px] space-y-12 pt-12">
       <header>
-        <h1 className="title-xl">团队</h1>
-        <p className="mt-2 max-w-[58ch] text-balance body-muted">
+        <h1 className="t-hero">团队</h1>
+        <p className="mt-2 max-w-[58ch] text-balance t-meta">
           专家 = 一个身份 + 一个本机 CLI。角色决定它在流水线上的位置，能力标签决定它接哪类活。
         </p>
       </header>

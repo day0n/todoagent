@@ -92,7 +92,7 @@ export function PhaseRail({
               {isCurrent ? (
                 <span
                   aria-hidden
-                  className="sweep pointer-events-none absolute inset-x-0 bottom-0 h-[2px] overflow-hidden opacity-70"
+                  className="indeterminate pointer-events-none absolute inset-x-0 bottom-0 h-[2px] overflow-hidden opacity-70"
                 />
               ) : null}
             </div>
@@ -150,7 +150,7 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
           ? "color-mix(in oklch, var(--color-info) 26%, transparent)"
           : "var(--color-line)",
         background: "var(--color-surface)",
-        boxShadow: "var(--shadow-sm), var(--highlight)",
+        boxShadow: "var(--shadow-sm)",
       }}
     >
       <div
@@ -189,7 +189,7 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
       {live.thinking.length > 0 ? (
         <button
           type="button"
-          className="flex w-full items-center gap-1.5 border-b px-3.5 py-1.5 text-left text-[0.75rem] transition-colors hover:bg-[oklch(1_0_0/4%)]"
+          className="flex w-full items-center gap-1.5 border-b px-3.5 py-1.5 text-left text-[0.75rem] transition-colors hover:bg-surface-2"
           style={{ borderColor: "var(--color-line)", color: "var(--color-grape)" }}
           onClick={() => setShowThinking((v) => !v)}
           aria-expanded={showThinking}
@@ -205,7 +205,10 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
       <div
         ref={scroller}
         onScroll={onScroll}
-        className={`max-h-[19rem] overflow-y-auto px-3.5 py-3 ${running ? "fade-bottom" : ""}`}
+        // `fade-top`, not `fade-bottom`: this box is pinned to the BOTTOM while an
+        // agent streams (see the scroll effect above), so the text being cut off is
+        // at the top. `fade-bottom` was never defined, so it faded nothing at all.
+        className={`max-h-[19rem] overflow-y-auto px-3.5 py-3 ${running ? "fade-top" : ""}`}
         style={{ background: "var(--color-surface)" }}
       >
         {showThinking && live.thinking.length > 0 ? (
