@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, fmtRelative } from "../lib/api.ts";
 import { TASK_STATUS_LABEL, TASK_STATUSES } from "../lib/types.ts";
 import type { ActorKind, Channel, Expert, Task, TaskStatus } from "../lib/types.ts";
@@ -41,9 +41,33 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
   /** Cards with a start request in flight, so only that card's button locks. */
   const [busy, setBusy] = useState<ReadonlySet<string>>(() => new Set());
 
+  /**
+   * Counts local mutations, so a poll cannot overwrite one it predates.
+   *
+   * A ref rather than state: `load` must read it without listing it as a
+   * dependency, or the callback — and every card holding it — would rebuild on
+   * every patch.
+   */
+  const mutations = useRef(0);
+
   const load = useCallback(async () => {
+    const at = mutations.current;
     try {
       const res = await api.tasks(channel.id);
+      /*
+       * A response issued BEFORE a local change is discarded.
+       *
+       * The board polls every 6s while a run is live, and `load` replaces the whole
+       * array. So a poll in flight when someone drags a card returned data that
+       * predates the move, snapped the card back, and nothing put it right again:
+       * the patch had already applied its optimistic update, and the success path
+       * wrote nothing. The card stayed in the wrong column until the next poll —
+       * or forever, once the run ended and polling stopped.
+       *
+       * Discarding is safe because the patch's own success handler writes the
+       * server's authoritative row, and a later poll refreshes everything else.
+       */
+      if (mutations.current !== at) return;
       setTasks(res.tasks);
       setError(null);
     } catch (err) {
@@ -118,9 +142,12 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
    */
   const patch = useCallback(
     async (id: string, next: Partial<Pick<Task, "status" | "assigneeKind" | "assigneeId">>) => {
+      // Counted before the optimistic write, so a poll already in flight is
+      // recognised as predating this change and discarded.
+      mutations.current++;
       setTasks((cur) => cur?.map((t) => (t.id === id ? { ...t, ...next } : t)) ?? cur);
       try {
-        await api.patchTask(id, {
+        const updated = await api.patchTask(id, {
           ...(next.status !== undefined ? { status: next.status } : {}),
           ...(next.assigneeKind !== undefined
             ? {
@@ -131,6 +158,20 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
               }
             : {}),
         });
+        /*
+         * The server's row replaces the optimistic guess.
+         *
+         * The other half of the race. Before this, a successful patch wrote
+         * nothing: the optimistic value stood unconfirmed until the next poll, and
+         * once a run finished and polling stopped, an overwritten card stayed wrong
+         * indefinitely. Now the authoritative row lands immediately, and it also
+         * carries fields the optimistic patch never guessed at — `updatedAt`, and
+         * the assignee pair the engine may have normalised.
+         *
+         * Scoped to this one id, so it cannot clobber a concurrent change to a
+         * different card.
+         */
+        setTasks((cur) => cur?.map((t) => (t.id === id ? updated : t)) ?? cur);
       } catch (err) {
         setError(err instanceof ApiError ? err.message : String(err));
         /*
@@ -168,6 +209,16 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
     async (id: string) => {
       setBusy((b) => new Set(b).add(id));
       setError(null);
+      /*
+       * Counted here for the same reason as in `patch`.
+       *
+       * This path writes the server's row AFTER an await, so a poll issued before
+       * the click and returning after it would overwrite that row with data
+       * predating the start — showing 待办 for a card whose run is already
+       * executing. Smaller window than a drag, since a click is one action, but the
+       * same class of wrong state.
+       */
+      mutations.current++;
       try {
         const res = await api.runTask(id);
         // The server's version of the card, which carries the run id and the
