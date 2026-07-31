@@ -56,16 +56,51 @@ export default function HomePage() {
     void load();
   }, [load]);
 
-  // Coarse polling for the history list. The run page itself uses SSE; this only
-  // needs to notice that something finished elsewhere.
+  /*
+   * Coarse polling for the history list, paused while the tab is hidden.
+   *
+   * The run page uses SSE; this only needs to notice that something finished
+   * elsewhere. Chat and the board both pause on `visibilitychange` and this did
+   * not — so a backgrounded tab kept asking the engine every 8s indefinitely for a
+   * list nobody was looking at. The listener also forces a refresh on return,
+   * which is exactly when the list is most likely to be stale.
+   *
+   * No stale-response guard needed here, unlike the board and the chat stream:
+   * this page holds no local mutation for a slow response to overwrite. Submitting
+   * navigates away with `window.location.href`, so there is nothing to lose.
+   */
   useEffect(() => {
-    const t = setInterval(() => {
+    let timer: ReturnType<typeof setInterval> | null = null;
+
+    const poll = (): void => {
       api
         .runs()
         .then(setRuns)
         .catch(() => undefined);
-    }, 8000);
-    return () => clearInterval(t);
+    };
+    const start = (): void => {
+      if (timer !== null) return;
+      timer = setInterval(poll, 8000);
+    };
+    const stop = (): void => {
+      if (timer === null) return;
+      clearInterval(timer);
+      timer = null;
+    };
+    const onVisibility = (): void => {
+      if (document.hidden) stop();
+      else {
+        poll();
+        start();
+      }
+    };
+
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, []);
 
   const submit = async (): Promise<void> => {
