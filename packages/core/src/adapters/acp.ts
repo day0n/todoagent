@@ -384,6 +384,26 @@ export function runAcp(prompt: string, opts: AcpOptions): {
       closed = true;
       notify?.();
 
+      /*
+       * In-flight requests are REJECTED, not abandoned.
+       *
+       * `request()` parks a promise in `pending` waiting for a JSON-RPC reply. Once
+       * the child is gone that reply can never arrive, so an abandoned entry stays
+       * pending forever — and `withTimeout` can then only settle via its own timer,
+       * which is not unref'd. A grok or kiro CLI that exits during the handshake
+       * (not logged in, wrong version, crash on start) therefore left a live 90s
+       * `handshakeMs` timer holding the event loop open, long after the caller had
+       * already been handed its error.
+       *
+       * Measured: one such spawn kept a Node process alive for 90s after the
+       * result had settled in 0.7s.
+       */
+      const gone = new Error(
+        ctx.failure ?? `acp process exited (${exitCode ?? "spawn error"}) before replying`,
+      );
+      for (const waiter of pending.values()) waiter.reject(gone);
+      pending.clear();
+
       const durationMs = Date.now() - startedAt;
       const base = {
         output: ctx.lastText,
