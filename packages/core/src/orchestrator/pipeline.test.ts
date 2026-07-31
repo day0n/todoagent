@@ -457,8 +457,10 @@ test("pipeline: a partial failure is reported as partial, not as success", async
     // But the loss has to be stated. This is the whole fix.
     assert.ok(outcome.error !== null, "a partial result must not report error=null");
     assert.match(outcome.error ?? "", /1\/2/, "says how much was lost");
+    const failedTitle = failed[0]?.title ?? "";
+    assert.notEqual(failedTitle, "", "the fixture must produce one failed subtask with a title");
     assert.ok(
-      (outcome.error ?? "").includes(failed[0]?.title ?? " "),
+      (outcome.error ?? "").includes(failedTitle),
       `names the failed subtask; got: ${outcome.error}`,
     );
 
