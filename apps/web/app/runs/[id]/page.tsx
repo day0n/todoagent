@@ -374,6 +374,7 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
                 <StageBoard
                   subtasks={subtasks}
                   attempts={attempts}
+                  reviews={reviews}
                   selectedId={selected}
                   onSelect={setSelected}
                 />

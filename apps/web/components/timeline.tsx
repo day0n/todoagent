@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import type { LiveAttempt } from "../lib/useRun.ts";
-import type { Attempt, Phase, RuntimeKind, SubTask } from "../lib/types.ts";
+import type { Attempt, Phase, Review, RuntimeKind, SubTask } from "../lib/types.ts";
 import { PHASE_LABEL, PHASE_ORDER } from "../lib/types.ts";
 import { Badge, Meta, RuntimeMark, SubTaskBadge } from "./atoms.tsx";
 
@@ -249,11 +249,14 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
 export function StageBoard({
   subtasks,
   attempts,
+  reviews,
   selectedId,
   onSelect,
 }: {
   subtasks: SubTask[];
   attempts: Attempt[];
+  /** Only needed to tell "unreviewed" from "reviewed, still open" — see below. */
+  reviews: Review[];
   selectedId: string | null;
   onSelect: (id: string | null) => void;
 }) {
@@ -261,6 +264,8 @@ export function StageBoard({
 
   const stages = [...new Set(subtasks.map((s) => s.stage))].sort((a, b) => a - b);
   const attemptsFor = (id: string): number => attempts.filter((a) => a.subTaskId === id).length;
+  /** Subtasks a reviewer actually filed something against. */
+  const reviewedIds = new Set(reviews.map((r) => r.subTaskId));
 
   return (
     <div className="space-y-5">
@@ -308,7 +313,26 @@ export function StageBoard({
                   >
                     <div className="flex items-start justify-between gap-2">
                       <p className="text-[0.875rem] font-medium leading-snug">{s.title}</p>
-                      <SubTaskBadge status={s.status} />
+                      <span className="flex shrink-0 flex-wrap items-center justify-end gap-1">
+                        <SubTaskBadge status={s.status} />
+                        {/*
+                          "Nobody reviewed this" and "reviewers found things and the
+                          rounds ran out" are both `in_review`, and they were
+                          rendering as the same 待复核 badge — so a review outage
+                          looked like agents having done their job and left notes.
+
+                          No extra data needed to tell them apart: a review row
+                          exists only for a FINDING, and a subtask reaches
+                          in_review normally BECAUSE it had blocking findings. So
+                          in_review with zero reviews means the review never
+                          happened.
+                        */}
+                        {s.status === "in_review" && !reviewedIds.has(s.id) ? (
+                          <Badge tone="warn" title="所有评审员都失败了，这份产出没有被任何人检查过">
+                            未经评审
+                          </Badge>
+                        ) : null}
+                      </span>
                     </div>
                     <p className="mt-2 line-clamp-2 t-meta">{s.brief}</p>
                     <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1">
