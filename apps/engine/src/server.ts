@@ -617,6 +617,266 @@ app.get("/api/runs/:id/events", (c) => {
   });
 });
 
+// ── Channels ────────────────────────────────────────────────
+//
+// Chat is the workspace. These endpoints sit above the execution layer: a
+// message is durable conversation, and a task is a board card that MAY later
+// point at a pipeline run. Nothing here starts agents on its own.
+
+app.get("/api/channels", (c) => c.json(store.listChannels()));
+
+const ChannelBody = z.object({
+  name: z.string().min(1).max(120),
+  purpose: z.string().max(500).default(""),
+  kind: z.enum(["channel", "dm"]).default("channel"),
+  projectId: z.string().min(1).nullable().default(null),
+  dmExpertId: z.string().min(1).nullable().default(null),
+});
+
+app.post("/api/channels", async (c) => {
+  const parsed = ChannelBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const body = parsed.data;
+
+  /*
+   * Referenced rows are checked here rather than trusted.
+   *
+   * The schema carries no foreign keys by design, so an unknown id would insert
+   * happily and only surface later as a channel whose project cannot be loaded —
+   * a channel that renders but can never run anything.
+   */
+  if (body.projectId !== null && !store.getProject(body.projectId)) {
+    return c.json({ error: `unknown project ${body.projectId}` }, 400);
+  }
+  if (body.dmExpertId !== null && !store.getExpert(body.dmExpertId)) {
+    return c.json({ error: `unknown expert ${body.dmExpertId}` }, 400);
+  }
+  // A DM is a conversation with somebody; without that id it is an empty room
+  // wearing a person's name.
+  if (body.kind === "dm" && body.dmExpertId === null) {
+    return c.json({ error: "a dm needs dmExpertId" }, 400);
+  }
+
+  return c.json(store.createChannel(body), 201);
+});
+
+app.get("/api/channels/:id/messages", (c) => {
+  const channel = store.getChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "unknown channel" }, 404);
+
+  const raw = Number(c.req.query("limit") ?? 200);
+  // Clamped rather than trusted: this is the only unbounded read in the app, and
+  // `?limit=1e9` on a long-lived channel would serialise the whole table.
+  const limit = Number.isFinite(raw) ? Math.min(500, Math.max(1, Math.trunc(raw))) : 200;
+
+  return c.json({
+    channel,
+    messages: store.listChannelMessages(channel.id, { limit }),
+  });
+});
+
+const MessageBody = z.object({
+  body: z.string().min(1).max(20_000),
+  authorKind: z.enum(["human", "expert"]).default("human"),
+  authorId: z.string().min(1).nullable().default(null),
+  /** Thread root. Omitted or null posts into the channel itself. */
+  parentId: z.string().min(1).nullable().default(null),
+  /**
+   * The composer's "as task" toggle.
+   *
+   * This is the join between chat and the board: one action both says the thing
+   * and creates the card, so a request does not have to be restated as a task by
+   * hand.
+   */
+  asTask: z.boolean().default(false),
+});
+
+app.post("/api/channels/:id/messages", async (c) => {
+  const channel = store.getChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "unknown channel" }, 404);
+
+  const parsed = MessageBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const body = parsed.data;
+
+  if (body.authorKind === "expert") {
+    if (body.authorId === null) return c.json({ error: "an expert author needs authorId" }, 400);
+    if (!store.getExpert(body.authorId)) {
+      return c.json({ error: `unknown expert ${body.authorId}` }, 400);
+    }
+  }
+
+  if (body.parentId !== null) {
+    const parent = store.getMessage(body.parentId);
+    if (!parent) return c.json({ error: `unknown parent ${body.parentId}` }, 400);
+    // Cross-channel threading would put a message in a channel it does not
+    // belong to, where it is invisible to that channel's own stream query.
+    if (parent.channelId !== channel.id) {
+      return c.json({ error: "parent belongs to another channel" }, 400);
+    }
+    /*
+     * Threads are one level deep.
+     *
+     * Flattening a reply-to-a-reply onto the same root would silently move the
+     * message somewhere the author did not point at. Refusing says so instead,
+     * and matches what the reference product exposes.
+     */
+    if (parent.parentId !== null) {
+      return c.json({ error: "threads are one level deep; reply to the root" }, 400);
+    }
+  }
+
+  // One transaction, because a half-applied "say it and track it" leaves either
+  // an untracked request or a card with no conversation behind it.
+  const created = store.tx(() => {
+    const message = store.createMessage({
+      channelId: channel.id,
+      authorKind: body.authorKind,
+      authorId: body.authorKind === "expert" ? body.authorId : null,
+      parentId: body.parentId,
+      body: body.body,
+    });
+
+    if (!body.asTask) return { message, task: null };
+
+    const task = store.createTask({
+      channelId: channel.id,
+      // A board card wants a line, not an essay. The full text stays on the
+      // message this points back at, so nothing is lost by trimming here.
+      title: taskTitleFrom(body.body),
+      status: "todo",
+      assigneeKind: null,
+      assigneeId: null,
+      creatorKind: body.authorKind,
+      creatorId: body.authorKind === "expert" ? body.authorId : null,
+      sourceMessageId: message.id,
+      runId: null,
+    });
+    return { message, task };
+  });
+
+  return c.json(created, 201);
+});
+
+/** First line of a message, trimmed to a board-card length. */
+function taskTitleFrom(body: string): string {
+  const firstLine = body.split("\n", 1)[0]?.trim() ?? "";
+  const source = firstLine.length > 0 ? firstLine : body.trim();
+  return source.length <= 120 ? source : `${source.slice(0, 119)}…`;
+}
+
+app.get("/api/messages/:id/replies", (c) => {
+  const message = store.getMessage(c.req.param("id"));
+  if (!message) return c.json({ error: "unknown message" }, 404);
+  return c.json({ root: message, replies: store.listThreadReplies(message.id) });
+});
+
+// ── Tasks ───────────────────────────────────────────────────
+
+app.get("/api/channels/:id/tasks", (c) => {
+  const channel = store.getChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "unknown channel" }, 404);
+  return c.json({ channel, board: store.board(channel.id), tasks: store.listTasks(channel.id) });
+});
+
+const TaskBody = z.object({
+  /**
+   * Titles, plural.
+   *
+   * The reference product's create dialog is a title field plus "Add Another",
+   * so entering several at once is the normal case rather than a bulk-import
+   * special case. Everything else about a task is set later, on the board.
+   */
+  titles: z.array(z.string().min(1).max(200)).min(1).max(50),
+  creatorKind: z.enum(["human", "expert"]).default("human"),
+  creatorId: z.string().min(1).nullable().default(null),
+});
+
+app.post("/api/channels/:id/tasks", async (c) => {
+  const channel = store.getChannel(c.req.param("id"));
+  if (!channel) return c.json({ error: "unknown channel" }, 404);
+
+  const parsed = TaskBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const body = parsed.data;
+
+  if (body.creatorKind === "expert" && body.creatorId !== null && !store.getExpert(body.creatorId)) {
+    return c.json({ error: `unknown expert ${body.creatorId}` }, 400);
+  }
+
+  // All or none: a partial batch would leave the user comparing what they typed
+  // against what appeared.
+  const tasks = store.tx(() =>
+    body.titles.map((title) =>
+      store.createTask({
+        channelId: channel.id,
+        title: title.trim(),
+        status: "todo",
+        assigneeKind: null,
+        assigneeId: null,
+        creatorKind: body.creatorKind,
+        creatorId: body.creatorKind === "expert" ? body.creatorId : null,
+        sourceMessageId: null,
+        runId: null,
+      }),
+    ),
+  );
+
+  return c.json(tasks, 201);
+});
+
+const TaskPatch = z.object({
+  title: z.string().min(1).max(200).optional(),
+  status: z.enum(["todo", "in_progress", "in_review", "done"]).optional(),
+  /**
+   * Assignment, as one unit.
+   *
+   * Kind and id are a pair — `expert` with no id, or an id with no kind, are both
+   * unresolvable. Accepting them separately would let a caller build exactly
+   * those states across two requests.
+   */
+  assignee: z
+    .object({
+      kind: z.enum(["human", "expert"]),
+      id: z.string().min(1).nullable().default(null),
+    })
+    .nullable()
+    .optional(),
+});
+
+app.patch("/api/tasks/:id", async (c) => {
+  const task = store.getTask(c.req.param("id"));
+  if (!task) return c.json({ error: "unknown task" }, 404);
+
+  const parsed = TaskPatch.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const body = parsed.data;
+
+  const patch: Parameters<typeof store.updateTask>[1] = {};
+  if (body.title !== undefined) patch.title = body.title.trim();
+  if (body.status !== undefined) patch.status = body.status;
+
+  if (body.assignee !== undefined) {
+    if (body.assignee === null) {
+      // Unclaiming clears both halves; leaving a dangling id would render as an
+      // assignee nobody can resolve.
+      patch.assigneeKind = null;
+      patch.assigneeId = null;
+    } else {
+      const { kind, id } = body.assignee;
+      if (kind === "expert") {
+        if (id === null) return c.json({ error: "an expert assignee needs an id" }, 400);
+        if (!store.getExpert(id)) return c.json({ error: `unknown expert ${id}` }, 400);
+      }
+      patch.assigneeKind = kind;
+      patch.assigneeId = kind === "expert" ? id : null;
+    }
+  }
+
+  store.updateTask(task.id, patch);
+  return c.json(store.getTask(task.id));
+});
+
 // ── Launch ──────────────────────────────────────────────────
 
 function launch(runId: string, autoApprovePlan: boolean): void {
