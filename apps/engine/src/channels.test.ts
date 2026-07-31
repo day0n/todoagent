@@ -353,7 +353,9 @@ test("asTask: one action both says the thing and creates the card", async () => 
       const board = await json<{ board: Record<string, Array<{ title: string }>> }>(
         await fetch(`${BASE}/api/channels/${f.channelId}/tasks`),
       );
-      assert.deepEqual(board.board.todo.map((t) => t.title), ["缓存一下 roster 查询"]);
+      // `?? []` keeps the assertion honest under noUncheckedIndexedAccess: a
+      // missing `todo` column still fails the comparison rather than throwing.
+      assert.deepEqual((board.board.todo ?? []).map((t) => t.title), ["缓存一下 roster 查询"]);
     });
   } finally {
     await f.dispose();
