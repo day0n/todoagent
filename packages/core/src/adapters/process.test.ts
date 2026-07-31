@@ -40,6 +40,54 @@ async function fixture(): Promise<Fixture> {
   };
 }
 
+/**
+ * Measured cost of spawning a script and getting its first line back.
+ *
+ * The idle watchdog is armed AT SPAWN, and that is correct product behaviour — a
+ * CLI that wedges before printing anything still has to be killed. But it means
+ * any test wanting the watchdog to fire on SILENCE rather than on startup needs a
+ * window wider than startup itself.
+ *
+ * Hardcoding that window has now failed twice: 400ms, raised to 1500ms, each
+ * passing in isolation and then failing under the full parallel suite's load. The
+ * symptom is a real signal misread as flakiness — output comes back empty because
+ * the process was killed before its first line, not because the code lost it.
+ *
+ * Startup cost is a property of the machine at that moment, not a constant, so it
+ * is measured here and every window below is derived from it. Cached, since it
+ * cannot change meaningfully within one file's run.
+ */
+let startupCostMs: number | null = null;
+
+async function startupCost(f: Fixture): Promise<number> {
+  if (startupCostMs !== null) return startupCostMs;
+  const probe = await f.script(
+    `echo '{"type":"text","content":"probe"}'\necho '{"type":"done"}'\nexit 0`,
+  );
+  let worst = 0;
+  // Three samples, keeping the worst: the first spawn in a process is reliably the
+  // slowest, and one sample would bake that outlier into every window.
+  for (let i = 0; i < 3; i++) {
+    const started = Date.now();
+    // Watchdog disabled, so this measures spawn + first line + exit and nothing else.
+    await run(probe, f.dir, { idleTimeoutMs: 0 });
+    worst = Math.max(worst, Date.now() - started);
+  }
+  startupCostMs = worst;
+  return worst;
+}
+
+/**
+ * An idle window comfortably clear of startup.
+ *
+ * 4x the measured cost with a 1.5s floor: enough headroom that load arriving after
+ * calibration does not flip the result, while staying short enough that a test
+ * waiting for the watchdog does not dominate the suite.
+ */
+async function idleWindow(f: Fixture): Promise<number> {
+  return Math.max(1500, (await startupCost(f)) * 4);
+}
+
 /** Minimal parser: one JSON object per line, `text` and tool events. */
 function onLine(line: string, ctx: LineContext): AgentEvent[] | null {
   const obj = parseJsonLine(line);
@@ -147,8 +195,9 @@ test("the idle watchdog kills a process that goes silent", async () => {
      * it. The product default is 10 minutes, where startup is irrelevant.
      */
     const script = await f.script(`echo '{"type":"text","content":"then silence"}'\nsleep 30`);
+    const window = await idleWindow(f);
     const started = Date.now();
-    const { result } = await run(script, f.dir, { idleTimeoutMs: 1500 });
+    const { result } = await run(script, f.dir, { idleTimeoutMs: window });
     const elapsed = Date.now() - started;
 
     assert.equal(result.status, "timeout", "a silent agent must not stall the run forever");
@@ -178,7 +227,7 @@ test("the idle watchdog is reset by each new line", async () => {
     const script = await f.script(
       `for i in 1 2 3 4 5; do echo '{"type":"text","content":"tick"}'; sleep 0.4; done\necho '{"type":"done"}'\nexit 0`,
     );
-    const { result } = await run(script, f.dir, { idleTimeoutMs: 1500 });
+    const { result } = await run(script, f.dir, { idleTimeoutMs: await idleWindow(f) });
     assert.equal(result.status, "completed");
   } finally {
     await f.dispose();
@@ -200,10 +249,22 @@ test("an in-flight tool call extends the idle window", async () => {
      * like a missing tool budget but was just an unrealistically short timeout.
      * The product default is 10 minutes, so startup latency is a non-issue there.
      */
+    /*
+     * The silence is DERIVED from the window, not fixed.
+     *
+     * This test only proves anything if the quiet stretch exceeds the generic
+     * window — otherwise it passes even with the tool budget removed. A fixed
+     * `sleep 3` against a calibrated window is exactly that hazard: on a slow
+     * machine the window could grow past 3s and the test would silently stop
+     * testing its own subject.
+     */
+    const window = await idleWindow(f);
+    const silenceMs = window * 2;
     const script = await f.script(
-      `echo '{"type":"tool_use"}'\nsleep 3\necho '{"type":"tool_result"}'\necho '{"type":"done"}'\nexit 0`,
+      `echo '{"type":"tool_use"}'\nsleep ${(silenceMs / 1000).toFixed(1)}\necho '{"type":"tool_result"}'\necho '{"type":"done"}'\nexit 0`,
     );
-    const { result, events } = await run(script, f.dir, { idleTimeoutMs: 1500 });
+    assert.ok(silenceMs > window, "the test is only meaningful if the silence outlasts the window");
+    const { result, events } = await run(script, f.dir, { idleTimeoutMs: window });
     assert.equal(result.status, "completed", "a tool call in flight must not be treated as a hang");
     assert.ok(events.some((e) => e.type === "tool_use"));
     assert.ok(events.some((e) => e.type === "tool_result"));
@@ -220,10 +281,21 @@ test("the idle window narrows again once the tool finishes", async () => {
     const script = await f.script(
       `echo '{"type":"tool_use"}'\necho '{"type":"tool_result"}'\nsleep 30`,
     );
+    const window = await idleWindow(f);
     const started = Date.now();
-    const { result } = await run(script, f.dir, { idleTimeoutMs: 1500 });
+    const { result } = await run(script, f.dir, { idleTimeoutMs: window });
+    const elapsed = Date.now() - started;
     assert.equal(result.status, "timeout");
-    assert.ok(Date.now() - started < 15_000, "the extended budget must not persist after the tool");
+    /*
+     * The bound is derived from the window rather than a flat 15s, so it stays
+     * meaningful if calibration widens the window. What is being ruled out is the
+     * TOOL budget (20 minutes) still applying after tool_result — anything in that
+     * neighbourhood would blow past this by orders of magnitude.
+     */
+    assert.ok(
+      elapsed < window * 4 + 5000,
+      `killed in ${elapsed}ms against a ${window}ms window — the extended budget must not persist`,
+    );
   } finally {
     await f.dispose();
   }
@@ -340,10 +412,17 @@ test("stdin is closed so a reading process does not hang", async () => {
      * must receive EOF immediately.
      */
     const script = await f.script(`cat > /dev/null\necho '{"type":"done"}'\nexit 0`);
+    // Derived, like the windows above: a fixed 3000 served as BOTH the watchdog
+    // window and the elapsed bound, so a slow spawn could either trip the watchdog
+    // or blow the assertion, neither of which is what this test is about.
+    const window = await idleWindow(f);
     const started = Date.now();
-    const { result } = await run(script, f.dir, { idleTimeoutMs: 3000 });
+    const { result } = await run(script, f.dir, { idleTimeoutMs: window });
+    const elapsed = Date.now() - started;
     assert.equal(result.status, "completed", "the process must see EOF on stdin, not block");
-    assert.ok(Date.now() - started < 3000);
+    // The failure being ruled out is a process blocked forever on stdin, which
+    // would hit the watchdog rather than finish just over the line.
+    assert.ok(elapsed < window, `finished in ${elapsed}ms, inside the ${window}ms window`);
   } finally {
     await f.dispose();
   }
@@ -418,7 +497,9 @@ test("a large burst of output is delivered without loss", async () => {
     const script = await f.script(
       `i=0\nwhile [ $i -lt 500 ]; do echo '{"type":"text","content":"line"}'; i=$((i+1)); done\necho '{"type":"done"}'\nexit 0`,
     );
-    const { result, events } = await run(script, f.dir, { idleTimeoutMs: 5000 });
+    // The 500 lines arrive back to back so no gap approaches the window; it only
+    // has to clear startup, which is what calibration guarantees.
+    const { result, events } = await run(script, f.dir, { idleTimeoutMs: await idleWindow(f) });
     assert.equal(result.status, "completed");
     // Backpressure between a fast producer and the async consumer must not drop
     // events — the event log is the only durable record of what an agent did.
