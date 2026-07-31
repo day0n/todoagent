@@ -295,6 +295,41 @@ test("createWorktree keeps a CJK title legible in the branch name", async () => 
   }
 });
 
+test("createWorktree gives two identical titles distinct branches", async () => {
+  const dir = await repo();
+  try {
+    /*
+     * A timestamp alone is not unique. `Date.now()` is evaluated before the
+     * worktree lock is taken, so concurrent callers share a millisecond —
+     * serialising the git command does not separate the names it was handed. With
+     * two subtasks sharing a title the second add failed outright:
+     *
+     *   fatal: a branch named 'council/Add-tests-ms9cx928' already exists
+     *
+     * Reachable in practice: a plan is model-generated and nothing enforces
+     * distinct titles, so a planner emitting "Add tests" twice would lose that
+     * whole subtask before it started. Seen in a real parallel run where two of
+     * three branches shared the suffix `ms9cwcnz` and only differing titles saved
+     * them.
+     */
+    const results = await Promise.all(
+      Array.from({ length: 4 }, () => createWorktree(dir, "Add tests")),
+    );
+    try {
+      const names = new Set(results.map((w) => w.branch));
+      assert.equal(names.size, results.length, `branch names collided: ${[...names].join(", ")}`);
+      for (const wt of results) {
+        const check = await git(["check-ref-format", "--branch", wt.branch], dir);
+        assert.equal(check.code, 0, `git rejected ${wt.branch}`);
+      }
+    } finally {
+      for (const wt of results) await wt.dispose();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("createWorktree survives titles that sanitize down to nothing", async () => {
   const dir = await repo();
   try {

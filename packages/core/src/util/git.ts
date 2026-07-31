@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -186,7 +187,29 @@ export async function createWorktree(
   baseRef = "HEAD",
 ): Promise<Worktree> {
   const safe = refSafe(name);
-  const branch = `council/${safe}-${Date.now().toString(36)}`;
+  /*
+   * A timestamp is not enough to make this unique.
+   *
+   * `Date.now()` is evaluated before the lock below is taken, so two concurrent
+   * callers get the SAME millisecond — serialising the git command does not
+   * separate the names it was given. With two subtasks sharing a title the second
+   * add then failed outright:
+   *
+   *   0: OK   council/Add-tests-ms9cx928
+   *   1: FAIL fatal: a branch named 'council/Add-tests-ms9cx928' already exists
+   *
+   * Reproduced in three lines, and reachable in practice: a plan is
+   * model-generated and nothing enforces distinct titles, so a planner emitting
+   * "Add tests" twice loses that whole subtask before it starts. Observed in a
+   * real parallel run where two of three branches shared the suffix `ms9cwcnz`
+   * and only differing titles saved them.
+   *
+   * The timestamp stays because it makes `git branch` readable and sorts
+   * chronologically; the random half is what guarantees uniqueness. 24 bits per
+   * name against a handful of concurrent subtasks — collision is not a practical
+   * concern, and a failed add is loud rather than silent if it ever happens.
+   */
+  const branch = `council/${safe}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
   const root = await mkdtemp(join(tmpdir(), "council-wt-"));
   const path = join(root, safe);
 
