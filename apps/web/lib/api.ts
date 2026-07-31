@@ -190,6 +190,23 @@ export const api = {
     }),
 
   /**
+   * Starts a pipeline run for a card.
+   *
+   * Never optimistic: this spawns real CLI processes and spends real tokens, and
+   * the engine can refuse it (no repository on the channel, another run already
+   * holding the repository lock, this card already running). The caller has to
+   * await the answer and show it.
+   */
+  runTask: (
+    taskId: string,
+    opts: { budgetTokens?: number; soloMode?: boolean; autoApprovePlan?: boolean } = {},
+  ) =>
+    req<{ run: Run; task: Task }>(`/api/tasks/${taskId}/run`, {
+      method: "POST",
+      body: JSON.stringify(opts),
+    }),
+
+  /**
    * Patches a card.
    *
    * `assignee` is one unit rather than two fields: `expert` with no id, or an id

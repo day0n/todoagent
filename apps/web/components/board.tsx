@@ -29,6 +29,8 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
   const [creating, setCreating] = useState(false);
   const [creator, setCreator] = useState<string>("all");
   const [assignee, setAssignee] = useState<string>("all");
+  /** Cards with a start request in flight, so only that card's button locks. */
+  const [busy, setBusy] = useState<ReadonlySet<string>>(() => new Set());
 
   const load = useCallback(async () => {
     try {
@@ -73,6 +75,40 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
       }
     },
     [tasks],
+  );
+
+  /**
+   * Starts a pipeline run for a card.
+   *
+   * Deliberately NOT optimistic, unlike a column move. This spawns real CLI
+   * processes and spends real tokens, and the engine can refuse it outright — no
+   * repository on the channel, another run holding the repository lock, or this
+   * card already running. Guessing that it succeeded would show a card as working
+   * when nothing started.
+   *
+   * `busy` is per-card so two cards can be started in sequence without the second
+   * button appearing dead, and so a refusal only unsticks the one that failed.
+   */
+  const run = useCallback(
+    async (id: string) => {
+      setBusy((b) => new Set(b).add(id));
+      setError(null);
+      try {
+        const res = await api.runTask(id);
+        // The server's version of the card, which carries the run id and the
+        // in_progress it moved to — rather than a locally invented shape.
+        setTasks((cur) => cur?.map((t) => (t.id === id ? res.task : t)) ?? cur);
+      } catch (err) {
+        setError(err instanceof ApiError ? err.message : String(err));
+      } finally {
+        setBusy((b) => {
+          const next = new Set(b);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [],
   );
 
   const filtered = useMemo(() => {
@@ -141,9 +177,26 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
             hint="用「新建任务」建一张卡，或在聊天里勾选「作为任务」。"
           />
         ) : view === "board" ? (
-          <BoardView tasks={filtered} experts={experts} onPatch={patch} />
+          <BoardView
+            tasks={filtered}
+            experts={experts}
+            onPatch={patch}
+            onRun={run}
+            busy={busy}
+            // The endpoint refuses a card in a channel with no repository, because
+            // the pipeline isolates each subtask in a git worktree. Passing that
+            // down lets the button say so instead of failing on click.
+            canRun={channel.projectId !== null}
+          />
         ) : (
-          <ListView tasks={filtered} experts={experts} onPatch={patch} />
+          <ListView
+            tasks={filtered}
+            experts={experts}
+            onPatch={patch}
+            onRun={run}
+            busy={busy}
+            canRun={channel.projectId !== null}
+          />
         )}
       </div>
 
@@ -226,10 +279,17 @@ function BoardView({
   tasks,
   experts,
   onPatch,
+  onRun,
+  busy,
+  canRun,
 }: {
   tasks: Task[];
   experts: Expert[];
   onPatch: (id: string, next: Partial<Pick<Task, "status" | "assigneeKind" | "assigneeId">>) => void;
+  onRun: (id: string) => void;
+  busy: ReadonlySet<string>;
+  /** False when the channel has no repository, so nothing can execute. */
+  canRun: boolean;
 }) {
   const [dragOver, setDragOver] = useState<TaskStatus | null>(null);
 
@@ -269,7 +329,15 @@ function BoardView({
             <ol className="space-y-2">
               {column.map((t) => (
                 <li key={t.id}>
-                  <Card task={t} experts={experts} onPatch={onPatch} />
+                  <Card
+                    task={t}
+                    experts={experts}
+                    onPatch={onPatch}
+                    onRun={onRun}
+                    // The container tracks a set; a card only cares about itself.
+                    busy={busy.has(t.id)}
+                    canRun={canRun}
+                  />
                 </li>
               ))}
             </ol>
@@ -284,10 +352,16 @@ function Card({
   task,
   experts,
   onPatch,
+  onRun,
+  busy,
+  canRun,
 }: {
   task: Task;
   experts: Expert[];
   onPatch: (id: string, next: Partial<Pick<Task, "status" | "assigneeKind" | "assigneeId">>) => void;
+  onRun: (id: string) => void;
+  busy: boolean;
+  canRun: boolean;
 }) {
   return (
     <article
@@ -319,8 +393,64 @@ function Card({
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
         <AssigneeMenu task={task} experts={experts} onPatch={onPatch} />
         <StatusMenu task={task} onPatch={onPatch} />
+        <RunButton task={task} onRun={onRun} busy={busy} canRun={canRun} />
       </div>
     </article>
+  );
+}
+
+/**
+ * Starts the pipeline for a card.
+ *
+ * Shared by the board and the list so the state rules live in one place — two
+ * copies would drift, and the disagreement would be a button that offers to start
+ * a run the engine then refuses.
+ *
+ * The board only knows a card's `runId`, not its run's status. But
+ * `syncTaskFromRun` moves a finished card off in_progress (completed → in_review,
+ * failed → todo), so `runId !== null && status === "in_progress"` is a sound
+ * inference for "a run is live" — and it is the same condition the engine's own
+ * 409 check applies.
+ */
+function RunButton({
+  task,
+  onRun,
+  busy,
+  canRun,
+}: {
+  task: Task;
+  onRun: (id: string) => void;
+  busy: boolean;
+  canRun: boolean;
+}) {
+  const live = task.runId !== null && task.status === "in_progress";
+
+  if (live) {
+    // No button at all: starting a second run for this card is refused, and
+    // offering it would be a control that only ever produces an error.
+    return (
+      <span className="tag" title="流水线正在执行这张卡">
+        执行中
+      </span>
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      className="btn btn-sm"
+      disabled={busy || !canRun}
+      onClick={() => onRun(task.id)}
+      title={
+        canRun
+          ? task.runId !== null
+            ? "再跑一次流水线"
+            : "让专家团队执行这张卡"
+          : "此频道未关联仓库，任务无法执行"
+      }
+    >
+      {busy ? "启动中…" : task.runId !== null ? "重新执行" : "执行"}
+    </button>
   );
 }
 
@@ -395,10 +525,16 @@ function ListView({
   tasks,
   experts,
   onPatch,
+  onRun,
+  busy,
+  canRun,
 }: {
   tasks: Task[];
   experts: Expert[];
   onPatch: (id: string, next: Partial<Pick<Task, "status" | "assigneeKind" | "assigneeId">>) => void;
+  onRun: (id: string) => void;
+  busy: ReadonlySet<string>;
+  canRun: boolean;
 }) {
   return (
     <div className="panel divide-soft overflow-hidden">
@@ -411,6 +547,7 @@ function ListView({
             <span className="t-meta">{actorLabel(t.assigneeKind, t.assigneeId, experts)}</span>
           )}
           <StatusMenu task={t} onPatch={onPatch} />
+          <RunButton task={t} onRun={onRun} busy={busy.has(t.id)} canRun={canRun} />
         </div>
       ))}
     </div>
