@@ -104,15 +104,6 @@ export interface Project {
  */
 export type Phase = "plan" | "draft" | "review" | "rebuttal" | "adjudicate" | "verify";
 
-export const PHASES: readonly Phase[] = [
-  "plan",
-  "draft",
-  "review",
-  "rebuttal",
-  "adjudicate",
-  "verify",
-];
-
 export type RunStatus =
   | "running"
   | "blocked_on_human"
