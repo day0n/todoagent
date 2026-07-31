@@ -97,6 +97,20 @@ function reconcileOrphanedRuns(): void {
         "The engine restarted while this run was executing, so it was interrupted. Any completed subtask work is still on its branch.",
       endedAt: new Date().toISOString(),
     });
+    /*
+     * The card is moved too, or a crash strands it permanently.
+     *
+     * A card started from the board sits at in_progress with a run id. Marking
+     * only the RUN as failed leaves the board saying work is happening when
+     * nothing is running, and there is no path out of it: the board's live-run
+     * inference stays true forever, so it polls indefinitely watching a value
+     * that will never change again.
+     *
+     * This is the fourth place a run reaches a terminal state — the other three
+     * are launch and the two resume endpoints — and the only one that runs before
+     * the server accepts traffic.
+     */
+    syncTaskFromRun(run.id);
   }
   console.log(`Reconciled ${orphaned.length} interrupted run(s) from a previous process.`);
 }

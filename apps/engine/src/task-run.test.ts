@@ -320,6 +320,58 @@ test("run: a second run is refused while the first is live", async () => {
   }
 });
 
+test("reconcile: an interrupted run releases its card instead of stranding it", async () => {
+  const f = await fixture();
+  try {
+    /*
+     * The state a crash leaves behind: a run still marked `running`, and a card
+     * pointing at it from in_progress. Written directly rather than by starting a
+     * real run, because the whole point is what happens when NOTHING is driving it.
+     */
+    const store = new Store(f.dbPath);
+    const project = store.listProjects()[0]!;
+    const run = store.createRun({ projectId: project.id, goal: "interrupted" });
+    const task = store.createTask({
+      channelId: f.repoChannelId,
+      title: "被中断的任务",
+      status: "in_progress",
+      assigneeKind: null,
+      assigneeId: null,
+      creatorKind: "human",
+      creatorId: null,
+      sourceMessageId: null,
+      runId: run.id,
+    });
+    assert.equal(store.getRun(run.id)?.status, "running", "the fixture must look live");
+    store.close();
+
+    // Booting is what triggers reconciliation, before any traffic is accepted.
+    await withEngine(f, async () => {
+      const board = await json<{ tasks: Array<{ id: string; status: string; runId: string | null }> }>(
+        await fetch(`${BASE}/api/channels/${f.repoChannelId}/tasks`),
+      );
+      const card = board.tasks.find((t) => t.id === task.id);
+
+      /*
+       * Back to todo. Marking only the RUN as failed left the board saying work
+       * was happening with no way out — the web board's live-run inference would
+       * stay true forever, so it polls indefinitely watching a value that can
+       * never change again.
+       */
+      assert.equal(card?.status, "todo");
+      assert.equal(card?.runId, run.id, "the link to the interrupted run is kept");
+
+      const detail = await json<{ run: { status: string; error: string | null } }>(
+        await fetch(`${BASE}/api/runs/${run.id}`),
+      );
+      assert.equal(detail.run.status, "failed");
+      assert.match(detail.run.error ?? "", /restarted/);
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("run: the same card cannot start a second run while its first is live", async () => {
   const f = await fixture();
   try {
