@@ -1,11 +1,16 @@
 import type {
   AttemptTranscript,
+  Channel,
   DetectedRuntime,
   Expert,
+  Message,
+  MessageWithThread,
   Project,
   Run,
   RunDetail,
   StreamEvent,
+  Task,
+  TaskStatus,
   Team,
 } from "./types.ts";
 
@@ -116,6 +121,89 @@ export const api = {
     }),
 
   cancel: (id: string) => req<{ ok: true }>(`/api/runs/${id}/cancel`, { method: "POST" }),
+
+  // ── Channels ────────────────────────────────────────────────
+
+  channels: () => req<Channel[]>("/api/channels"),
+
+  createChannel: (body: {
+    name: string;
+    purpose?: string;
+    kind?: "channel" | "dm";
+    projectId?: string | null;
+    dmExpertId?: string | null;
+  }) => req<Channel>("/api/channels", { method: "POST", body: JSON.stringify(body) }),
+
+  /**
+   * A channel's root messages with their thread summaries.
+   *
+   * The engine clamps `limit` to 1..500 rather than trusting it, so asking for
+   * more than that quietly returns 500 instead of erroring.
+   */
+  messages: (channelId: string, limit?: number) =>
+    req<{ channel: Channel; messages: MessageWithThread[] }>(
+      `/api/channels/${channelId}/messages${limit === undefined ? "" : `?limit=${limit}`}`,
+    ),
+
+  /**
+   * Posts a message, optionally creating a board card from it.
+   *
+   * `asTask` is the join between chat and the board: one action both says the
+   * thing and tracks it, in a single transaction, so a request never has to be
+   * restated by hand.
+   */
+  postMessage: (
+    channelId: string,
+    body: {
+      body: string;
+      authorKind?: "human" | "expert";
+      authorId?: string | null;
+      parentId?: string | null;
+      asTask?: boolean;
+    },
+  ) =>
+    req<{ message: Message; task: Task | null }>(`/api/channels/${channelId}/messages`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  /** One thread's replies. Threads are one level deep. */
+  replies: (messageId: string) =>
+    req<{ root: Message; replies: Message[] }>(`/api/messages/${messageId}/replies`),
+
+  /**
+   * A channel's board.
+   *
+   * Every column is present even when empty — a Kanban board with a missing
+   * column is a layout bug rather than a state worth rendering.
+   */
+  tasks: (channelId: string) =>
+    req<{ channel: Channel; board: Record<TaskStatus, Task[]>; tasks: Task[] }>(
+      `/api/channels/${channelId}/tasks`,
+    ),
+
+  /** Creates one or more cards. All or none: a partial batch is never stored. */
+  createTasks: (channelId: string, titles: string[]) =>
+    req<Task[]>(`/api/channels/${channelId}/tasks`, {
+      method: "POST",
+      body: JSON.stringify({ titles }),
+    }),
+
+  /**
+   * Patches a card.
+   *
+   * `assignee` is one unit rather than two fields: `expert` with no id, or an id
+   * with no kind, are both unresolvable, and accepting them separately would let
+   * the UI build exactly those states across two requests. `null` unclaims.
+   */
+  patchTask: (
+    taskId: string,
+    patch: {
+      title?: string;
+      status?: TaskStatus;
+      assignee?: { kind: "human" | "expert"; id?: string | null } | null;
+    },
+  ) => req<Task>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(patch) }),
 };
 
 /**

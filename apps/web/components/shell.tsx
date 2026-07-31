@@ -4,7 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { api } from "../lib/api.ts";
-import type { DetectedRuntime, Expert, Project, RuntimeKind } from "../lib/types.ts";
+import type { Channel, DetectedRuntime, Expert, RuntimeKind } from "../lib/types.ts";
 
 /**
  * The workspace shell: an icon rail, a channel sidebar, and one panel.
@@ -36,7 +36,7 @@ const RUNTIME_TONE: Record<RuntimeKind, { bg: string; fg: string }> = {
 
 export function WorkspaceShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [channels, setChannels] = useState<Channel[]>([]);
   const [experts, setExperts] = useState<Expert[]>([]);
   const [runtimes, setRuntimes] = useState<DetectedRuntime[]>([]);
   const [offline, setOffline] = useState(false);
@@ -45,8 +45,8 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
 
   const load = useCallback(async () => {
     try {
-      const [ps, ex, rt] = await Promise.all([api.projects(), api.experts(), api.runtimes()]);
-      setProjects(ps);
+      const [ch, ex, rt] = await Promise.all([api.channels(), api.experts(), api.runtimes()]);
+      setChannels(ch);
       setExperts(ex);
       setRuntimes(rt.detected);
       setOffline(false);
@@ -65,6 +65,10 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
   }, [load]);
 
   const online = new Set(runtimes.map((r) => r.kind));
+  // Split once here rather than filtering twice in the markup, so the counts in
+  // the section headers cannot disagree with the rows underneath them.
+  const rooms = channels.filter((c) => c.kind === "channel");
+  const dms = channels.filter((c) => c.kind === "dm");
 
   return (
     <div className="flex h-full">
@@ -112,43 +116,48 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
         </div>
 
         <div className="flex-1 overflow-y-auto px-2 py-3">
-          <Section title="频道" count={projects.length}>
+          <Section title="频道" count={rooms.length}>
             {offline ? (
               <Hint>引擎未启动</Hint>
             ) : !loaded ? (
               <Hint>载入中…</Hint>
-            ) : projects.length === 0 ? (
-              <Hint>还没有项目</Hint>
+            ) : rooms.length === 0 ? (
+              <Hint>运行 pnpm seed 建立频道</Hint>
             ) : (
-              projects.map((p) => (
+              rooms.map((c) => (
                 <Link
-                  key={p.id}
-                  href={`/?project=${encodeURIComponent(p.id)}`}
+                  key={c.id}
+                  href={`/channels/${c.id}`}
                   className="nav-row"
-                  title={p.repoPath}
+                  data-active={pathname === `/channels/${c.id}`}
+                  title={c.purpose === "" ? undefined : c.purpose}
                   onClick={() => setSidebarOpen(false)}
                 >
                   <span aria-hidden className="shrink-0 text-subtle-fg">
                     #
                   </span>
-                  <span className="truncate">{p.name}</span>
+                  <span className="truncate">{c.name}</span>
                 </Link>
               ))
             )}
           </Section>
 
           {/*
-            Agents grouped under the machine they run on, the way Raft's members
-            page does it — a machine row, then its agents with a presence dot.
-            The grouping is the point: these are local CLIs, so which computer
-            they live on is what determines whether they can run at all.
+            DMs grouped under the machine the agents run on, the way Raft's
+            members page does it — a machine row, then each agent with a presence
+            dot. The grouping is the point: these are local CLIs, so which
+            computer they live on determines whether they can run at all.
 
-            The machine is labelled "本机" rather than a hostname because the
-            engine does not report one; inventing a name would be worse than
-            naming the thing accurately.
+            One list, not two. A DM row IS the agent: click to talk to them, and
+            the dot says whether their CLI is installed. A separate roster section
+            would repeat the same six names directly below itself.
+
+            The machine reads "本机" rather than a hostname because the engine
+            does not report one, and inventing a name would be worse than naming
+            the thing accurately.
           */}
-          <Section title="Agent" count={experts.length}>
-            {experts.length === 0 ? (
+          <Section title="私信" count={dms.length}>
+            {dms.length === 0 ? (
               <Hint>{offline ? "—" : "运行 pnpm seed 建立团队"}</Hint>
             ) : (
               <>
@@ -158,32 +167,28 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
                   </span>
                   <span className="mono truncate text-[0.6875rem] text-muted-fg">本机</span>
                 </div>
-                {experts.map((e) => (
-                  <MemberRow
-                    key={e.id}
-                    name={e.name}
-                    kind={e.runtimeKind}
-                    // A runtime absent from PATH can never run, so it reads as
-                    // offline here instead of silently failing when work routes
-                    // to it.
-                    online={online.has(e.runtimeKind)}
-                  />
-                ))}
+                {dms.map((c) => {
+                  const expert =
+                    c.dmExpertId === null
+                      ? null
+                      : (experts.find((e) => e.id === c.dmExpertId) ?? null);
+                  return (
+                    <DmRow
+                      key={c.id}
+                      href={`/channels/${c.id}`}
+                      name={expert?.name ?? c.name}
+                      kind={expert?.runtimeKind ?? null}
+                      // A runtime absent from PATH can never run, so it reads as
+                      // offline here instead of silently failing when work routes
+                      // to it.
+                      online={expert !== null && online.has(expert.runtimeKind)}
+                      active={pathname === `/channels/${c.id}`}
+                      onNavigate={() => setSidebarOpen(false)}
+                    />
+                  );
+                })}
               </>
             )}
-          </Section>
-
-          <Section title="成员">
-            <div className="nav-row cursor-default">
-              <span
-                aria-hidden
-                className="grid h-4 w-4 shrink-0 place-items-center rounded-[4px] text-[9px] font-semibold"
-                style={{ background: "var(--color-muted)", color: "var(--color-muted-fg)" }}
-              >
-                你
-              </span>
-              <span className="truncate">你</span>
-            </div>
           </Section>
         </div>
 
@@ -266,29 +271,54 @@ function Hint({ children }: { children: React.ReactNode }) {
   return <p className="t-meta px-2 py-0.5">{children}</p>;
 }
 
-function MemberRow({
+/**
+ * One agent, as a DM you can open.
+ *
+ * A link rather than a static row: an agent here is a persistent teammate you
+ * address, not a setting you inspect. The presence dot is about their CLI, not
+ * about the conversation — an offline agent's DM still opens and still holds its
+ * history, so the row stays clickable and says why work would fail instead.
+ */
+function DmRow({
+  href,
   name,
   kind,
   online,
+  active,
+  onNavigate,
 }: {
+  href: string;
   name: string;
-  kind: RuntimeKind;
+  /** Null when the DM points at an expert that no longer exists. */
+  kind: RuntimeKind | null;
   online: boolean;
+  active: boolean;
+  onNavigate: () => void;
 }) {
-  const tone = RUNTIME_TONE[kind] ?? {
-    bg: "var(--color-muted)",
-    fg: "var(--color-muted-fg)",
-  };
+  const tone =
+    kind === null
+      ? null
+      : (RUNTIME_TONE[kind] ?? { bg: "var(--color-muted)", fg: "var(--color-muted-fg)" });
+
   return (
-    <div
-      className="nav-row cursor-default"
-      title={online ? kind : `${kind} — 未安装，派活会失败`}
+    <Link
+      href={href}
+      className="nav-row"
+      data-active={active}
+      onClick={onNavigate}
+      title={
+        kind === null
+          ? "这个 agent 已不存在"
+          : online
+            ? kind
+            : `${kind} — 未安装，派活会失败`
+      }
     >
       <span
         aria-hidden
         className="grid h-4 w-4 shrink-0 place-items-center rounded-[4px] text-[9px] font-semibold uppercase"
         style={
-          online
+          tone !== null && online
             ? { background: tone.bg, color: tone.fg }
             : { background: "var(--color-muted)", color: "var(--color-subtle-fg)" }
         }
@@ -303,6 +333,6 @@ function MemberRow({
         }`}
         title={online ? "在线" : "离线"}
       />
-    </div>
+    </Link>
   );
 }

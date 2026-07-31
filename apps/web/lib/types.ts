@@ -233,3 +233,89 @@ export interface DetectedRuntime {
   execPath: string;
   version: string;
 }
+
+// ─────────────────────────────────────────────────────────────
+// Channel layer
+//
+// Chat is the workspace: channels, DMs and threads, with agents as persistent
+// members rather than one-shot invocations. A channel message is durable
+// conversation; `DiscussionMessage` above is a transcript of one review round
+// inside one subtask. Different layers, deliberately different types.
+// ─────────────────────────────────────────────────────────────
+
+/** Who acted. There is a single local human, so `human` carries no id. */
+export type ActorKind = "human" | "expert";
+
+export interface Channel {
+  id: string;
+  name: string;
+  purpose: string;
+  kind: "channel" | "dm";
+  /**
+   * The repository this channel's work lands in.
+   *
+   * Null is legitimate: a DM, or a channel used purely for discussion, has no
+   * repo — and a task there cannot start a run, which the UI has to say plainly
+   * rather than offering a button that fails.
+   */
+  projectId: string | null;
+  dmExpertId: string | null;
+  createdAt: string;
+}
+
+export interface Message {
+  /** Total order. Not derived from `createdAt`, which collides at ms resolution. */
+  seq: number;
+  id: string;
+  channelId: string;
+  authorKind: ActorKind;
+  authorId: string | null;
+  /** Thread root, or null when this message is itself a root. One level deep. */
+  parentId: string | null;
+  body: string;
+  createdAt: string;
+}
+
+/** A root message plus its thread summary, as the channel stream returns it. */
+export interface MessageWithThread extends Message {
+  replyCount: number;
+  lastReplyAt: string | null;
+}
+
+/**
+ * Board column.
+ *
+ * Deliberately not `SubTaskStatus`: that tracks one agent's work inside a run
+ * and carries states a board has no column for (`reworking`, `blocked`,
+ * `failed`).
+ */
+export type TaskStatus = "todo" | "in_progress" | "in_review" | "done";
+
+export const TASK_STATUSES: readonly TaskStatus[] = [
+  "todo",
+  "in_progress",
+  "in_review",
+  "done",
+];
+
+export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
+  todo: "待办",
+  in_progress: "进行中",
+  in_review: "待复核",
+  done: "已完成",
+};
+
+export interface Task {
+  id: string;
+  channelId: string;
+  title: string;
+  status: TaskStatus;
+  assigneeKind: ActorKind | null;
+  assigneeId: string | null;
+  creatorKind: ActorKind;
+  creatorId: string | null;
+  sourceMessageId: string | null;
+  runId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}

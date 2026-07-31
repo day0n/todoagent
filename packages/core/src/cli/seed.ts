@@ -152,8 +152,47 @@ async function main(): Promise<void> {
   const existing = store.listProjects().find((p) => p.repoPath === repoPath);
   const project = existing ?? store.createProject({ name: projectName, repoPath, teamId: team.id });
 
+  /*
+   * One channel per project, plus a DM per agent.
+   *
+   * Chat is the workspace, so a fresh install that opens onto an empty sidebar
+   * has nowhere to start. One channel per project is the right granularity — a
+   * project is exactly one repository's stream of work — and a DM per agent is
+   * what makes them addressable individually rather than only as a team.
+   *
+   * Idempotent, like everything else here: re-seeding finds the existing rows
+   * instead of stacking duplicates.
+   */
+  const channels = store.listChannels();
+  const channel =
+    channels.find((c) => c.kind === "channel" && c.projectId === project.id) ??
+    store.createChannel({
+      name: project.name,
+      purpose: `${project.repoPath} 的工作频道`,
+      kind: "channel",
+      projectId: project.id,
+      dmExpertId: null,
+    });
+
+  const dmCount = detected.reduce((made, runtime) => {
+    const expert = store.getExpertByName(BLUEPRINTS[runtime.kind].name);
+    if (!expert) return made;
+    if (channels.some((c) => c.kind === "dm" && c.dmExpertId === expert.id)) return made;
+    store.createChannel({
+      name: expert.name,
+      purpose: expert.description,
+      kind: "dm",
+      // A DM has no repository, and that is a legitimate state: a task created
+      // there cannot start a run, which is an honest limit rather than a bug.
+      projectId: null,
+      dmExpertId: expert.id,
+    });
+    return made + 1;
+  }, 0);
+
   console.log(`\nTeam:    ${team.name} (${team.id})`);
   console.log(`Project: ${project.name} → ${project.repoPath}`);
+  console.log(`Channel: #${channel.name}${dmCount > 0 ? ` (+ ${dmCount} 个私信)` : ""}`);
   console.log(`\nStart the engine with: pnpm dev`);
   store.close();
 }
