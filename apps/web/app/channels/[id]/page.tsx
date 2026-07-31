@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "next/navigation";
 import { api, ApiError } from "../../../lib/api.ts";
 import type { Channel, Expert, Project } from "../../../lib/types.ts";
@@ -34,6 +34,10 @@ export default function ChannelPage() {
   const [tab, setTab] = useState<Tab>("chat");
   const [taskBump, setTaskBump] = useState(0);
 
+  /** The channel in the URL right now, readable when a response resolves. */
+  const openId = useRef(channelId);
+  openId.current = channelId;
+
   const load = useCallback(async () => {
     try {
       /*
@@ -46,6 +50,14 @@ export default function ChannelPage() {
         api.experts(),
         api.projects(),
       ]);
+      /*
+       * Ignored if the user has already navigated elsewhere.
+       *
+       * `load` is recreated per channel, so a request for A resolves inside the OLD
+       * closure where `channelId` is still A — comparing against that would compare
+       * A to A and pass. The ref is the only value current at resolution time.
+       */
+      if (stream.channel.id !== openId.current) return;
       setChannel(stream.channel);
       setExperts(ex);
       setProject(
@@ -55,11 +67,27 @@ export default function ChannelPage() {
       );
       setError(null);
     } catch (err) {
+      if (openId.current !== channelId) return;
       setError(err instanceof ApiError ? err.message : String(err));
     }
   }, [channelId]);
 
   useEffect(() => {
+    /*
+     * Cleared BEFORE fetching, which is the actual root cause of the
+     * cross-channel bug rather than the stale-response race I chased first.
+     *
+     * This page never reset `channel` when the id changed, so navigating from A to
+     * B rendered A's header, A's repo path and A's conversation while the URL said
+     * B — every single time, not occasionally. Now the switch shows the spinner
+     * until B's own data lands.
+     */
+    setChannel(null);
+    setProject(null);
+    setError(null);
+    // The TAB is deliberately kept. Switching channels while comparing two boards
+    // should not throw you back to 聊天, and the tab has nothing to do with the bug
+    // this reset exists for.
     void load();
   }, [load]);
 
