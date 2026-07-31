@@ -349,11 +349,28 @@ test("jsonschema: emits an object schema with required fields", () => {
   assert.ok(schema.required?.includes("subtasks"));
 });
 
-test("jsonschema: a .default() field is not required", () => {
+test("jsonschema: a .default() field IS required, because strict mode demands it", () => {
+  /*
+   * This test used to assert the opposite, reasoning that "`findings` is
+   * defaulted, so demanding it would make codex reject its own otherwise-valid
+   * output". Plausible, and empirically wrong: what gets rejected is the REQUEST,
+   * not the model's answer. OpenAI's structured output runs strict and returns
+   * HTTP 400 when `required` omits any key in `properties`:
+   *
+   *   invalid_json_schema: 'required' ... an array including every key in
+   *   properties. Missing 'evidence'.
+   *
+   * The attempt history settles it: codex went 0/10 on `review` (three defaulted
+   * fields) and 11/11 on `repro` (every field mandatory). Since codex is seeded as
+   * the reviewer, cross-vendor review had been running a vendor short for the
+   * project's whole life, logged only as `review:errored`.
+   *
+   * Safe because a field the model may have no answer for is emitted as nullable,
+   * so it writes `null` rather than omitting the key — and the zod `.default()`
+   * still covers the other runtimes, which receive no schema at all.
+   */
   const schema = zodToJsonSchema(ReviewSchema) as { required?: string[] };
-  // `findings` is defaulted, so demanding it would make codex reject its own
-  // otherwise-valid output.
-  assert.ok(!(schema.required ?? []).includes("findings"));
+  assert.ok((schema.required ?? []).includes("findings"), "a defaulted key must still be required");
   assert.ok((schema.required ?? []).includes("overall"));
 });
 

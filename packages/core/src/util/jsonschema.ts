@@ -77,17 +77,40 @@ function convert(schema: z.ZodTypeAny, depth: number): Record<string, unknown> {
           ? (shapeFn as () => Record<string, z.ZodTypeAny>)()
           : ((shapeFn ?? {}) as Record<string, z.ZodTypeAny>);
       const properties: Record<string, unknown> = {};
-      const required: string[] = [];
       for (const [key, value] of Object.entries(shape)) {
         properties[key] = convert(value, depth + 1);
-        if (!isSkippable(value)) required.push(key);
       }
+      /*
+       * EVERY key is required, including optional and defaulted ones.
+       *
+       * Standard JSON Schema would omit them, and doing so silently broke codex
+       * for the entire life of this project. OpenAI's structured output runs in
+       * strict mode, which demands that `required` list every key in
+       * `properties`; anything less is rejected with HTTP 400:
+       *
+       *   invalid_json_schema: 'required' is required to be supplied and to be an
+       *   array including every key in properties. Missing 'evidence'.
+       *
+       * Measured against the real attempt history: codex completed 11/11 `repro`
+       * turns — the one schema whose fields are all mandatory — and 0/10 `review`
+       * turns. codex is seeded as the reviewer/verifier, so cross-vendor review,
+       * the entire premise of this system, had been running one vendor short
+       * without ever saying so. `collectReviews` logged `review:errored` and
+       * carried on.
+       *
+       * Requiring them costs nothing: a nullable field already emits
+       * `type: [..., "null"]` so the model can answer null, and the zod
+       * `.default()` stays as the safety net for the OTHER runtimes, which get no
+       * schema at all and may legitimately omit a key.
+       *
+       * `additionalProperties: false` was already here with a comment about strict
+       * mode — the author knew about it and this half was simply missed.
+       */
+      const required = Object.keys(properties);
       return {
         type: "object",
         properties,
         ...(required.length > 0 ? { required } : {}),
-        // Codex enforces the schema strictly; leaving this open invites extra
-        // keys that then have to be tolerated downstream.
         additionalProperties: false,
       };
     }
@@ -144,9 +167,8 @@ function convert(schema: z.ZodTypeAny, depth: number): Record<string, unknown> {
   }
 }
 
-/** Optional and defaulted fields are not required in the emitted schema. */
-function isSkippable(schema: z.ZodTypeAny): boolean {
-  const def = (schema as { _def?: Record<string, unknown> })._def;
-  const typeName = typeof def?.["typeName"] === "string" ? def["typeName"] : "";
-  return typeName === "ZodOptional" || typeName === "ZodDefault";
-}
+/*
+ * `isSkippable` used to live here, reporting whether a field was optional or
+ * defaulted so it could be left out of `required`. Every key is required now —
+ * see the note in the ZodObject branch — so nothing asks the question any more.
+ */
