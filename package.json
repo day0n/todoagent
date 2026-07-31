@@ -14,11 +14,14 @@
     "test": "pnpm -r test",
     "test:core": "pnpm --filter @council/core test",
     "test:engine": "pnpm --filter @council/engine test",
-    "e2e": "pnpm --filter @council/core e2e",
-    "doctor": "pnpm --filter @council/core doctor",
-    "seed": "pnpm --filter @council/core seed",
+    "e2e": "pnpm --filter @council/core run e2e",
+    "doctor": "pnpm --filter @council/core run doctor",
+    "// runtimes": "Use `pnpm runtimes`. `pnpm doctor` silently runs PNPM's builtin doctor instead of this script — pnpm resolves the builtin before consulting package.json, so no script name can win that collision.",
+    "runtimes": "pnpm --filter @council/core run doctor",
+    "seed": "pnpm --filter @council/core run seed",
     "// check": "Static checks that typecheck and the test suite cannot see: stray control bytes, undefined CSS classes and custom properties, responsive rules, dead exports. Each one caught a real bug that everything else reported as fine.",
-    "check": "node scripts/check-all.mjs"
+    "check": "node scripts/check-all.mjs",
+    "// doctor": "`run` is explicit because `doctor` is also a pnpm builtin: without it, pnpm runs the builtin and fails with Unknown option: recursive."
   },
   "devDependencies": {
     "typescript": "5.7.3",
