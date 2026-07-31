@@ -272,6 +272,17 @@ if (prompt.includes("decompose the goal")) {
   writeFileSync("note.txt", "hello from the maker\\n");
   emit("created note.txt");
 } else if (prompt.includes("You are reviewing another agent")) {
+  /*
+   * A provider outage during review, which is what one API incident looks like
+   * from here — both reviewers of a subtask hit the same endpoint.
+   *
+   * The draft above still succeeds, so this isolates the review step: the work
+   * exists and is good, and the only thing missing is that anybody checked it.
+   */
+  if (C.behaviour === "review-outage") {
+    process.stderr.write("Error: [unavailable] HTTP 503\\n");
+    process.exit(1);
+  }
   emit(C.review);
 } else if (prompt.includes("Respond to each one")) {
   /*
@@ -422,6 +433,61 @@ test("pipeline: a clean review completes without discussion or rework", async ()
     // The work must actually be reachable, not just reported.
     const files = await git(["ls-files"], h.repo);
     assert.ok(files.stdout.includes("note.txt"), "the maker's file merged into main");
+  } finally {
+    await h.dispose();
+  }
+});
+
+test("pipeline: every reviewer failing is not approval", async () => {
+  const h = await setup("review-outage");
+  try {
+    /*
+     * The worst bug found in this codebase, and it was invisible.
+     *
+     * `collectReviews` returned findings only, so an empty array meant both
+     * "reviewed and clean" and "nobody managed to review this". The second took
+     * the accept branch — status `done`, logged as "no blocking findings" — and
+     * `mergeStage` merges every `done` subtask. So UNREVIEWED code landed on the
+     * user's branch and the run reported success.
+     *
+     * One API incident away from real: a live run hit `cursor-agent exited 1`
+     * with `[unavailable] HTTP 503`, and the same outage reaching both reviewers
+     * of one subtask is the ordinary case, not a contrived one. Cross-vendor
+     * review is the entire premise of this system.
+     */
+    await runPipeline({ store: h.store, runId: h.runId, ...PIPELINE_OPTS });
+
+    const subtasks = h.store.listSubTasks(h.runId);
+    assert.equal(subtasks.length, 1);
+    const s = subtasks[0];
+
+    // Not `done`: that is the status that gets merged.
+    assert.equal(s?.status, "in_review", `expected in_review, got ${s?.status}`);
+
+    // The security-critical property. Nothing else in this test matters as much.
+    const files = await git(["ls-files"], h.repo);
+    assert.ok(
+      !files.stdout.includes("note.txt"),
+      "unreviewed work must NOT be merged into the working branch",
+    );
+
+    // But the work is preserved rather than thrown away — the draft succeeded, and
+    // a human can still look at the branch.
+    assert.ok(s?.branch, "the draft's branch must survive for a human to inspect");
+    const branchExists = await git(["rev-parse", "--verify", s?.branch ?? ""], h.repo);
+    assert.equal(branchExists.code, 0, "the branch must still exist");
+
+    // And it says so, rather than being silently skipped.
+    const events = h.store.eventsAfter(h.runId, 0, 5000);
+    const unreviewed = events.find((e) => e.type === "subtask:unreviewed");
+    assert.ok(unreviewed, "the run must record that this was never reviewed");
+    assert.ok(
+      !events.some((e) => e.type === "subtask:accepted"),
+      "nothing may be recorded as accepted when no review happened",
+    );
+
+    // No review rows, because no reviewer delivered one.
+    assert.equal(h.store.listReviews(h.runId).length, 0);
   } finally {
     await h.dispose();
   }

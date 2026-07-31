@@ -789,7 +789,45 @@ async function runSubTask(
 
       // ── review (parallel, independent) ──
       setPhaseSafe(ctx, "review");
-      const reviews = await collectReviews(ctx, subTask, author, diff, round, worktree.path);
+      const round1 = await collectReviews(ctx, subTask, author, diff, round, worktree.path);
+
+      /*
+       * Every reviewer failing is NOT approval.
+       *
+       * This function used to return findings only, so an empty array had two
+       * meanings that the caller could not tell apart: "reviewed and clean" and
+       * "nobody managed to review this". The second one took the accept branch
+       * below — status `done`, logged as "no blocking findings" — and `mergeStage`
+       * merges every `done` subtask, so UNREVIEWED code landed on the user's
+       * branch and the run reported success.
+       *
+       * Not hypothetical. A real run had `cursor-agent exited 1` with
+       * `[unavailable] HTTP 503`; the same outage hitting both reviewers of a
+       * subtask is one API incident away, and cross-vendor review is the entire
+       * premise of this system.
+       *
+       * `in_review` is the right landing state, not `failed`: the draft itself
+       * succeeded and its branch holds real work, a human should look at it, and
+       * the barrier already treats `in_review` as terminal while `mergeStage`
+       * merges only `done`. So the work is preserved, visible, and not merged
+       * unreviewed.
+       *
+       * `attempted === 0` is excluded deliberately — with one runtime installed
+       * there IS nobody to cross-review, `seed` says so, and failing every subtask
+       * would make a single-runtime install unusable.
+       */
+      if (round1.attempted > 0 && round1.delivered === 0) {
+        ctx.store.updateSubTask(subTask.id, { status: "in_review" });
+        log(ctx, "subtask:unreviewed", {
+          subTaskId: subTask.id,
+          round,
+          attempted: round1.attempted,
+          reason: "every reviewer failed, so this was never actually reviewed",
+        });
+        return;
+      }
+
+      const reviews = round1.reviews;
 
       // ── repro: settle verifiable claims by experiment ──
       await settleVerifiableClaims(ctx, subTask, reviews, worktree.path);
@@ -799,7 +837,14 @@ async function runSubTask(
 
       if (blocking.length === 0) {
         ctx.store.updateSubTask(subTask.id, { status: "done" });
-        log(ctx, "subtask:accepted", { subTaskId: subTask.id, round, reason: "no blocking findings" });
+        log(ctx, "subtask:accepted", {
+          subTaskId: subTask.id,
+          round,
+          // Recorded so "clean review" and "no reviewer existed" are distinguishable
+          // after the fact, not just at the moment of the decision.
+          reviewersDelivered: round1.delivered,
+          reason: round1.attempted === 0 ? "no reviewer available" : "no blocking findings",
+        });
         return;
       }
 
@@ -933,6 +978,21 @@ function setPhaseSafe(ctx: Ctx, phase: Run["phase"]): void {
  * reproduction step then refuted its own reviewer's claim, having been pointed at
  * the correct tree — costing a full rework round on a phantom defect.
  */
+/**
+ * The outcome of a review round, not just its findings.
+ *
+ * `attempted` and `delivered` exist because an empty `reviews` array has two
+ * completely different meanings, and conflating them silently skipped the entire
+ * point of this system — see the note at the call site.
+ */
+interface ReviewRound {
+  reviews: Review[];
+  /** Reviewers who were asked. Zero means nobody other than the author exists. */
+  attempted: number;
+  /** Reviewers whose verdict actually parsed. */
+  delivered: number;
+}
+
 async function collectReviews(
   ctx: Ctx,
   subTask: SubTask,
@@ -940,11 +1000,14 @@ async function collectReviews(
   diff: string,
   round: number,
   worktreePath: string,
-): Promise<Review[]> {
+): Promise<ReviewRound> {
   const reviewers = pickReviewers(ctx.roster, author.id);
   if (reviewers.length === 0) {
     log(ctx, "review:skipped", { subTaskId: subTask.id, reason: "no reviewer other than the author" });
-    return [];
+    // Legitimate: with one runtime installed there is nobody to cross-review, and
+    // `seed` warns about exactly that. Distinguished from "asked and all failed"
+    // by `attempted: 0`.
+    return { reviews: [], attempted: 0, delivered: 0 };
   }
 
   /*
@@ -977,6 +1040,14 @@ async function collectReviews(
   );
 
   const created: Review[] = [];
+  /*
+   * Counted separately from `created.length`.
+   *
+   * A reviewer that approves cleanly delivers a verdict and zero findings, so
+   * findings cannot stand in for participation — which is precisely the confusion
+   * that let a round with every reviewer dead read as unanimous approval.
+   */
+  let delivered = 0;
   for (const s of settled) {
     if (s.status === "rejected") {
       if (s.reason instanceof BudgetExceededError) throw s.reason;
@@ -991,6 +1062,9 @@ async function collectReviews(
       log(ctx, "review:unparsed", { subTaskId: subTask.id, reviewerId: reviewer.id, error: out.error });
       continue;
     }
+    // A verdict arrived and parsed. Counted here, before findings are examined,
+    // because "approved with nothing to say" is a delivered review.
+    delivered++;
     for (const f of out.value.findings) {
       created.push(
         ctx.store.createReview({
@@ -1016,7 +1090,7 @@ async function collectReviews(
       findings: out.value.findings.length,
     });
   }
-  return created;
+  return { reviews: created, attempted: reviewers.length, delivered };
 }
 
 /**
