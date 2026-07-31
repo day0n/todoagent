@@ -93,6 +93,24 @@ export function useRun(runId: string): RunState {
   }, [reload]);
 
   useEffect(() => {
+    /*
+     * Cleared when the run changes, PRECAUTIONARY rather than fixing a live bug.
+     *
+     * `useState` initialisers run once per mount, and Next reuses one component
+     * across two ids of the same dynamic route — the defect I just fixed on the
+     * channel page, where it rendered A's conversation under B's URL. Here the
+     * identical shape exists and is currently unreachable: nothing navigates
+     * run-to-run client-side. The home page links in from `/` (a mount), the board
+     * uses a plain `<a>` (a full load), and the run page only links back to `/`, so
+     * two run pages can never be adjacent in history.
+     *
+     * Kept anyway because the sibling components all reset, and the day someone
+     * adds a "next run" link this would otherwise show the previous run's event log
+     * and live cards under the new id.
+     */
+    setDetail(null);
+    setStream(emptyRunStreamState());
+    setError(null);
     reload();
     return () => {
       if (refetchTimer.current !== null) clearTimeout(refetchTimer.current);
