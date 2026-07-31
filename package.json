@@ -1,0 +1,26 @@
+{
+  "name": "council",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @council/engine dev",
+    "dev:web": "pnpm --filter @council/web dev",
+    "typecheck": "pnpm -r typecheck",
+    "// test": "-r so every workspace runs. The engine's SSE and reconciliation suites existed but were never executed by the default command, which makes them decorative.",
+    "test": "pnpm -r test",
+    "test:core": "pnpm --filter @council/core test",
+    "test:engine": "pnpm --filter @council/engine test",
+    "e2e": "pnpm --filter @council/core e2e",
+    "doctor": "pnpm --filter @council/core doctor",
+    "seed": "pnpm --filter @council/core seed"
+  },
+  "devDependencies": {
+    "typescript": "5.7.3",
+    "@types/node": "22.13.1",
+    "tsx": "4.19.2"
+  }
+}

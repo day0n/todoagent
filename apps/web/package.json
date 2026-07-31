@@ -1,0 +1,27 @@
+{
+  "name": "@council/web",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "next dev -p 3000",
+    "build": "next build",
+    "start": "next start -p 3000",
+    "typecheck": "tsc -p tsconfig.json",
+    "// test": "Scoped to lib/ — .tsx components need a DOM renderer, while the pure logic there does not.",
+    "test": "node --test --experimental-strip-types 'lib/**/*.test.ts'"
+  },
+  "dependencies": {
+    "@council/core": "workspace:*",
+    "next": "15.1.6",
+    "react": "19.0.0",
+    "react-dom": "19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.8",
+    "@types/react-dom": "19.0.3",
+    "tailwindcss": "4.3.3",
+    "@tailwindcss/postcss": "4.3.3",
+    "postcss": "8.5.1"
+  }
+}

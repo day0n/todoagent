@@ -1,0 +1,24 @@
+{
+  "name": "@council/core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./types": "./src/types.ts",
+    "./db": "./src/db/index.ts",
+    "./adapters": "./src/adapters/index.ts",
+    "./orchestrator": "./src/orchestrator/index.ts",
+    "./review-rules": "./src/review-rules.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "node --test --experimental-strip-types 'src/**/*.test.ts'",
+    "doctor": "tsx src/cli/doctor.ts",
+    "seed": "tsx src/cli/seed.ts",
+    "e2e": "tsx src/cli/e2e.ts"
+  },
+  "dependencies": {
+    "zod": "3.24.1"
+  }
+}

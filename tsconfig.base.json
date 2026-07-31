@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    // Imports carry explicit .ts extensions so Node's own type stripping and
+    // tsx can resolve them at runtime without a build step.
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    // Dead locals and unused imports are how "declared but never wired up" hides.
+    // Typecheck stayed green while an import sat unused after a refactor, so the
+    // compiler is asked to enforce it rather than relying on review.
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "exactOptionalPropertyTypes": false,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "declaration": true,
+    "sourceMap": true,
+    "noEmit": true
+  }
+}

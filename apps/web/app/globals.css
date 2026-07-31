@@ -1,0 +1,426 @@
+@import "tailwindcss";
+
+/**
+ * Neo-brutalist design system, matching Raft.
+ *
+ * Every value here was EXTRACTED from app.raft.build's compiled stylesheet via
+ * browser automation, not guessed from a screenshot. The tokens below are what
+ * their app actually computes:
+ *
+ *   body            #ffffff, text rgb(20,17,17), Space Grotesk 16px
+ *   button/input    border 2px solid black, border-radius 0
+ *   shadow          rgb(20,17,17) 2px 2px 0 0   ← hard, zero blur
+ *   font-weight     700 on buttons, labels, headings
+ *   --color-brutal-yellow  #ffd440   (aliased as --color-soft-signal)
+ *   --color-brutal-pink    #fe7da8   (aliased as --accent-*)
+ *   panel header    h-panel-header = 62px, border-b-2 border-black
+ *
+ * This replaces a dark, soft-shadowed, rounded system that was wrong on every
+ * axis. The style is not decoration: hard edges and offset shadows mean depth is
+ * conveyed by geometry rather than blur, so nothing is ambiguous at any zoom.
+ */
+
+@theme {
+  /* ── Core ───────────────────────────────────────────────────
+     Warm near-black rather than pure black — the value their app computes for
+     body text and for every border and shadow. */
+  --color-ink: #141111;
+  --color-paper: #ffffff;
+
+  /* Greys are only for de-emphasised text and inert fills. Structure comes from
+     black borders, never from a grey step. */
+  --color-mute: #6b6565;
+  --color-faint: #f4f2f2;
+  --color-faint-2: #e8e5e5;
+
+  /* ── Brand ──────────────────────────────────────────────────
+     Their four brutal hues. Yellow is the "signal" surface (headers, active
+     state), pink is the accent (primary action), purple and cyan tag things. */
+  --color-signal: #ffd440;
+  --color-signal-soft: oklch(97.5% 0.027 85.64);
+  --color-accent: #fe7da8;
+  --color-accent-soft: oklch(93.6% 0.034 2.02);
+  --color-grape: oklch(78.3% 0.078 294.55);
+  --color-grape-soft: oklch(94% 0.03 294);
+  --color-aqua: oklch(78.3% 0.135 219.2);
+  --color-aqua-soft: oklch(94.5% 0.033 226.27);
+
+  /* ── Semantic ───────────────────────────────────────────────
+     Chosen to sit on white at 700 weight, which is where most of this UI lives. */
+  --color-ok: oklch(52.7% 0.154 150.069);
+  --color-ok-soft: oklch(94% 0.05 150);
+  --color-warn: oklch(55.5% 0.163 48.998);
+  --color-warn-soft: oklch(95% 0.05 60);
+  --color-bad: oklch(50.5% 0.213 27.518);
+  --color-bad-soft: oklch(94% 0.04 20);
+
+  --font-sans: var(--font-space-grotesk), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+
+  /* Panel chrome height, measured from their rendered header. */
+  --h-panel: 62px;
+  --w-rail: 15rem;
+}
+
+@layer base {
+  * {
+    border-color: var(--color-ink);
+  }
+
+  html {
+    color-scheme: light;
+    scrollbar-gutter: stable;
+  }
+
+  body {
+    background-color: var(--color-paper);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 0.875rem;
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+    /* Live token counts and durations sit in dense rows; proportional digits make
+       them jitter as values change. */
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Headings are heavy and tight — the defining move of this style. */
+  h1,
+  h2,
+  h3 {
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+  }
+
+  ::selection {
+    background: var(--color-signal);
+    color: var(--color-ink);
+  }
+
+  /* A blocky scrollbar rather than a soft pill, so it belongs to the system. */
+  ::-webkit-scrollbar {
+    width: 12px;
+    height: 12px;
+  }
+  ::-webkit-scrollbar-track {
+    background: var(--color-faint);
+    border-left: 2px solid var(--color-ink);
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-ink);
+    border: 3px solid var(--color-faint);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-mute);
+  }
+
+  /* Focus is a hard offset ring; this app is driven from the keyboard a lot. */
+  :focus-visible {
+    outline: 3px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  textarea,
+  input,
+  select,
+  button {
+    font: inherit;
+    font-variant-numeric: inherit;
+  }
+}
+
+@layer components {
+  /* ── Surfaces ───────────────────────────────────────────────
+     A "card" is a white box with a 2px black border and a hard offset shadow.
+     Depth is geometric: the shadow is a solid duplicate, never a blur. */
+  .brut {
+    background: var(--color-paper);
+    border: 2px solid var(--color-ink);
+    box-shadow: 2px 2px 0 0 var(--color-ink);
+  }
+
+  /* A heavier lift for things that must read as foreground: gates, dialogs. */
+  .brut-lift {
+    background: var(--color-paper);
+    border: 2px solid var(--color-ink);
+    box-shadow: 4px 4px 0 0 var(--color-ink);
+  }
+
+  /* Flat panel: bordered but not floating. For rails, headers, inline rows. */
+  .brut-flat {
+    background: var(--color-paper);
+    border: 2px solid var(--color-ink);
+  }
+
+  /* Recessed area for transcripts and code. Grey fill, no shadow. */
+  .brut-inset {
+    background: var(--color-faint);
+    border: 2px solid var(--color-ink);
+  }
+
+  /* Interactive card. Press moves it INTO its own shadow — the canonical
+     brutalist affordance, and far more legible than an opacity change. */
+  .brut-press {
+    background: var(--color-paper);
+    border: 2px solid var(--color-ink);
+    box-shadow: 2px 2px 0 0 var(--color-ink);
+    transition:
+      transform 90ms steps(2, end),
+      box-shadow 90ms steps(2, end),
+      background-color 90ms ease;
+  }
+  .brut-press:hover {
+    background: var(--color-signal-soft);
+  }
+  .brut-press:active {
+    transform: translate(2px, 2px);
+    box-shadow: 0 0 0 0 var(--color-ink);
+  }
+
+  /* ── Buttons ────────────────────────────────────────────────
+     700 weight, square, black border, hard shadow — matching their computed
+     button styles exactly. */
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.375rem;
+    padding: 0.4375rem 0.75rem;
+    font-size: 0.875rem;
+    font-weight: 700;
+    white-space: nowrap;
+    color: var(--color-ink);
+    background: var(--color-paper);
+    border: 2px solid var(--color-ink);
+    box-shadow: 2px 2px 0 0 var(--color-ink);
+    transition:
+      transform 90ms steps(2, end),
+      box-shadow 90ms steps(2, end),
+      background-color 90ms ease;
+  }
+  .btn:hover:not(:disabled) {
+    background: var(--color-faint);
+  }
+  .btn:active:not(:disabled) {
+    transform: translate(2px, 2px);
+    box-shadow: 0 0 0 0 var(--color-ink);
+  }
+  .btn:disabled {
+    background: var(--color-faint-2);
+    color: var(--color-mute);
+    box-shadow: 2px 2px 0 0 var(--color-mute);
+    border-color: var(--color-mute);
+    cursor: not-allowed;
+  }
+
+  .btn-primary {
+    background: var(--color-accent);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: oklch(80.8% 0.116 0.76);
+  }
+
+  .btn-signal {
+    background: var(--color-signal);
+  }
+  .btn-signal:hover:not(:disabled) {
+    background: oklch(91.3% 0.103 88.02);
+  }
+
+  /* Borderless, for tertiary actions where a full box would be noise. */
+  .btn-bare {
+    border-color: transparent;
+    box-shadow: none;
+    background: transparent;
+    font-weight: 600;
+  }
+  .btn-bare:hover:not(:disabled) {
+    background: var(--color-faint);
+    border-color: transparent;
+  }
+  .btn-bare:active:not(:disabled) {
+    transform: none;
+    box-shadow: none;
+  }
+
+  .btn-sm {
+    padding: 0.25rem 0.5rem;
+    font-size: 0.75rem;
+  }
+
+  /* ── Inputs ─────────────────────────────────────────────────
+     Transparent fill and a black box, as theirs compute. */
+  .field {
+    width: 100%;
+    background: transparent;
+    color: var(--color-ink);
+    border: 2px solid var(--color-ink);
+    box-shadow: 2px 2px 0 0 var(--color-ink);
+    padding: 0.5rem;
+    transition: box-shadow 90ms steps(2, end);
+  }
+  .field::placeholder {
+    color: var(--color-mute);
+  }
+  .field:focus {
+    outline: none;
+    /* Deepens rather than glows — a soft ring would break the language. */
+    box-shadow: 4px 4px 0 0 var(--color-accent);
+  }
+
+  select.field {
+    appearance: none;
+    padding-right: 1.75rem;
+    cursor: pointer;
+    background-image: linear-gradient(45deg, transparent 50%, currentColor 50%),
+      linear-gradient(135deg, currentColor 50%, transparent 50%);
+    background-position:
+      calc(100% - 0.875rem) 55%,
+      calc(100% - 0.625rem) 55%;
+    background-size: 0.3125rem 0.3125rem;
+    background-repeat: no-repeat;
+  }
+
+  /* ── Tags ───────────────────────────────────────────────────
+     Square, bordered, 700 weight. Meaning is carried by fill colour on a black
+     outline, so a tag never dissolves into the page. */
+  .tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    padding: 0.0625rem 0.3125rem;
+    font-size: 0.6875rem;
+    font-weight: 700;
+    line-height: 1.4;
+    white-space: nowrap;
+    border: 2px solid var(--color-ink);
+    background: var(--color-paper);
+  }
+
+  /* ── Typography ─────────────────────────────────────────────
+     A real scale. The previous system had everything between 11 and 13px, so
+     nothing had rank. */
+  .t-hero {
+    font-size: 1.75rem;
+    font-weight: 700;
+    letter-spacing: -0.028em;
+    line-height: 1.15;
+  }
+  .t-lg {
+    font-size: 1.25rem;
+    font-weight: 700;
+    letter-spacing: -0.022em;
+  }
+  .t-md {
+    font-size: 1rem;
+    font-weight: 700;
+    letter-spacing: -0.014em;
+  }
+
+  /* Uppercase section label — wide tracking is what makes it read as a label
+     rather than as shrunken body copy. */
+  .t-label {
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    color: var(--color-mute);
+  }
+
+  .t-meta {
+    font-size: 0.78125rem;
+    color: var(--color-mute);
+  }
+
+  .mono {
+    font-family: var(--font-mono);
+    font-size: 0.78125rem;
+    line-height: 1.6;
+    font-variant-ligatures: none;
+  }
+
+  /* ── Chrome ─────────────────────────────────────────────────
+     The yellow panel header, matching their measured 62px and bottom rule. */
+  .panel-header {
+    display: flex;
+    height: var(--h-panel);
+    flex-shrink: 0;
+    align-items: center;
+    gap: 0.75rem;
+    border-bottom: 2px solid var(--color-ink);
+    background: var(--color-signal);
+    padding-inline: 1rem;
+  }
+
+  .rule {
+    border-bottom: 2px solid var(--color-ink);
+  }
+
+  .divide-hard > * + * {
+    border-top: 2px solid var(--color-ink);
+  }
+}
+
+@layer utilities {
+  /* Live indicator: a hard blink, not a soft fade — consistent with the style. */
+  @keyframes blink-hard {
+    0%,
+    49% {
+      opacity: 1;
+    }
+    50%,
+    100% {
+      opacity: 0.25;
+    }
+  }
+  .blink {
+    animation: blink-hard 1.1s steps(1, end) infinite;
+  }
+
+  @keyframes pop {
+    from {
+      opacity: 0;
+      transform: translateY(4px);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+  .pop {
+    animation: pop 140ms steps(3, end);
+  }
+
+  /* Indeterminate progress for a running phase. */
+  @keyframes march {
+    to {
+      background-position: 16px 0;
+    }
+  }
+  .marching {
+    background-image: repeating-linear-gradient(
+      -45deg,
+      var(--color-ink) 0 3px,
+      transparent 3px 8px
+    );
+    animation: march 700ms linear infinite;
+  }
+
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .blink,
+    .pop,
+    .marching {
+      animation: none;
+    }
+    .btn,
+    .brut-press,
+    .field {
+      transition: none;
+    }
+  }
+}
