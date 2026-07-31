@@ -372,6 +372,65 @@ test("reconcile: an interrupted run releases its card instead of stranding it", 
   }
 });
 
+test("cancel: a run parked at a gate releases its card", async () => {
+  const f = await fixture();
+  try {
+    /*
+     * The state written directly is the state that matters: a run parked at the
+     * plan gate, with no AbortController driving it. That is not contrived — the
+     * approve-plan endpoint creates its own controller, so a parked run is NOT in
+     * `active` while it waits, and the plan gate is on by default, so every
+     * card-started run passes through here.
+     *
+     * Before the fix, cancelling in this state wrote `status: cancelled` and
+     * nothing else. No `finally` exists anywhere to catch it, so the card sat at
+     * in_progress permanently and the web board polled it forever. Reading a plan,
+     * deciding it is wrong, and cancelling is the ordinary way to use this.
+     */
+    const store = new Store(f.dbPath);
+    const project = store.listProjects()[0]!;
+    const run = store.createRun({ projectId: project.id, goal: "parked" });
+    store.updateRun(run.id, { status: "blocked_on_human", gate: "plan_approval" });
+    const task = store.createTask({
+      channelId: f.repoChannelId,
+      title: "计划不对，取消掉",
+      status: "in_progress",
+      assigneeKind: null,
+      assigneeId: null,
+      creatorKind: "human",
+      creatorId: null,
+      sourceMessageId: null,
+      runId: run.id,
+    });
+    store.close();
+
+    await withEngine(f, async () => {
+      const res = await post(`/api/runs/${run.id}/cancel`);
+      assert.equal(res.status, 200);
+      // No controller existed, so nothing was reaped — this is the orphan path.
+      assert.equal((await json<{ reaped: boolean }>(res)).reaped, false);
+
+      const board = await json<{ tasks: Array<{ id: string; status: string; runId: string | null }> }>(
+        await fetch(`${BASE}/api/channels/${f.repoChannelId}/tasks`),
+      );
+      const card = board.tasks.find((t) => t.id === task.id);
+
+      assert.equal(card?.status, "todo", "the card must be released, not left executing");
+      assert.equal(card?.runId, run.id, "the link to the cancelled run is kept");
+
+      const detail = await json<{ run: { status: string; gate: string | null } }>(
+        await fetch(`${BASE}/api/runs/${run.id}`),
+      );
+      assert.equal(detail.run.status, "cancelled");
+      // The gate is cleared too, or the UI keeps offering "approve plan" on a
+      // stopped run.
+      assert.equal(detail.run.gate, null);
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("run: the same card cannot start a second run while its first is live", async () => {
   const f = await fixture();
   try {

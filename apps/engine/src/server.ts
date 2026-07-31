@@ -503,6 +503,15 @@ app.post("/api/runs/:id/cancel", (c) => {
     // leaving it set kept offering "approve plan" / "submit decision" on a stopped
     // run — which then failed asynchronously after the API had already said ok.
     store.updateRun(id, { status: "cancelled", gate: null, endedAt: new Date().toISOString() });
+    /*
+     * Synced here rather than left to `launch`'s finally.
+     *
+     * That finally does fire eventually, but only once the aborted pipeline
+     * actually settles — which can be tens of seconds while an agent CLI is
+     * mid-turn. The person just clicked cancel; the card should move now.
+     * `syncTaskFromRun` is idempotent, so the later call is a no-op.
+     */
+    syncTaskFromRun(id);
     return c.json({ ok: true, reaped: true });
   }
 
@@ -514,6 +523,19 @@ app.post("/api/runs/:id/cancel", (c) => {
    */
   if (run.status === "running" || run.status === "blocked_on_human") {
     store.updateRun(id, { status: "cancelled", gate: null, endedAt: new Date().toISOString() });
+    /*
+     * This is the path that NEEDS the sync, and it is a common one.
+     *
+     * Nothing is driving the run, so there is no `finally` anywhere that will fire
+     * — the card would sit at in_progress permanently and the board would poll it
+     * forever. A run parked at a gate is exactly this case: `approve-plan` creates
+     * its own controller, which means the run is not in `active` while it waits.
+     *
+     * And the plan gate is on by default, so every card-started run parks there.
+     * Reading the plan, deciding it is wrong, and cancelling is the ordinary way
+     * to use this feature.
+     */
+    syncTaskFromRun(id);
     return c.json({ ok: true, reaped: false });
   }
 
