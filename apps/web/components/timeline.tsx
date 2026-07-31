@@ -180,14 +180,20 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
             ) : live.retrying !== null ? (
               /*
                 A retry spawns a NEW attempt with its own id, so without this the
-                user sees a bare failure and then an unrelated-looking new card —
+                user sees a bare failure followed by an unrelated-looking new card —
                 the system reads as flailing when it is actually recovering.
 
-                Amber rather than red: the turn did fail, but the outcome is not
-                decided yet, and red would claim it was.
+                Past tense, and no pulsing dot. This card is never cleaned up: the
+                failed attempt stays in the map, and the run page renders the last
+                two finished ones. So "重试中" with a live dot kept claiming a retry
+                was pending long after it had happened and the run had ended.
+                "已重试" is true at emission and stays true.
+
+                Amber rather than red: this turn failed, but another one followed,
+                so red would overstate the outcome.
               */
-              <Badge tone="warn" dot>
-                {`${live.expertName || "专家"} 失败，重试中 ${live.retrying.attempt}/${live.retrying.of}`}
+              <Badge tone="warn">
+                {`${live.expertName || "专家"} 失败，已重试 ${live.retrying.attempt}/${live.retrying.of}`}
               </Badge>
             ) : (
               <Badge tone={tone}>
