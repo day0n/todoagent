@@ -474,6 +474,53 @@ test("cascade: the turn ceiling holds for one message naming many agents", async
   }
 });
 
+test("cascade: one agent is asked once per delivery, not once per mention", async () => {
+  // Each reply names the OTHER of the pair, so without dedup this bounces until
+  // the turn ceiling.
+  const f = await fixture("pingpong", "Atlas,Probe");
+  try {
+    /*
+     * Regression test for waste observed in a REAL run.
+     *
+     * A message named both Atlas and Probe: Probe answered it, then Atlas's reply
+     * also named Probe, so Probe was spawned a second time and produced
+     * near-identical advice. Two real CLI invocations, two lots of tokens, and the
+     * same paragraph twice in the channel — a failure that looks like the feature
+     * working, which is why it needs a test rather than a code comment.
+     */
+    const res = await deliver(f, f.channel, say(f, f.channel, "@Atlas @Probe 都说一下"));
+
+    assert.deepEqual(
+      res.posted.map((m) => m.authorId),
+      [f.atlas.id, f.probe.id],
+      "both answer the human once, and neither answers the other's mention",
+    );
+    // The cascade ends because everyone addressed has spoken, NOT because it ran
+    // out of budget — which is the difference between converging and being cut off.
+    assert.equal(res.truncated, false);
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("cascade: an agent whose cli fails is not retried on every mention", async () => {
+  const f = await fixture("fail");
+  try {
+    // Otherwise a broken CLI that people keep naming becomes a retry loop that
+    // spends the whole ceiling on one agent which cannot answer.
+    const res = await deliver(f, f.channel, say(f, f.channel, "@Atlas @Probe 都说一下"));
+
+    assert.deepEqual(res.posted, []);
+    assert.equal(res.failed.length, 2, "each agent is attempted exactly once");
+    assert.deepEqual(
+      [...new Set(res.failed.map((x) => x.expertName))].sort(),
+      ["Atlas", "Probe"],
+    );
+  } finally {
+    await f.dispose();
+  }
+});
+
 test("cascade: a message nobody is addressed in spends nothing", async () => {
   const f = await fixture();
   try {

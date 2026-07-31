@@ -99,6 +99,16 @@ export interface ReplyOptions {
    * blew past a six-turn ceiling before the check was ever reached.
    */
   maxTurns?: number;
+  /**
+   * Experts that must not be asked, however they were addressed.
+   *
+   * `deliverMessage` uses this to stop asking one agent the same question twice.
+   * Observed in a real run: a message named both Atlas and Probe, Probe answered
+   * it, then Atlas's reply also named Probe — so Probe was spawned again and
+   * produced near-identical advice. Two real CLI invocations, two lots of tokens,
+   * and the same paragraph twice in the channel.
+   */
+  exclude?: ReadonlySet<string>;
 }
 
 export interface ReplyResult {
@@ -129,7 +139,9 @@ export async function replyToMessage(opts: ReplyOptions): Promise<ReplyResult> {
     dmExpertId: channel.dmExpertId,
     candidates: experts.map((e) => ({ id: e.id, name: e.name })),
     authorId: message.authorId,
-  });
+  }).filter((id) => opts.exclude?.has(id) !== true);
+  // Everyone addressed here has already been asked, which is the same outcome as
+  // nobody being addressed: there is no new question for anyone.
   if (responders.length === 0) return { ...empty, skipped: "no_responder" };
 
   if (agentChainLength(store, message) >= MAX_AGENT_CHAIN) {
@@ -248,6 +260,23 @@ export async function deliverMessage(opts: ReplyOptions): Promise<DeliverResult>
   let turns = 0;
   let truncated = false;
 
+  /*
+   * One turn per agent per delivered message.
+   *
+   * Observed in a real run: a message named both Atlas and Probe, Probe answered
+   * it, and Atlas's reply then also named Probe — so Probe was spawned a second
+   * time and produced near-identical advice. Two real CLI invocations and the
+   * same paragraph twice in the channel.
+   *
+   * The cost of this rule is real and worth naming: it also blocks the pattern
+   * where B asks A a genuine follow-up question. That is accepted deliberately —
+   * a cascade is "everyone addressed says their piece once", and a real
+   * back-and-forth resumes the moment the person posts again, which resets
+   * everything. Spending a second CLI turn to hear the same advice twice is the
+   * worse failure, because it looks like the feature working.
+   */
+  const asked = new Set<string>();
+
   while (queue.length > 0) {
     const next = queue.shift();
     if (next === undefined) break;
@@ -271,6 +300,7 @@ export async function deliverMessage(opts: ReplyOptions): Promise<DeliverResult>
       ...opts,
       message: next,
       maxTurns: MAX_DELIVERY_TURNS - turns,
+      exclude: asked,
     });
 
     // Failures count against the ceiling too: a broken CLI still costs a spawn,
@@ -279,6 +309,16 @@ export async function deliverMessage(opts: ReplyOptions): Promise<DeliverResult>
     posted.push(...res.posted);
     failed.push(...res.failed);
     if (res.truncated) truncated = true;
+
+    /*
+     * A failed turn still counts as asked.
+     *
+     * Otherwise a broken CLI that somebody keeps naming becomes a retry loop:
+     * each mention spawns it again, it fails again, and the ceiling is spent on
+     * one agent that cannot answer.
+     */
+    for (const m of res.posted) if (m.authorId !== null) asked.add(m.authorId);
+    for (const f of res.failed) asked.add(f.expertId);
 
     // Each reply may itself address somebody. A branch ends naturally when a
     // reply mentions nobody, or when the chain guard refuses it.

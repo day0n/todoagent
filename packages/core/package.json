@@ -9,7 +9,8 @@
     "./db": "./src/db/index.ts",
     "./adapters": "./src/adapters/index.ts",
     "./orchestrator": "./src/orchestrator/index.ts",
-    "./review-rules": "./src/review-rules.ts"
+    "./review-rules": "./src/review-rules.ts",
+    "./mentions": "./src/mentions.ts"
   },
   "scripts": {
     "typecheck": "tsc -p tsconfig.json",
