@@ -325,6 +325,110 @@ export interface DiscussionMessage {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Channel layer
+//
+// Chat is the workspace: channels, DMs and threads, with agents as persistent
+// members rather than one-shot invocations. This sits ABOVE the execution layer
+// — a channel message is durable conversation, whereas `DiscussionMessage` is a
+// transcript of one review round inside one subtask.
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * Who acted: the local human, or one of the agents.
+ *
+ * Polymorphic in the same shape as a polymorphic assignee — a `kind` plus an id
+ * that is only meaningful for one of the kinds. There is a single local human,
+ * so `human` carries no id.
+ */
+export type ActorKind = "human" | "expert";
+
+export interface Channel {
+  id: string;
+  name: string;
+  purpose: string;
+  kind: "channel" | "dm";
+  /**
+   * The repository this channel's work lands in.
+   *
+   * Null is legitimate: a DM with an agent, or a channel used purely for
+   * discussion, has no repo. A task created there cannot start a pipeline run,
+   * which is an honest limit rather than a broken state.
+   */
+  projectId: string | null;
+  /** For `kind: "dm"`, the agent on the other side of the conversation. */
+  dmExpertId: string | null;
+  createdAt: string;
+}
+
+export interface Message {
+  /**
+   * Total order within the stream.
+   *
+   * Not derived from `createdAt`: ISO strings collide at millisecond resolution,
+   * so two agents replying at once would sort arbitrarily and could swap places
+   * between reads.
+   */
+  seq: number;
+  id: string;
+  channelId: string;
+  authorKind: ActorKind;
+  /** An `Expert.id` when `authorKind` is `expert`, otherwise null. */
+  authorId: string | null;
+  /** Thread root, or null when this message is itself a root. One level deep. */
+  parentId: string | null;
+  body: string;
+  createdAt: string;
+}
+
+/**
+ * A root message plus its thread summary.
+ *
+ * The channel stream shows roots only — an agent working a task can post many
+ * turns, and letting those into the main stream would bury everything else. The
+ * counts come from one grouped query rather than a lookup per row.
+ */
+export interface MessageWithThread extends Message {
+  replyCount: number;
+  /** Newest reply's timestamp, or null when there are none. */
+  lastReplyAt: string | null;
+}
+
+/**
+ * Board column.
+ *
+ * Deliberately NOT `SubTaskStatus`: that tracks one agent's work inside a run
+ * and carries states a board has no column for (`reworking`, `blocked`,
+ * `failed`). Collapsing the two would force the board to invent columns nobody
+ * asked for.
+ */
+export type TaskStatus = "todo" | "in_progress" | "in_review" | "done";
+
+export const TASK_STATUSES: readonly TaskStatus[] = [
+  "todo",
+  "in_progress",
+  "in_review",
+  "done",
+];
+
+export interface Task {
+  id: string;
+  channelId: string;
+  title: string;
+  status: TaskStatus;
+  /** Null while unclaimed. An agent claims a task itself, as often as a person does. */
+  assigneeKind: ActorKind | null;
+  assigneeId: string | null;
+  creatorKind: ActorKind;
+  creatorId: string | null;
+  /** Set when the task came from a chat message rather than the New Task dialog. */
+  sourceMessageId: string | null;
+  /** The pipeline run doing the work, once started. */
+  runId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Agent-produced schemas
 //
 // CLI agents emit text, not objects. Every schema below is parsed with zod and

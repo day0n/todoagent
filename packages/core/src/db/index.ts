@@ -5,12 +5,16 @@ import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type {
+  ActorKind,
   Adjudication,
   Attempt,
+  Channel,
   DiscussionMessage,
   Expert,
   ExpertRole,
   HumanGate,
+  Message,
+  MessageWithThread,
   Phase,
   Project,
   Rebuttal,
@@ -19,10 +23,12 @@ import type {
   RunStatus,
   SubTask,
   SubTaskStatus,
+  Task,
+  TaskStatus,
   Team,
   TeamMember,
 } from "../types.ts";
-import { TERMINAL_SUBTASK_STATUS } from "../types.ts";
+import { TASK_STATUSES, TERMINAL_SUBTASK_STATUS } from "../types.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -54,6 +60,18 @@ function num(v: unknown): number {
 function bool(v: unknown): boolean {
   return num(v) !== 0;
 }
+/**
+ * Coerces a stored actor kind.
+ *
+ * Anything unrecognised becomes `human`, which is the safe direction: the only
+ * privilege attached to `expert` is being resolved against the expert table, so
+ * a corrupt value degrades to "the local person said this" rather than to a
+ * dangling agent reference the UI would render as a blank author.
+ */
+function actorKind(v: unknown): ActorKind {
+  return v === "expert" ? "expert" : "human";
+}
+
 function jsonArray(v: unknown): string[] {
   if (typeof v !== "string") return [];
   try {
@@ -891,5 +909,237 @@ export class Store {
           createdAt: str(r["created_at"]),
         };
       });
+  }
+
+  // ── Channels ──────────────────────────────────────────────
+
+  createChannel(
+    c: Omit<Channel, "id" | "createdAt"> & { id?: string },
+  ): Channel {
+    const row: Channel = { ...c, id: c.id ?? newId(), createdAt: nowIso() };
+    this.db
+      .prepare(
+        `INSERT INTO channel (id,name,purpose,kind,project_id,dm_expert_id,created_at)
+         VALUES (?,?,?,?,?,?,?)`,
+      )
+      .run(row.id, row.name, row.purpose, row.kind, row.projectId, row.dmExpertId, row.createdAt);
+    return row;
+  }
+
+  listChannels(): Channel[] {
+    return this.db
+      .prepare(`SELECT * FROM channel ORDER BY kind, created_at`)
+      .all()
+      .map((raw) => this.toChannel(raw as Row));
+  }
+
+  getChannel(id: string): Channel | null {
+    const raw = this.db.prepare(`SELECT * FROM channel WHERE id=?`).get(id);
+    return raw ? this.toChannel(raw as Row) : null;
+  }
+
+  private toChannel(r: Row): Channel {
+    return {
+      id: str(r["id"]),
+      name: str(r["name"]),
+      purpose: str(r["purpose"]),
+      kind: str(r["kind"]) === "dm" ? "dm" : "channel",
+      projectId: strOrNull(r["project_id"]),
+      dmExpertId: strOrNull(r["dm_expert_id"]),
+      createdAt: str(r["created_at"]),
+    };
+  }
+
+  // ── Messages ──────────────────────────────────────────────
+
+  /**
+   * Appends a message and returns it with its assigned `seq`.
+   *
+   * `seq` is `INTEGER PRIMARY KEY AUTOINCREMENT`, so it is the rowid and comes
+   * back from the insert directly — no follow-up SELECT, and no per-channel
+   * MAX() scan of the kind that made event appends quadratic.
+   */
+  createMessage(m: Omit<Message, "id" | "seq" | "createdAt"> & { id?: string }): Message {
+    const id = m.id ?? newId();
+    const createdAt = nowIso();
+    const result = this.db
+      .prepare(
+        `INSERT INTO message (id,channel_id,author_kind,author_id,parent_id,body,created_at)
+         VALUES (?,?,?,?,?,?,?)`,
+      )
+      .run(id, m.channelId, m.authorKind, m.authorId, m.parentId, m.body, createdAt);
+    return { ...m, id, seq: num(result.lastInsertRowid), createdAt };
+  }
+
+  /**
+   * A channel's root messages, oldest first, with each one's thread summary.
+   *
+   * Roots only: an agent working a task can post many turns into its thread, and
+   * letting those into the main stream would bury everything else. The reply
+   * counts come from one grouped self-join rather than a query per row.
+   *
+   * `limit` takes the NEWEST n roots and still returns them ascending, which is
+   * what a chat client wants — a channel grows without bound, and the interesting
+   * end is the recent one.
+   */
+  listChannelMessages(channelId: string, opts: { limit?: number } = {}): MessageWithThread[] {
+    const limit = opts.limit ?? 200;
+    const rows = this.db
+      .prepare(
+        `SELECT m.*,
+                COUNT(r.seq)      AS reply_count,
+                MAX(r.created_at) AS last_reply_at
+           FROM message m
+           LEFT JOIN message r ON r.parent_id = m.id
+          WHERE m.channel_id = ? AND m.parent_id IS NULL
+          GROUP BY m.seq
+          ORDER BY m.seq DESC
+          LIMIT ?`,
+      )
+      .all(channelId, limit) as Row[];
+
+    return rows.reverse().map((r) => ({
+      ...this.toMessage(r),
+      replyCount: num(r["reply_count"]),
+      lastReplyAt: strOrNull(r["last_reply_at"]),
+    }));
+  }
+
+  /** One thread's replies, oldest first. Threads are one level deep. */
+  listThreadReplies(parentId: string): Message[] {
+    return this.db
+      .prepare(`SELECT * FROM message WHERE parent_id=? ORDER BY seq`)
+      .all(parentId)
+      .map((raw) => this.toMessage(raw as Row));
+  }
+
+  getMessage(id: string): Message | null {
+    const raw = this.db.prepare(`SELECT * FROM message WHERE id=?`).get(id);
+    return raw ? this.toMessage(raw as Row) : null;
+  }
+
+  private toMessage(r: Row): Message {
+    return {
+      seq: num(r["seq"]),
+      id: str(r["id"]),
+      channelId: str(r["channel_id"]),
+      authorKind: actorKind(r["author_kind"]),
+      authorId: strOrNull(r["author_id"]),
+      parentId: strOrNull(r["parent_id"]),
+      body: str(r["body"]),
+      createdAt: str(r["created_at"]),
+    };
+  }
+
+  // ── Tasks ─────────────────────────────────────────────────
+
+  createTask(
+    t: Omit<Task, "id" | "createdAt" | "updatedAt"> & { id?: string },
+  ): Task {
+    const at = nowIso();
+    const row: Task = { ...t, id: t.id ?? newId(), createdAt: at, updatedAt: at };
+    this.db
+      .prepare(
+        `INSERT INTO task
+           (id,channel_id,title,status,assignee_kind,assignee_id,creator_kind,creator_id,
+            source_message_id,run_id,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        row.id,
+        row.channelId,
+        row.title,
+        row.status,
+        row.assigneeKind,
+        row.assigneeId,
+        row.creatorKind,
+        row.creatorId,
+        row.sourceMessageId,
+        row.runId,
+        row.createdAt,
+        row.updatedAt,
+      );
+    return row;
+  }
+
+  listTasks(channelId: string): Task[] {
+    return this.db
+      .prepare(`SELECT * FROM task WHERE channel_id=? ORDER BY created_at`)
+      .all(channelId)
+      .map((raw) => this.toTask(raw as Row));
+  }
+
+  /**
+   * A channel's tasks grouped into board columns.
+   *
+   * Every column is present even when empty, because a Kanban board with a
+   * missing column is a layout bug rather than a state worth rendering. Building
+   * the shape here also keeps `TaskStatus` as the single source of truth for
+   * which columns exist.
+   */
+  board(channelId: string): Record<TaskStatus, Task[]> {
+    const columns = Object.fromEntries(TASK_STATUSES.map((s) => [s, [] as Task[]])) as Record<
+      TaskStatus,
+      Task[]
+    >;
+    for (const task of this.listTasks(channelId)) {
+      // An unrecognised status would otherwise vanish from the board silently.
+      (columns[task.status] ?? columns.todo).push(task);
+    }
+    return columns;
+  }
+
+  getTask(id: string): Task | null {
+    const raw = this.db.prepare(`SELECT * FROM task WHERE id=?`).get(id);
+    return raw ? this.toTask(raw as Row) : null;
+  }
+
+  updateTask(
+    id: string,
+    patch: Partial<Pick<Task, "title" | "status" | "assigneeKind" | "assigneeId" | "runId">>,
+  ): void {
+    const cols: Record<keyof typeof patch, string> = {
+      title: "title",
+      status: "status",
+      assigneeKind: "assignee_kind",
+      assigneeId: "assignee_id",
+      runId: "run_id",
+    };
+    const sets: string[] = [];
+    const vals: Array<string | null> = [];
+    for (const [k, col] of Object.entries(cols) as Array<[keyof typeof patch, string]>) {
+      const v = patch[k];
+      if (v === undefined) continue;
+      sets.push(`${col}=?`);
+      vals.push(v);
+    }
+    if (sets.length === 0) return;
+    // Always stamped, so "when did this last move" is answerable from the row
+    // rather than inferred from the board's render order.
+    sets.push("updated_at=?");
+    vals.push(nowIso());
+    vals.push(id);
+    this.db.prepare(`UPDATE task SET ${sets.join(",")} WHERE id=?`).run(...vals);
+  }
+
+  private toTask(r: Row): Task {
+    const assigneeKind = strOrNull(r["assignee_kind"]);
+    const status = str(r["status"]);
+    return {
+      id: str(r["id"]),
+      channelId: str(r["channel_id"]),
+      title: str(r["title"]),
+      status: (TASK_STATUSES as readonly string[]).includes(status)
+        ? (status as TaskStatus)
+        : "todo",
+      assigneeKind: assigneeKind === null ? null : actorKind(assigneeKind),
+      assigneeId: strOrNull(r["assignee_id"]),
+      creatorKind: actorKind(r["creator_kind"]),
+      creatorId: strOrNull(r["creator_id"]),
+      sourceMessageId: strOrNull(r["source_message_id"]),
+      runId: strOrNull(r["run_id"]),
+      createdAt: str(r["created_at"]),
+      updatedAt: str(r["updated_at"]),
+    };
   }
 }

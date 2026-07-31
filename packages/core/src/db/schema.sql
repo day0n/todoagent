@@ -187,3 +187,84 @@ CREATE TABLE IF NOT EXISTS discussion_message (
 );
 
 CREATE INDEX IF NOT EXISTS idx_discussion_subtask ON discussion_message (subtask_id, round);
+
+-- ── Channel layer ───────────────────────────────────────────
+--
+-- Chat is the workspace: channels, DMs and threads, with agents as persistent
+-- members rather than one-shot invocations. This sits ABOVE the execution layer.
+-- A channel message is durable conversation; `discussion_message` above is a
+-- transcript of one review round inside a single subtask. They are not the same
+-- thing and deliberately do not share a table.
+
+CREATE TABLE IF NOT EXISTS channel (
+  id         TEXT PRIMARY KEY,
+  name       TEXT NOT NULL,
+  purpose    TEXT NOT NULL DEFAULT '',
+  -- 'channel' | 'dm'
+  kind       TEXT NOT NULL DEFAULT 'channel',
+  -- The repository this channel's work lands in. NULL is legitimate: a DM with
+  -- an agent, or a channel used purely for discussion, has no repo — and a task
+  -- there cannot start a pipeline run, which is honest rather than broken.
+  project_id TEXT,
+  -- For kind='dm', the agent on the other side of a 1:1 conversation.
+  dm_expert_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_project ON channel (project_id);
+
+CREATE TABLE IF NOT EXISTS message (
+  -- Ordering key. A message stream needs a total order, and deriving one from
+  -- `created_at` is unsound: ISO strings collide at millisecond resolution, so
+  -- two agents replying at once would sort arbitrarily and could swap places
+  -- between reads. AUTOINCREMENT also gives cheap keyset pagination.
+  --
+  -- A per-channel counter would reintroduce the MAX() scan that made `event`
+  -- appends quadratic; a global sequence has no such lookup.
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  -- Stable reference key, since `parent_id` and `task.source_message_id` point
+  -- at messages and must not depend on insertion order.
+  id          TEXT NOT NULL UNIQUE,
+  channel_id  TEXT NOT NULL,
+  -- Polymorphic author, following the same shape as a polymorphic assignee:
+  -- 'human' | 'expert'. `author_id` is an expert.id only when kind='expert';
+  -- there is a single local human, who needs no row.
+  author_kind TEXT NOT NULL,
+  author_id   TEXT,
+  -- Thread root. NULL means this message is itself a root. Replies are one level
+  -- deep, matching what the reference product exposes.
+  parent_id   TEXT,
+  body        TEXT NOT NULL,
+  created_at  TEXT NOT NULL
+);
+
+-- Serves the channel stream (roots, newest last) and thread expansion.
+CREATE INDEX IF NOT EXISTS idx_message_channel ON message (channel_id, seq);
+CREATE INDEX IF NOT EXISTS idx_message_parent ON message (parent_id, seq);
+
+CREATE TABLE IF NOT EXISTS task (
+  id            TEXT PRIMARY KEY,
+  channel_id    TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  -- Board column: 'todo' | 'in_progress' | 'in_review' | 'done'.
+  --
+  -- Distinct from `subtask.status`, which tracks one agent's work inside a run
+  -- and carries states a board has no column for (reworking, blocked, failed).
+  -- Collapsing them would force the board to invent columns nobody asked for.
+  status        TEXT NOT NULL DEFAULT 'todo',
+  -- Polymorphic assignee: 'human' | 'expert', or NULL for unclaimed. An agent
+  -- claims a task itself, so this is written by the agent as often as by a person.
+  assignee_kind TEXT,
+  assignee_id   TEXT,
+  creator_kind  TEXT NOT NULL DEFAULT 'human',
+  creator_id    TEXT,
+  -- The message this task was created from, when it came from chat rather than
+  -- the board's own New Task dialog.
+  source_message_id TEXT,
+  -- The pipeline run doing the work, once started. NULL until then.
+  run_id        TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_task_channel ON task (channel_id, status);
