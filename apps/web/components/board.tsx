@@ -4,6 +4,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError, fmtRelative } from "../lib/api.ts";
 import { TASK_STATUS_LABEL, TASK_STATUSES } from "../lib/types.ts";
 import type { ActorKind, Channel, Expert, Task, TaskStatus } from "../lib/types.ts";
+import {
+  applyOptimistic,
+  applyPoll,
+  applyServerRow,
+  hasLiveRun,
+  isRunLive,
+} from "../lib/board-state.ts";
 import { Empty, ErrorBox, RuntimeMark, Spinner } from "./atoms.tsx";
 
 /**
@@ -54,21 +61,9 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
     const at = mutations.current;
     try {
       const res = await api.tasks(channel.id);
-      /*
-       * A response issued BEFORE a local change is discarded.
-       *
-       * The board polls every 6s while a run is live, and `load` replaces the whole
-       * array. So a poll in flight when someone drags a card returned data that
-       * predates the move, snapped the card back, and nothing put it right again:
-       * the patch had already applied its optimistic update, and the success path
-       * wrote nothing. The card stayed in the wrong column until the next poll —
-       * or forever, once the run ended and polling stopped.
-       *
-       * Discarding is safe because the patch's own success handler writes the
-       * server's authoritative row, and a later poll refreshes everything else.
-       */
-      if (mutations.current !== at) return;
-      setTasks(res.tasks);
+      // The ordering rule lives in lib/board-state.ts, where it is tested against
+      // real interleavings rather than reasoned about here.
+      setTasks((cur) => applyPoll(cur, res.tasks, at, mutations.current));
       setError(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
@@ -91,7 +86,7 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
    * in_progress, so a card still there with a run id is one whose run has not
    * reached a terminal state.
    */
-  const hasLiveRun = (tasks ?? []).some((t) => t.runId !== null && t.status === "in_progress");
+  const live = hasLiveRun(tasks);
 
   /*
    * Polls only while something is running.
@@ -105,7 +100,10 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
    * here changes them, and those paths update state directly.
    */
   useEffect(() => {
-    if (!hasLiveRun) return;
+    // `live`, not `hasLiveRun`: the latter is now the imported FUNCTION, and a
+    // function object is always truthy — so `!hasLiveRun` never fired and polling
+    // stayed armed on an idle board.
+    if (!live) return;
 
     let timer: ReturnType<typeof setInterval> | null = null;
     const start = (): void => {
@@ -132,7 +130,7 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
       stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [hasLiveRun, load]);
+  }, [live, load]);
 
   /**
    * Applies a patch locally first, then persists it.
@@ -145,7 +143,7 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
       // Counted before the optimistic write, so a poll already in flight is
       // recognised as predating this change and discarded.
       mutations.current++;
-      setTasks((cur) => cur?.map((t) => (t.id === id ? { ...t, ...next } : t)) ?? cur);
+      setTasks((cur) => applyOptimistic(cur, id, next));
       try {
         const updated = await api.patchTask(id, {
           ...(next.status !== undefined ? { status: next.status } : {}),
@@ -171,7 +169,7 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
          * Scoped to this one id, so it cannot clobber a concurrent change to a
          * different card.
          */
-        setTasks((cur) => cur?.map((t) => (t.id === id ? updated : t)) ?? cur);
+        setTasks((cur) => applyServerRow(cur, updated));
       } catch (err) {
         setError(err instanceof ApiError ? err.message : String(err));
         /*
@@ -223,7 +221,7 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
         const res = await api.runTask(id);
         // The server's version of the card, which carries the run id and the
         // in_progress it moved to — rather than a locally invented shape.
-        setTasks((cur) => cur?.map((t) => (t.id === id ? res.task : t)) ?? cur);
+        setTasks((cur) => applyServerRow(cur, res.task));
       } catch (err) {
         setError(err instanceof ApiError ? err.message : String(err));
       } finally {
@@ -549,7 +547,9 @@ function RunButton({
   busy: boolean;
   canRun: boolean;
 }) {
-  const live = task.runId !== null && task.status === "in_progress";
+  // Shared with the polling decision, so the button and the poller cannot
+  // disagree about whether a run is in flight.
+  const live = isRunLive(task);
 
   if (live) {
     // No button at all: starting a second run for this card is refused, and
