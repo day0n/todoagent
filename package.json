@@ -16,7 +16,9 @@
     "test:engine": "pnpm --filter @council/engine test",
     "e2e": "pnpm --filter @council/core e2e",
     "doctor": "pnpm --filter @council/core doctor",
-    "seed": "pnpm --filter @council/core seed"
+    "seed": "pnpm --filter @council/core seed",
+    "// check": "Static checks that typecheck and the test suite cannot see: stray control bytes, undefined CSS classes and custom properties, responsive rules, dead exports. Each one caught a real bug that everything else reported as fine.",
+    "check": "node scripts/check-all.mjs"
   },
   "devDependencies": {
     "typescript": "5.7.3",
