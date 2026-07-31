@@ -22,6 +22,15 @@ import { Empty, ErrorBox, RuntimeMark, Spinner } from "./atoms.tsx";
 /** Board or flat list. A long backlog is easier to scan as rows than columns. */
 type View = "board" | "list";
 
+/**
+ * How often to re-read the board while a run is live.
+ *
+ * Slower than the chat stream's 4s on purpose: a pipeline run takes minutes, and
+ * the only thing being waited on is its final state change. Anything faster is
+ * polling a whole board to watch a value that changes once.
+ */
+const LIVE_POLL_MS = 6000;
+
 export function Board({ channel, experts }: { channel: Channel; experts: Expert[] }) {
   const [tasks, setTasks] = useState<Task[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -47,6 +56,60 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
     void load();
   }, [load]);
 
+  /*
+   * A live run is the only thing on this board that changes on its own.
+   *
+   * Derived as a BOOLEAN rather than depending on `tasks`: the effect below would
+   * otherwise tear down and rebuild its interval on every poll result, resetting
+   * the timer each time. As a boolean it re-runs only when the answer flips.
+   *
+   * The inference matches the engine: `syncTaskFromRun` moves a finished card off
+   * in_progress, so a card still there with a run id is one whose run has not
+   * reached a terminal state.
+   */
+  const hasLiveRun = (tasks ?? []).some((t) => t.runId !== null && t.status === "in_progress");
+
+  /*
+   * Polls only while something is running.
+   *
+   * Without this the board never refreshed at all, and the omission looked exactly
+   * like the feature working: starting a run showed "执行中" correctly, and then
+   * the card sat there forever. The engine had already moved it to 待复核 —
+   * nothing was ever going to tell this component.
+   *
+   * A board with nothing live needs no polling: cards only change when somebody
+   * here changes them, and those paths update state directly.
+   */
+  useEffect(() => {
+    if (!hasLiveRun) return;
+
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const start = (): void => {
+      if (timer !== null) return;
+      timer = setInterval(() => void load(), LIVE_POLL_MS);
+    };
+    const stop = (): void => {
+      if (timer === null) return;
+      clearInterval(timer);
+      timer = null;
+    };
+    const onVisibility = (): void => {
+      if (document.hidden) stop();
+      else {
+        // Refresh on return, which is when the board is most likely to be stale.
+        void load();
+        start();
+      }
+    };
+
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      stop();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [hasLiveRun, load]);
+
   /**
    * Applies a patch locally first, then persists it.
    *
@@ -55,7 +118,6 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
    */
   const patch = useCallback(
     async (id: string, next: Partial<Pick<Task, "status" | "assigneeKind" | "assigneeId">>) => {
-      const before = tasks;
       setTasks((cur) => cur?.map((t) => (t.id === id ? { ...t, ...next } : t)) ?? cur);
       try {
         await api.patchTask(id, {
@@ -70,11 +132,24 @@ export function Board({ channel, experts }: { channel: Channel; experts: Expert[
             : {}),
         });
       } catch (err) {
-        setTasks(before);
         setError(err instanceof ApiError ? err.message : String(err));
+        /*
+         * Re-read rather than restore the captured array.
+         *
+         * `before` is a snapshot from the moment the patch started, and now that
+         * the board polls while a run is live, a refresh can land in between —
+         * restoring the snapshot would then silently discard it, including a card
+         * the engine had just moved. The server is the authority on what the board
+         * looks like, so ask it.
+         */
+        void load();
       }
     },
-    [tasks],
+    // No `tasks` dependency: the update is functional and the failure path
+    // re-reads from the server, so nothing here closes over the array. Keeping it
+    // would rebuild this callback on every poll now that the board polls, and
+    // re-render every card that receives it six seconds apart.
+    [load],
   );
 
   /**
