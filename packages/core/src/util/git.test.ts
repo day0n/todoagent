@@ -256,6 +256,64 @@ test("createWorktree sanitizes a title into a usable branch name", async () => {
   }
 });
 
+test("createWorktree keeps a CJK title legible in the branch name", async () => {
+  const dir = await repo();
+  try {
+    /*
+     * The branch IS the deliverable — see the note on `subtask.branch` in
+     * schema.sql. It is what the user is left holding in their own repository, so
+     * it has to say which piece of work it was.
+     *
+     * The previous sanitiser kept `[a-zA-Z0-9._-]` and replaced everything else,
+     * which erased every CJK character: two different Chinese titles produced
+     * branch names distinguishable only by their timestamp suffix. A real leftover
+     * branch in the demo repo read `council/------------ms96bmug`. The old test
+     * passed throughout, because "no spaces and a valid ref" is true of
+     * `council/----------` too.
+     */
+    const a = await createWorktree(dir, "给首页加一个空状态");
+    const b = await createWorktree(dir, "修复登录时的空指针");
+    try {
+      assert.ok(a.branch.includes("给首页加一个空状态"), `title lost: ${a.branch}`);
+      assert.ok(b.branch.includes("修复登录时的空指针"), `title lost: ${b.branch}`);
+      assert.ok(
+        !/^council\/-+/.test(a.branch),
+        `the name must not collapse to dashes: ${a.branch}`,
+      );
+
+      // git's own arbiter, not a guess about what it accepts.
+      for (const wt of [a, b]) {
+        const check = await git(["check-ref-format", "--branch", wt.branch], dir);
+        assert.equal(check.code, 0, `git rejected ${wt.branch}`);
+      }
+    } finally {
+      await a.dispose();
+      await b.dispose();
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("createWorktree survives titles that sanitize down to nothing", async () => {
+  const dir = await repo();
+  try {
+    // An all-punctuation title would otherwise leave an empty ref component, and
+    // a leading dash or a trailing dot is rejected outright by git.
+    for (const title of ["...", "---", "@{", "..", "!!!"]) {
+      const wt = await createWorktree(dir, title);
+      try {
+        const check = await git(["check-ref-format", "--branch", wt.branch], dir);
+        assert.equal(check.code, 0, `git rejected ${wt.branch} (from ${title})`);
+      } finally {
+        await wt.dispose();
+      }
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
 test("createWorktree fails loudly on a bad base ref", async () => {
   const dir = await repo();
   try {

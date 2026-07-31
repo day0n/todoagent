@@ -57,6 +57,47 @@ function withWorktreeLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T>
   return run;
 }
 
+/**
+ * Turns a subtask title into a branch name git will accept.
+ *
+ * Only characters git ACTUALLY rejects are replaced. The previous version kept
+ * `[a-zA-Z0-9._-]` and substituted everything else, which threw away every CJK
+ * character: "给首页加一个空状态" became `----------`, and two different Chinese
+ * titles produced branch names distinguishable only by their timestamp suffix.
+ * A real leftover branch in the demo repo read `council/------------ms96bmug`.
+ *
+ * Verified against `git check-ref-format --branch`: a CJK name is accepted, a
+ * name containing a space is not. So the old sanitiser was discarding legal
+ * characters, not protecting against illegal ones.
+ *
+ * This matters because the branch IS the deliverable — see the note on
+ * `subtask.branch` in schema.sql. It is what the user is left holding in their
+ * own repository after a run, and it has to say which piece of work it was.
+ */
+function refSafe(name: string): string {
+  const cleaned = Array.from(
+    name
+      // Control characters, DEL, and the characters git forbids in a ref. `/`
+      // would open a nested namespace rather than name one branch.
+      .replace(/[\x00-\x1f\x7f ~^:?*[\]\\/]+/g, "-")
+      // Rejected as SEQUENCES even though the characters are legal alone.
+      .replace(/\.{2,}/g, "-")
+      .replace(/@\{/g, "-")
+      .replace(/-{2,}/g, "-"),
+  )
+    // Sliced by code point, so a 60-character cut cannot split a surrogate pair
+    // and leave an unpaired half behind.
+    .slice(0, 60)
+    .join("")
+    // git rejects a ref component that begins or ends with either of these, and
+    // slicing above can expose a new trailing one.
+    .replace(/^[-.]+/, "")
+    .replace(/[-.]+$/, "");
+
+  // An all-punctuation title would otherwise yield an empty component.
+  return cleaned === "" ? "work" : cleaned;
+}
+
 /** Runs a git command. Never throws on a nonzero exit — callers inspect `code`. */
 export function git(args: string[], cwd: string): Promise<GitResult> {
   return new Promise((resolve) => {
@@ -144,10 +185,10 @@ export async function createWorktree(
   name: string,
   baseRef = "HEAD",
 ): Promise<Worktree> {
-  const safe = name.replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 60);
+  const safe = refSafe(name);
   const branch = `council/${safe}-${Date.now().toString(36)}`;
   const root = await mkdtemp(join(tmpdir(), "council-wt-"));
-  const path = join(root, safe || "work");
+  const path = join(root, safe);
 
   // Only the git call is serialised; mkdtemp above is per-caller and safe.
   const add = await withWorktreeLock(repoPath, () =>
