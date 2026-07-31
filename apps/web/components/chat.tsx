@@ -133,6 +133,27 @@ export function Chat({
     [pending, send],
   );
 
+  /**
+   * Posts a reply inside a thread.
+   *
+   * THROWS on failure rather than swallowing it, unlike `send`. The thread renders
+   * its own error next to the draft the person still has in hand; surfacing it in
+   * the channel-level error box would put the message far from the text that caused
+   * it, and would leave the thread looking like it worked.
+   *
+   * No pending row and no `asTask`: a thread reply is a short interjection, and a
+   * board card appearing from one would be a surprise.
+   */
+  const reply = useCallback(
+    async (rootId: string, body: string): Promise<void> => {
+      await api.postMessage(channel.id, { body, parentId: rootId });
+      // Refreshes the ROOT's reply count and timestamp in the stream behind the
+      // open thread; the thread refetches its own list separately.
+      await load();
+    },
+    [channel.id, load],
+  );
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <Stream
@@ -145,6 +166,7 @@ export function Chat({
         onOpenThread={setOpenThread}
         onRetry={retry}
         onReload={() => void load()}
+        onReply={reply}
       />
       <Composer channel={channel} experts={experts} onSend={send} />
     </div>
@@ -161,6 +183,7 @@ function Stream({
   onOpenThread,
   onRetry,
   onReload,
+  onReply,
 }: {
   channel: Channel;
   experts: Expert[];
@@ -171,6 +194,7 @@ function Stream({
   onOpenThread: (id: string | null) => void;
   onRetry: (key: string) => void;
   onReload: () => void;
+  onReply: (rootId: string, body: string) => Promise<void>;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const atBottom = useRef(true);
@@ -222,9 +246,11 @@ function Stream({
               <li key={m.id}>
                 <Row
                   message={m}
+                  channel={channel}
                   experts={experts}
                   threadOpen={openThread === m.id}
                   onToggleThread={() => onOpenThread(openThread === m.id ? null : m.id)}
+                  onReply={onReply}
                 />
               </li>
             ))}
@@ -283,14 +309,18 @@ function Body({ text, experts, className }: { text: string; experts: Expert[]; c
 
 function Row({
   message,
+  channel,
   experts,
   threadOpen,
   onToggleThread,
+  onReply,
 }: {
   message: MessageWithThread;
+  channel: Channel;
   experts: Expert[];
   threadOpen: boolean;
   onToggleThread: () => void;
+  onReply: (rootId: string, body: string) => Promise<void>;
 }) {
   const expert = authorOf(message, experts);
 
@@ -344,7 +374,9 @@ function Row({
         </button>
       ) : null}
 
-      {threadOpen ? <Thread rootId={message.id} experts={experts} /> : null}
+      {threadOpen ? (
+        <Thread rootId={message.id} channel={channel} experts={experts} onReply={onReply} />
+      ) : null}
     </div>
   );
 }
@@ -395,26 +427,79 @@ function PendingRow({
  * Loaded on demand rather than with the stream: a channel's threads together can
  * hold far more text than the channel itself, and almost all of it is never read.
  */
-function Thread({ rootId, experts }: { rootId: string; experts: Expert[] }) {
+function Thread({
+  rootId,
+  channel,
+  experts,
+  onReply,
+}: {
+  rootId: string;
+  channel: Channel;
+  experts: Expert[];
+  onReply: (rootId: string, body: string) => Promise<void>;
+}) {
   const [replies, setReplies] = useState<Message[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
+
+  /**
+   * Fetches the thread. One path, used by both the open and the post-reply refresh.
+   *
+   * My first version of this had two copies — an inline fetch in the effect and
+   * this callback — which is exactly the kind of pair that drifts. Deliberately
+   * does NOT clear `replies` first: the effect does that on open to show a spinner,
+   * while a refresh after replying should not flash the list away.
+   */
+  const load = useCallback(async (): Promise<void> => {
+    try {
+      const res = await api.replies(rootId);
+      setReplies(res.replies);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    }
+  }, [rootId]);
 
   useEffect(() => {
-    let live = true;
+    // Reset to the loading state, then fetch. A stale response cannot land on the
+    // wrong thread: each root renders its own Thread instance, so switching threads
+    // unmounts this one entirely.
     setReplies(null);
     setError(null);
-    api
-      .replies(rootId)
-      .then((res) => {
-        if (live) setReplies(res.replies);
-      })
-      .catch((err: unknown) => {
-        if (live) setError(err instanceof ApiError ? err.message : String(err));
-      });
-    return () => {
-      live = false;
-    };
-  }, [rootId]);
+    setDraft("");
+    void load();
+  }, [load]);
+
+  const submit = async (): Promise<void> => {
+    const body = draft.trim();
+    if (body === "") return;
+    setSending(true);
+    try {
+      await onReply(rootId, body);
+      setDraft("");
+      // Refetched rather than appended optimistically: an agent may answer this
+      // reply within the same request, and inventing a local row would then show
+      // the wrong thing until the next poll.
+      await load();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : String(err));
+    } finally {
+      setSending(false);
+    }
+  };
+
+  /*
+   * Same routing rule as the main composer, and it matters more here.
+   *
+   * A thread is where an agent hands work to another agent, so a person joining in
+   * is usually answering somebody — and in a channel a message with no recognised
+   * mention is answered by NOBODY, silently. Without this line a typo'd name looks
+   * identical to an agent still thinking.
+   */
+  const mentioned = findMentions(draft, experts).map((m) => m.name);
+  const unaddressed =
+    channel.kind === "channel" && draft.trim().length > 0 && mentioned.length === 0;
 
   return (
     <div className="mt-2.5 border-l-2 border-line pl-3.5">
@@ -448,6 +533,50 @@ function Thread({ rootId, experts }: { rootId: string; experts: Expert[] }) {
           })}
         </ol>
       )}
+
+      {/*
+        Threads were read-only, and that was a real gap rather than a missing
+        convenience. A thread is where an agent hands work to another agent, and
+        the engine's loop guard counts CONSECUTIVE agent messages in a thread — a
+        human message resets it. With no way to reply here, a person could neither
+        join the conversation that was actually happening nor interrupt a
+        back-and-forth between two agents.
+      */}
+      <div className="mt-3 flex flex-col gap-1.5">
+        <textarea
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            // Enter sends, Shift+Enter breaks the line. `isComposing` is the load
+            // bearing part for Chinese input: without it, selecting a candidate
+            // with Enter would send a half-typed message.
+            if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+              e.preventDefault();
+              void submit();
+            }
+          }}
+          rows={1}
+          disabled={sending}
+          placeholder="回复这个话题…"
+          className="field min-h-[2.25rem] resize-y py-1.5 text-[0.8125rem]"
+          aria-label="线程回复"
+        />
+        <div className="flex items-center gap-2">
+          {unaddressed ? (
+            <span className="t-meta">没有 @ 任何人，不会有 agent 回复</span>
+          ) : mentioned.length > 0 ? (
+            <span className="t-meta">将回复：{mentioned.join("、")}</span>
+          ) : null}
+          <button
+            type="button"
+            className="btn btn-sm ml-auto"
+            onClick={() => void submit()}
+            disabled={sending || draft.trim() === ""}
+          >
+            {sending ? "发送中…" : "回复"}
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
