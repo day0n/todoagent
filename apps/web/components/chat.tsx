@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { findMentions, segmentBody } from "@council/core/mentions";
 import { api, ApiError, fmtRelative } from "../lib/api.ts";
 import type { Channel, Expert, Message, MessageWithThread } from "../lib/types.ts";
+import { acceptMessages } from "../lib/chat-state.ts";
 import { Empty, ErrorBox, RuntimeMark, Spinner } from "./atoms.tsx";
 
 /**
@@ -50,10 +51,31 @@ export function Chat({
   const [pending, setPending] = useState<Pending[]>([]);
   const [openThread, setOpenThread] = useState<string | null>(null);
 
+  /*
+   * The channel open RIGHT NOW, read when a response lands.
+   *
+   * A ref, not the closure's `channel.id`. `load` is recreated per channel, so a
+   * request issued for channel A resolves inside the OLD closure where
+   * `channel.id` is still A — comparing the response against that would compare A
+   * to A and pass, applying A's messages to the B view. The ref is the only value
+   * that is current at resolution time.
+   */
+  const openChannelId = useRef(channel.id);
+  openChannelId.current = channel.id;
+
   const load = useCallback(async () => {
     try {
       const res = await api.messages(channel.id);
-      setMessages(res.messages);
+      // Identity and ordering are decided in lib/chat-state.ts, where both are
+      // tested against real interleavings.
+      setMessages((cur) =>
+        acceptMessages({
+          current: cur,
+          incoming: res.messages,
+          incomingChannelId: res.channel.id,
+          channelId: openChannelId.current,
+        }),
+      );
       setError(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : String(err));
