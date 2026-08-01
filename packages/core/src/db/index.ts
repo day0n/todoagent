@@ -836,20 +836,12 @@ export class Store {
     return this.db
       .prepare(`SELECT * FROM adjudication WHERE run_id=? ORDER BY created_at`)
       .all(runId)
-      .map((raw) => {
-        const r = raw as Row;
-        return {
-          id: str(r["id"]),
-          runId: str(r["run_id"]),
-          subTaskId: str(r["subtask_id"]),
-          round: num(r["round"]),
-          verdict: str(r["verdict"]) as Adjudication["verdict"],
-          rationale: str(r["rationale"]),
-          escalatedToHuman: bool(r["escalated_to_human"]),
-          humanDecision: strOrNull(r["human_decision"]),
-          createdAt: str(r["created_at"]),
-        };
-      });
+      .map((raw) => this.toAdjudication(raw as Row));
+  }
+
+  getAdjudication(id: string): Adjudication | null {
+    const r = this.db.prepare(`SELECT * FROM adjudication WHERE id=?`).get(id) as Row | undefined;
+    return r ? this.toAdjudication(r) : null;
   }
 
   /**
@@ -864,10 +856,10 @@ export class Store {
     this.db
       .prepare(`UPDATE adjudication SET human_decision=? WHERE id=?`)
       .run(decision, adjudicationId);
-    const r = this.db
-      .prepare(`SELECT * FROM adjudication WHERE id=?`)
-      .get(adjudicationId) as Row | undefined;
-    if (!r) return null;
+    return this.getAdjudication(adjudicationId);
+  }
+
+  private toAdjudication(r: Row): Adjudication {
     return {
       id: str(r["id"]),
       runId: str(r["run_id"]),

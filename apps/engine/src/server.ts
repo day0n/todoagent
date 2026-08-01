@@ -16,7 +16,7 @@ import {
   runPipeline,
   type BusEvent,
 } from "@council/core";
-import { EXPERT_ROLES, RUNTIME_KINDS } from "@council/core/types";
+import { EXPERT_ROLES, RUNTIME_KINDS, type Run } from "@council/core/types";
 
 const PORT = Number(process.env["COUNCIL_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());
@@ -76,13 +76,34 @@ function projectBusyWith(projectId: string, exceptRunId?: string): string | null
   return null;
 }
 
-function resumeBlockedReason(status: string): string | null {
-  if (status === "cancelled") {
+function resumeBlockedReason(run: Run): string | null {
+  if (run.status === "cancelled") {
     return "this run was cancelled; start a new one instead of resuming it";
   }
-  if (status === "completed") return "this run has already finished";
-  if (status === "budget_exceeded") {
+  if (run.status === "completed") return "this run has already finished";
+  if (run.status === "budget_exceeded") {
     return "this run exhausted its token budget; start a new one with a higher ceiling";
+  }
+  /*
+   * The BUDGET is checked, not just the status.
+   *
+   * A run can be parked at a gate with its ceiling already breached — the last
+   * turn before the gate can carry it over. Its status is `blocked_on_human`, so a
+   * status-only check let the resume through: the ruling was recorded, the API
+   * answered ok, and the pipeline then died in the background with
+   * BudgetExceededError having spent nothing.
+   *
+   * That is the exact failure both call sites' comments exist to prevent, arriving
+   * by a route those comments did not cover. It is worse than an ordinary error
+   * here: the user has just written out a considered judgment and it is discarded
+   * silently.
+   *
+   * Found on a real parked run: spent 2,110,081 of a 2,000,000 ceiling while
+   * showing 需要你裁决 with a live submit button. Same condition `runOne` applies
+   * before spawning, where zero means unlimited.
+   */
+  if (run.budgetTokens > 0 && run.spentTokens >= run.budgetTokens) {
+    return `this run has already spent ${run.spentTokens.toLocaleString()} of its ${run.budgetTokens.toLocaleString()} token ceiling, so it cannot continue; start a new one with a higher budget`;
   }
   return null;
 }
@@ -398,7 +419,7 @@ app.post("/api/runs/:id/approve-plan", (c) => {
    * the console — so the user saw success while nothing ran. A predictable refusal
    * has to be an HTTP error, not a background log line.
    */
-  const notResumable = resumeBlockedReason(run.status);
+  const notResumable = resumeBlockedReason(run);
   if (notResumable !== null) return c.json({ error: notResumable }, 409);
   // Resuming re-enters the merge path, so it needs the same repository lock as a
   // fresh start.
@@ -438,11 +459,17 @@ app.post("/api/runs/:id/resolve", async (c) => {
   if (!run) return c.json({ error: "not found" }, 404);
   const parsed = EscalationBody.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  // Same shape as approve-plan's gate check. Without it, a ruling posted at the
+  // plan gate (or with gate cleared) answered ok and then ran the resume path,
+  // clearing whatever gate was actually holding the run.
+  if (run.gate !== "adjudication") {
+    return c.json({ error: `run is not at the adjudication gate (gate=${run.gate})` }, 409);
+  }
   if (active.has(id)) return c.json({ error: "run already executing" }, 409);
   // Synchronous refusal, same reason as the plan gate: this handler answers before
   // the orchestrator's own guard can reject, so the error would never reach the
   // user. Also prevents recording a ruling on a run that will never act on it.
-  const notResumable = resumeBlockedReason(run.status);
+  const notResumable = resumeBlockedReason(run);
   if (notResumable !== null) return c.json({ error: notResumable }, 409);
   // Acting on a ruling re-runs the stages and merges, so it takes the repository
   // lock too. Refused BEFORE the decision is recorded: storing a ruling that is
@@ -450,6 +477,32 @@ app.post("/api/runs/:id/resolve", async (c) => {
   const busy = projectBusyWith(run.projectId, id);
   if (busy !== null) {
     return c.json({ error: `another run is working in this repository (run ${busy})` }, 409);
+  }
+  /*
+   * Checked HERE, synchronously — same class of hole as resumeBlockedReason.
+   *
+   * `resolveEscalationAndContinue` throws `adjudication not found` on a missing
+   * id, but this handler used to answer `{ ok: true, resumed: true }` first and
+   * only then run that check in a background promise. A forged id therefore
+   * looked like success in the UI, after which `.catch` marked the whole run
+   * `failed`. Verified with a probe: HTTP 200, then a background failure.
+   *
+   * Belonging to another run is the same timing trap: the write would land on
+   * the foreign row, then the resume would throw and this run would be marked
+   * failed for an id that was never its own.
+   */
+  const adjudication = store.getAdjudication(parsed.data.adjudicationId);
+  if (!adjudication) {
+    return c.json({ error: `adjudication not found: ${parsed.data.adjudicationId}` }, 404);
+  }
+  if (adjudication.runId !== id) {
+    return c.json({ error: "that adjudication belongs to a different run" }, 409);
+  }
+  // The resume path needs the subtask immediately after writing the ruling. A
+  // missing row used to be discovered only after `{ ok: true }`, with the decision
+  // already persisted and the run then marked failed in `.catch`.
+  if (!store.getSubTask(adjudication.subTaskId)) {
+    return c.json({ error: `subtask not found: ${adjudication.subTaskId}` }, 404);
   }
 
   /*

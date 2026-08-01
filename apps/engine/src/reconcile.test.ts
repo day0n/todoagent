@@ -340,3 +340,188 @@ test("cancel: an already-finished run is refused", async () => {
     await f.dispose().catch(() => undefined);
   }
 });
+
+/**
+ * Builds a run parked at a gate with its token ceiling already breached.
+ *
+ * Not contrived: the turn immediately before a gate can carry the run past its
+ * budget, leaving `status: blocked_on_human` and `spent > budget` at once. Found
+ * on a real run — 2,110,081 spent of a 2,000,000 ceiling — while the UI showed
+ * 需要你裁决 with a live submit button.
+ */
+function seedExhaustedGate(
+  store: Store,
+  gate: "plan_approval" | "adjudication",
+): { runId: string; adjudicationId: string } {
+  const projectId = seedProject(store, "/tmp");
+  const run = store.createRun({ projectId, goal: "parked with no budget left", budgetTokens: 1000 });
+  const sub = store.createSubTask({
+    runId: run.id,
+    stage: 0,
+    title: "s",
+    brief: "b",
+    acceptance: "a",
+    capability: "general",
+    assignedExpertId: null,
+    dependsOn: [],
+    status: "blocked",
+    worktreePath: null,
+    branch: "council/s",
+  });
+  const adj = store.createAdjudication({
+    runId: run.id,
+    subTaskId: sub.id,
+    round: 1,
+    verdict: "escalate",
+    rationale: "a taste call no test can settle",
+    escalatedToHuman: true,
+    humanDecision: null,
+  });
+  // Status says "waiting for a human", spend says "nothing more can run".
+  store.updateRun(run.id, { status: "blocked_on_human", gate, spentTokens: 1500 });
+  return { runId: run.id, adjudicationId: adj.id };
+}
+
+test("resume: a ruling is refused when the budget is already spent", async () => {
+  const f = await fixture();
+  try {
+    /*
+     * `resumeBlockedReason` checked only `status`, and `blocked_on_human` is not in
+     * its list — so the ruling was recorded, the API answered ok, and the pipeline
+     * then died in the background with BudgetExceededError having spent nothing.
+     *
+     * Worse than an ordinary error: the user has just written out a considered
+     * judgment, and it was discarded silently.
+     */
+    const { runId, adjudicationId } = seedExhaustedGate(f.store, "adjudication");
+    f.store.close();
+
+    await withEngine(f.dbPath, async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/runs/${runId}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adjudicationId, decision: "use the flat shape" }),
+      });
+
+      assert.equal(res.status, 409);
+      const body = (await res.json()) as { error: string };
+      // The message has to say what to DO — the run looks resumable on screen.
+      assert.match(body.error, /budget|ceiling/i);
+      assert.match(body.error, /1,500/, "states what was spent");
+
+      // And nothing may be recorded: a stored ruling claims a decision was applied.
+      const detail = (await (await fetch(`http://127.0.0.1:${PORT}/api/runs/${runId}`)).json()) as {
+        adjudications: Array<{ humanDecision: string | null }>;
+      };
+      assert.equal(detail.adjudications[0]?.humanDecision, null);
+    });
+  } finally {
+    await f.dispose().catch(() => undefined);
+  }
+});
+
+test("resume: approving a plan is refused when the budget is already spent", async () => {
+  const f = await fixture();
+  try {
+    // The guard has two call sites and they share it, so both are pinned. Covering
+    // one would be the partial fix this whole session has been removing.
+    const { runId } = seedExhaustedGate(f.store, "plan_approval");
+    f.store.close();
+
+    await withEngine(f.dbPath, async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/runs/${runId}/approve-plan`, {
+        method: "POST",
+      });
+      assert.equal(res.status, 409);
+      assert.match(((await res.json()) as { error: string }).error, /budget|ceiling/i);
+
+      // Still parked, not silently advanced.
+      const detail = (await (await fetch(`http://127.0.0.1:${PORT}/api/runs/${runId}`)).json()) as {
+        run: { status: string; gate: string | null };
+      };
+      assert.equal(detail.run.status, "blocked_on_human");
+      assert.equal(detail.run.gate, "plan_approval");
+    });
+  } finally {
+    await f.dispose().catch(() => undefined);
+  }
+});
+
+test("resume: a ruling is refused when the run is not at the adjudication gate", async () => {
+  const f = await fixture();
+  try {
+    // approve-plan already refuses off-gate; resolve used to skip the check and
+    // answer ok, then clear whatever gate was actually holding the run.
+    const { runId, adjudicationId } = seedExhaustedGate(f.store, "plan_approval");
+    // Spend under the ceiling so the refusal is specifically about the gate.
+    f.store.updateRun(runId, { spentTokens: 10 });
+    f.store.close();
+
+    await withEngine(f.dbPath, async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/runs/${runId}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adjudicationId, decision: "use the flat shape" }),
+      });
+      assert.equal(res.status, 409);
+      assert.match(((await res.json()) as { error: string }).error, /adjudication gate/i);
+
+      const detail = (await (await fetch(`http://127.0.0.1:${PORT}/api/runs/${runId}`)).json()) as {
+        run: { status: string; gate: string | null };
+        adjudications: Array<{ humanDecision: string | null }>;
+      };
+      assert.equal(detail.run.status, "blocked_on_human");
+      assert.equal(detail.run.gate, "plan_approval");
+      assert.equal(detail.adjudications[0]?.humanDecision, null);
+    });
+  } finally {
+    await f.dispose().catch(() => undefined);
+  }
+});
+
+test("resume: a forged adjudication id is refused before the API claims success", async () => {
+  const f = await fixture();
+  try {
+    /*
+     * Two things pinned at once:
+     *
+     * 1. Budget guard negative case — 10 of 1,000,000 spent must NOT be the reason.
+     * 2. The forged-id hole — the endpoint used to answer `{ ok: true, resumed: true }`
+     *    and only then throw `adjudication not found` in the background, so a test
+     *    that merely checked `body.error` was undefined would vacuously pass.
+     *
+     * Deliberately never reaches the resume path: that would launch the pipeline
+     * and spawn the operator's real CLI, which default tests must never do.
+     */
+    const projectId = seedProject(f.store, "/tmp");
+    const run = f.store.createRun({ projectId, goal: "plenty left", budgetTokens: 1_000_000 });
+    f.store.updateRun(run.id, { status: "blocked_on_human", gate: "adjudication", spentTokens: 10 });
+    f.store.close();
+
+    await withEngine(f.dbPath, async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/runs/${run.id}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ adjudicationId: "no-such-adjudication", decision: "x" }),
+      });
+
+      assert.equal(res.status, 404);
+      const body = (await res.json()) as { error?: string; ok?: boolean };
+      assert.match(body.error ?? "", /adjudication not found/i);
+      assert.equal(body.ok, undefined, "must not claim success for a forged id");
+      assert.ok(
+        !/budget|ceiling/i.test(body.error ?? ""),
+        `a run with 10 of 1,000,000 spent must not be refused for budget; got: ${body.error}`,
+      );
+
+      // The run must stay parked — the old hole marked it `failed` via .catch.
+      const detail = (await (await fetch(`http://127.0.0.1:${PORT}/api/runs/${run.id}`)).json()) as {
+        run: { status: string; error: string | null };
+      };
+      assert.equal(detail.run.status, "blocked_on_human");
+      assert.equal(detail.run.error, null);
+    });
+  } finally {
+    await f.dispose().catch(() => undefined);
+  }
+});
