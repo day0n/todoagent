@@ -1,7 +1,7 @@
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { serve } from "@hono/node-server";
-import { Hono } from "hono";
+import { Hono, type Context, type Next } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import {
@@ -59,6 +59,47 @@ app.use(
     origin: (origin) => (origin !== "" && isAllowedOrigin(origin) ? origin : null),
   }),
 );
+
+/**
+ * Announces a board change after any successful mutation of a task or list.
+ *
+ * Middleware rather than a call at the end of each handler, because there are ten
+ * such routes and the failure mode of forgetting one is silent: that mutation just
+ * does not reach other windows until the backstop poll, which looks like ordinary
+ * lag rather than a missing line of code. A route added later gets this for free.
+ *
+ * Two conditions, both load-bearing:
+ *
+ *   GET is skipped        — reading changes nothing.
+ *   4xx/5xx is skipped    — a refusal changed nothing either. Dispatch returning
+ *                           409 because the repository is locked, or 400 because
+ *                           the list has no repo, must not tell every client to
+ *                           re-read state that is exactly as they left it.
+ *
+ * `syncTaskFromRun` is deliberately NOT covered here: it is called from the run
+ * lifecycle rather than from a request, and it is the single most important
+ * publisher — it is what moves a task out of 进行中 when an agent finishes.
+ */
+app.use("/api/*", async (c: Context, next: Next) => {
+  await next();
+  if (c.req.method === "GET") return;
+  if (c.res.status >= 400) return;
+
+  /*
+   * Matched here rather than by registering several `app.use` paths.
+   *
+   * Whether `app.use("/api/tasks", …)` also matches `/api/tasks/:id` is a Hono
+   * matching detail, and registering both `/api/tasks` and `/api/tasks/*` to be
+   * safe would fire the middleware twice on the same request under one of the two
+   * readings. One registration with an explicit test is unambiguous.
+   *
+   * Channels are included because a list IS a channel row, and the legacy channel
+   * routes can still create tasks.
+   */
+  const path = new URL(c.req.url).pathname;
+  if (!/^\/api\/(tasks|lists|channels)(\/|$)/.test(path)) return;
+  bus.publishBoard();
+});
 
 /** In-flight runs, so a second start cannot race the first. */
 const active = new Map<string, AbortController>();
@@ -725,6 +766,85 @@ app.get("/api/runs/:id/events", (c) => {
           closed = true;
         }
       }, 15000);
+
+      const shutdown = (): void => {
+        closed = true;
+        clearInterval(heartbeat);
+        unsub();
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      };
+
+      c.req.raw.signal.addEventListener("abort", shutdown, { once: true });
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+});
+
+/**
+ * Board invalidation stream.
+ *
+ * Sends "something changed, re-read it" and NOTHING else. The client answers by
+ * calling the same fetch-and-reconcile path a poll uses, so there is exactly one
+ * code path from server state to UI state regardless of what triggered it. Pushing
+ * task rows down this stream instead would create a second one, and the two would
+ * eventually disagree — with the loser being whichever arrived second.
+ *
+ * That also makes failure cheap: if this connection dies, the client degrades to
+ * polling and stays correct. Nothing is persisted and nothing is replayed on
+ * reconnect, because a missed hint costs one poll interval, not a lost update.
+ *
+ * Separate from `/api/runs/:id/events`, which replays a persisted per-run log by
+ * `Last-Event-ID`. Different guarantees, different lifetime, different channel on
+ * the bus — see `publishBoard`.
+ */
+app.get("/api/stream", (c) => {
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      let closed = false;
+
+      const write = (frame: string): void => {
+        if (closed) return;
+        try {
+          controller.enqueue(encoder.encode(frame));
+        } catch {
+          closed = true;
+        }
+      };
+
+      /*
+       * An immediate frame, before anything has changed.
+       *
+       * EventSource does not fire `onopen` until the response body starts arriving,
+       * and @hono/node-server does not flush headers on their own. Without this the
+       * client cannot tell "connected and idle" from "still connecting", so it
+       * would sit on the fast polling fallback while a perfectly good stream was
+       * open.
+       */
+      write(`data: ${JSON.stringify({ type: "stream:ready" })}\n\n`);
+
+      const unsub = bus.subscribeBoard((ev) => {
+        // No `event:` field, matching the run stream: EventSource delivers a NAMED
+        // event only to a matching addEventListener, never to `onmessage`, so
+        // naming it would require the client to keep a list that silently drifts.
+        write(`data: ${JSON.stringify(ev)}\n\n`);
+      });
+
+      // A comment frame, so an idle connection is not dropped by the browser or a
+      // proxy. 25s is under the usual 30s idle timeouts and cheap enough to ignore.
+      const heartbeat = setInterval(() => write(": keepalive\n\n"), 25_000);
 
       const shutdown = (): void => {
         closed = true;
@@ -1513,6 +1633,17 @@ function syncTaskFromRun(runId: string): void {
   } else {
     store.updateTask(task.id, { status: next, needsKind: null, needsText: null });
   }
+
+  /*
+   * The publish that matters most.
+   *
+   * Every other board change originates in a request, so the client that caused it
+   * already knows. This one does not: an agent finished on its own schedule, and
+   * without this announcement nothing on screen moves until the next poll. It sits
+   * after the early returns above so it fires only when a status actually changed —
+   * a `running` run reaching this function changes nothing and must stay quiet.
+   */
+  bus.publishBoard(task.id);
 }
 
 /**

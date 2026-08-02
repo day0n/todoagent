@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError } from "../lib/api.ts";
+import { api, ApiError, subscribeBoard } from "../lib/api.ts";
 import type {
   ChatMessage,
   Expert,
@@ -37,9 +37,20 @@ import { ChatPane } from "../components/chat-pane.tsx";
  * reverting a click.
  */
 
-/** While a run is live the view changes without the user touching anything. */
+/*
+ * Polling cadences, in descending order of desperation.
+ *
+ * With the invalidation stream connected, a change announces itself within
+ * milliseconds, so the timer is only a backstop against a signal being missed —
+ * a minute is frequent enough for that and cheap enough to ignore. The other two
+ * are what M2 used and are still exactly right when the stream is down: a live run
+ * changes state on its own schedule, and an idle board only changes when another
+ * window touches it.
+ */
+const POLL_BACKSTOP_MS = 60_000;
+/** No stream, and a run is live: state changes without the user touching anything. */
 const POLL_FAST_MS = 4_000;
-/** Otherwise only another window can change it. */
+/** No stream, nothing running. */
 const POLL_IDLE_MS = 15_000;
 
 export default function Page() {
@@ -56,6 +67,14 @@ export default function Page() {
   const [counts, setCounts] = useState<ViewCounts>({ today: 0, needs: 0, done: 0 });
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
+  /*
+   * Is the invalidation stream connected?
+   *
+   * Drives the polling cadence and nothing visible. Starts false so a page that
+   * cannot reach the stream at all still polls at the M2 rate from the first
+   * moment, rather than waiting a minute to discover it is not connected.
+   */
+  const [streamOk, setStreamOk] = useState(false);
   /*
    * A load failure that is still true, as distinct from the toast.
    *
@@ -128,6 +147,21 @@ export default function Page() {
     [view],
   );
 
+  /*
+   * The current `refresh`, reachable without depending on it.
+   *
+   * `refresh` is rebuilt whenever `view` changes, and the EventSource subscription
+   * below must NOT be torn down for that: this channel has no replay, so a signal
+   * arriving during the gap between closing one connection and opening the next is
+   * gone for good — and the gap includes a fresh HTTP handshake. Reading the
+   * function through a ref keeps one connection open for the page's whole life
+   * while still calling the newest closure.
+   */
+  const refreshRef = useRef(refresh);
+  useEffect(() => {
+    refreshRef.current = refresh;
+  }, [refresh]);
+
   // First paint, and again whenever the view changes. Unguarded: a view switch is
   // itself the user's request for that view's contents.
   useEffect(() => {
@@ -168,14 +202,68 @@ export default function Page() {
   }, [loadArchived]);
 
   /*
-   * Polling, paused while the tab is hidden.
+   * The invalidation stream: "something changed, re-read it".
    *
-   * Keyed on the cadence so a run starting or finishing re-arms the timer at the
-   * other interval, and on `refresh` so it always fetches the visible view. The
-   * `visibilitychange` listener also forces an immediate poll on return, which is
-   * exactly when the data is most likely to be stale.
+   * Mounted once for the page's lifetime — note the empty dependency list, which
+   * only works because `refreshRef` above decouples this from `view`. It carries no
+   * data by design, so the handler goes through the same guarded `refresh()` a poll
+   * uses and every reconciliation rule applies unchanged.
+   *
+   * Closed while the tab is hidden rather than left open: a background tab holding
+   * an idle connection keeps the engine writing heartbeats to a reader nobody is
+   * looking at. Coming back reopens it AND refreshes immediately, because anything
+   * announced while disconnected was missed for good — this channel has no replay.
+   */
+  useEffect(() => {
+    let unsubscribe: (() => void) | null = null;
+
+    const open = (): void => {
+      if (unsubscribe !== null) return;
+      unsubscribe = subscribeBoard(
+        () => {
+          refreshRef.current().catch(() => undefined);
+        },
+        (ok) => setStreamOk(ok),
+      );
+    };
+    const close = (): void => {
+      if (unsubscribe === null) return;
+      unsubscribe();
+      unsubscribe = null;
+      // Not connected any more, so the timer below must go back to a real cadence.
+      setStreamOk(false);
+    };
+    const onVisibility = (): void => {
+      if (document.hidden) close();
+      else {
+        open();
+        refreshRef.current().catch(() => undefined);
+      }
+    };
+
+    if (!document.hidden) open();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      close();
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, []);
+
+  /*
+   * Polling, now a backstop rather than the mechanism.
+   *
+   * Keyed on the cadence so a run starting or finishing — or the stream dropping —
+   * re-arms the timer at the right interval, and on `refresh` so it always fetches
+   * the visible view. The `visibilitychange` listener also forces an immediate poll
+   * on return, which is exactly when the data is most likely to be stale.
+   *
+   * When the stream is up this fires once a minute purely to catch a missed signal.
+   * When it is down, the M2 cadences take over and the app degrades to exactly what
+   * it was before — which is the reason the stream carries no data: losing it costs
+   * latency, never correctness.
    */
   const fast = hasLiveRun(groups);
+  const cadence = streamOk ? POLL_BACKSTOP_MS : fast ? POLL_FAST_MS : POLL_IDLE_MS;
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
 
@@ -184,19 +272,24 @@ export default function Page() {
     };
     const start = (): void => {
       if (timer !== null) return;
-      timer = setInterval(poll, fast ? POLL_FAST_MS : POLL_IDLE_MS);
+      timer = setInterval(poll, cadence);
     };
     const stop = (): void => {
       if (timer === null) return;
       clearInterval(timer);
       timer = null;
     };
+    /*
+     * Only the TIMER is managed here, not a catch-up fetch.
+     *
+     * The stream effect above already refreshes on return — it has to, because a
+     * signal announced while its connection was closed is gone for good. Doing it
+     * here as well fired two identical requests on every tab focus, which is what
+     * the M2 version did before there was another listener to coordinate with.
+     */
     const onVisibility = (): void => {
       if (document.hidden) stop();
-      else {
-        poll();
-        start();
-      }
+      else start();
     };
 
     if (!document.hidden) start();
@@ -205,7 +298,10 @@ export default function Page() {
       stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, [refresh, fast]);
+    // `cadence`, not `fast`: it already folds in both the stream's health and
+    // whether a run is live, and depending on `fast` as well would leave the timer
+    // running at a stale interval whenever only the stream state changed.
+  }, [refresh, cadence]);
 
   // Toasts dismiss themselves; an engine refusal is worth reading once, not
   // worth a click to clear.

@@ -250,6 +250,45 @@ export function subscribeRun(
   return () => source.close();
 }
 
+/**
+ * Subscribes to board invalidation.
+ *
+ * The engine sends "something changed" and no data, so `onChange` is expected to
+ * re-read through the same path a poll uses. That is the point: one code path
+ * turns server state into UI state regardless of what triggered it, so there is no
+ * second path to disagree with the first.
+ *
+ * `onHealth` drives the polling cadence rather than any UI. EventSource reconnects
+ * on its own with its own backoff, so a dropped connection needs no handling here
+ * beyond telling the caller to poll faster until it returns.
+ */
+export function subscribeBoard(
+  onChange: () => void,
+  onHealth?: (open: boolean) => void,
+): () => void {
+  const source = new EventSource(`${ENGINE}/api/stream`);
+
+  source.onmessage = (e: MessageEvent<string>) => {
+    // Any frame at all proves the connection is live. `onopen` should have said so
+    // already, but a browser that delivers data before firing it would otherwise
+    // leave the caller polling at the fallback rate over a working stream.
+    onHealth?.(true);
+    try {
+      const ev = JSON.parse(e.data) as { type?: string };
+      if (ev.type === "board:changed") onChange();
+      // `stream:ready` needs no action: its only job is to start the response body
+      // so the browser fires `onopen`.
+    } catch {
+      /* a malformed frame must not kill the stream */
+    }
+  };
+
+  source.onopen = () => onHealth?.(true);
+  source.onerror = () => onHealth?.(false);
+
+  return () => source.close();
+}
+
 export function fmtTokens(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
