@@ -131,7 +131,14 @@ export const api = {
    * do, and fetching them separately would let the sidebar show a badge that
    * disagrees with the list beside it.
    */
-  lists: () => req<ListsResponse>("/api/lists"),
+  /**
+   * `archived: true` returns the archived lists INSTEAD of the live ones.
+   *
+   * Read on mount and after an archive or restore, never on the poll — which is
+   * why it is a separate request rather than an extra field on every row.
+   */
+  lists: (opts: { archived?: boolean } = {}) =>
+    req<ListsResponse>(`/api/lists${opts.archived === true ? "?archived=1" : ""}`),
 
   /**
    * Creates a list, optionally bound to a repository.

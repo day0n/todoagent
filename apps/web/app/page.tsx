@@ -46,6 +46,13 @@ export default function Page() {
   const [view, setView] = useState<ViewKey>("today");
   const [groups, setGroups] = useState<TaskGroups | null>(null);
   const [lists, setLists] = useState<TodoList[]>([]);
+  /*
+   * Archived lists, fetched separately from the live ones.
+   *
+   * Read on mount and after an archive or restore — never on the poll, which runs
+   * every few seconds and has no use for them.
+   */
+  const [archived, setArchived] = useState<TodoList[]>([]);
   const [counts, setCounts] = useState<ViewCounts>({ today: 0, needs: 0, done: 0 });
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
@@ -76,6 +83,18 @@ export default function Page() {
 
   const showError = useCallback((err: unknown): void => {
     setToast(err instanceof ApiError || err instanceof Error ? err.message : String(err));
+  }, []);
+
+  /**
+   * Re-reads the archived lists.
+   *
+   * Separate from `refresh` on purpose: this only changes when a list is archived
+   * or restored, and folding it into the poll would fetch a second list every few
+   * seconds to render a section that is usually collapsed and usually empty.
+   */
+  const loadArchived = useCallback(async (): Promise<void> => {
+    const res = await api.lists({ archived: true });
+    setArchived(res.lists);
   }, []);
 
   /** Re-reads the current view and the sidebar together. */
@@ -142,7 +161,11 @@ export default function Page() {
       // A missing runtime list degrades the subtitle and the chat header; it is
       // not worth a toast over, and the task list works regardless.
       .catch(() => setChat([]));
-  }, []);
+
+    // Its own request, and its own failure: an empty archived section is the
+    // normal case, so a failure here must not disturb the task list.
+    void loadArchived().catch(() => undefined);
+  }, [loadArchived]);
 
   /*
    * Polling, paused while the tab is hidden.
@@ -234,6 +257,25 @@ export default function Page() {
       });
   };
 
+  const renameTask = (task: Task, title: string): void => {
+    const next = title.trim();
+    // Nothing to do, and an empty title would leave a row with no label at all.
+    if (next === "" || next === task.title) return;
+
+    mutations.current += 1;
+    setGroups((current) => applyOptimistic(current, view, task.id, { title: next }));
+
+    void api
+      .patchTask(task.id, { title: next })
+      .then((row) => {
+        setGroups((current) => applyServerRow(current, view, row));
+      })
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
   /**
    * Dispatch is never optimistic: it spawns a real CLI process and spends real
    * tokens, and the engine refuses it for reasons only it knows — the repository
@@ -302,14 +344,37 @@ export default function Page() {
 
   const archiveList = (id: string): void => {
     setLists((current) => current.filter((l) => l.id !== id));
-    // Leave a view that is about to stop existing before the request lands.
+    // Leave a view that is about to stop existing before the request lands. The
+    // engine now 404s an archived list's view, so staying would bounce anyway —
+    // this just avoids the flash.
     if (view === `list:${id}`) setView("today");
     void api
       .patchList(id, { archived: true })
-      .then(() => refresh())
+      .then(() => Promise.all([refresh(), loadArchived()]))
       .catch((err: unknown) => {
         showError(err);
         void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
+  const restoreList = (id: string): void => {
+    // Optimistic in both directions: out of the archived section, and back into
+    // the live list where `refresh` will confirm its position and count.
+    const restored = archived.find((l) => l.id === id);
+    setArchived((current) => current.filter((l) => l.id !== id));
+    if (restored !== undefined) {
+      setLists((current) =>
+        current.some((l) => l.id === id)
+          ? current
+          : [...current, { ...restored, archivedAt: null }],
+      );
+    }
+    void api
+      .patchList(id, { archived: false })
+      .then(() => Promise.all([refresh(), loadArchived()]))
+      .catch((err: unknown) => {
+        showError(err);
+        void Promise.all([refresh({ guard: false }), loadArchived()]).catch(() => undefined);
       });
   };
 
@@ -342,12 +407,14 @@ export default function Page() {
     <>
       <Sidebar
         lists={lists}
+        archived={archived}
         counts={counts}
         view={view}
         onSelect={setView}
         onCreate={createList}
         onRename={renameList}
         onArchive={archiveList}
+        onRestore={restoreList}
       />
 
       <TaskPane
@@ -370,6 +437,7 @@ export default function Page() {
         }}
         onAdd={addTask}
         onToggleDone={toggleDone}
+        onRenameTask={renameTask}
         onDispatch={dispatch}
         onCancel={cancel}
         onDelete={remove}

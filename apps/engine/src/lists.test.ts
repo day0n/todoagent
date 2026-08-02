@@ -107,6 +107,107 @@ test("lists: created, patched, archived out of the sidebar", async () => {
       await req("PATCH", `/api/lists/${list.id}`, { archived: true });
       const after = await json<{ lists: Array<{ id: string }> }>(await req("GET", "/api/lists"));
       assert.ok(!after.lists.some((l) => l.id === list.id), "archived lists leave the sidebar");
+
+      /*
+       * ...and are still reachable, which is what makes archiving reversible.
+       *
+       * Without this view the operation was one-way in practice: the engine
+       * accepted `{archived:false}` but nothing could name a list the user can no
+       * longer see, so there was no path back.
+       */
+      const arch = await json<{ lists: Array<{ id: string; name: string }> }>(
+        await req("GET", "/api/lists?archived=1"),
+      );
+      assert.deepEqual(
+        arch.lists.map((l) => l.id),
+        [list.id],
+        "?archived=1 returns the archived list instead of the live ones",
+      );
+      assert.equal(arch.lists[0]?.name, "灵感", "it keeps the name it was renamed to");
+
+      // Restoring puts it back where it was.
+      await req("PATCH", `/api/lists/${list.id}`, { archived: false });
+      const restored = await json<{ lists: Array<{ id: string }> }>(await req("GET", "/api/lists"));
+      assert.ok(restored.lists.some((l) => l.id === list.id), "restored lists return to the sidebar");
+      const emptyArch = await json<{ lists: unknown[] }>(
+        await req("GET", "/api/lists?archived=1"),
+      );
+      assert.equal(emptyArch.lists.length, 0, "and leave the archived view");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("views: an archived list's view is 404, and its tasks survive the round trip", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const task = await json<Task>(
+        await req("POST", "/api/tasks", { title: "归档前的任务", listId: f.listId }),
+      );
+
+      // Live, the view works.
+      assert.equal((await req("GET", `/api/tasks?view=list:${f.listId}`)).status, 200);
+
+      await req("PATCH", `/api/lists/${f.listId}`, { archived: true });
+
+      /*
+       * 404 rather than an empty 200.
+       *
+       * The list has left the sidebar, so a client asking for it is working from a
+       * stale id — another window archived it, or this one held it across the
+       * change. The web app falls back to 我的一天 on a 404; answering 200 left it
+       * showing a pane titled after a list the user could neither see nor reach.
+       */
+      const gone = await req("GET", `/api/tasks?view=list:${f.listId}`);
+      assert.equal(gone.status, 404, "an archived list's view is not reachable");
+
+      // The task is only hidden, never deleted — that is the promise archiving makes.
+      await req("PATCH", `/api/lists/${f.listId}`, { archived: false });
+      const back = await json<{ groups: Groups }>(
+        await req("GET", `/api/tasks?view=list:${f.listId}`),
+      );
+      assert.deepEqual(
+        back.groups.todo.map((t) => t.id),
+        [task.id],
+        "restoring the list brings its tasks back with it",
+      );
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("cors: any loopback port is accepted, a lookalike host is not", async () => {
+  /*
+   * The HTTP-level counterpart to origin.test.ts, which tests the predicate but
+   * not that Hono is actually asking it. Both halves are needed: the M2 symptom
+   * was a browser silently dropping responses while curl saw 200, so a wiring
+   * mistake here is invisible to every other test in this suite.
+   */
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const allowed = await fetch(`${BASE}/api/lists`, {
+        headers: { Origin: "http://localhost:3111" },
+      });
+      assert.equal(
+        allowed.headers.get("access-control-allow-origin"),
+        "http://localhost:3111",
+        "a non-3000 loopback port is echoed back",
+      );
+
+      const refused = await fetch(`${BASE}/api/lists`, {
+        headers: { Origin: "http://localhost.evil.com" },
+      });
+      // A domain an attacker can register, which merely STARTS with "localhost".
+      // Reaching this API means arbitrary code execution, so this must not pass.
+      assert.notEqual(
+        refused.headers.get("access-control-allow-origin"),
+        "http://localhost.evil.com",
+        "a lookalike host must never be echoed back",
+      );
     });
   } finally {
     await f.dispose();

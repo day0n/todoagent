@@ -30,6 +30,7 @@ export function TaskPane({
   onRetry,
   onAdd,
   onToggleDone,
+  onRenameTask,
   onDispatch,
   onCancel,
   onDelete,
@@ -50,6 +51,7 @@ export function TaskPane({
   onRetry?: () => void;
   onAdd: (title: string) => Promise<void>;
   onToggleDone: (task: Task) => void;
+  onRenameTask: (task: Task, title: string) => void;
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
@@ -73,6 +75,7 @@ export function TaskPane({
             repoByList={repoByList}
             executorFor={executorFor}
             onToggleDone={onToggleDone}
+            onRenameTask={onRenameTask}
             onDispatch={onDispatch}
             onCancel={onCancel}
             onDelete={onDelete}
@@ -209,6 +212,7 @@ function Group({
   repoByList,
   executorFor,
   onToggleDone,
+  onRenameTask,
   onDispatch,
   onCancel,
   onDelete,
@@ -218,6 +222,7 @@ function Group({
   repoByList: Map<string, string | null>;
   executorFor: (task: Task) => string | null;
   onToggleDone: (task: Task) => void;
+  onRenameTask: (task: Task, title: string) => void;
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
@@ -258,6 +263,7 @@ function Group({
               repoPath={repoByList.get(task.channelId) ?? null}
               executor={executorFor(task)}
               onToggleDone={onToggleDone}
+              onRenameTask={onRenameTask}
               onDispatch={onDispatch}
               onCancel={onCancel}
               onDelete={onDelete}
@@ -274,6 +280,7 @@ function Row({
   repoPath,
   executor,
   onToggleDone,
+  onRenameTask,
   onDispatch,
   onCancel,
   onDelete,
@@ -282,6 +289,7 @@ function Row({
   repoPath: string | null;
   executor: string | null;
   onToggleDone: (task: Task) => void;
+  onRenameTask: (task: Task, title: string) => void;
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
@@ -289,6 +297,23 @@ function Row({
   const done = task.status === "done";
   const running = task.status === "in_progress";
   const needs = task.status === "needs_you";
+
+  /*
+   * Inline title editing, opened by double-click.
+   *
+   * Allowed in every status, including in_progress: the title is a label, and the
+   * prompt the agent is working from was sent at dispatch time, so renaming
+   * mid-run changes nothing about the execution. That is the opposite of the tick
+   * control next to it, which is disabled while running because it WOULD conflict
+   * with a live process.
+   */
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(task.title);
+
+  const commitTitle = (): void => {
+    setEditing(false);
+    onRenameTask(task, draft);
+  };
 
   return (
     <div className={`row${done ? " done" : ""}${needs ? " needs" : ""}`}>
@@ -306,7 +331,38 @@ function Row({
       </button>
 
       <div className="grow">
-        <div className="tt">{task.title}</div>
+        {editing ? (
+          <input
+            className="tt-edit"
+            value={draft}
+            autoFocus
+            aria-label="任务标题"
+            onChange={(e) => setDraft(e.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitTitle();
+              if (e.key === "Escape") {
+                // Discard, and put the draft back so reopening starts clean.
+                setDraft(task.title);
+                setEditing(false);
+              }
+            }}
+          />
+        ) : (
+          <div
+            className="tt"
+            title="双击改标题"
+            onDoubleClick={() => {
+              // Seeded HERE rather than from initial state: a poll may have
+              // changed the title since this row mounted, and editing a stale
+              // draft would silently revert someone else's rename.
+              setDraft(task.title);
+              setEditing(true);
+            }}
+          >
+            {task.title}
+          </div>
+        )}
         <Subline task={task} executor={executor} />
       </div>
 

@@ -27,6 +27,7 @@ import {
   type Task,
   type TaskStatus,
 } from "@todoagent/core/types";
+import { isAllowedOrigin } from "./origin.ts";
 
 const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());
@@ -41,8 +42,23 @@ const app = new Hono();
  * anywhere else: exposing this port lets anyone who can reach it execute
  * arbitrary code on this machine under your credentials. Adding auth is a
  * prerequisite for any non-loopback deployment.
+ *
+ * The allowlist was pinned to port 3000, which broke any other dev port with a
+ * symptom that reads as a client bug: the browser blocks the response while curl
+ * against the same endpoint returns 200, so the app renders its shell with no
+ * data and no error. Widening to any loopback port does not enlarge the attack
+ * surface — a process that can bind a local port can already reach this API
+ * directly, and a remote page's origin cannot match — but it only holds because
+ * the pattern above is anchored.
  */
-app.use("*", cors({ origin: ["http://localhost:3000", "http://127.0.0.1:3000"] }));
+app.use(
+  "*",
+  cors({
+    // Hono hands back whatever this returns as `Access-Control-Allow-Origin`, so
+    // a rejection must be null rather than a fallback origin.
+    origin: (origin) => (origin !== "" && isAllowedOrigin(origin) ? origin : null),
+  }),
+);
 
 /** In-flight runs, so a second start cannot race the first. */
 const active = new Map<string, AbortController>();
@@ -1126,6 +1142,19 @@ function inToday(t: Task, now: Date): boolean {
 }
 
 app.get("/api/lists", (c) => {
+  /*
+   * `?archived=1` returns the archived lists INSTEAD of the live ones.
+   *
+   * A separate view rather than an extra field on every row: archiving is rare and
+   * restoring is rarer, so the sidebar reads this once on mount and after an
+   * archive or restore, and the default response — which the poll fetches
+   * repeatedly — carries nothing extra.
+   *
+   * `counts` is computed over all tasks either way. Those three numbers describe
+   * the aggregate views, which are defined by task status and do not care whether
+   * a task's list is archived.
+   */
+  const wantArchived = c.req.query("archived") === "1";
   const tasks = store.listAllTasks();
   const open = new Map<string, number>();
   for (const t of tasks) {
@@ -1134,7 +1163,9 @@ app.get("/api/lists", (c) => {
   const now = new Date();
   const lists = store
     .listChannels()
-    .filter((ch) => ch.kind === "channel" && ch.archivedAt === null)
+    .filter(
+      (ch) => ch.kind === "channel" && (wantArchived ? ch.archivedAt !== null : ch.archivedAt === null),
+    )
     .map((ch) => ({
       ...ch,
       openCount: open.get(ch.id) ?? 0,
@@ -1226,7 +1257,18 @@ app.get("/api/tasks", (c) => {
   else if (view === "done") picked = all.filter((t) => t.status === "done");
   else if (view.startsWith("list:")) {
     const id = view.slice("list:".length);
-    if (!store.getChannel(id)) return c.json({ error: "unknown list" }, 404);
+    const list = store.getChannel(id);
+    if (!list) return c.json({ error: "unknown list" }, 404);
+    /*
+     * An archived list is 404 here, not an empty view.
+     *
+     * It has left the sidebar, so a client asking for it is working from a stale
+     * copy — another window archived it, or this one has an old id in hand. The
+     * web app already falls back to 我的一天 on a 404, and answering 200 instead
+     * left it displaying a pane titled after a list the user cannot see or reach.
+     * The tasks are still there and come back with the list if it is restored.
+     */
+    if (list.archivedAt !== null) return c.json({ error: "list is archived" }, 404);
     picked = all.filter((t) => t.channelId === id);
   } else {
     return c.json({ error: `unknown view ${view}` }, 400);

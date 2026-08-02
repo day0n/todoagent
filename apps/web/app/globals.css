@@ -461,6 +461,56 @@
     font-weight: 600;
     letter-spacing: 0.045em;
   }
+
+  /* ── Archived lists ─────────────────────────────────────────
+     A collapsed section at the foot of the list area. Archiving used to be
+     one-way in the UI: the engine accepts `{archived:false}` but nothing could
+     name a list you can no longer see. */
+  .item.arch-toggle {
+    height: 34px;
+    margin-top: 6px;
+    color: var(--ink-3);
+    font-size: 12.5px;
+  }
+  .item .caret {
+    width: 9px;
+    height: 9px;
+    margin-left: 3px;
+    stroke-width: 2.4;
+    opacity: 0.6;
+    transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .item[aria-expanded="true"] .caret {
+    transform: rotate(90deg);
+  }
+  /* A row, not a button: the list is archived, so selecting it is meaningless.
+     Only the restore action is interactive. */
+  .item.arch {
+    height: 34px;
+    padding-left: 24px;
+    color: var(--ink-3);
+    cursor: default;
+  }
+  .item.arch:hover {
+    background: transparent;
+  }
+  .item.arch .swatch {
+    opacity: 0.5;
+  }
+  .item .restore {
+    margin-left: auto;
+    padding: 2px 8px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--accent);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .item .restore:hover {
+    background: var(--accent-tint);
+  }
   .swatch {
     width: 8px;
     height: 8px;
@@ -822,6 +872,19 @@
     min-width: 0;
   }
   .tt {
+    font-size: 14.5px;
+    line-height: 1.45;
+  }
+  /* Inline title edit, opened by double-click. Sized to match `.tt` exactly so
+     the row does not change height when it opens. */
+  .tt-edit {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    border-bottom: 1px solid var(--accent);
+    outline: 0;
+    background: transparent;
+    color: var(--ink);
     font-size: 14.5px;
     line-height: 1.45;
   }

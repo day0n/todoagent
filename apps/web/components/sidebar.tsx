@@ -3,7 +3,15 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { TodoList, ViewCounts, ViewKey } from "../lib/types.ts";
-import { IconDone, IconGear, IconMore, IconNeeds, IconPlus, IconToday } from "./icons.tsx";
+import {
+  IconCaret,
+  IconDone,
+  IconGear,
+  IconMore,
+  IconNeeds,
+  IconPlus,
+  IconToday,
+} from "./icons.tsx";
 
 /**
  * The six colours offered when creating a list.
@@ -21,14 +29,18 @@ const DEFAULT_SWATCH = "#3a3a3c";
 
 export function Sidebar({
   lists,
+  archived,
   counts,
   view,
   onSelect,
   onCreate,
   onRename,
   onArchive,
+  onRestore,
 }: {
   lists: TodoList[];
+  /** Archived lists, for the restore section. Empty hides that section entirely. */
+  archived: TodoList[];
   counts: ViewCounts;
   view: ViewKey;
   onSelect: (view: ViewKey) => void;
@@ -36,8 +48,10 @@ export function Sidebar({
   onCreate: (input: { name: string; color: string | null; repoPath: string | null }) => Promise<void>;
   onRename: (id: string, name: string) => void;
   onArchive: (id: string) => void;
+  onRestore: (id: string) => void;
 }) {
   const [composing, setComposing] = useState(false);
+  const [showArchived, setShowArchived] = useState(false);
 
   return (
     <nav className="side">
@@ -107,6 +121,45 @@ export function Sidebar({
             <span className="label">新建清单</span>
           </button>
         )}
+
+        {/*
+          Archived lists, collapsed, and absent entirely when there are none.
+          Without this, archiving was one-way in the UI: the engine accepts
+          `{archived:false}` but nothing could name a list you can no longer see.
+        */}
+        {archived.length > 0 ? (
+          <>
+            <button
+              type="button"
+              className="item arch-toggle"
+              aria-expanded={showArchived}
+              onClick={() => setShowArchived((v) => !v)}
+            >
+              <IconCaret className="caret" />
+              <span className="label">已归档</span>
+              <span className="n">{archived.length}</span>
+            </button>
+
+            {showArchived
+              ? archived.map((list) => (
+                  <div className="item arch" key={list.id}>
+                    <span
+                      className="swatch"
+                      style={{ background: list.color ?? DEFAULT_SWATCH }}
+                    />
+                    <span className="label">{list.name}</span>
+                    <button
+                      type="button"
+                      className="restore"
+                      onClick={() => onRestore(list.id)}
+                    >
+                      恢复
+                    </button>
+                  </div>
+                ))
+              : null}
+          </>
+        ) : null}
       </div>
 
       <div className="side-foot">
