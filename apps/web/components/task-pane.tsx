@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { Task, TaskGroups, TaskStatus, TodoList, ViewKey } from "../lib/types.ts";
 import { TASK_STATUS_LABEL } from "../lib/types.ts";
@@ -34,6 +33,7 @@ export function TaskPane({
   onDispatch,
   onCancel,
   onDelete,
+  onOpenResult,
 }: {
   view: ViewKey;
   title: string;
@@ -55,6 +55,8 @@ export function TaskPane({
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
+  /** Opens the result drawer for a finished or failed task. */
+  onOpenResult: (task: Task) => void;
 }) {
   const shown = visibleGroups(groups);
   const repoByList = new Map(lists.map((l) => [l.id, l.repoPath]));
@@ -79,6 +81,7 @@ export function TaskPane({
             onDispatch={onDispatch}
             onCancel={onCancel}
             onDelete={onDelete}
+            onOpenResult={onOpenResult}
           />
         ))}
 
@@ -216,6 +219,7 @@ function Group({
   onDispatch,
   onCancel,
   onDelete,
+  onOpenResult,
 }: {
   status: TaskStatus;
   tasks: Task[];
@@ -226,6 +230,7 @@ function Group({
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
+  onOpenResult: (task: Task) => void;
 }) {
   // 已完成 starts collapsed: it grows without bound and is the one group nobody
   // opens the app to read.
@@ -267,6 +272,7 @@ function Group({
               onDispatch={onDispatch}
               onCancel={onCancel}
               onDelete={onDelete}
+              onOpenResult={onOpenResult}
             />
           ))}
         </div>
@@ -284,6 +290,7 @@ function Row({
   onDispatch,
   onCancel,
   onDelete,
+  onOpenResult,
 }: {
   task: Task;
   repoPath: string | null;
@@ -293,6 +300,7 @@ function Row({
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
+  onOpenResult: (task: Task) => void;
 }) {
   const done = task.status === "done";
   const running = task.status === "in_progress";
@@ -385,6 +393,7 @@ function Row({
         canDispatch={repoPath !== null}
         onDispatch={onDispatch}
         onCancel={onCancel}
+        onOpenResult={onOpenResult}
       />
 
       <button
@@ -431,21 +440,28 @@ const NEEDS_FALLBACK: Record<string, string> = {
 };
 
 /**
- * The one primary action a row gets, by status.
+ * The actions a row offers, by status.
  *
- * Deliberately at most one: the prototype's row has room for a single pill, and
- * a row offering three competing verbs is a row nobody reads.
+ * One pill for every status except a FAILED needs_you row, which gets two: the
+ * thing you almost always want (重派) and the thing you need first if you don't
+ * (查看). That exception is the whole point — a failed task's most common next
+ * step should not be two clicks behind a drawer.
+ *
+ * A needs_you row whose `needsKind` is `question` keeps a single 查看: answering it
+ * is M5, and offering 重派 there would discard the question the agent asked.
  */
 function RowAction({
   task,
   canDispatch,
   onDispatch,
   onCancel,
+  onOpenResult,
 }: {
   task: Task;
   canDispatch: boolean;
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
+  onOpenResult: (task: Task) => void;
 }) {
   if (task.status === "todo") {
     // No repository on the list means no working directory, so there is nothing
@@ -477,22 +493,32 @@ function RowAction({
     );
   }
 
-  // in_review and needs_you both point at the run. `runId` can be null on a
-  // needs_you task that never ran, which is why this is a guard and not a cast.
+  // Both remaining states point at a run. `runId` can be null on a needs_you task
+  // that never ran, which is why this is a guard and not a cast — a 查看 button
+  // there would link at `/runs/null`.
   if (task.runId === null) return null;
 
   if (task.status === "in_review") {
     return (
-      <Link href={`/runs/${task.runId}`} className="act">
+      <button type="button" className="act" onClick={() => onOpenResult(task)}>
         看结果
-      </Link>
+      </button>
     );
   }
+
   if (task.status === "needs_you") {
+    const failed = task.needsKind === "failed";
     return (
-      <Link href={`/runs/${task.runId}`} className="act">
-        查看
-      </Link>
+      <>
+        {failed && canDispatch ? (
+          <button type="button" className="act" onClick={() => onDispatch(task)}>
+            重派
+          </button>
+        ) : null}
+        <button type="button" className="act" onClick={() => onOpenResult(task)}>
+          查看
+        </button>
+      </>
     );
   }
   return null;

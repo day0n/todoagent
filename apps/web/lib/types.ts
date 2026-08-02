@@ -362,6 +362,26 @@ export interface TasksResponse {
   groups: TaskGroups;
 }
 
+/**
+ * What a finished run left behind, as `GET /api/runs/:id/result` returns it.
+ *
+ * `diff` distinguishes two answers that must not be collapsed:
+ *
+ *   null  no snapshot was taken — the run failed, was cancelled, or predates the
+ *         column. The UI must not claim the agent changed nothing, because a run
+ *         that died mid-edit may well have changed several files.
+ *   ""    a snapshot WAS taken and the tree was clean. The agent genuinely changed
+ *         no files, which is a real outcome worth stating.
+ */
+export interface RunResult {
+  run: Run;
+  diff: string | null;
+  /** The newest attempt's final text, skipping crashed retries that produced none. */
+  output: string | null;
+  /** Runtime that did the work, e.g. "codex". Null when no attempt exists. */
+  executor: string | null;
+}
+
 /** One turn of the main-agent conversation. Posting into it arrives with M4. */
 export interface ChatMessage {
   id: string;

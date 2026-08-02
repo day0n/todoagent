@@ -15,6 +15,7 @@ import {
   applyOptimistic,
   applyPoll,
   applyServerRow,
+  findTask,
   hasLiveRun,
   insertTask,
   removeTask,
@@ -22,6 +23,7 @@ import {
 import { Sidebar } from "../components/sidebar.tsx";
 import { TaskPane } from "../components/task-pane.tsx";
 import { ChatPane } from "../components/chat-pane.tsx";
+import { ResultDrawer } from "../components/result-drawer.tsx";
 
 /**
  * The whole product surface: sidebar, task list, agent conversation.
@@ -75,6 +77,16 @@ export default function Page() {
    * moment, rather than waiting a minute to discover it is not connected.
    */
   const [streamOk, setStreamOk] = useState(false);
+  /*
+   * Which task's result drawer is open, by ID rather than by object.
+   *
+   * Holding the task itself would freeze a copy at the moment it was clicked, and
+   * this view refreshes underneath it — on a poll, on an SSE signal, on every
+   * mutation. The drawer would then go on showing a status the task no longer has.
+   * Looking it up each render also closes the drawer for free when the task leaves
+   * the view, which is exactly what should happen if it is no longer a member.
+   */
+  const [drawerTaskId, setDrawerTaskId] = useState<string | null>(null);
   /*
    * A load failure that is still true, as distinct from the toast.
    *
@@ -499,6 +511,18 @@ export default function Page() {
     return expert.runtimeKind;
   };
 
+  /*
+   * The task the drawer is showing, resolved fresh on every render.
+   *
+   * This is why the drawer holds an id: the row it came from is replaced wholesale
+   * by every poll and every SSE signal, so a captured object would keep rendering a
+   * status the task has since left. Resolving from the current groups also closes
+   * the drawer on its own if the task leaves the view — deleted, or evicted by a
+   * status change the view filters on — rather than leaving a panel open over
+   * something that is no longer there.
+   */
+  const drawerTask = drawerTaskId === null ? null : findTask(groups, drawerTaskId);
+
   return (
     <>
       <Sidebar
@@ -534,12 +558,31 @@ export default function Page() {
         onAdd={addTask}
         onToggleDone={toggleDone}
         onRenameTask={renameTask}
+        onOpenResult={(t) => setDrawerTaskId(t.id)}
         onDispatch={dispatch}
         onCancel={cancel}
         onDelete={remove}
       />
 
       <ChatPane messages={chat} runtimeNames={runtimeNames} />
+
+      {drawerTask !== null ? (
+        <ResultDrawer
+          // Remounts when the task changes, so no state from the previous task's
+          // panel (a expanded output section, a half-loaded fetch) survives.
+          key={drawerTask.id}
+          task={drawerTask}
+          onClose={() => setDrawerTaskId(null)}
+          onComplete={(t) => {
+            toggleDone(t);
+            setDrawerTaskId(null);
+          }}
+          onRedispatch={(t) => {
+            dispatch(t);
+            setDrawerTaskId(null);
+          }}
+        />
+      ) : null}
 
       {toast !== null ? (
         <div className="toast" role="alert">

@@ -7,6 +7,7 @@ import type {
   Project,
   Run,
   RunDetail,
+  RunResult,
   SettableTaskStatus,
   StreamEvent,
   Task,
@@ -208,6 +209,16 @@ export const api = {
   /** Aborts a task's live run. The task returns to todo. */
   cancelTask: (taskId: string) =>
     req<{ ok: true; task: Task }>(`/api/tasks/${taskId}/cancel`, { method: "POST" }),
+
+  /**
+   * What a finished run left behind: the working-tree snapshot and the final output.
+   *
+   * One request rather than two, because the drawer opens on a click and a second
+   * round trip would render a header with an empty body under it. Kept off the run
+   * detail endpoint deliberately — a snapshot is capped at 2M characters, and that
+   * payload is refetched on every structural event.
+   */
+  runResult: (runId: string) => req<RunResult>(`/api/runs/${runId}/result`),
 
   /** The main-agent conversation. Empty until M4 wires posting. */
   chatHistory: () => req<ChatMessage[]>("/api/chat/history"),

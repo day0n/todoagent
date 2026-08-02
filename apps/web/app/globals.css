@@ -1230,6 +1230,202 @@
     cursor: not-allowed;
   }
 
+  /* ══ Result drawer ══════════════════════════════════════════
+     What a finished run left behind, without leaving the task list. A drawer
+     rather than a route because reviewing a result is a glance in the middle of
+     working through a list, and navigating away loses the scroll position and the
+     open groups. */
+  .scrim {
+    position: fixed;
+    inset: 0;
+    z-index: 60;
+    background: rgba(0, 0, 0, 0.14);
+    backdrop-filter: blur(2px);
+    -webkit-backdrop-filter: blur(2px);
+    animation: fade-in 0.18s ease-out;
+  }
+  @keyframes fade-in {
+    from {
+      opacity: 0;
+    }
+  }
+
+  .drawer {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 61;
+    width: 560px;
+    max-width: 100vw;
+    display: flex;
+    flex-direction: column;
+    border-left: 0.5px solid rgba(0, 0, 0, 0.08);
+    background: rgba(252, 252, 253, 0.97);
+    backdrop-filter: blur(30px) saturate(1.3);
+    -webkit-backdrop-filter: blur(30px) saturate(1.3);
+    box-shadow: -1px 0 3px rgba(0, 0, 0, 0.04), -18px 0 60px rgba(0, 0, 0, 0.16);
+    animation: drawer-in 0.26s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  @keyframes drawer-in {
+    from {
+      transform: translateX(24px);
+      opacity: 0.4;
+    }
+  }
+
+  .dhead {
+    flex-shrink: 0;
+    padding: 20px 18px 15px;
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    border-bottom: 0.5px solid var(--line);
+  }
+  .dtitle {
+    font-size: 16px;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+    line-height: 1.35;
+  }
+  .dsub {
+    margin-top: 3px;
+    color: var(--ink-2);
+    font-size: 12.5px;
+  }
+  /* The close button is always visible: `.act` starts at opacity 0 for row hover,
+     which is wrong for a dialog's only exit. */
+  .dhead .act.ghost {
+    opacity: 1;
+  }
+
+  .dbody {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 16px 18px 20px;
+  }
+  .dnote {
+    margin: 0 0 12px;
+    padding: 9px 12px;
+    border-radius: 10px;
+    background: var(--accent-tint);
+    color: var(--accent);
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+  .dempty {
+    padding: 40px 12px;
+    color: var(--ink-3);
+    font-size: 13px;
+    text-align: center;
+  }
+
+  /* Hand-rendered diff: no dependency, one span per line, coloured by prefix. */
+  .diff {
+    margin: 0;
+    padding: 10px 0;
+    overflow-x: auto;
+    border: 0.5px solid rgba(0, 0, 0, 0.05);
+    border-radius: 12px;
+    background: var(--white);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+    tab-size: 2;
+  }
+  .dl {
+    display: block;
+    padding: 0 12px;
+    white-space: pre;
+  }
+  .dl.add {
+    background: rgba(52, 199, 89, 0.1);
+    color: #1d7f3f;
+  }
+  .dl.del {
+    background: rgba(255, 59, 48, 0.08);
+    color: #c8000f;
+  }
+  /* Hunk headers and file headers are structure, not content — grey, so the eye
+     goes to the coloured lines between them. */
+  .dl.hunk {
+    margin-top: 4px;
+    background: var(--fill);
+    color: var(--ink-2);
+    font-weight: 600;
+  }
+  .dl.meta {
+    color: var(--ink-3);
+  }
+  .dl.ctx {
+    color: var(--ink);
+  }
+
+  .dout {
+    margin-top: 18px;
+  }
+  /* `.glabel` carries a 32px top margin for the task pane's rhythm, which is too
+     much inside a drawer section that already has its own. */
+  .dout .glabel {
+    margin: 0 0 8px;
+  }
+  .outbody {
+    margin: 0;
+    padding: 11px 13px;
+    max-height: 320px;
+    overflow: auto;
+    border: 0.5px solid rgba(0, 0, 0, 0.05);
+    border-radius: 12px;
+    background: var(--white);
+    color: var(--ink-2);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .dfoot {
+    flex-shrink: 0;
+    padding: 13px 18px 18px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    border-top: 0.5px solid var(--line);
+  }
+  /* Pushed right: it leaves the drawer, so it should not sit next to the two
+     actions that keep you in it. */
+  .dmore {
+    margin-left: auto;
+    color: var(--ink-2);
+  }
+  /*
+   * Icon sizing for `.btn`.
+   *
+   * Not previously needed — every `.btn` in M2 was text only — and its absence is
+   * not a small visual nit: an inline SVG with no width or height falls back to its
+   * default intrinsic size (300×150 in most engines), so the tick inside 完成 would
+   * blow the button across the footer.
+   */
+  .btn svg {
+    width: 13px;
+    height: 13px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.4;
+  }
+
+  /* The task list is already narrow at this width; a 560px panel over it would
+     leave nothing behind. Full-bleed instead. */
+  @media (max-width: 620px) {
+    .drawer {
+      width: 100vw;
+      border-left: 0;
+    }
+  }
+
   /* ══ Toast ══════════════════════════════════════════════════
      Refusals from the engine (409 repo busy, 400 no repo) land here. Bottom
      centre, above the task pane, so it does not cover the row it is about. */
@@ -1237,7 +1433,16 @@
     position: fixed;
     left: 50%;
     bottom: 28px;
-    z-index: 50;
+    /*
+     * Above the drawer (60/61), not below it.
+     *
+     * At 50 a toast raised while the drawer was open rendered behind its scrim —
+     * invisible. Today's paths happen to close the drawer before an engine refusal
+     * arrives, so this was a trap rather than a live bug, but the toast is the only
+     * channel for those refusals and the drawer is a surface that triggers them
+     * (重派). A transient notification belongs above every panel.
+     */
+    z-index: 70;
     max-width: 460px;
     padding: 11px 16px;
     display: flex;
