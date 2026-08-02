@@ -85,7 +85,17 @@ function classesIn(src) {
   const spans = [];
   for (const m of src.matchAll(/className=(["'])([\s\S]*?)\1/g)) spans.push(m[2]);
   for (const m of src.matchAll(/className=\{([\s\S]*?)\}(?=[\s/>])/g)) {
-    const expr = m[1];
+    /*
+     * Comparison operands are dropped before anything else.
+     *
+     * `className={`item${view === "today" ? " on" : ""}`}` contains two string
+     * literals with completely different meanings: " on" is a class, and "today"
+     * is a value being tested. Extracting both reported `.today` and `.user` as
+     * undefined classes — the same shape of false positive as the `${}` and
+     * variant-prefix cases below, and the reason those were fixed: a checker that
+     * cries wolf about correct code stops being read.
+     */
+    const expr = m[1].replace(/[=!]==?\s*(["'])(?:(?!\1)[\s\S])*?\1/g, " ");
     // String branches of a ternary, and the static halves of a template.
     for (const q of expr.matchAll(/(["'])((?:(?!\1)[\s\S])*?)\1/g)) spans.push(q[2]);
     for (const t of expr.matchAll(/`((?:[^`\\]|\\[\s\S])*?)`/g)) {
