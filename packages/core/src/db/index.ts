@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import type {
   ActorKind,
   Adjudication,
+  AgentChatMessage,
   Attempt,
   Channel,
   DiscussionMessage,
@@ -113,6 +114,12 @@ export class Store {
     const expected: Array<{ table: string; column: string; definition: string }> = [
       { table: "subtask", column: "branch", definition: "TEXT" },
       { table: "attempt", column: "cost_usd", definition: "REAL NOT NULL DEFAULT 0" },
+      { table: "channel", column: "color", definition: "TEXT" },
+      { table: "channel", column: "archived_at", definition: "TEXT" },
+      { table: "task", column: "note", definition: "TEXT NOT NULL DEFAULT ''" },
+      { table: "task", column: "my_day", definition: "TEXT" },
+      { table: "task", column: "needs_kind", definition: "TEXT" },
+      { table: "task", column: "needs_text", definition: "TEXT" },
     ];
 
     for (const { table, column, definition } of expected) {
@@ -906,15 +913,34 @@ export class Store {
   // ── Channels ──────────────────────────────────────────────
 
   createChannel(
-    c: Omit<Channel, "id" | "createdAt"> & { id?: string },
+    c: Omit<Channel, "id" | "createdAt" | "color" | "archivedAt"> & {
+      id?: string;
+      color?: string | null;
+    },
   ): Channel {
-    const row: Channel = { ...c, id: c.id ?? newId(), createdAt: nowIso() };
+    const row: Channel = {
+      ...c,
+      id: c.id ?? newId(),
+      color: c.color ?? null,
+      archivedAt: null,
+      createdAt: nowIso(),
+    };
     this.db
       .prepare(
-        `INSERT INTO channel (id,name,purpose,kind,project_id,dm_expert_id,created_at)
-         VALUES (?,?,?,?,?,?,?)`,
+        `INSERT INTO channel (id,name,purpose,kind,project_id,dm_expert_id,color,archived_at,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
       )
-      .run(row.id, row.name, row.purpose, row.kind, row.projectId, row.dmExpertId, row.createdAt);
+      .run(
+        row.id,
+        row.name,
+        row.purpose,
+        row.kind,
+        row.projectId,
+        row.dmExpertId,
+        row.color,
+        row.archivedAt,
+        row.createdAt,
+      );
     return row;
   }
 
@@ -930,6 +956,28 @@ export class Store {
     return raw ? this.toChannel(raw as Row) : null;
   }
 
+  updateChannel(
+    id: string,
+    patch: Partial<Pick<Channel, "name" | "color" | "archivedAt">>,
+  ): void {
+    const cols: Record<keyof typeof patch, string> = {
+      name: "name",
+      color: "color",
+      archivedAt: "archived_at",
+    };
+    const sets: string[] = [];
+    const vals: Array<string | null> = [];
+    for (const [k, col] of Object.entries(cols) as Array<[keyof typeof patch, string]>) {
+      const v = patch[k];
+      if (v === undefined) continue;
+      sets.push(`${col}=?`);
+      vals.push(v);
+    }
+    if (sets.length === 0) return;
+    vals.push(id);
+    this.db.prepare(`UPDATE channel SET ${sets.join(",")} WHERE id=?`).run(...vals);
+  }
+
   private toChannel(r: Row): Channel {
     return {
       id: str(r["id"]),
@@ -938,6 +986,8 @@ export class Store {
       kind: str(r["kind"]) === "dm" ? "dm" : "channel",
       projectId: strOrNull(r["project_id"]),
       dmExpertId: strOrNull(r["dm_expert_id"]),
+      color: strOrNull(r["color"]),
+      archivedAt: strOrNull(r["archived_at"]),
       createdAt: str(r["created_at"]),
     };
   }
@@ -1026,22 +1076,45 @@ export class Store {
   // ── Tasks ─────────────────────────────────────────────────
 
   createTask(
-    t: Omit<Task, "id" | "createdAt" | "updatedAt"> & { id?: string },
+    t: Omit<
+      Task,
+      "id" | "createdAt" | "updatedAt" | "note" | "myDay" | "needsKind" | "needsText"
+    > & {
+      id?: string;
+      note?: string;
+      myDay?: string | null;
+      needsKind?: Task["needsKind"];
+      needsText?: string | null;
+    },
   ): Task {
     const at = nowIso();
-    const row: Task = { ...t, id: t.id ?? newId(), createdAt: at, updatedAt: at };
+    const row: Task = {
+      ...t,
+      id: t.id ?? newId(),
+      note: t.note ?? "",
+      myDay: t.myDay ?? null,
+      needsKind: t.needsKind ?? null,
+      needsText: t.needsText ?? null,
+      createdAt: at,
+      updatedAt: at,
+    };
     this.db
       .prepare(
         `INSERT INTO task
-           (id,channel_id,title,status,assignee_kind,assignee_id,creator_kind,creator_id,
+           (id,channel_id,title,status,note,my_day,needs_kind,needs_text,
+            assignee_kind,assignee_id,creator_kind,creator_id,
             source_message_id,run_id,created_at,updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         row.id,
         row.channelId,
         row.title,
         row.status,
+        row.note,
+        row.myDay,
+        row.needsKind,
+        row.needsText,
         row.assigneeKind,
         row.assigneeId,
         row.creatorKind,
@@ -1052,6 +1125,14 @@ export class Store {
         row.updatedAt,
       );
     return row;
+  }
+
+  /** Every task across every list, for the aggregated views (today / needs / done). */
+  listAllTasks(): Task[] {
+    return this.db
+      .prepare(`SELECT * FROM task ORDER BY created_at`)
+      .all()
+      .map((raw) => this.toTask(raw as Row));
   }
 
   listTasks(channelId: string): Task[] {
@@ -1100,11 +1181,28 @@ export class Store {
 
   updateTask(
     id: string,
-    patch: Partial<Pick<Task, "title" | "status" | "assigneeKind" | "assigneeId" | "runId">>,
+    patch: Partial<
+      Pick<
+        Task,
+        | "title"
+        | "status"
+        | "note"
+        | "myDay"
+        | "needsKind"
+        | "needsText"
+        | "assigneeKind"
+        | "assigneeId"
+        | "runId"
+      >
+    >,
   ): void {
     const cols: Record<keyof typeof patch, string> = {
       title: "title",
       status: "status",
+      note: "note",
+      myDay: "my_day",
+      needsKind: "needs_kind",
+      needsText: "needs_text",
       assigneeKind: "assignee_kind",
       assigneeId: "assignee_id",
       runId: "run_id",
@@ -1129,6 +1227,7 @@ export class Store {
   private toTask(r: Row): Task {
     const assigneeKind = strOrNull(r["assignee_kind"]);
     const status = str(r["status"]);
+    const needsKind = strOrNull(r["needs_kind"]);
     return {
       id: str(r["id"]),
       channelId: str(r["channel_id"]),
@@ -1136,6 +1235,13 @@ export class Store {
       status: (TASK_STATUSES as readonly string[]).includes(status)
         ? (status as TaskStatus)
         : "todo",
+      note: str(r["note"] ?? ""),
+      myDay: strOrNull(r["my_day"]),
+      needsKind:
+        needsKind === "question" || needsKind === "blocked" || needsKind === "failed"
+          ? needsKind
+          : null,
+      needsText: strOrNull(r["needs_text"]),
       assigneeKind: assigneeKind === null ? null : actorKind(assigneeKind),
       assigneeId: strOrNull(r["assignee_id"]),
       creatorKind: actorKind(r["creator_kind"]),
@@ -1145,5 +1251,42 @@ export class Store {
       createdAt: str(r["created_at"]),
       updatedAt: str(r["updated_at"]),
     };
+  }
+
+  deleteTask(id: string): boolean {
+    const res = this.db.prepare(`DELETE FROM task WHERE id=?`).run(id);
+    return res.changes > 0;
+  }
+
+  // ── Main-agent chat ───────────────────────────────────────
+
+  appendAgentChat(m: {
+    role: AgentChatMessage["role"];
+    body: string;
+    taskRefs?: string[];
+  }): AgentChatMessage {
+    const id = newId();
+    const createdAt = nowIso();
+    const taskRefs = m.taskRefs ?? [];
+    this.db
+      .prepare(`INSERT INTO agent_chat (id,role,body,task_refs,created_at) VALUES (?,?,?,?,?)`)
+      .run(id, m.role, m.body, JSON.stringify(taskRefs), createdAt);
+    const seq = this.db.prepare(`SELECT seq FROM agent_chat WHERE id=?`).get(id) as Row;
+    return { seq: Number(seq["seq"]), id, role: m.role, body: m.body, taskRefs, createdAt };
+  }
+
+  /** The newest `limit` entries, returned oldest-first for straight rendering. */
+  listAgentChat(limit = 200): AgentChatMessage[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM agent_chat ORDER BY seq DESC LIMIT ?`)
+      .all(limit) as Row[];
+    return rows.reverse().map((r) => ({
+      seq: Number(r["seq"]),
+      id: str(r["id"]),
+      role: str(r["role"]) === "agent" ? "agent" : "user",
+      body: str(r["body"]),
+      taskRefs: jsonArray(r["task_refs"]),
+      createdAt: str(r["created_at"]),
+    }));
   }
 }

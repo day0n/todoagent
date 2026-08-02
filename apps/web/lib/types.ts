@@ -289,11 +289,12 @@ export interface MessageWithThread extends Message {
  * and carries states a board has no column for (`reworking`, `blocked`,
  * `failed`).
  */
-export type TaskStatus = "todo" | "in_progress" | "in_review" | "done";
+export type TaskStatus = "todo" | "in_progress" | "needs_you" | "in_review" | "done";
 
 export const TASK_STATUSES: readonly TaskStatus[] = [
   "todo",
   "in_progress",
+  "needs_you",
   "in_review",
   "done",
 ];
@@ -301,15 +302,22 @@ export const TASK_STATUSES: readonly TaskStatus[] = [
 export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
   todo: "待办",
   in_progress: "进行中",
-  in_review: "待复核",
+  needs_you: "需要你",
+  in_review: "待确认",
   done: "已完成",
 };
+
+export type NeedsKind = "question" | "blocked" | "failed";
 
 export interface Task {
   id: string;
   channelId: string;
   title: string;
   status: TaskStatus;
+  note: string;
+  myDay: string | null;
+  needsKind: NeedsKind | null;
+  needsText: string | null;
   assigneeKind: ActorKind | null;
   assigneeId: string | null;
   creatorKind: ActorKind;

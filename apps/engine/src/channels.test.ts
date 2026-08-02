@@ -375,6 +375,7 @@ test("board: every column is present even with no tasks", async () => {
         "done",
         "in_progress",
         "in_review",
+        "needs_you",
         "todo",
       ]);
     });

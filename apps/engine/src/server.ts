@@ -17,7 +17,16 @@ import {
   runPipeline,
   type BusEvent,
 } from "@todoagent/core";
-import { EXPERT_ROLES, RUNTIME_KINDS, type Expert, type Run } from "@todoagent/core/types";
+import {
+  EXPERT_ROLES,
+  RUNTIME_KINDS,
+  TASK_STATUSES,
+  type Channel,
+  type Expert,
+  type Run,
+  type Task,
+  type TaskStatus,
+} from "@todoagent/core/types";
 
 const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());
@@ -1004,7 +1013,13 @@ app.post("/api/channels/:id/tasks", async (c) => {
 
 const TaskPatch = z.object({
   title: z.string().min(1).max(200).optional(),
+  // `needs_you` is deliberately absent: only run outcomes and agent questions
+  // park a task there. A person moves it out by answering, re-dispatching, or
+  // closing it — never in by hand.
   status: z.enum(["todo", "in_progress", "in_review", "done"]).optional(),
+  note: z.string().max(2000).optional(),
+  /** ISO date to pin into 我的一天, or null to unpin. */
+  myDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
   /**
    * Assignment, as one unit.
    *
@@ -1031,7 +1046,17 @@ app.patch("/api/tasks/:id", async (c) => {
 
   const patch: Parameters<typeof store.updateTask>[1] = {};
   if (body.title !== undefined) patch.title = body.title.trim();
-  if (body.status !== undefined) patch.status = body.status;
+  if (body.status !== undefined) {
+    patch.status = body.status;
+    // Leaving needs_you by any route clears the parked question — a card in
+    // "done" still showing "codex 提问…" would be describing the past as present.
+    if (task.status === "needs_you") {
+      patch.needsKind = null;
+      patch.needsText = null;
+    }
+  }
+  if (body.note !== undefined) patch.note = body.note;
+  if (body.myDay !== undefined) patch.myDay = body.myDay;
 
   if (body.assignee !== undefined) {
     if (body.assignee === null) {
@@ -1053,6 +1078,244 @@ app.patch("/api/tasks/:id", async (c) => {
   store.updateTask(task.id, patch);
   return c.json(store.getTask(task.id));
 });
+
+// ── Lists & todo views ──────────────────────────────────────
+//
+// The todoagent surface. Lists ARE channels — the table was kept and the
+// vocabulary changed — and the aggregated views (today / needs / done) are
+// derived at read time rather than stored, per the 2026-08-02 decision.
+
+const DEFAULT_LIST_NAME = "收件箱";
+
+/** The list quick-added tasks land in when none is chosen. Created on demand. */
+function defaultList(): Channel {
+  const existing = store
+    .listChannels()
+    .find((ch) => ch.kind === "channel" && ch.archivedAt === null && ch.name === DEFAULT_LIST_NAME);
+  if (existing) return existing;
+  return store.createChannel({
+    name: DEFAULT_LIST_NAME,
+    purpose: "",
+    kind: "channel",
+    projectId: null,
+    dmExpertId: null,
+  });
+}
+
+function sameLocalDay(iso: string, now: Date): boolean {
+  const d = new Date(iso);
+  return (
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate()
+  );
+}
+
+/**
+ * 我的一天, derived (方案 B):
+ * everything alive right now (needs_you / in_progress / in_review), plus todos
+ * created today, plus tasks finished today so the day's wins stay visible.
+ * `myDay` is a manual pin on top of that, not the mechanism.
+ */
+function inToday(t: Task, now: Date): boolean {
+  if (t.status === "needs_you" || t.status === "in_progress" || t.status === "in_review") return true;
+  if (t.myDay !== null && sameLocalDay(`${t.myDay}T00:00:00`, now)) return true;
+  if (t.status === "todo" && sameLocalDay(t.createdAt, now)) return true;
+  if (t.status === "done" && sameLocalDay(t.updatedAt, now)) return true;
+  return false;
+}
+
+app.get("/api/lists", (c) => {
+  const tasks = store.listAllTasks();
+  const open = new Map<string, number>();
+  for (const t of tasks) {
+    if (t.status !== "done") open.set(t.channelId, (open.get(t.channelId) ?? 0) + 1);
+  }
+  const now = new Date();
+  const lists = store
+    .listChannels()
+    .filter((ch) => ch.kind === "channel" && ch.archivedAt === null)
+    .map((ch) => ({
+      ...ch,
+      openCount: open.get(ch.id) ?? 0,
+      repoPath: ch.projectId === null ? null : (store.getProject(ch.projectId)?.repoPath ?? null),
+    }));
+  const counts = {
+    today: tasks.filter((t) => t.status !== "done" && inToday(t, now)).length,
+    needs: tasks.filter((t) => t.status === "needs_you").length,
+    done: tasks.filter((t) => t.status === "done").length,
+  };
+  return c.json({ lists, counts });
+});
+
+const ListBody = z.object({
+  name: z.string().min(1).max(120),
+  color: z.string().max(32).nullable().default(null),
+  /** Binding a repository is what makes the list's tasks dispatchable. */
+  repoPath: z.string().min(1).nullable().default(null),
+});
+
+app.post("/api/lists", async (c) => {
+  const parsed = ListBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const { name, color, repoPath } = parsed.data;
+
+  let projectId: string | null = null;
+  if (repoPath !== null) {
+    const abs = resolve(repoPath);
+    if (!(await isGitRepo(abs))) {
+      return c.json({ error: `${abs} 不是 git 仓库。先在那里运行 git init。` }, 400);
+    }
+    const existing = store.listProjects().find((p) => resolve(p.repoPath) === abs);
+    if (existing) {
+      projectId = existing.id;
+    } else {
+      // Projects carry a team from the pipeline era; reuse one or make a stub.
+      const team = store.listTeams()[0] ?? store.createTeam("todoagent");
+      projectId = store.createProject({ name, repoPath: abs, teamId: team.id }).id;
+    }
+  }
+
+  const list = store.createChannel({
+    name,
+    purpose: "",
+    kind: "channel",
+    projectId,
+    dmExpertId: null,
+    color,
+  });
+  return c.json(list, 201);
+});
+
+const ListPatch = z.object({
+  name: z.string().min(1).max(120).optional(),
+  color: z.string().max(32).nullable().optional(),
+  archived: z.boolean().optional(),
+});
+
+app.patch("/api/lists/:id", async (c) => {
+  const list = store.getChannel(c.req.param("id"));
+  if (!list) return c.json({ error: "unknown list" }, 404);
+
+  const parsed = ListPatch.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const body = parsed.data;
+
+  const patch: Parameters<typeof store.updateChannel>[1] = {};
+  if (body.name !== undefined) patch.name = body.name.trim();
+  if (body.color !== undefined) patch.color = body.color;
+  if (body.archived !== undefined) patch.archivedAt = body.archived ? new Date().toISOString() : null;
+  store.updateChannel(list.id, patch);
+  return c.json(store.getChannel(list.id));
+});
+
+/**
+ * Tasks for one view, pre-grouped by status.
+ *
+ * Grouped here rather than in the client so `TASK_STATUSES` stays the single
+ * source of truth for which groups exist and in what order.
+ */
+app.get("/api/tasks", (c) => {
+  const view = c.req.query("view") ?? "today";
+  const all = store.listAllTasks();
+  const now = new Date();
+
+  let picked: Task[];
+  if (view === "today") picked = all.filter((t) => inToday(t, now));
+  else if (view === "needs") picked = all.filter((t) => t.status === "needs_you");
+  else if (view === "done") picked = all.filter((t) => t.status === "done");
+  else if (view.startsWith("list:")) {
+    const id = view.slice("list:".length);
+    if (!store.getChannel(id)) return c.json({ error: "unknown list" }, 404);
+    picked = all.filter((t) => t.channelId === id);
+  } else {
+    return c.json({ error: `unknown view ${view}` }, 400);
+  }
+
+  const groups = Object.fromEntries(TASK_STATUSES.map((s) => [s, [] as Task[]])) as Record<
+    TaskStatus,
+    Task[]
+  >;
+  for (const t of picked) (groups[t.status] ?? groups.todo).push(t);
+  groups.done.reverse(); // finished list reads newest-first
+  return c.json({ view, groups });
+});
+
+const QuickTaskBody = z.object({
+  title: z.string().min(1).max(500),
+  note: z.string().max(2000).default(""),
+  /** Absent means the 收件箱 default list. */
+  listId: z.string().min(1).nullable().default(null),
+});
+
+app.post("/api/tasks", async (c) => {
+  const parsed = QuickTaskBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const body = parsed.data;
+
+  const list = body.listId === null ? defaultList() : store.getChannel(body.listId);
+  if (!list) return c.json({ error: "unknown list" }, 404);
+
+  const task = store.createTask({
+    channelId: list.id,
+    title: body.title.trim(),
+    note: body.note,
+    status: "todo",
+    assigneeKind: null,
+    assigneeId: null,
+    creatorKind: "human",
+    creatorId: null,
+    sourceMessageId: null,
+    runId: null,
+  });
+  return c.json(task, 201);
+});
+
+app.delete("/api/tasks/:id", (c) => {
+  const task = store.getTask(c.req.param("id"));
+  if (!task) return c.json({ error: "unknown task" }, 404);
+
+  // A live run must not keep spending tokens for a card that no longer exists.
+  if (task.runId !== null) abortRun(task.runId);
+  store.deleteTask(task.id);
+  return c.json({ ok: true });
+});
+
+/** Stops a task's live run. The card returns to todo via the usual sync. */
+app.post("/api/tasks/:id/cancel", (c) => {
+  const task = store.getTask(c.req.param("id"));
+  if (!task) return c.json({ error: "unknown task" }, 404);
+  if (task.runId === null) return c.json({ error: "这张卡没有进行中的执行" }, 409);
+
+  const stopped = abortRun(task.runId);
+  if (!stopped) return c.json({ error: "执行已经结束了" }, 409);
+  return c.json({ ok: true, task: store.getTask(task.id) });
+});
+
+/**
+ * Aborts a run if it is still alive. Returns whether anything was stopped.
+ * Shared by task cancel and task delete; run-level cancel keeps its own route.
+ */
+function abortRun(runId: string): boolean {
+  const controller = active.get(runId);
+  if (controller) {
+    controller.abort();
+    store.updateRun(runId, { status: "cancelled", gate: null, endedAt: new Date().toISOString() });
+    syncTaskFromRun(runId);
+    return true;
+  }
+  const run = store.getRun(runId);
+  if (run && (run.status === "running" || run.status === "blocked_on_human")) {
+    // Stale `running` with no driver — a crash artifact. Settle it now.
+    store.updateRun(runId, { status: "cancelled", gate: null, endedAt: new Date().toISOString() });
+    syncTaskFromRun(runId);
+    return true;
+  }
+  return false;
+}
+
+/** The main-agent conversation timeline. Posting into it arrives with M4. */
+app.get("/api/chat/history", (c) => c.json(store.listAgentChat()));
 
 const TaskRunBody = z.object({
   budgetTokens: z.number().int().min(0).max(200_000_000).default(2_000_000),
@@ -1151,6 +1414,10 @@ app.post("/api/tasks/:id/run", async (c) => {
     store.updateTask(task.id, {
       runId: created.id,
       status: "in_progress",
+      // Re-dispatch is how a needs_you card gets unstuck, so the parked
+      // question is consumed here rather than lingering next to a live run.
+      needsKind: null,
+      needsText: null,
       assigneeKind: "expert",
       assigneeId: expert.id,
     });
@@ -1169,12 +1436,12 @@ app.post("/api/tasks/:id/run", async (c) => {
  * A no-op for runs started directly, which have no card. The mapping is
  * deliberate:
  *
- *   completed → in_review, never done. The pipeline's own review is agents
- *     checking each other; a person still has to look at the merged branch.
- *     Auto-completing would claim an approval nobody gave.
- *   failed / cancelled / budget_exceeded → todo. Leaving it in_progress would
- *     say work is happening when nothing is running. `run_id` is preserved, so
- *     the card still links to the attempt that failed.
+ *   completed → in_review, never done. Nobody reviewed this work; a person
+ *     still has to look. Auto-completing would claim an approval nobody gave.
+ *   failed / budget_exceeded → needs_you. A person decides what happens next
+ *     (re-dispatch, hand-fix, close); silently returning to todo hid failures
+ *     in the backlog.
+ *   cancelled → todo. The user stopped it on purpose; there is nothing to ask.
  */
 function syncTaskFromRun(runId: string): void {
   const task = store.getTaskByRunId(runId);
@@ -1185,14 +1452,25 @@ function syncTaskFromRun(runId: string): void {
   const next =
     run.status === "completed"
       ? "in_review"
-      : run.status === "failed" || run.status === "cancelled" || run.status === "budget_exceeded"
+      : run.status === "cancelled"
         ? "todo"
-        : null;
+        : run.status === "failed" || run.status === "budget_exceeded"
+          ? "needs_you"
+          : null;
 
   // `running` and `blocked_on_human` leave the card alone: it is already
   // in_progress, and a gate is surfaced on the run page rather than the board.
   if (next === null || task.status === next) return;
-  store.updateTask(task.id, { status: next });
+
+  if (next === "needs_you") {
+    store.updateTask(task.id, {
+      status: next,
+      needsKind: "failed",
+      needsText: (run.error ?? "执行失败，看看日志再决定。").slice(0, 500),
+    });
+  } else {
+    store.updateTask(task.id, { status: next, needsKind: null, needsText: null });
+  }
 }
 
 /**

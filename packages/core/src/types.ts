@@ -348,6 +348,10 @@ export interface Channel {
   projectId: string | null;
   /** For `kind: "dm"`, the agent on the other side of the conversation. */
   dmExpertId: string | null;
+  /** Sidebar swatch, e.g. "#3a3a3c". Null renders the default. */
+  color: string | null;
+  /** Archived lists keep their tasks but leave the sidebar. */
+  archivedAt: string | null;
   createdAt: string;
 }
 
@@ -392,20 +396,38 @@ export interface MessageWithThread extends Message {
  * `failed`). Collapsing the two would force the board to invent columns nobody
  * asked for.
  */
-export type TaskStatus = "todo" | "in_progress" | "in_review" | "done";
+export type TaskStatus = "todo" | "in_progress" | "needs_you" | "in_review" | "done";
 
 export const TASK_STATUSES: readonly TaskStatus[] = [
   "todo",
   "in_progress",
+  "needs_you",
   "in_review",
   "done",
 ];
+
+/**
+ * Why a task is parked in `needs_you`.
+ *
+ *   question — the agent finished its turn by asking something
+ *   blocked  — the agent cannot proceed (dirty worktree, missing credential…)
+ *   failed   — the run errored or timed out; a person decides what happens next
+ */
+export type NeedsKind = "question" | "blocked" | "failed";
 
 export interface Task {
   id: string;
   channelId: string;
   title: string;
   status: TaskStatus;
+  /** Free-form second line under the title, written by the user or the agent. */
+  note: string;
+  /** ISO date (YYYY-MM-DD) for a manual "my day" pin. Automatic membership is derived. */
+  myDay: string | null;
+  /** Set exactly when status is `needs_you`. */
+  needsKind: NeedsKind | null;
+  /** The agent's question or the blocking reason, verbatim or summarised. */
+  needsText: string | null;
   /** Null while unclaimed. An agent claims a task itself, as often as a person does. */
   assigneeKind: ActorKind | null;
   assigneeId: string | null;
@@ -417,6 +439,17 @@ export interface Task {
   runId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** One entry in the main-agent conversation timeline. */
+export interface AgentChatMessage {
+  seq: number;
+  id: string;
+  role: "user" | "agent";
+  body: string;
+  /** Tasks this message created or referenced, for inline cards in the chat. */
+  taskRefs: string[];
+  createdAt: string;
 }
 
 // ─────────────────────────────────────────────────────────────

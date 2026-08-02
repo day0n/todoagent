@@ -208,6 +208,10 @@ CREATE TABLE IF NOT EXISTS channel (
   project_id TEXT,
   -- For kind='dm', the agent on the other side of a 1:1 conversation.
   dm_expert_id TEXT,
+  -- Sidebar swatch. NULL renders the default gray dot.
+  color       TEXT,
+  -- Archived lists keep their tasks but leave the sidebar.
+  archived_at TEXT,
   created_at TEXT NOT NULL
 );
 
@@ -246,12 +250,24 @@ CREATE TABLE IF NOT EXISTS task (
   id            TEXT PRIMARY KEY,
   channel_id    TEXT NOT NULL,
   title         TEXT NOT NULL,
-  -- Board column: 'todo' | 'in_progress' | 'in_review' | 'done'.
+  -- Board column: 'todo' | 'in_progress' | 'needs_you' | 'in_review' | 'done'.
+  --
+  -- `needs_you` is the product's heart: the task is parked until a person
+  -- answers a question, unblocks it, or decides what to do about a failure.
   --
   -- Distinct from `subtask.status`, which tracks one agent's work inside a run
   -- and carries states a board has no column for (reworking, blocked, failed).
   -- Collapsing them would force the board to invent columns nobody asked for.
   status        TEXT NOT NULL DEFAULT 'todo',
+  -- Free-form second line under the title.
+  note          TEXT NOT NULL DEFAULT '',
+  -- ISO date (YYYY-MM-DD) for a manual "my day" pin; automatic membership
+  -- (needs_you / in_progress / in_review / created today) is derived, not stored.
+  my_day        TEXT,
+  -- Why the task sits in needs_you: 'question' | 'blocked' | 'failed'.
+  needs_kind    TEXT,
+  -- The agent's question or blocking reason, shown on the card.
+  needs_text    TEXT,
   -- Polymorphic assignee: 'human' | 'expert', or NULL for unclaimed. An agent
   -- claims a task itself, so this is written by the agent as often as by a person.
   assignee_kind TEXT,
@@ -268,3 +284,19 @@ CREATE TABLE IF NOT EXISTS task (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_channel ON task (channel_id, status);
+
+-- ── Main-agent conversation ─────────────────────────────────
+--
+-- A single timeline, not per-channel: the main agent is one assistant for the
+-- whole workspace. Same AUTOINCREMENT reasoning as `message`.
+
+CREATE TABLE IF NOT EXISTS agent_chat (
+  seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+  id         TEXT NOT NULL UNIQUE,
+  -- 'user' | 'agent'
+  role       TEXT NOT NULL,
+  body       TEXT NOT NULL,
+  -- JSON array of task ids this message created or referenced, for inline cards.
+  task_refs  TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL
+);

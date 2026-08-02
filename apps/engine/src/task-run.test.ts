@@ -259,27 +259,35 @@ test("run: the goal is the source message, not the truncated card title", async 
   }
 });
 
-test("run: a failed run puts the card back in todo, keeping the run link", async () => {
+test("run: a failed run parks the card in needs_you with the reason attached", async () => {
   const f = await fixture();
   try {
     await withEngine(f, async () => {
       const id = await makeCard(f.repoChannelId, "会失败的任务", false);
       const started = await json<{ run: { id: string } }>(await post(`/api/tasks/${id}/run`));
 
-      // Every CLI is a refusing stub, so the planner cannot produce a plan.
+      // Every CLI is a refusing stub, so the agent cannot do the work.
       await waitForRun(started.run.id, (s) => s === "failed" || s === "cancelled");
 
-      const task = await json<{ tasks: Array<{ status: string; runId: string | null }> }>(
-        await fetch(`${BASE}/api/channels/${f.repoChannelId}/tasks`),
-      );
+      const task = await json<{
+        tasks: Array<{
+          status: string;
+          runId: string | null;
+          needsKind: string | null;
+          needsText: string | null;
+        }>;
+      }>(await fetch(`${BASE}/api/channels/${f.repoChannelId}/tasks`));
       const card = task.tasks.find((t) => t.runId === started.run.id);
 
       /*
-       * Back to todo, not left in_progress: a card claiming work is happening when
-       * nothing is running is the misleading state. `run_id` is preserved so the
-       * card still links to the attempt that failed.
+       * needs_you, not todo: a failure silently returning to the backlog is a
+       * hidden failure. A person decides what happens next, and the card carries
+       * the reason so they can decide without digging. `run_id` is preserved so
+       * the card still links to the attempt that failed.
        */
-      assert.equal(card?.status, "todo");
+      assert.equal(card?.status, "needs_you");
+      assert.equal(card?.needsKind, "failed");
+      assert.ok((card?.needsText ?? "").length > 0, "the reason travels with the card");
       assert.equal(card?.runId, started.run.id);
     });
   } finally {
@@ -347,18 +355,18 @@ test("reconcile: an interrupted run releases its card instead of stranding it", 
 
     // Booting is what triggers reconciliation, before any traffic is accepted.
     await withEngine(f, async () => {
-      const board = await json<{ tasks: Array<{ id: string; status: string; runId: string | null }> }>(
-        await fetch(`${BASE}/api/channels/${f.repoChannelId}/tasks`),
-      );
+      const board = await json<{
+        tasks: Array<{ id: string; status: string; runId: string | null; needsKind: string | null }>;
+      }>(await fetch(`${BASE}/api/channels/${f.repoChannelId}/tasks`));
       const card = board.tasks.find((t) => t.id === task.id);
 
       /*
-       * Back to todo. Marking only the RUN as failed left the board saying work
-       * was happening with no way out — the web board's live-run inference would
-       * stay true forever, so it polls indefinitely watching a value that can
-       * never change again.
+       * Parked in needs_you. Marking only the RUN as failed left the board saying
+       * work was happening with no way out — and silently returning to todo would
+       * hide that the engine died under this task. A person decides what's next.
        */
-      assert.equal(card?.status, "todo");
+      assert.equal(card?.status, "needs_you");
+      assert.equal(card?.needsKind, "failed");
       assert.equal(card?.runId, run.id, "the link to the interrupted run is kept");
 
       const detail = await json<{ run: { status: string; error: string | null } }>(
