@@ -1,49 +1,47 @@
 @import "tailwindcss";
 
 /**
- * Design system: white, quiet, shadcn/ui-flavoured.
+ * Design system: Apple-flavoured, extracted from mockups/v1d-apple.html.
  *
- * The token values below were extracted from niuzj.org's computed `:root` — a
- * Next.js + Tailwind + shadcn/ui site on the zinc ramp with Geist Sans. That is
- * the reference for how this app should feel: white surfaces, 1px zinc
- * hairlines, small radii, restrained colour used only where it carries meaning.
+ * The `:root` block below is that file's own token set, carried over verbatim so
+ * the prototype stays the reference a person can diff against. The three-pane
+ * shell (sidebar / task pane / chat pane) is plain CSS in @layer components with
+ * the prototype's class names, for the same reason.
  *
- * This replaces a neo-brutalist system (2px black borders, zero-blur offset
- * shadows, Space Grotesk 700) copied from Raft's own UI. Raft's product logic is
- * still the model — the look deliberately is not.
+ * Tailwind stays because the retained pages (`/runs`, `/team`) and the shared
+ * atoms are built on it. The `@theme` block is therefore kept and only re-tuned:
+ * its greys and its accent now resolve to the Apple palette, so those pages sit
+ * next to the new surface without looking like a different product. Their markup
+ * is untouched.
  *
- * Light only, by request. There is no theme toggle and no dark block: a local
- * tool with one intended appearance is simpler to reason about than one that
- * silently restyles itself, and every colour below is chosen for contrast on
- * white specifically.
- *
- * Colour discipline, since this UI shows a lot of parallel machine output at
- * once: greys carry all structure, and hue is reserved for state a person must
- * act on (a blocker, a gate, a failure). If everything is coloured, the one red
- * row that matters stops being visible.
+ * Light only, by request. Every colour here is chosen for contrast on the
+ * #f3f3f5 desktop grey specifically.
  */
 
 @theme {
-  /* ── Neutral ramp (zinc) ───────────────────────────────────── */
+  /* ── Neutral ramp ───────────────────────────────────────────
+     Re-pointed from zinc onto the prototype's greys. The names are unchanged
+     because ~40 sites on the retained pages read them. */
   --color-bg: #ffffff;
-  --color-fg: #09090b;
-  --color-surface: #fafafa;
-  --color-surface-2: #f4f4f5;
-  --color-muted: #f4f4f5;
-  --color-muted-fg: #71717b;
-  --color-subtle-fg: #9f9fa9;
-  --color-line: #e4e4e7;
-  --color-line-strong: #d4d4d8;
+  --color-fg: #1d1d1f;
+  --color-surface: #f8f8fa;
+  --color-surface-2: #f3f3f5;
+  --color-muted: rgba(118, 118, 128, 0.1);
+  --color-muted-fg: #6e6e73;
+  --color-subtle-fg: #98989d;
+  --color-line: rgba(60, 60, 67, 0.12);
+  --color-line-strong: rgba(60, 60, 67, 0.2);
 
-  /* ── Accent and semantics ──────────────────────────────────── */
-  /* The reference site's link blue, used as this app's single primary accent. */
-  --color-accent: #1447e6;
+  /* ── Accent and semantics ──────────────────────────────────
+     System blue, matching the prototype. The semantic trio keeps its meaning:
+     hue is spent only on state a person has to act on. */
+  --color-accent: #007aff;
   --color-accent-fg: #ffffff;
-  --color-accent-soft: #eef2ff;
+  --color-accent-soft: rgba(0, 122, 255, 0.11);
 
-  --color-ok: #00863c;
+  --color-ok: #1d7f3f;
   --color-ok-soft: #e7f8ee;
-  --color-warn: #a35200;
+  --color-warn: #9a5b00;
   --color-warn-soft: #fdf3e7;
   --color-bad: #c8000f;
   --color-bad-soft: #fdecee;
@@ -52,37 +50,103 @@
   --color-grape: #6d3fd4;
   --color-grape-soft: #f1ecfd;
 
-  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
-  --font-mono: var(--font-geist-mono), ui-monospace, "SF Mono", Menlo, monospace;
+  /*
+   * The system font stack, from the prototype.
+   *
+   * This replaces the two next/font/google faces. They were a real dependency
+   * for a Geist-based design that no longer exists, and `var(--font-geist-sans)`
+   * would now be undefined — which does not degrade, it voids the whole
+   * `font-family` declaration at computed-value time.
+   */
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
 
+  /*
+   * Deliberately NOT the prototype's `--radius: 16px`.
+   *
+   * The prototype declares that token and then never reads it — every corner in
+   * it is a literal (15px input, 18px group card, 999px pill). Meanwhile
+   * `--radius` here is the shared `.card` / `.field` / `.btn` corner on the
+   * retained pages. Taking the 16px value would reshape those for no gain, so
+   * the name keeps its existing meaning and the shell uses literals like the
+   * prototype does.
+   */
   --radius: 0.5rem;
   --radius-sm: 0.375rem;
 
-  /* Chrome metrics. 56px matches the reference site's --header-height. */
   --h-header: 56px;
-  --w-rail: 3.25rem;
-  --w-sidebar: 15rem;
+}
+
+/**
+ * The prototype's own tokens, verbatim.
+ *
+ * Kept as a separate `:root` block rather than folded into `@theme` on purpose:
+ * these are read by the hand-written shell CSS below, and a side-by-side diff
+ * against mockups/v1d-apple.html should come out clean.
+ */
+:root {
+  --bg: #f3f3f5;
+  --glass: rgba(248, 248, 250, 0.76);
+  --card: rgba(255, 255, 255, 0.96);
+  --ink: #1d1d1f;
+  --ink-2: #6e6e73;
+  --ink-3: #98989d;
+  --line: rgba(60, 60, 67, 0.1);
+  --line-strong: rgba(60, 60, 67, 0.16);
+  --fill: rgba(118, 118, 128, 0.1);
+  --fill-hover: rgba(118, 118, 128, 0.15);
+  --black: #1d1d1f;
+  --white: #ffffff;
+  --accent: #007aff;
+  --accent-pressed: #0062cc;
+  --accent-tint: rgba(0, 122, 255, 0.11);
+  --accent-line: rgba(0, 122, 255, 0.18);
+  --mono: ui-monospace, "SF Mono", monospace;
 }
 
 @layer base {
   html {
     /* Pins form controls and scrollbars to light rendering, so a person on a
-       dark OS gets the same UI rather than half-inverted native widgets. */
+       dark OS gets this UI rather than half-inverted native widgets. */
     color-scheme: light;
-    scrollbar-gutter: stable;
   }
 
+  /*
+   * The three-pane shell is the body itself, per the prototype.
+   *
+   * `100dvh` rather than the prototype's `100vh`: on mobile Safari the latter is
+   * the larger viewport, which would push the chat composer under the browser
+   * toolbar. Identical on every desktop width, which is where the comparison
+   * happens.
+   *
+   * Secondary pages (`/runs`, `/team`) opt into this flex parent with `.page`.
+   */
   body {
-    background-color: var(--color-bg);
-    color: var(--color-fg);
+    height: 100dvh;
+    overflow: hidden;
+    display: flex;
+    background: var(--bg);
+    color: var(--ink);
     font-family: var(--font-sans);
-    font-size: 0.875rem;
-    line-height: 1.55;
+    font-size: 14px;
+    letter-spacing: -0.01em;
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
-    /* Token counts and durations update in place in dense rows; proportional
-       digits make them jitter as the numbers change. */
-    font-variant-numeric: tabular-nums;
+  }
+
+  button,
+  input,
+  textarea,
+  select {
+    font: inherit;
+    color: inherit;
+  }
+  button {
+    -webkit-tap-highlight-color: transparent;
+  }
+  svg {
+    display: block;
   }
 
   h1,
@@ -94,11 +158,11 @@
   }
 
   ::selection {
-    background: color-mix(in oklab, var(--color-accent) 20%, transparent);
+    background: var(--accent-tint);
   }
 
-  /* A thin, self-effacing scrollbar — transcripts and event logs scroll a lot,
-     and a heavy track competes with the content for attention. */
+  /* Thin and self-effacing: transcripts and task lists scroll a lot, and a heavy
+     track competes with the content. */
   ::-webkit-scrollbar {
     width: 10px;
     height: 10px;
@@ -107,187 +171,1206 @@
     background: transparent;
   }
   ::-webkit-scrollbar-thumb {
-    background: var(--color-line-strong);
+    background: rgba(60, 60, 67, 0.22);
     border: 3px solid transparent;
     background-clip: content-box;
     border-radius: 9999px;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: var(--color-subtle-fg);
+    background: rgba(60, 60, 67, 0.36);
     background-clip: content-box;
   }
 
   :focus-visible {
-    outline: 2px solid var(--color-accent);
+    outline: 2px solid var(--accent);
     outline-offset: 1px;
-    border-radius: 2px;
+    border-radius: 3px;
   }
 
-  textarea,
-  input,
-  select,
-  button {
-    font: inherit;
-    font-variant-numeric: inherit;
-    color: inherit;
-  }
-
-  /* Let long agent identifiers and repo paths break rather than force a
-     horizontal scrollbar on the whole panel. */
   .break-anywhere {
     overflow-wrap: anywhere;
   }
 }
 
 @layer components {
-  /* ── Surfaces ───────────────────────────────────────────────
-     One hairline plus an almost-invisible shadow. Elevation is conveyed by the
-     border; the shadow only keeps a card from looking pasted on. */
-  .card {
-    background: var(--color-bg);
-    border: 1px solid var(--color-line);
-    border-radius: var(--radius);
-    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.04);
+  /* ══ Sidebar ════════════════════════════════════════════════ */
+
+  .side {
+    width: 244px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding: 26px 13px 17px;
+    border-right: 1px solid rgba(0, 0, 0, 0.055);
+    background: var(--glass);
+    backdrop-filter: blur(28px) saturate(1.35);
+    -webkit-backdrop-filter: blur(28px) saturate(1.35);
+    box-shadow: inset -0.5px 0 0 rgba(255, 255, 255, 0.62);
+  }
+  /* The list section scrolls; the brand and the footer stay put. */
+  .side-scroll {
+    min-height: 0;
+    flex: 1;
+    overflow-y: auto;
+    margin-inline: -13px;
+    padding-inline: 13px;
   }
 
-  /* Interactive card. The lift is small on purpose: a list of these should not
-     flutter as the pointer crosses it. */
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 10px 29px;
+  }
+  .brand .mark {
+    width: 30px;
+    height: 30px;
+    position: relative;
+    display: grid;
+    place-items: center;
+    border-radius: 9px;
+    background: linear-gradient(180deg, #343438, #1d1d1f);
+    box-shadow:
+      inset 0 0.5px 0 rgba(255, 255, 255, 0.3),
+      0 1px 2px rgba(0, 0, 0, 0.12),
+      0 5px 14px rgba(0, 0, 0, 0.08);
+  }
+  /* Three bullets and three rules — a checklist, drawn rather than shipped as an
+     asset so it stays crisp at any density. */
+  .brand .mark::before {
+    content: "";
+    width: 3px;
+    height: 3px;
+    position: absolute;
+    left: 7px;
+    top: 7px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow:
+      0 6.5px 0 rgba(255, 255, 255, 0.92),
+      0 13px 0 rgba(255, 255, 255, 0.92);
+  }
+  .brand .mark::after {
+    content: "";
+    width: 11px;
+    height: 1.5px;
+    position: absolute;
+    left: 13px;
+    top: 7.75px;
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow:
+      0 6.5px 0 rgba(255, 255, 255, 0.92),
+      0 13px 0 rgba(255, 255, 255, 0.92);
+  }
+  .brand .t {
+    font-size: 14px;
+    font-weight: 650;
+    letter-spacing: -0.02em;
+  }
+
+  /*
+   * Nav entry. A `<button>` for the fixed views, a wrapping `<div>` for a list —
+   * a list row carries its own overflow-menu button, and a button inside a button
+   * is invalid markup that browsers recover from by dropping one of them.
+   */
+  .item {
+    width: 100%;
+    height: 40px;
+    padding: 0 10px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    border: 0;
+    border-radius: 10px;
+    background: transparent;
+    color: #3a3a3c;
+    cursor: pointer;
+    font-size: 13.5px;
+    text-align: left;
+    transition:
+      background 0.14s ease,
+      color 0.14s ease;
+  }
+  .item:hover {
+    background: rgba(0, 0, 0, 0.04);
+  }
+  /* The name half of a list row: everything except the overflow menu. */
+  .item .pick {
+    min-width: 0;
+    flex: 1;
+    height: 100%;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    font: inherit;
+    font-weight: inherit;
+    text-align: left;
+  }
+  /* Inline rename, in place of the name. Sized to the row so the sidebar does
+     not reflow while typing. */
+  .item .rename {
+    min-width: 0;
+    flex: 1;
+    height: 26px;
+    padding: 0 7px;
+    border: 1px solid var(--accent);
+    border-radius: 7px;
+    outline: 0;
+    background: var(--white);
+    color: var(--ink);
+    font-size: 13px;
+    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+  }
+  /* Rename / archive. Anchored to the row's right edge, above the task pane. */
+  .item .lmenu {
+    position: absolute;
+    top: 34px;
+    right: 6px;
+    z-index: 30;
+    min-width: 116px;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    border: 0.5px solid rgba(0, 0, 0, 0.07);
+    border-radius: 11px;
+    background: rgba(255, 255, 255, 0.97);
+    backdrop-filter: blur(22px) saturate(1.3);
+    -webkit-backdrop-filter: blur(22px) saturate(1.3);
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.07),
+      0 12px 32px rgba(0, 0, 0, 0.14);
+    animation: rise 140ms ease-out;
+  }
+  .item .lmenu button {
+    height: 30px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 400;
+    text-align: left;
+  }
+  .item .lmenu button:hover {
+    background: var(--accent);
+    color: var(--white);
+  }
+  .item.on {
+    background: var(--accent-tint);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .item svg {
+    width: 16px;
+    height: 16px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    opacity: 0.8;
+  }
+  .item.on svg {
+    opacity: 1;
+  }
+  .item .label {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .item .n {
+    min-width: 20px;
+    margin-left: auto;
+    color: var(--ink-3);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+  }
+  .item.on .n {
+    color: var(--accent);
+    opacity: 0.72;
+  }
+  .item .n.hot {
+    min-width: 20px;
+    padding: 1px 7px;
+    border-radius: 999px;
+    background: var(--accent);
+    color: var(--white);
+    font-size: 11px;
+    font-weight: 650;
+  }
+  .item.on .n.hot {
+    color: var(--white);
+    opacity: 1;
+  }
+
+  /* Per-list overflow menu, revealed on hover or keyboard focus. The count moves
+     out of the way rather than sitting behind it. */
+  .item .more {
+    width: 22px;
+    height: 22px;
+    margin-left: auto;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.14s ease,
+      background 0.14s ease;
+  }
+  .item .more svg {
+    width: 14px;
+    height: 14px;
+    stroke-width: 2;
+  }
+  .item:hover .more,
+  .item .more:focus-visible,
+  .item .more[data-open="true"] {
+    opacity: 1;
+  }
+  .item .more:hover {
+    background: rgba(0, 0, 0, 0.06);
+  }
+  /* The count yields to the overflow menu on hover. Scoped with `:has` to rows
+     that HAVE one — the fixed views do not, and hiding their count on hover
+     would just make it flicker. */
+  .item:has(.more):hover .n:not(.hot) {
+    display: none;
+  }
+
+  .side-label {
+    padding: 27px 10px 8px;
+    color: var(--ink-3);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.045em;
+  }
+  .swatch {
+    width: 8px;
+    height: 8px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: #3a3a3c;
+  }
+  .side-foot {
+    margin-top: auto;
+    padding: 13px 10px 9px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  /*
+   * A drawn monogram, not a photo.
+   *
+   * The prototype points at ../../niuzj-blog/public/images/avatar-day.webp —
+   * a path outside this repository, which would 404 in the app.
+   */
+  .avatar {
+    width: 30px;
+    height: 30px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: #d1d1d6;
+    color: var(--white);
+    font-size: 12px;
+    font-weight: 650;
+    box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+  }
+  .side-foot .name {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    color: var(--ink-2);
+    font-size: 13px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .side-foot .gear {
+    width: 26px;
+    height: 26px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border-radius: 7px;
+    color: var(--ink-3);
+    transition:
+      background 0.14s ease,
+      color 0.14s ease;
+  }
+  .side-foot .gear:hover {
+    background: rgba(0, 0, 0, 0.05);
+    color: var(--ink-2);
+  }
+  .side-foot .gear svg {
+    width: 15px;
+    height: 15px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+  }
+
+  /* Inline "new list" form. A sheet would be too much furniture for two fields. */
+  .nlform {
+    margin: 4px 0 2px;
+    padding: 11px 11px 12px;
+    border: 0.5px solid rgba(0, 0, 0, 0.06);
+    border-radius: 12px;
+    background: var(--card);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.03),
+      0 6px 18px rgba(0, 0, 0, 0.05);
+  }
+  .nlform input {
+    width: 100%;
+    height: 30px;
+    padding: 0 9px;
+    border: 1px solid rgba(0, 0, 0, 0.1);
+    border-radius: 8px;
+    outline: 0;
+    background: var(--white);
+    font-size: 13px;
+    transition:
+      border-color 0.12s ease,
+      box-shadow 0.12s ease;
+  }
+  .nlform input::placeholder {
+    color: var(--ink-3);
+  }
+  .nlform input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+  }
+  .nlform input + input {
+    margin-top: 7px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+  }
+  .nlform .dots {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .nlform .dot {
+    width: 16px;
+    height: 16px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    cursor: pointer;
+  }
+  .nlform .dot i {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: currentColor;
+    transition: transform 0.14s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .nlform .dot[aria-pressed="true"] {
+    box-shadow: 0 0 0 1.5px currentColor;
+  }
+  .nlform .dot[aria-pressed="true"] i {
+    transform: scale(0.72);
+  }
+  .nlform .acts {
+    margin-top: 11px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+  .nlform .err {
+    margin-top: 8px;
+    color: var(--color-bad);
+    font-size: 11.5px;
+    line-height: 1.45;
+  }
+
+  /* ══ Task pane ══════════════════════════════════════════════ */
+
+  .main {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+  }
+  .main-in {
+    max-width: 724px;
+    margin: 0 auto;
+    padding: 54px 36px 96px;
+  }
+  .main-in h1 {
+    font-size: 34px;
+    line-height: 1.1;
+    font-weight: 700;
+    letter-spacing: -0.04em;
+  }
+  .sub {
+    margin-top: 7px;
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+
+  .qadd {
+    width: 100%;
+    height: 54px;
+    margin-top: 29px;
+    padding: 0 16px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    border: 0.5px solid rgba(0, 0, 0, 0.035);
+    border-radius: 15px;
+    background: var(--card);
+    color: var(--ink-3);
+    cursor: text;
+    font-size: 14px;
+    text-align: left;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.025),
+      0 9px 28px rgba(0, 0, 0, 0.035);
+    transition:
+      box-shadow 0.22s cubic-bezier(0.2, 0.8, 0.2, 1),
+      transform 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .qadd:hover {
+    transform: translateY(-1px);
+    box-shadow:
+      0 2px 4px rgba(0, 0, 0, 0.04),
+      0 13px 34px rgba(0, 0, 0, 0.05);
+  }
+  .qadd:active {
+    transform: scale(0.995);
+  }
+  /* Open for typing: the lift is dropped so the field reads as anchored. */
+  .qadd.open,
+  .qadd.open:hover {
+    transform: none;
+    border-color: var(--accent-line);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.025),
+      0 9px 28px rgba(0, 0, 0, 0.035),
+      0 0 0 3px rgba(0, 122, 255, 0.1);
+  }
+  .qadd .pl {
+    width: 24px;
+    height: 24px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    background: var(--accent);
+  }
+  .qadd .pl svg {
+    width: 11px;
+    height: 11px;
+    fill: none;
+    stroke: var(--white);
+    stroke-width: 2.2;
+  }
+  .qadd input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--ink);
+    font-size: 14.5px;
+  }
+  .qadd input::placeholder {
+    color: var(--ink-3);
+  }
+
+  .glabel {
+    margin: 32px 5px 10px;
+    display: flex;
+    align-items: baseline;
+    gap: 7px;
+    color: var(--ink-2);
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .glabel.attention {
+    color: var(--accent);
+  }
+  .glabel .gn {
+    color: var(--ink-3);
+    font-size: 11.5px;
+    font-weight: 500;
+  }
+  /* The 已完成 label is a disclosure control, so it gets a button's affordances
+     without a button's box. */
+  .glabel.toggle {
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    font: inherit;
+    font-weight: 600;
+  }
+  .glabel .caret {
+    width: 9px;
+    height: 9px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.4;
+    opacity: 0.55;
+    transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .glabel[aria-expanded="true"] .caret {
+    transform: rotate(90deg);
+  }
+
+  /*
+   * Group card.
+   *
+   * Named `.tgroup`, not the prototype's `.group`: Tailwind v4 uses a bare
+   * `group` class as the marker for `group-*` variants, and a plain `.group`
+   * rule in the same stylesheet would silently give any future
+   * `class="group"` element an 18px white card. Every other class name here is
+   * the prototype's.
+   */
+  .tgroup {
+    overflow: hidden;
+    border: 0.5px solid rgba(0, 0, 0, 0.035);
+    border-radius: 18px;
+    background: var(--card);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.025),
+      0 8px 26px rgba(0, 0, 0, 0.028);
+  }
+  .tgroup.priority {
+    border-color: var(--accent-line);
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.025),
+      0 11px 32px rgba(0, 122, 255, 0.055);
+  }
+
+  .row {
+    min-height: 62px;
+    padding: 11px 17px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 13px;
+    transition: background 0.18s ease;
+  }
+  .row:hover {
+    background: rgba(118, 118, 128, 0.055);
+  }
+  .row + .row::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 48px;
+    right: 0;
+    height: 0.5px;
+    background: var(--line);
+  }
+
+  .ring {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1.5px solid #b8b8bd;
+    border-radius: 50%;
+    background: transparent;
+    cursor: pointer;
+    transition: border-color 0.12s ease;
+  }
+  .row:hover .ring:not(:disabled) {
+    border-color: var(--accent);
+  }
+  .ring:disabled {
+    cursor: default;
+    opacity: 0.55;
+  }
+  .row.done .ring {
+    border-color: var(--black);
+    background: var(--black);
+  }
+  .row.done .ring svg {
+    width: 10px;
+    height: 10px;
+    fill: none;
+    stroke: var(--white);
+    stroke-width: 2.6;
+  }
+
+  .grow {
+    flex: 1;
+    min-width: 0;
+  }
+  .tt {
+    font-size: 14.5px;
+    line-height: 1.45;
+  }
+  .row.done .tt {
+    color: var(--ink-3);
+    text-decoration: line-through;
+    text-decoration-color: #c7c7cc;
+  }
+  /*
+   * `line-height: normal` is not redundant here.
+   *
+   * The prototype has no CSS reset, so this line inherits the UA default and
+   * computes a 17px box. Tailwind's preflight sets `line-height: 1.5` on `html`,
+   * which turns the same 12.5px text into 18.75px and makes every two-line task
+   * row 2px taller than the reference.
+   */
+  .mm {
+    margin-top: 2px;
+    color: var(--ink-2);
+    font-size: 12.5px;
+    line-height: normal;
+  }
+  .mm.attention {
+    color: var(--accent);
+  }
+  .repo {
+    color: var(--ink-3);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    white-space: nowrap;
+  }
+  .st {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: var(--ink-2);
+    font-size: 12px;
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .st i {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #8e8e93;
+  }
+  .st.run {
+    color: var(--accent);
+  }
+  .st.run i {
+    background: var(--accent);
+    animation: pulse 1.4s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    50% {
+      opacity: 0.22;
+    }
+  }
+
+  /*
+   * Row action pill.
+   *
+   * `inline-flex` is load-bearing, not cosmetic: this class lands on a `<button>`
+   * for 派发 and 取消 but on an `<a>` for 看结果 and 查看, and an anchor is
+   * `display: inline` by default — which ignores `height` outright and will not
+   * centre its own label. Left as-is, two pills that are meant to be identical
+   * render at different heights depending on which element they happen to be.
+   */
+  .act {
+    height: 32px;
+    padding: 0 16px;
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 0;
+    border-radius: 999px;
+    background: var(--fill);
+    color: var(--ink);
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    text-decoration: none;
+    opacity: 0;
+    transition:
+      opacity 0.18s ease,
+      background 0.18s ease,
+      transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .act:hover {
+    background: var(--fill-hover);
+  }
+  .act:active {
+    transform: scale(0.96);
+    opacity: 0.82;
+  }
+  /*
+   * `:focus-within` is not in the prototype and is not optional: an action that
+   * appears only on pointer hover is unreachable by keyboard.
+   *
+   * `:not(.ghost)` on the needs-row clause is the point of the third selector.
+   * A 需要你 row shows its PRIMARY action without hovering, because it is waiting
+   * on a person — but that is one button, not every button. Without the exclusion
+   * the delete × was permanently visible on exactly the rows that already carry
+   * the most visual weight.
+   */
+  .row:hover .act,
+  .row:focus-within .act,
+  .row.needs .act:not(.ghost) {
+    opacity: 1;
+  }
+  .row.needs .act {
+    background: var(--accent);
+    color: var(--white);
+  }
+  .row.needs .act:hover {
+    background: var(--accent-pressed);
+  }
+  /*
+   * Delete. The quietest thing in the row, and it has to stay that way.
+   *
+   * The `.row.needs` selector is deliberately repeated: `.row.needs .act` is
+   * specificity (0,3,0) and beats a bare `.act.ghost` at (0,2,0), so on a 需要你
+   * row this button inherited the filled-blue treatment and rendered as a second
+   * primary action competing with 查看 — the opposite of what a ghost is for.
+   */
+  .act.ghost,
+  .row.needs .act.ghost {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    display: grid;
+    place-items: center;
+    background: transparent;
+    color: var(--ink-3);
+  }
+  .act.ghost svg {
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+  }
+  /* Same specificity trap as the base rule above: `.row.needs .act:hover` is
+     (0,4,0), so the ghost's own hover has to be qualified to match it. */
+  .act.ghost:hover,
+  .row.needs .act.ghost:hover {
+    background: var(--fill-hover);
+    color: var(--color-bad);
+  }
+
+  /* Empty view. One quiet line — an illustration would overstate the moment. */
+  .gempty {
+    padding: 64px 20px;
+    color: var(--ink-3);
+    font-size: 13.5px;
+    text-align: center;
+  }
+
+  /* ══ Chat pane ══════════════════════════════════════════════ */
+
+  .chat {
+    width: 360px;
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    border-left: 1px solid rgba(0, 0, 0, 0.055);
+    background: rgba(255, 255, 255, 0.78);
+    backdrop-filter: blur(28px) saturate(1.35);
+    -webkit-backdrop-filter: blur(28px) saturate(1.35);
+    box-shadow: inset 0.5px 0 0 rgba(255, 255, 255, 0.7);
+  }
+  .chead {
+    padding: 25px 20px 17px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    border-bottom: 0.5px solid var(--line);
+  }
+  .chead .face {
+    width: 46px;
+    height: 46px;
+    position: relative;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    border: 0.5px solid rgba(0, 0, 0, 0.07);
+    background: rgba(255, 255, 255, 0.86);
+    box-shadow:
+      inset 0 0.5px 0 rgba(255, 255, 255, 0.95),
+      0 1px 3px rgba(0, 0, 0, 0.07),
+      0 9px 24px rgba(0, 0, 0, 0.07);
+  }
+  .chead .face::before {
+    content: "";
+    width: 20px;
+    height: 20px;
+    background: var(--accent);
+    clip-path: polygon(50% 0%, 61% 37%, 100% 50%, 61% 63%, 50% 100%, 39% 63%, 0% 50%, 39% 37%);
+  }
+  .chead .face::after {
+    content: "";
+    width: 7px;
+    height: 7px;
+    position: absolute;
+    top: 9px;
+    right: 8px;
+    background: #8e8e93;
+    clip-path: polygon(50% 0%, 61% 37%, 100% 50%, 61% 63%, 50% 100%, 39% 63%, 0% 50%, 39% 37%);
+  }
+  .chead .t {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: 600;
+  }
+  .chead .t i {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: #636366;
+  }
+  .chead .s {
+    color: var(--ink-3);
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .cbody {
+    flex: 1;
+    overflow-y: auto;
+    padding: 21px 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+  }
+  .stamp {
+    margin: 6px 0 10px;
+    color: var(--ink-3);
+    font-size: 10.5px;
+    text-align: center;
+  }
+  .m {
+    max-width: 86%;
+    margin-bottom: 10px;
+    padding: 9px 14px;
+    font-size: 13.5px;
+    line-height: 1.55;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .m.u {
+    align-self: flex-end;
+    border-radius: 18px 18px 5px 18px;
+    background: var(--accent);
+    color: var(--white);
+  }
+  .m.a {
+    align-self: flex-start;
+    border-radius: 18px 18px 18px 5px;
+    background: #e9e9eb;
+    color: var(--ink);
+  }
+  /* Waiting for the main agent (M4). Centred rather than a bubble, so it reads as
+     the pane's state and not as something an agent said. */
+  .cempty {
+    margin: auto;
+    padding: 0 18px;
+    color: var(--ink-3);
+    font-size: 12.5px;
+    line-height: 1.6;
+    text-align: center;
+  }
+  .cinput-wrap {
+    padding: 11px 16px 20px;
+  }
+  .cinput {
+    height: 44px;
+    padding: 0 6px 0 16px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1px solid rgba(0, 0, 0, 0.11);
+    border-radius: 999px;
+    background: var(--card);
+    transition:
+      border-color 0.12s ease,
+      box-shadow 0.12s ease;
+  }
+  .cinput:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+  }
+  .cinput input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    font-size: 13.5px;
+  }
+  .cinput input::placeholder {
+    color: var(--ink-3);
+  }
+  .cinput .send {
+    width: 32px;
+    height: 32px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+    transition:
+      transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
+      opacity 0.18s ease;
+  }
+  .cinput .send:active {
+    transform: scale(0.92);
+    opacity: 0.78;
+  }
+  .cinput .send:hover {
+    background: var(--accent-pressed);
+  }
+  .cinput .send svg {
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: var(--white);
+    stroke-width: 2.4;
+  }
+  /* Disabled until M4 wires the main agent. Stated plainly rather than hidden:
+     the pane is the product's promise, and an empty space would not say so. */
+  .cinput.off {
+    opacity: 0.6;
+  }
+  .cinput.off .send {
+    background: #c7c7cc;
+    cursor: not-allowed;
+  }
+
+  /* ══ Toast ══════════════════════════════════════════════════
+     Refusals from the engine (409 repo busy, 400 no repo) land here. Bottom
+     centre, above the task pane, so it does not cover the row it is about. */
+  .toast {
+    position: fixed;
+    left: 50%;
+    bottom: 28px;
+    z-index: 50;
+    max-width: 460px;
+    padding: 11px 16px;
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    transform: translateX(-50%);
+    border: 0.5px solid rgba(0, 0, 0, 0.06);
+    border-radius: 13px;
+    background: rgba(255, 255, 255, 0.94);
+    backdrop-filter: blur(22px) saturate(1.3);
+    -webkit-backdrop-filter: blur(22px) saturate(1.3);
+    color: var(--ink);
+    font-size: 13px;
+    line-height: 1.5;
+    box-shadow:
+      0 1px 3px rgba(0, 0, 0, 0.06),
+      0 14px 40px rgba(0, 0, 0, 0.14);
+    animation: toast-in 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .toast .x {
+    margin: -2px -4px 0 0;
+    border: 0;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    font-size: 15px;
+    line-height: 1;
+  }
+  @keyframes toast-in {
+    from {
+      opacity: 0;
+      transform: translate(-50%, 8px);
+    }
+  }
+
+  /* ══ Secondary pages ════════════════════════════════════════
+     `/runs` and `/team` are not the three-pane surface; they opt into the flex
+     body as a single scrolling column. */
+  .page {
+    flex: 1;
+    min-width: 0;
+    overflow-y: auto;
+  }
+  /* No top padding: both pages already set their own `pt-*`, and adding to it
+     here would push their headers down by twice what they asked for. */
+  .page-in {
+    max-width: 940px;
+    margin: 0 auto;
+    padding: 0 28px 80px;
+  }
+  .backlink {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 18px;
+    color: var(--ink-2);
+    font-size: 13px;
+  }
+  .backlink:hover {
+    color: var(--ink);
+  }
+  .backlink svg {
+    width: 13px;
+    height: 13px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2;
+  }
+
+  /* ── Retained atoms (Tailwind-based pages) ──────────────────
+     Unchanged in shape; they now inherit the Apple palette through @theme. */
+  .card {
+    background: var(--white);
+    border: 0.5px solid rgba(0, 0, 0, 0.055);
+    border-radius: 14px;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.025),
+      0 8px 26px rgba(0, 0, 0, 0.028);
+  }
   .card-hover {
-    background: var(--color-bg);
-    border: 1px solid var(--color-line);
-    border-radius: var(--radius);
-    box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.04);
+    background: var(--white);
+    border: 0.5px solid rgba(0, 0, 0, 0.055);
+    border-radius: 14px;
+    box-shadow:
+      0 1px 2px rgba(0, 0, 0, 0.025),
+      0 8px 26px rgba(0, 0, 0, 0.028);
     transition:
       border-color 120ms ease,
       box-shadow 120ms ease,
-      background-color 120ms ease;
+      transform 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
   .card-hover:hover {
-    border-color: var(--color-line-strong);
-    box-shadow: 0 2px 8px -2px rgb(0 0 0 / 0.08);
+    transform: translateY(-1px);
+    box-shadow:
+      0 2px 4px rgba(0, 0, 0, 0.04),
+      0 13px 34px rgba(0, 0, 0, 0.05);
   }
-
-  /* Panel: bordered, not floating. Rails, headers, inline rows. */
   .panel {
-    background: var(--color-bg);
-    border: 1px solid var(--color-line);
-    border-radius: var(--radius);
+    background: var(--white);
+    border: 0.5px solid rgba(0, 0, 0, 0.055);
+    border-radius: 14px;
   }
-
-  /* Recessed area for transcripts, diffs, code. */
   .inset {
     background: var(--color-surface);
-    border: 1px solid var(--color-line);
-    border-radius: var(--radius);
+    border: 0.5px solid var(--line);
+    border-radius: 12px;
   }
 
-  /* ── Buttons ────────────────────────────────────────────────
-     Medium weight, small radius, hairline border. The pressed state is a 1px
-     nudge — enough to feel, not enough to shift layout. */
   .btn {
     display: inline-flex;
     align-items: center;
     justify-content: center;
     gap: 0.375rem;
-    height: 2rem;
-    padding-inline: 0.75rem;
-    font-size: 0.8125rem;
-    font-weight: 500;
+    height: 32px;
+    padding-inline: 14px;
+    font-size: 13px;
+    font-weight: 600;
     white-space: nowrap;
-    border-radius: var(--radius-sm);
-    border: 1px solid var(--color-line);
-    background: var(--color-bg);
+    border-radius: 999px;
+    border: 0;
+    background: var(--fill);
+    color: var(--ink);
     transition:
-      background-color 120ms ease,
-      border-color 120ms ease,
-      transform 60ms ease;
+      background 0.18s ease,
+      transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
+      opacity 0.18s ease;
   }
   .btn:hover:not(:disabled) {
-    background: var(--color-surface-2);
-    border-color: var(--color-line-strong);
+    background: var(--fill-hover);
   }
   .btn:active:not(:disabled) {
-    transform: translateY(1px);
+    transform: scale(0.96);
+    opacity: 0.82;
   }
   .btn:disabled {
-    opacity: 0.5;
+    opacity: 0.45;
     cursor: not-allowed;
   }
-
   .btn-primary {
-    background: var(--color-accent);
-    color: var(--color-accent-fg);
-    border-color: transparent;
+    background: var(--accent);
+    color: var(--white);
   }
   .btn-primary:hover:not(:disabled) {
-    background: color-mix(in oklab, var(--color-accent) 88%, black);
-    border-color: transparent;
+    background: var(--accent-pressed);
   }
-
   .btn-danger {
-    background: var(--color-bg);
+    background: var(--color-bad-soft);
     color: var(--color-bad);
-    border-color: color-mix(in oklab, var(--color-bad) 30%, var(--color-line));
   }
   .btn-danger:hover:not(:disabled) {
-    background: var(--color-bad-soft);
-    border-color: var(--color-bad);
+    background: color-mix(in oklab, var(--color-bad) 16%, white);
   }
-
-  /* Borderless, for tertiary actions where a full box would be noise. */
   .btn-ghost {
-    border-color: transparent;
     background: transparent;
   }
   .btn-ghost:hover:not(:disabled) {
-    background: var(--color-surface-2);
-    border-color: transparent;
+    background: var(--fill);
   }
-
   .btn-sm {
-    height: 1.625rem;
-    padding-inline: 0.5rem;
-    font-size: 0.75rem;
+    height: 27px;
+    padding-inline: 11px;
+    font-size: 12px;
     gap: 0.25rem;
   }
-
-  /* Square icon button, for rail and header affordances. */
   .btn-icon {
-    width: 2rem;
+    width: 32px;
     padding-inline: 0;
     flex-shrink: 0;
   }
   .btn-icon.btn-sm {
-    width: 1.625rem;
+    width: 27px;
   }
 
-  /* ── Inputs ─────────────────────────────────────────────────── */
   .field {
     width: 100%;
-    background: var(--color-bg);
-    border: 1px solid var(--color-line);
-    border-radius: var(--radius-sm);
-    padding: 0.4375rem 0.625rem;
+    background: var(--white);
+    border: 1px solid rgba(0, 0, 0, 0.11);
+    border-radius: 10px;
+    padding: 0.4375rem 0.6875rem;
     transition:
-      border-color 120ms ease,
-      box-shadow 120ms ease;
+      border-color 0.12s ease,
+      box-shadow 0.12s ease;
   }
   .field::placeholder {
-    color: var(--color-subtle-fg);
+    color: var(--ink-3);
   }
   .field:focus {
     outline: none;
-    border-color: var(--color-accent);
-    /* A soft ring rather than a hard outline, so a focused field reads as active
-       without the surrounding layout appearing to jump. */
-    box-shadow: 0 0 0 3px color-mix(in oklab, var(--color-accent) 15%, transparent);
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
   }
   .field:disabled {
     background: var(--color-surface);
-    color: var(--color-muted-fg);
+    color: var(--ink-2);
     cursor: not-allowed;
   }
-
   select.field {
     appearance: none;
     padding-right: 1.75rem;
@@ -301,109 +1384,93 @@
     background-repeat: no-repeat;
   }
 
-  /* ── Tags ───────────────────────────────────────────────────
-     Soft tinted fill, no border. Meaning comes from a low-chroma wash plus the
-     saturated text colour on top of it. */
   .tag {
     display: inline-flex;
     align-items: center;
     gap: 0.25rem;
-    padding: 0.0625rem 0.375rem;
-    font-size: 0.6875rem;
+    padding: 0.0625rem 0.4375rem;
+    font-size: 11px;
     font-weight: 500;
-    line-height: 1.5;
+    line-height: 1.6;
     white-space: nowrap;
-    border-radius: 0.25rem;
-    background: var(--color-muted);
-    color: var(--color-muted-fg);
+    border-radius: 999px;
+    background: var(--fill);
+    color: var(--ink-2);
   }
 
-  /* ── Typography ─────────────────────────────────────────────── */
   .t-hero {
-    font-size: 1.5rem;
-    font-weight: 600;
-    letter-spacing: -0.021em;
-    line-height: 1.2;
+    font-size: 26px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.15;
   }
   .t-lg {
-    font-size: 1.125rem;
-    font-weight: 600;
-    letter-spacing: -0.017em;
+    font-size: 18px;
+    font-weight: 650;
+    letter-spacing: -0.022em;
   }
   .t-md {
-    font-size: 0.9375rem;
-    font-weight: 600;
-    letter-spacing: -0.011em;
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: -0.014em;
   }
-
-  /* Uppercase section label. Wide tracking is what makes it read as a label
-     rather than as shrunken body copy. */
   .t-label {
-    font-size: 0.6875rem;
+    font-size: 11px;
     font-weight: 600;
-    letter-spacing: 0.055em;
+    letter-spacing: 0.045em;
     text-transform: uppercase;
-    color: var(--color-muted-fg);
+    color: var(--ink-3);
   }
-
   .t-meta {
-    font-size: 0.78125rem;
-    color: var(--color-muted-fg);
+    font-size: 12.5px;
+    color: var(--ink-2);
   }
-
   .mono {
-    font-family: var(--font-mono);
-    font-size: 0.78125rem;
+    font-family: var(--mono);
+    font-size: 11.5px;
     line-height: 1.6;
     font-variant-ligatures: none;
   }
 
-  /* ── Chrome ─────────────────────────────────────────────────── */
   .app-header {
     display: flex;
     height: var(--h-header);
     flex-shrink: 0;
     align-items: center;
     gap: 0.625rem;
-    border-bottom: 1px solid var(--color-line);
+    border-bottom: 0.5px solid var(--line);
     padding-inline: 1rem;
   }
-
   .rule {
-    border-bottom: 1px solid var(--color-line);
+    border-bottom: 0.5px solid var(--line);
   }
-
   .divide-soft > * + * {
-    border-top: 1px solid var(--color-line);
+    border-top: 0.5px solid var(--line);
   }
-
-  /* Sidebar row. Active state is a filled surface, not a coloured bar — the
-     accent stays reserved for things that need action. */
   .nav-row {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     width: 100%;
-    padding: 0.3125rem 0.5rem;
-    border-radius: var(--radius-sm);
-    font-size: 0.8125rem;
-    color: var(--color-fg);
+    padding: 0.375rem 0.625rem;
+    border-radius: 9px;
+    font-size: 13px;
+    color: #3a3a3c;
     transition:
-      background-color 120ms ease,
-      color 120ms ease;
+      background 0.14s ease,
+      color 0.14s ease;
   }
   .nav-row:hover {
-    background: var(--color-surface-2);
+    background: rgba(0, 0, 0, 0.04);
   }
   .nav-row[data-active="true"] {
-    background: var(--color-surface-2);
-    font-weight: 550;
+    background: var(--accent-tint);
+    color: var(--accent);
+    font-weight: 600;
   }
 }
 
 @layer utilities {
-  /* Live indicator: a soft breath, not a hard blink. Several of these can be on
-     screen while agents run in parallel, so it must not be aggressive. */
   @keyframes pulse-soft {
     0%,
     100% {
@@ -431,7 +1498,6 @@
     animation: rise 180ms ease-out;
   }
 
-  /* Indeterminate progress for a phase that is running with no known total. */
   @keyframes slide {
     from {
       transform: translateX(-100%);
@@ -446,7 +1512,7 @@
     inset-block: 0;
     left: 0;
     width: 33%;
-    background: var(--color-accent);
+    background: var(--accent);
     border-radius: 9999px;
     animation: slide 1.4s ease-in-out infinite;
   }
@@ -454,24 +1520,107 @@
   .text-balance {
     text-wrap: balance;
   }
-
-  /* Fades the top edge of a scrolling transcript so cut-off text reads as
-     "there is more above" rather than as a hard crop. */
   .fade-top {
     mask-image: linear-gradient(to bottom, transparent, black 1.5rem);
   }
+}
 
-  @media (prefers-reduced-motion: reduce) {
-    .pulse,
-    .rise,
-    .indeterminate::after {
-      animation: none;
-    }
-    .btn,
-    .card-hover,
-    .field,
-    .nav-row {
-      transition: none;
-    }
+/**
+ * Responsive, from the prototype.
+ *
+ * Written outside a layer and last so these rules win over the component
+ * declarations above regardless of how Tailwind orders its layers.
+ */
+
+/* The chat pane is the first thing to go: the task list is the working surface. */
+@media (max-width: 1050px) {
+  .chat {
+    display: none;
+  }
+}
+
+/*
+ * Icon-only sidebar.
+ *
+ * One deliberate divergence from the prototype, which also carries
+ * `.item:not(.on) { display: none }` — that hides every unselected entry, so at
+ * this width three of the four views and every list become unreachable. The
+ * prototype is a static screenshot of one selected state; this is a nav that has
+ * to keep working, so all entries stay and only their labels collapse.
+ */
+@media (max-width: 720px) {
+  .side {
+    width: 68px;
+    padding-left: 9px;
+    padding-right: 9px;
+  }
+  .brand {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  .brand .t,
+  .item .label,
+  .item .n,
+  .item .more,
+  .side-label,
+  .side-foot .name {
+    display: none;
+  }
+  .item {
+    justify-content: center;
+    padding: 0;
+    gap: 0;
+  }
+  /* The hot badge survives as a bare dot: "needs you" is the one count that
+     still has to be visible when there is no room for a number. */
+  .item .n.hot {
+    display: block;
+    position: absolute;
+    min-width: 0;
+    width: 7px;
+    height: 7px;
+    margin: -13px 0 0 13px;
+    padding: 0;
+    overflow: hidden;
+    color: transparent;
+    font-size: 0;
+  }
+  .item {
+    position: relative;
+  }
+  .side-scroll {
+    margin-inline: -9px;
+    padding-inline: 9px;
+  }
+  .nlform {
+    display: none;
+  }
+  .side-foot {
+    justify-content: center;
+    padding-left: 0;
+    padding-right: 0;
+  }
+  .side-foot .gear {
+    display: none;
+  }
+  .main-in {
+    padding: 32px 17px 70px;
+  }
+  .page-in {
+    padding: 24px 17px 70px;
+  }
+  .repo,
+  .st {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
   }
 }
