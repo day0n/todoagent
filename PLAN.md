@@ -132,8 +132,8 @@ Store 已有 migrate 机制（`db/index.ts`），按既有模式加列/建表 + 
 |---|---|---|---|
 | M0 | 直派执行（任务→单 agent 直跑，无流水线）| 测试过 | ✅ `d45cb62` |
 | M1 | 数据模型迁移 + lists/tasks API | curl 全链路建单/建卡/查视图，测试过 | ✅ `8eb60bc` |
-| M2 | 前端三栏重做（照 v1d 原型，接 M1 API）| UI 与原型一致，增删勾选/派发/取消可用 | 📋 prompt: `plans/M2-web-ui.md` |
-| M3 | 执行反馈打磨 | 轮询→SSE、看结果抽屉（diff+transcript）、失败重派 | 待写 prompt |
+| M2 | 前端三栏重做（照 v1d 原型，接 M1 API）| UI 与原型一致，增删勾选/派发/取消可用 | ✅ `3e46360`…`dfd4bed`，452 测试全绿 |
+| M3 | 执行反馈打磨 + M2 遗留缺口 | SSE、看结果抽屉（diff+transcript）、失败重派、CORS/归档修复、任务改标题 | 📋 prompt: `plans/M3-run-feedback.md` |
 | M4 | 主 agent chat（pi 接入）| 说一句话 → 建卡出现在清单 + 关联提示 | 等 API key |
 | M5 | 需要你闭环 | 产出分类进 needs_you；回答 → resume 续跑 → 完成 | 等 M4 |
 | M6 | 打磨 | 空状态/快捷键/响应式/已完成折叠；e2e 更新 | 待写 prompt |
