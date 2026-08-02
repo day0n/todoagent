@@ -279,23 +279,68 @@ export function subscribeBoard(
 ): () => void {
   const source = new EventSource(`${ENGINE}/api/stream`);
 
+  /** Has this connection ever been up? Distinguishes a first open from a re-open. */
+  let everOpen = false;
+  /** Current believed state, so a transition is only acted on once. */
+  let healthy = false;
+
+  /**
+   * Called whenever the connection is observably alive.
+   *
+   * The RE-OPEN branch is the whole reason this is not a one-line `onHealth(true)`.
+   * EventSource reconnects by itself after an outage, but this channel has no
+   * replay — so every change announced while it was down is gone for good. Without
+   * a re-read on reconnect the page stayed stale until the 60s backstop poll
+   * happened to fire: measured at 65 seconds to notice a task created 3 seconds
+   * after the engine came back. The tab-hide path already did this; an automatic
+   * reconnect is the same problem arriving without a visibility event.
+   *
+   * Guarded on the unhealthy→healthy transition so it fires exactly once per
+   * outage, rather than on every frame that follows one.
+   */
+  const markHealthy = (): void => {
+    if (healthy) return;
+    healthy = true;
+    onHealth?.(true);
+    if (everOpen) onChange();
+    everOpen = true;
+  };
+
   source.onmessage = (e: MessageEvent<string>) => {
     // Any frame at all proves the connection is live. `onopen` should have said so
     // already, but a browser that delivers data before firing it would otherwise
     // leave the caller polling at the fallback rate over a working stream.
-    onHealth?.(true);
+    markHealthy();
     try {
       const ev = JSON.parse(e.data) as { type?: string };
       if (ev.type === "board:changed") onChange();
-      // `stream:ready` needs no action: its only job is to start the response body
-      // so the browser fires `onopen`.
+      // `stream:ready` needs no action beyond the health signal above: its only job
+      // is to start the response body so the browser fires `onopen`.
     } catch {
       /* a malformed frame must not kill the stream */
     }
   };
 
-  source.onopen = () => onHealth?.(true);
-  source.onerror = () => onHealth?.(false);
+  source.onopen = markHealthy;
+
+  /**
+   * The mirror of `markHealthy`, and guarded for the same reason.
+   *
+   * A retrying EventSource fires `onerror` on every failed attempt, so an
+   * unguarded version reported `false` several times per outage. React's state
+   * setter happens to bail out when the value is identical, which is why this was
+   * harmless in practice — but that makes the contract depend on a detail of the
+   * one current caller. Reporting transitions only is what the name `onHealth`
+   * already implies.
+   *
+   * An error arriving before any successful open reports nothing, which is correct:
+   * the caller starts out assuming no stream, so nothing has changed.
+   */
+  source.onerror = () => {
+    if (!healthy) return;
+    healthy = false;
+    onHealth?.(false);
+  };
 
   return () => source.close();
 }
