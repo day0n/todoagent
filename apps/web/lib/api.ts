@@ -197,10 +197,7 @@ export const api = {
    * holding the repository lock, this card already running). The caller has to
    * await the answer and show it.
    */
-  runTask: (
-    taskId: string,
-    opts: { budgetTokens?: number; soloMode?: boolean; autoApprovePlan?: boolean } = {},
-  ) =>
+  runTask: (taskId: string, opts: { budgetTokens?: number } = {}) =>
     req<{ run: Run; task: Task }>(`/api/tasks/${taskId}/run`, {
       method: "POST",
       body: JSON.stringify(opts),

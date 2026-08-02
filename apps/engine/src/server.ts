@@ -13,10 +13,11 @@ import {
   detectAll,
   isGitRepo,
   resolveEscalationAndContinue,
+  runDirect,
   runPipeline,
   type BusEvent,
 } from "@todoagent/core";
-import { EXPERT_ROLES, RUNTIME_KINDS, type Run } from "@todoagent/core/types";
+import { EXPERT_ROLES, RUNTIME_KINDS, type Expert, type Run } from "@todoagent/core/types";
 
 const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());
@@ -1055,17 +1056,16 @@ app.patch("/api/tasks/:id", async (c) => {
 
 const TaskRunBody = z.object({
   budgetTokens: z.number().int().min(0).max(200_000_000).default(2_000_000),
-  soloMode: z.boolean().default(false),
-  autoApprovePlan: z.boolean().default(false),
 });
 
 /**
- * Starts a pipeline run for a board card.
+ * Dispatches a board card to one agent, directly.
  *
- * This is the seam between the two halves of the product: chat and the board are
- * where work is described, the pipeline is what does it. `task.run_id` existed in
- * the schema from the start and nothing ever set it, so the board was decorative
- * — cards could be moved by hand but never executed.
+ * The todoagent default path: no decomposition, no cross-review, no
+ * verification. The card's assigned expert (or the first expert on file) gets
+ * the task text and works in the repository itself; the card's status then
+ * tracks the run's outcome. The six-phase pipeline still exists behind
+ * `POST /api/runs` for a future deep mode.
  */
 app.post("/api/tasks/:id/run", async (c) => {
   const task = store.getTask(c.req.param("id"));
@@ -1078,11 +1078,9 @@ app.post("/api/tasks/:id/run", async (c) => {
   if (!channel) return c.json({ error: "the card's channel is gone" }, 409);
 
   /*
-   * A channel with no repository cannot execute anything.
-   *
-   * Refused rather than attempted: the pipeline isolates each subtask in a git
-   * worktree, so with no repo every run fails at the first step. The composer
-   * already says this when the card is created; this is the enforcement.
+   * A channel with no repository cannot execute anything: the agent needs a
+   * working directory. The composer already says this when the card is
+   * created; this is the enforcement.
    */
   if (channel.projectId === null) {
     return c.json(
@@ -1126,6 +1124,20 @@ app.post("/api/tasks/:id/run", async (c) => {
   const source = task.sourceMessageId === null ? null : store.getMessage(task.sourceMessageId);
   const goal = source !== null && source.body.trim() !== "" ? source.body : task.title;
 
+  /*
+   * Who executes: the card's assignee when it is an expert, otherwise the
+   * first expert on file. Resolved BEFORE the run row exists, so a board with
+   * no experts refuses cleanly instead of creating a run that can only fail.
+   */
+  const assigned =
+    task.assigneeKind === "expert" && task.assigneeId !== null
+      ? store.getExpert(task.assigneeId)
+      : null;
+  const expert = assigned ?? store.listExperts()[0] ?? null;
+  if (expert === null) {
+    return c.json({ error: "没有可用的 agent。先运行 pnpm seed 或在团队页创建一个专家。" }, 400);
+  }
+
   // One transaction: a run whose card was never updated would execute with
   // nothing on the board pointing at it.
   const run = store.tx(() => {
@@ -1134,13 +1146,18 @@ app.post("/api/tasks/:id/run", async (c) => {
       goal,
       acceptance: null,
       budgetTokens: parsed.data.budgetTokens,
-      soloMode: parsed.data.soloMode,
+      soloMode: true,
     });
-    store.updateTask(task.id, { runId: created.id, status: "in_progress" });
+    store.updateTask(task.id, {
+      runId: created.id,
+      status: "in_progress",
+      assigneeKind: "expert",
+      assigneeId: expert.id,
+    });
     return created;
   });
 
-  launch(run.id, parsed.data.autoApprovePlan);
+  launchDirect(run.id, expert);
   return c.json({ run, task: store.getTask(task.id) }, 201);
 });
 
@@ -1176,6 +1193,32 @@ function syncTaskFromRun(runId: string): void {
   // in_progress, and a gate is surfaced on the run page rather than the board.
   if (next === null || task.status === next) return;
   store.updateTask(task.id, { status: next });
+}
+
+/**
+ * Direct dispatch driver. Same lifecycle contract as `launch`: registered in
+ * `active` so cancel and shutdown reach it, and the card is synced in
+ * `finally` so a crash moves it too.
+ */
+function launchDirect(runId: string, expert: Expert): void {
+  const controller = new AbortController();
+  active.set(runId, controller);
+  void runDirect({ store, runId, expert, signal: controller.signal })
+    .then((res) => {
+      console.log(`[run ${runId}] ${res.status}${res.error ? `: ${res.error}` : ""}`);
+    })
+    .catch((err: unknown) => {
+      console.error(`[run ${runId}] crashed:`, err);
+      store.updateRun(runId, {
+        status: "failed",
+        error: err instanceof Error ? err.message : String(err),
+        endedAt: new Date().toISOString(),
+      });
+    })
+    .finally(() => {
+      active.delete(runId);
+      syncTaskFromRun(runId);
+    });
 }
 
 function launch(runId: string, autoApprovePlan: boolean): void {

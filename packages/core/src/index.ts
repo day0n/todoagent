@@ -25,6 +25,7 @@ export {
   type RosterEntry,
   type StagedTask,
 } from "./orchestrator/pipeline.ts";
+export { runDirect, type DirectRunOptions, type DirectRunResult } from "./orchestrator/direct.ts";
 export {
   MAX_AGENT_CHAIN,
   REPLY_IDLE_MS,

@@ -32,4 +32,5 @@ export {
   type RosterEntry,
   type StagedTask,
 } from "./pipeline.ts";
+export { runDirect, type DirectRunOptions, type DirectRunResult } from "./direct.ts";
 export { extractJson, repairPrompt, tryParse } from "./structured.ts";
