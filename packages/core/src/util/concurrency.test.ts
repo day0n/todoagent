@@ -372,8 +372,8 @@ test("Semaphore: accounting stays honest under load", async () => {
 // ── defaultConcurrency ──────────────────────────────────────
 
 test("defaultConcurrency: stays inside a sane range", () => {
-  const original = process.env["COUNCIL_MAX_CONCURRENT_AGENTS"];
-  delete process.env["COUNCIL_MAX_CONCURRENT_AGENTS"];
+  const original = process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"];
+  delete process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"];
   try {
     const n = defaultConcurrency();
     // Small on purpose: each unit is a full CLI process on the user's own
@@ -381,24 +381,24 @@ test("defaultConcurrency: stays inside a sane range", () => {
     assert.ok(n >= 2 && n <= 6, `default was ${n}, outside 2..6`);
     assert.equal(Number.isInteger(n), true);
   } finally {
-    if (original !== undefined) process.env["COUNCIL_MAX_CONCURRENT_AGENTS"] = original;
+    if (original !== undefined) process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"] = original;
   }
 });
 
 test("defaultConcurrency: an env override wins", () => {
-  const original = process.env["COUNCIL_MAX_CONCURRENT_AGENTS"];
+  const original = process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"];
   try {
-    process.env["COUNCIL_MAX_CONCURRENT_AGENTS"] = "12";
+    process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"] = "12";
     assert.equal(defaultConcurrency(), 12, "an operator with a big machine can raise it");
 
     // Nonsense values fall back rather than producing 0 or NaN workers.
     for (const bad of ["0", "-3", "abc", ""]) {
-      process.env["COUNCIL_MAX_CONCURRENT_AGENTS"] = bad;
+      process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"] = bad;
       const n = defaultConcurrency();
       assert.ok(n >= 2 && n <= 6, `${JSON.stringify(bad)} produced ${n}`);
     }
   } finally {
-    if (original === undefined) delete process.env["COUNCIL_MAX_CONCURRENT_AGENTS"];
-    else process.env["COUNCIL_MAX_CONCURRENT_AGENTS"] = original;
+    if (original === undefined) delete process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"];
+    else process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"] = original;
   }
 });

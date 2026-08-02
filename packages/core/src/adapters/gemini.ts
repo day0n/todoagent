@@ -47,7 +47,7 @@ function buildArgs(prompt: string, opts: ExecOptions): string[] {
  *
  * NOT verified against a live run — this machine has `gemini` on PATH but the
  * adapter was written from the Qwen Code protocol Multica documents. Treat the
- * event names as provisional: `council doctor --probe gemini` captures a real
+ * event names as provisional: `todoagent doctor --probe gemini` captures a real
  * transcript so the mapping can be corrected against it.
  */
 export function parseGeminiLine(line: string, ctx: LineContext): AgentEvent[] | null {

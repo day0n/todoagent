@@ -27,7 +27,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "Council",
+  title: "TodoAgent",
   description:
     "把本地的 Claude / Codex / Cursor / Kiro / Grok 组成一支有分工、会互相挑错的专家团队。",
 };

@@ -135,7 +135,7 @@ async function fixture(
   mode: "echo" | "mention" | "empty" | "fail" | "pingpong" = "echo",
   mentionName = "",
 ): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "council-chat-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-chat-"));
   const binDir = join(root, "bin");
   await mkdir(binDir, { recursive: true });
 

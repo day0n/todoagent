@@ -87,7 +87,7 @@ async function main(): Promise<void> {
   const args = process.argv.slice(2);
   const repoArg = args.find((a) => !a.startsWith("--"));
   const repoPath = repoArg ?? process.cwd();
-  const teamName = valueOf(args, "--team") ?? "Council";
+  const teamName = valueOf(args, "--team") ?? "TodoAgent";
   const projectName = valueOf(args, "--project") ?? repoPath.split("/").filter(Boolean).at(-1) ?? "project";
 
   const detected = await detectAll();

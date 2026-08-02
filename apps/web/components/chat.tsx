@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { findMentions, segmentBody } from "@council/core/mentions";
+import { findMentions, segmentBody } from "@todoagent/core/mentions";
 import { api, ApiError, fmtRelative } from "../lib/api.ts";
 import type { Channel, Expert, Message, MessageWithThread } from "../lib/types.ts";
 import { acceptMessages } from "../lib/chat-state.ts";

@@ -5,7 +5,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * One run per repository.
@@ -73,7 +73,7 @@ async function gitRepo(dir: string): Promise<void> {
 }
 
 async function fixture(): Promise<Harness> {
-  const root = await mkdtemp(join(tmpdir(), "council-lock-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-lock-"));
   const binDir = join(root, "bin");
   const repoA = join(root, "repo-a");
   const repoB = join(root, "repo-b");
@@ -119,8 +119,8 @@ async function withEngine<T>(h: Harness, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
     env: {
       ...process.env,
-      COUNCIL_DB: h.dbPath,
-      COUNCIL_PORT: String(PORT),
+      TODOAGENT_DB: h.dbPath,
+      TODOAGENT_PORT: String(PORT),
       // Fakes ahead of the real CLIs, so no real agent turn is spent.
       PATH: `${binDir}${delimiter}${process.env["PATH"] ?? ""}`,
     },

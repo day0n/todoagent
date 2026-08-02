@@ -50,11 +50,11 @@ function check(name: string, ok: boolean, detail: string, soft = false): void {
 
 /** A minimal but real repo, so agents have somewhere honest to work. */
 async function scaffoldRepo(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "council-e2e-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-e2e-"));
   await writeFile(
     join(dir, "package.json"),
     JSON.stringify(
-      { name: "council-e2e-fixture", version: "1.0.0", type: "module", scripts: { test: "node --test" } },
+      { name: "todoagent-e2e-fixture", version: "1.0.0", type: "module", scripts: { test: "node --test" } },
       null,
       2,
     ),
@@ -62,13 +62,13 @@ async function scaffoldRepo(): Promise<string> {
   );
   await writeFile(
     join(dir, "README.md"),
-    "# Fixture\n\nA scratch repository used by Council's end-to-end test.\n",
+    "# Fixture\n\nA scratch repository used by TodoAgent's end-to-end test.\n",
     "utf8",
   );
   await git(["init", "-q", "-b", "main", "."], dir);
   await git(["add", "-A"], dir);
   await git(
-    ["-c", "user.name=Council", "-c", "user.email=council@localhost", "commit", "-q", "-m", "chore: fixture"],
+    ["-c", "user.name=TodoAgent", "-c", "user.email=todoagent@localhost", "commit", "-q", "-m", "chore: fixture"],
     dir,
   );
   return dir;
@@ -148,7 +148,7 @@ async function main(): Promise<void> {
   const discussMode = args.includes("--discuss");
   const budgetM = Number(args.find((a) => a.startsWith("--budget="))?.split("=")[1] ?? "3");
 
-  console.log("Council end-to-end test\n");
+  console.log("TodoAgent end-to-end test\n");
 
   const detected = await detectAll();
   if (detected.length === 0) {
@@ -330,7 +330,7 @@ async function main(): Promise<void> {
 
     // ── Did the work actually land? ──
     const lsFiles = await git(["ls-files"], repo);
-    const branches = await git(["branch", "--list", "council/*"], repo);
+    const branches = await git(["branch", "--list", "todoagent/*"], repo);
     // Untracked files count. Solo mode edits the repository directly and
     // deliberately does NOT commit — it is the operator's working tree, and
     // auto-committing to their branch would be worse than leaving a diff to

@@ -65,7 +65,7 @@ function withWorktreeLock<T>(repoPath: string, fn: () => Promise<T>): Promise<T>
  * `[a-zA-Z0-9._-]` and substituted everything else, which threw away every CJK
  * character: "给首页加一个空状态" became `----------`, and two different Chinese
  * titles produced branch names distinguishable only by their timestamp suffix.
- * A real leftover branch in the demo repo read `council/------------ms96bmug`.
+ * A real leftover branch in the demo repo read `todoagent/------------ms96bmug`.
  *
  * Verified against `git check-ref-format --branch`: a CJK name is accepted, a
  * name containing a space is not. So the old sanitiser was discarding legal
@@ -164,7 +164,7 @@ export interface Worktree {
    * Drops the branch, but ONLY if its commits are reachable elsewhere.
    *
    * Returns false — leaving the branch intact — when deleting would lose work.
-   * A `council/*` branch is often the only copy of an agent's output (a subtask
+   * A `todoagent/*` branch is often the only copy of an agent's output (a subtask
    * that failed review, or one whose run crashed), so git's own merged-check is
    * the arbiter rather than a force delete.
    */
@@ -195,8 +195,8 @@ export async function createWorktree(
    * separate the names it was given. With two subtasks sharing a title the second
    * add then failed outright:
    *
-   *   0: OK   council/Add-tests-ms9cx928
-   *   1: FAIL fatal: a branch named 'council/Add-tests-ms9cx928' already exists
+   *   0: OK   todoagent/Add-tests-ms9cx928
+   *   1: FAIL fatal: a branch named 'todoagent/Add-tests-ms9cx928' already exists
    *
    * Reproduced in three lines, and reachable in practice: a plan is
    * model-generated and nothing enforces distinct titles, so a planner emitting
@@ -209,8 +209,8 @@ export async function createWorktree(
    * name against a handful of concurrent subtasks — collision is not a practical
    * concern, and a failed add is loud rather than silent if it ever happens.
    */
-  const branch = `council/${safe}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
-  const root = await mkdtemp(join(tmpdir(), "council-wt-"));
+  const branch = `todoagent/${safe}-${Date.now().toString(36)}-${randomUUID().slice(0, 6)}`;
+  const root = await mkdtemp(join(tmpdir(), "todoagent-wt-"));
   const path = join(root, safe);
 
   // Only the git call is serialised; mkdtemp above is per-caller and safe.
@@ -263,7 +263,7 @@ export async function pruneWorktrees(repoPath: string): Promise<void> {
 /**
  * Deletes a branch only if its commits are already reachable elsewhere.
  *
- * Uses `-d`, never `-D`. A `council/*` branch may hold the ONLY copy of an
+ * Uses `-d`, never `-D`. A `todoagent/*` branch may hold the ONLY copy of an
  * agent's work — a subtask that failed review, or one whose run crashed — and
  * force-deleting it would destroy that silently. git's own merged-check is the
  * right arbiter, so this is a no-op precisely when the work would be lost.
@@ -273,9 +273,9 @@ export async function deleteBranchIfMerged(repoPath: string, branch: string): Pr
   return res.code === 0;
 }
 
-/** Lists leftover `council/*` branches, so unmerged work can be reported. */
-export async function listCouncilBranches(repoPath: string): Promise<string[]> {
-  const res = await git(["branch", "--list", "council/*", "--format=%(refname:short)"], repoPath);
+/** Lists leftover `todoagent/*` branches, so unmerged work can be reported. */
+export async function listTodoagentBranches(repoPath: string): Promise<string[]> {
+  const res = await git(["branch", "--list", "todoagent/*", "--format=%(refname:short)"], repoPath);
   if (res.code !== 0) return [];
   return res.stdout
     .split("\n")
@@ -292,7 +292,7 @@ export async function commitAll(worktreePath: string, message: string): Promise<
   const status = await git(["status", "--porcelain"], worktreePath);
   if (status.stdout.trim().length === 0) return null;
   const commit = await git(
-    ["-c", "user.name=Council", "-c", "user.email=council@localhost", "commit", "-m", message],
+    ["-c", "user.name=TodoAgent", "-c", "user.email=todoagent@localhost", "commit", "-m", message],
     worktreePath,
   );
   if (commit.code !== 0) return null;
@@ -313,13 +313,13 @@ export async function mergeBranch(repoPath: string, branch: string): Promise<Git
   return git(
     [
       "-c",
-      "user.name=Council",
+      "user.name=TodoAgent",
       "-c",
-      "user.email=council@localhost",
+      "user.email=todoagent@localhost",
       "merge",
       "--no-ff",
       "-m",
-      `council: merge ${branch}`,
+      `todoagent: merge ${branch}`,
       branch,
     ],
     repoPath,

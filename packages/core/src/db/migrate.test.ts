@@ -19,7 +19,7 @@ import { Store } from "./index.ts";
 
 /** Builds a database with the pre-`branch`, pre-`cost_usd` table definitions. */
 async function legacyDb(): Promise<{ path: string; dispose: () => Promise<void> }> {
-  const dir = await mkdtemp(join(tmpdir(), "council-migrate-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-migrate-"));
   const path = join(dir, "legacy.db");
   const db = new DatabaseSync(path);
 
@@ -79,8 +79,8 @@ test("migrate: an old database gains the branch column instead of crashing", asy
       assert.equal(rows[0]?.branch, null, "a pre-existing row has no branch yet");
 
       // Writing is what used to throw `no such column: branch`.
-      assert.doesNotThrow(() => store.updateSubTask("s1", { branch: "council/recovered" }));
-      assert.equal(store.getSubTask("s1")?.branch, "council/recovered");
+      assert.doesNotThrow(() => store.updateSubTask("s1", { branch: "todoagent/recovered" }));
+      assert.equal(store.getSubTask("s1")?.branch, "todoagent/recovered");
     } finally {
       store.close();
     }
@@ -116,13 +116,13 @@ test("migrate: reopening is idempotent", async () => {
   const legacy = await legacyDb();
   try {
     const first = new Store(legacy.path);
-    first.updateSubTask("s1", { branch: "council/x" });
+    first.updateSubTask("s1", { branch: "todoagent/x" });
     first.close();
 
     // A second ALTER TABLE would fail with "duplicate column name".
     const second = new Store(legacy.path);
     try {
-      assert.equal(second.getSubTask("s1")?.branch, "council/x", "data persists across opens");
+      assert.equal(second.getSubTask("s1")?.branch, "todoagent/x", "data persists across opens");
     } finally {
       second.close();
     }
@@ -135,7 +135,7 @@ test("migrate: reopening is idempotent", async () => {
 });
 
 test("migrate: a fresh database needs no migration and works fully", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "council-fresh-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-fresh-"));
   try {
     const store = new Store(join(dir, "fresh.db"));
     try {
@@ -162,9 +162,9 @@ test("migrate: a fresh database needs no migration and works fully", async () =>
         dependsOn: [],
         status: "todo",
         worktreePath: null,
-        branch: "council/fresh",
+        branch: "todoagent/fresh",
       });
-      assert.equal(store.getSubTask(sub.id)?.branch, "council/fresh");
+      assert.equal(store.getSubTask(sub.id)?.branch, "todoagent/fresh");
     } finally {
       store.close();
     }

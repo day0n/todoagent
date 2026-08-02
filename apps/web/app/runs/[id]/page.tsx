@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { use, useMemo, useRef, useState } from "react";
-import { isBlocking } from "@council/core/review-rules";
+import { isBlocking } from "@todoagent/core/review-rules";
 import { api, ApiError, fmtDuration, fmtTokens, fmtUsd } from "../../../lib/api.ts";
 import type { SubTask } from "../../../lib/types.ts";
 import { useRun, type LogRow, type VerifyReport as VerifyReportData } from "../../../lib/useRun.ts";

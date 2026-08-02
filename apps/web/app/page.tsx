@@ -264,7 +264,7 @@ export default function HomePage() {
             <Empty
               icon="◇"
               title="还没有配置项目"
-              hint="在 council 目录运行 pnpm seed <你的仓库路径>，它会按本机已安装的 CLI 自动组一支团队。"
+              hint="在 todoagent 目录运行 pnpm seed <你的仓库路径>，它会按本机已安装的 CLI 自动组一支团队。"
             />
           </div>
         ) : null}

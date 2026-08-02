@@ -15,7 +15,7 @@ import { detectAll, getAdapter } from "../adapters/index.ts";
 import { git } from "../util/git.ts";
 import { RUNTIME_KINDS, type RuntimeKind } from "../types.ts";
 
-const PROBE_PROMPT = "Reply with exactly: COUNCIL_OK";
+const PROBE_PROMPT = "Reply with exactly: TODOAGENT_OK";
 const PROBE_TIMEOUT_MS = 180_000;
 
 interface ProbeResult {
@@ -118,7 +118,7 @@ async function main(): Promise<void> {
     .filter((a) => !a.startsWith("--"))
     .filter((a): a is RuntimeKind => (RUNTIME_KINDS as readonly string[]).includes(a));
 
-  console.log("Council doctor\n");
+  console.log("TodoAgent doctor\n");
 
   const detected = await detectAll();
   console.log("Detected runtimes:");
@@ -140,9 +140,9 @@ async function main(): Promise<void> {
 
   // Probes run in a throwaway git repo: several CLIs refuse to operate outside
   // one, and a temp dir keeps the probe from touching a real project.
-  const dir = await mkdtemp(join(tmpdir(), "council-doctor-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-doctor-"));
   await git(["init", "-q", "."], dir);
-  await git(["-c", "user.name=Council", "-c", "user.email=council@localhost", "commit", "--allow-empty", "-q", "-m", "init"], dir);
+  await git(["-c", "user.name=TodoAgent", "-c", "user.email=todoagent@localhost", "commit", "--allow-empty", "-q", "-m", "init"], dir);
 
   const targets = only.length > 0 ? only : detected.map((d) => d.kind);
   console.log(`\nProbing ${targets.length} runtime(s) in ${dir} ...\n`);

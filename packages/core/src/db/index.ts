@@ -34,7 +34,7 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 
 export function defaultDbPath(): string {
   const home = process.env["HOME"] ?? ".";
-  return process.env["COUNCIL_DB"] ?? join(home, ".council", "council.db");
+  return process.env["TODOAGENT_DB"] ?? join(home, ".todoagent", "todoagent.db");
 }
 
 export function nowIso(): string {

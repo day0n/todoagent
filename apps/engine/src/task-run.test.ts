@@ -5,7 +5,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * Starting a pipeline run from a board card.
@@ -46,7 +46,7 @@ async function git(args: string[], cwd: string): Promise<void> {
 }
 
 async function fixture(): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "council-taskrun-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-taskrun-"));
   const repo = join(root, "repo");
   const binDir = join(root, "bin");
   await mkdir(repo, { recursive: true });
@@ -114,7 +114,7 @@ async function fixture(): Promise<Fixture> {
 async function withEngine<T>(f: Fixture, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
     // PATH goes to the CHILD: the engine spawns the CLIs, not this process.
-    env: { ...process.env, COUNCIL_DB: f.dbPath, COUNCIL_PORT: String(PORT), PATH: f.stubbedPath },
+    env: { ...process.env, TODOAGENT_DB: f.dbPath, TODOAGENT_PORT: String(PORT), PATH: f.stubbedPath },
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {

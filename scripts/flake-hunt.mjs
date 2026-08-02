@@ -27,7 +27,7 @@ import { argv, exit } from "node:process";
 const rounds = Number(argv.find((a) => /^\d+$/.test(a)) ?? 5);
 const keepAll = argv.includes("--keep");
 
-const dir = mkdtempSync(join(tmpdir(), "council-flake-"));
+const dir = mkdtempSync(join(tmpdir(), "todoagent-flake-"));
 console.log(`logs: ${dir}`);
 
 /** Runs one round, returning its output and exit code. */

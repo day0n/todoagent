@@ -16,7 +16,7 @@ import { ErrorBox } from "./atoms.tsx";
  * document that scrolls as a whole.
  *
  * Projects ARE the channels. Raft's own guidance is "one channel per project or
- * workstream", and a Council project is exactly one repository's stream of work,
+ * workstream", and a TodoAgent project is exactly one repository's stream of work,
  * so mapping them keeps a single source of truth instead of inventing a parallel
  * container.
  *
@@ -104,7 +104,7 @@ export function WorkspaceShell({ children }: { children: React.ReactNode }) {
       >
         <Link
           href="/"
-          aria-label="Council 首页"
+          aria-label="TodoAgent 首页"
           className="mb-1.5 grid h-8 w-8 place-items-center rounded-[var(--radius-sm)] bg-fg text-[13px] font-semibold text-bg"
         >
           C

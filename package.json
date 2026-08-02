@@ -1,5 +1,5 @@
 {
-  "name": "council",
+  "name": "todoagent",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -7,18 +7,18 @@
     "node": ">=22"
   },
   "scripts": {
-    "dev": "pnpm --filter @council/engine dev",
-    "dev:web": "pnpm --filter @council/web dev",
+    "dev": "pnpm --filter @todoagent/engine dev",
+    "dev:web": "pnpm --filter @todoagent/web dev",
     "typecheck": "pnpm -r typecheck",
     "// test": "-r so every workspace runs. The engine's SSE and reconciliation suites existed but were never executed by the default command, which makes them decorative.",
     "test": "pnpm -r test",
-    "test:core": "pnpm --filter @council/core test",
-    "test:engine": "pnpm --filter @council/engine test",
-    "e2e": "pnpm --filter @council/core run e2e",
-    "doctor": "pnpm --filter @council/core run doctor",
+    "test:core": "pnpm --filter @todoagent/core test",
+    "test:engine": "pnpm --filter @todoagent/engine test",
+    "e2e": "pnpm --filter @todoagent/core run e2e",
+    "doctor": "pnpm --filter @todoagent/core run doctor",
     "// runtimes": "Use `pnpm runtimes`. `pnpm doctor` silently runs PNPM's builtin doctor instead of this script — pnpm resolves the builtin before consulting package.json, so no script name can win that collision.",
-    "runtimes": "pnpm --filter @council/core run doctor",
-    "seed": "pnpm --filter @council/core run seed",
+    "runtimes": "pnpm --filter @todoagent/core run doctor",
+    "seed": "pnpm --filter @todoagent/core run seed",
     "// check": "Static checks that typecheck and the test suite cannot see: stray control bytes, undefined CSS classes and custom properties, responsive rules, dead exports. Each one caught a real bug that everything else reported as fine.",
     "check": "node scripts/check-all.mjs",
     "// doctor": "`run` is explicit because `doctor` is also a pnpm builtin: without it, pnpm runs the builtin and fails with Unknown option: recursive."

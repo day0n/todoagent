@@ -63,7 +63,7 @@ process.stdout.write(JSON.stringify({
 }
 
 async function fixture(chars: number, mode: "text" | "tool" = "text"): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "council-bounds-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-bounds-"));
   const binDir = join(root, "bin");
   await mkdir(binDir, { recursive: true });
   const fake = join(binDir, "claude");

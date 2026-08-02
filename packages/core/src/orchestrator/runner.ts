@@ -344,7 +344,7 @@ export async function runStructured<T>(
   let schemaDir: string | null = null;
   let schemaPath: string | null = null;
   if (opts.schemaJson !== undefined && opts.expert.runtimeKind === "codex") {
-    schemaDir = await mkdtemp(join(tmpdir(), "council-schema-"));
+    schemaDir = await mkdtemp(join(tmpdir(), "todoagent-schema-"));
     schemaPath = join(schemaDir, "schema.json");
     await writeFile(schemaPath, JSON.stringify(opts.schemaJson), "utf8");
   }
@@ -395,7 +395,7 @@ export async function runStructured<T>(
     /*
      * Remove the schema directory on EVERY exit path.
      *
-     * It was never removed at all: measured 418 abandoned `council-schema-*`
+     * It was never removed at all: measured 418 abandoned `todoagent-schema-*`
      * directories in this machine's temp space, one per structured codex turn. The
      * function has several returns and can throw (budget, cancellation), so a
      * `finally` is the only placement that covers them.

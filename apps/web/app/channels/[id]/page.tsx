@@ -16,7 +16,7 @@ import { ErrorBox, RuntimeMark, Spinner } from "../../../components/atoms.tsx";
  * views of one channel rather than two features, which is why the tab lives here
  * and not in the sidebar.
  *
- * There is no Files tab. The reference product has one, but Council stores no
+ * There is no Files tab. The reference product has one, but TodoAgent stores no
  * files of its own — an agent's output lands in a git branch. A tab that opens
  * onto a permanent "nothing here" is worse than no tab.
  */

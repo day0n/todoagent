@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * The transcript payload contract.
@@ -39,7 +39,7 @@ interface Fixture {
 }
 
 async function fixture(): Promise<Fixture> {
-  const dir = await mkdtemp(join(tmpdir(), "council-transcript-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-transcript-"));
   const dbPath = join(dir, "t.db");
   const store = new Store(dbPath);
 
@@ -67,7 +67,7 @@ async function fixture(): Promise<Fixture> {
     dependsOn: [],
     status: "done",
     worktreePath: null,
-    branch: "council/x",
+    branch: "todoagent/x",
   });
   const attempt = store.startAttempt({
     runId: run.id,
@@ -108,7 +108,7 @@ async function fixture(): Promise<Fixture> {
 
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, COUNCIL_DB: dbPath, COUNCIL_PORT: String(PORT) },
+    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {

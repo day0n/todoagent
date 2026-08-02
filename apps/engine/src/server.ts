@@ -15,10 +15,10 @@ import {
   resolveEscalationAndContinue,
   runPipeline,
   type BusEvent,
-} from "@council/core";
-import { EXPERT_ROLES, RUNTIME_KINDS, type Run } from "@council/core/types";
+} from "@todoagent/core";
+import { EXPERT_ROLES, RUNTIME_KINDS, type Run } from "@todoagent/core/types";
 
-const PORT = Number(process.env["COUNCIL_PORT"] ?? 8787);
+const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());
 const app = new Hono();
 
@@ -284,7 +284,7 @@ app.post("/api/projects", async (c) => {
   if (!(await isGitRepo(repoPath))) {
     return c.json(
       {
-        error: `${repoPath} is not a git repository. Council isolates each subtask in a git worktree, so the project must be a repo (run \`git init\` there first).`,
+        error: `${repoPath} is not a git repository. TodoAgent isolates each subtask in a git worktree, so the project must be a repo (run \`git init\` there first).`,
       },
       400,
     );
@@ -1210,7 +1210,7 @@ function launch(runId: string, autoApprovePlan: boolean): void {
 reconcileOrphanedRuns();
 
 serve({ fetch: app.fetch, port: PORT, hostname: "127.0.0.1" }, (info) => {
-  console.log(`Council engine on http://127.0.0.1:${info.port}`);
+  console.log(`TodoAgent engine on http://127.0.0.1:${info.port}`);
   console.log(`Database: ${defaultDbPath()}`);
   console.log("Loopback only — the agent CLIs run with tool confirmation bypassed.");
 });

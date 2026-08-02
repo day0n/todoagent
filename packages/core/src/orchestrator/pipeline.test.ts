@@ -333,7 +333,7 @@ interface Harness {
 }
 
 async function setup(behaviour: string): Promise<Harness> {
-  const root = await mkdtemp(join(tmpdir(), "council-pipe-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-pipe-"));
   const repo = join(root, "repo");
   const binDir = join(root, "bin");
   const artifactDir = join(root, "artifacts");
@@ -1165,7 +1165,7 @@ test("pipeline: single-expert mode is exempt from the clean-tree requirement", a
 test("pipeline: a non-git repository is refused before any agent runs", async () => {
   const h = await setup("clean");
   try {
-    const plain = await mkdtemp(join(tmpdir(), "council-plain-"));
+    const plain = await mkdtemp(join(tmpdir(), "todoagent-plain-"));
     try {
       const project = h.store.createProject({
         name: "plain",

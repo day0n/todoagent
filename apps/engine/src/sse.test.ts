@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * Integration test for the live event stream.
@@ -31,7 +31,7 @@ interface Harness {
 }
 
 async function boot(): Promise<Harness> {
-  const dir = await mkdtemp(join(tmpdir(), "council-sse-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-sse-"));
   const dbPath = join(dir, "sse.db");
 
   // Seed durable state before the engine opens the file.
@@ -69,7 +69,7 @@ async function boot(): Promise<Harness> {
   store.close();
 
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, COUNCIL_DB: dbPath, COUNCIL_PORT: String(PORT) },
+    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -220,7 +220,7 @@ test("SSE: Last-Event-ID resumes without duplicating", async () => {
 });
 
 test("SSE: a long history replays in full, not just the first page", async () => {
-  const dir = await mkdtemp(join(tmpdir(), "council-sse-long-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-sse-long-"));
   const dbPath = join(dir, "long.db");
   try {
     // More than the old single-read cap of 2000. A measured long run emits ~2880
@@ -261,7 +261,7 @@ test("SSE: a long history replays in full, not just the first page", async () =>
     store.close();
 
     const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-      env: { ...process.env, COUNCIL_DB: dbPath, COUNCIL_PORT: String(PORT) },
+      env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
       stdio: ["ignore", "pipe", "pipe"],
     });
     try {

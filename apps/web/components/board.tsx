@@ -436,7 +436,7 @@ function BoardView({
             onDrop={(e) => {
               e.preventDefault();
               setDragOver(null);
-              const id = e.dataTransfer.getData("text/council-task");
+              const id = e.dataTransfer.getData("text/todoagent-task");
               if (id !== "") onPatch(id, { status });
             }}
             className={`flex min-h-32 flex-col rounded-[var(--radius)] border p-2 transition-colors ${
@@ -493,7 +493,7 @@ function Card({
       onDragStart={(e) => {
         // A private type, so dropping a card onto an unrelated target elsewhere
         // cannot be mistaken for plain text.
-        e.dataTransfer.setData("text/council-task", task.id);
+        e.dataTransfer.setData("text/todoagent-task", task.id);
         e.dataTransfer.effectAllowed = "move";
       }}
       className="card cursor-grab p-2.5 active:cursor-grabbing"

@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * Expert creation validation.
@@ -31,7 +31,7 @@ interface Fixture {
 }
 
 async function fixture(): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "council-experts-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-experts-"));
   const fakeHome = join(root, "home");
   await mkdir(fakeHome, { recursive: true });
 
@@ -51,8 +51,8 @@ async function withEngine<T>(
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
     env: {
       ...process.env,
-      COUNCIL_DB: f.dbPath,
-      COUNCIL_PORT: String(PORT),
+      TODOAGENT_DB: f.dbPath,
+      TODOAGENT_PORT: String(PORT),
       ...(restrict ? { PATH: restrict.path, HOME: restrict.home } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],

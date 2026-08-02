@@ -20,12 +20,12 @@ importers:
 
   apps/engine:
     dependencies:
-      '@council/core':
-        specifier: workspace:*
-        version: link:../../packages/core
       '@hono/node-server':
         specifier: 1.13.7
         version: 1.13.7(hono@4.6.20)
+      '@todoagent/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       hono:
         specifier: 4.6.20
         version: 4.6.20
@@ -35,7 +35,7 @@ importers:
 
   apps/web:
     dependencies:
-      '@council/core':
+      '@todoagent/core':
         specifier: workspace:*
         version: link:../../packages/core
       next:

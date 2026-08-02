@@ -5,7 +5,7 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * Project creation validation.
@@ -43,7 +43,7 @@ async function gitInit(dir: string): Promise<void> {
 }
 
 async function fixture(): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "council-projects-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-projects-"));
   const repo = join(root, "a-real-repo");
   const plainDir = join(root, "not-a-repo");
   await mkdir(repo, { recursive: true });
@@ -86,7 +86,7 @@ async function fixture(): Promise<Fixture> {
  */
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>, cwd?: string): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, COUNCIL_DB: dbPath, COUNCIL_PORT: String(PORT) },
+    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
     ...(cwd !== undefined ? { cwd } : {}),
     stdio: ["ignore", "pipe", "pipe"],
   });

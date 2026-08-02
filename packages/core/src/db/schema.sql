@@ -1,4 +1,4 @@
--- Council schema.
+-- TodoAgent schema.
 --
 -- Two deliberate choices carried over from Multica's conventions:
 --   * No foreign keys. Relationships, validation, and dependent cleanup are

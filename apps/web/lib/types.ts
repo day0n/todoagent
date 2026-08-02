@@ -1,7 +1,7 @@
 /**
  * Client-side mirrors of the engine's wire shapes.
  *
- * Deliberately declared here rather than imported from @council/core: the web
+ * Deliberately declared here rather than imported from @todoagent/core: the web
  * app talks to the engine over HTTP and should survive the engine returning a
  * slightly older or newer shape. Every field is read defensively at the point of
  * use, so a missing one degrades the display instead of blanking the page.
@@ -54,7 +54,7 @@ export interface Run {
   acceptance: string | null;
   status: RunStatus;
   phase: Phase;
-  /** Only gates the engine actually sets; see HumanGate in @council/core. */
+  /** Only gates the engine actually sets; see HumanGate in @todoagent/core. */
   gate: "plan_approval" | "adjudication" | null;
   budgetTokens: number;
   spentTokens: number;

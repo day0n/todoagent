@@ -2,7 +2,7 @@
 const nextConfig = {
   reactStrictMode: true,
   // Shared packages ship raw .ts and are compiled by the consuming app.
-  transpilePackages: ["@council/core"],
+  transpilePackages: ["@todoagent/core"],
   eslint: { ignoreDuringBuilds: true },
 };
 

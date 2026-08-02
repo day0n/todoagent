@@ -25,7 +25,7 @@ interface Fixture {
 }
 
 async function fixture(): Promise<Fixture> {
-  const dir = await mkdtemp(join(tmpdir(), "council-proc-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-proc-"));
   let n = 0;
   return {
     dir,

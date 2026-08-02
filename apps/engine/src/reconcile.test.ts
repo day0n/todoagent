@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * Startup reconciliation and orphan cancellation.
@@ -31,7 +31,7 @@ interface Harness {
 }
 
 async function fixture(): Promise<Harness> {
-  const dir = await mkdtemp(join(tmpdir(), "council-reconcile-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-reconcile-"));
   const dbPath = join(dir, "reconcile.db");
   const store = new Store(dbPath);
   return {
@@ -61,7 +61,7 @@ function seedProject(store: Store, dir: string): string {
 /** Boots the engine and waits for it to answer, then stops it. */
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, COUNCIL_DB: dbPath, COUNCIL_PORT: String(PORT) },
+    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {
@@ -284,7 +284,7 @@ test("resume: a ruling is refused on a cancelled run rather than recorded", asyn
       dependsOn: [],
       status: "blocked",
       worktreePath: null,
-      branch: "council/s",
+      branch: "todoagent/s",
     });
     const adj = f.store.createAdjudication({
       runId: run.id,
@@ -366,7 +366,7 @@ function seedExhaustedGate(
     dependsOn: [],
     status: "blocked",
     worktreePath: null,
-    branch: "council/s",
+    branch: "todoagent/s",
   });
   const adj = store.createAdjudication({
     runId: run.id,

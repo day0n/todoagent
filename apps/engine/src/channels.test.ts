@@ -5,7 +5,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Store } from "@council/core";
+import { Store } from "@todoagent/core";
 
 /**
  * Channel layer endpoints.
@@ -31,7 +31,7 @@ interface Fixture {
 }
 
 async function fixture(): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "council-channels-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-channels-"));
   const dbPath = join(root, "c.db");
   const store = new Store(dbPath);
 
@@ -68,7 +68,7 @@ async function fixture(): Promise<Fixture> {
 
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, COUNCIL_DB: dbPath, COUNCIL_PORT: String(PORT) },
+    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {

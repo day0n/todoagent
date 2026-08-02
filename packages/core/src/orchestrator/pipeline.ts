@@ -21,7 +21,7 @@ import {
   dirtyTrackedFiles,
   git,
   isGitRepo,
-  listCouncilBranches,
+  listTodoagentBranches,
   mergeBranch,
   pruneWorktrees,
   type Worktree,
@@ -656,7 +656,7 @@ async function mergeStage(ctx: Ctx, stage: number, ledger: MergeLedger): Promise
        *
        * Uses git's own merged-check (`branch -d`), so it is a no-op exactly when
        * deleting would lose work. Without this the user's repository accumulates
-       * a `council/*` branch per subtask forever — measured: four leftover
+       * a `todoagent/*` branch per subtask forever — measured: four leftover
        * branches after a handful of runs, with nothing ever removing them.
        */
       await deleteBranchIfMerged(ctx.repoPath, s.branch);
@@ -778,7 +778,7 @@ async function runSubTask(
       });
       if (!draft.ok) throw new Error(draft.error ?? "draft failed");
 
-      await commitAll(worktree.path, `council: ${subTask.title} (round ${round})`);
+      await commitAll(worktree.path, `todoagent: ${subTask.title} (round ${round})`);
       const diff = await diffAgainst(worktree.path, baseRef);
       log(ctx, "subtask:drafted", {
         subTaskId: subTask.id,
@@ -917,7 +917,7 @@ async function runSubTask(
     // Commit before disposal so the branch survives; the worktree directory is
     // disposable, the branch is the deliverable.
     if (worktree) {
-      await commitAll(worktree.path, `council: ${subTask.title} (final)`).catch(() => null);
+      await commitAll(worktree.path, `todoagent: ${subTask.title} (final)`).catch(() => null);
       const st = ctx.store.getSubTask(subTask.id);
       if (st) {
         recordEvent(ctx.store, ctx.run.id, null, "subtask:branch_ready", {
@@ -1381,10 +1381,10 @@ async function phaseVerify(ctx: Ctx, ledger: MergeLedger): Promise<void> {
   }
 
   // Tidy the registrations for this run's disposed worktrees, then report any
-  // council/* branches still holding work so the user knows what is recoverable
+  // todoagent/* branches still holding work so the user knows what is recoverable
   // and where. Branches are never force-deleted — see deleteBranchIfMerged.
   await pruneWorktrees(ctx.repoPath);
-  const leftover = await listCouncilBranches(ctx.repoPath);
+  const leftover = await listTodoagentBranches(ctx.repoPath);
   if (leftover.length > 0) {
     log(ctx, "branches:leftover", { branches: leftover });
   }

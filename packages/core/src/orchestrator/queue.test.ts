@@ -49,7 +49,7 @@ interface Fixture {
 }
 
 async function fixture(budgetTokens = 0): Promise<Fixture> {
-  const root = await mkdtemp(join(tmpdir(), "council-queue-"));
+  const root = await mkdtemp(join(tmpdir(), "todoagent-queue-"));
   const binDir = join(root, "bin");
   await mkdir(binDir, { recursive: true });
   const fake = join(binDir, "claude");

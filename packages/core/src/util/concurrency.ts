@@ -14,7 +14,7 @@ import { cpus } from "node:os";
  * runs on the user's own workstation while they use it, so it starts lower.
  */
 export function defaultConcurrency(): number {
-  const fromEnv = Number.parseInt(process.env["COUNCIL_MAX_CONCURRENT_AGENTS"] ?? "", 10);
+  const fromEnv = Number.parseInt(process.env["TODOAGENT_MAX_CONCURRENT_AGENTS"] ?? "", 10);
   if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
   const cores = cpus().length;
   // Leave headroom for the engine, the browser, and whatever the user is doing.

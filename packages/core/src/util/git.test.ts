@@ -12,7 +12,7 @@ import {
   diffAgainst,
   git,
   isGitRepo,
-  listCouncilBranches,
+  listTodoagentBranches,
   mergeBranch,
   pruneWorktrees,
 } from "./git.ts";
@@ -25,7 +25,7 @@ import {
  */
 
 async function repo(): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "council-git-test-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-git-test-"));
   await git(["init", "-q", "-b", "main", "."], dir);
   await writeFile(join(dir, "a.txt"), "one\n", "utf8");
   await git(["add", "-A"], dir);
@@ -38,7 +38,7 @@ async function repo(): Promise<string> {
 
 test("isGitRepo distinguishes a repo from a plain directory", async () => {
   const dir = await repo();
-  const plain = await mkdtemp(join(tmpdir(), "council-plain-"));
+  const plain = await mkdtemp(join(tmpdir(), "todoagent-plain-"));
   try {
     assert.equal(await isGitRepo(dir), true);
     assert.equal(await isGitRepo(plain), false);
@@ -87,7 +87,7 @@ test("deleteBranch REFUSES to drop unmerged work", async () => {
     await wt.dispose();
 
     /*
-     * The data-loss guard. A council/* branch is frequently the ONLY copy of an
+     * The data-loss guard. A todoagent/* branch is frequently the ONLY copy of an
      * agent's output — a subtask that failed review, or one whose run crashed —
      * so deletion uses git's merged-check (`branch -d`) rather than a force
      * delete. It is a no-op exactly when it would destroy something.
@@ -166,7 +166,7 @@ test("pruneWorktrees clears registrations left by a crash", async () => {
   }
 });
 
-test("listCouncilBranches reports leftover work and ignores other branches", async () => {
+test("listTodoagentBranches reports leftover work and ignores other branches", async () => {
   const dir = await repo();
   try {
     await git(["branch", "feature/unrelated"], dir);
@@ -175,7 +175,7 @@ test("listCouncilBranches reports leftover work and ignores other branches", asy
     await commitAll(a.path, "a");
     await a.dispose();
 
-    const listed = await listCouncilBranches(dir);
+    const listed = await listTodoagentBranches(dir);
     // Used to tell the user exactly what is recoverable and where; a plain
     // "nothing merged" message would not say that.
     assert.deepEqual(listed, [a.branch]);
@@ -190,7 +190,7 @@ test("deleteBranchIfMerged tolerates a branch that does not exist", async () => 
   const dir = await repo();
   try {
     // Reachable when two cleanup paths race; must report false, not throw.
-    assert.equal(await deleteBranchIfMerged(dir, "council/never-existed"), false);
+    assert.equal(await deleteBranchIfMerged(dir, "todoagent/never-existed"), false);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -244,7 +244,7 @@ test("createWorktree sanitizes a title into a usable branch name", async () => {
     // Plan titles are model-generated prose: spaces, slashes, punctuation, CJK.
     const wt = await createWorktree(dir, "Add dark mode / 深色模式 (v2)!");
     try {
-      assert.match(wt.branch, /^council\//);
+      assert.match(wt.branch, /^todoagent\//);
       assert.ok(!wt.branch.includes(" "), "a space would break the ref");
       const rev = await git(["rev-parse", "--verify", wt.branch], dir);
       assert.equal(rev.code, 0, "the branch must be a valid ref");
@@ -267,9 +267,9 @@ test("createWorktree keeps a CJK title legible in the branch name", async () => 
      * The previous sanitiser kept `[a-zA-Z0-9._-]` and replaced everything else,
      * which erased every CJK character: two different Chinese titles produced
      * branch names distinguishable only by their timestamp suffix. A real leftover
-     * branch in the demo repo read `council/------------ms96bmug`. The old test
+     * branch in the demo repo read `todoagent/------------ms96bmug`. The old test
      * passed throughout, because "no spaces and a valid ref" is true of
-     * `council/----------` too.
+     * `todoagent/----------` too.
      */
     const a = await createWorktree(dir, "给首页加一个空状态");
     const b = await createWorktree(dir, "修复登录时的空指针");
@@ -277,7 +277,7 @@ test("createWorktree keeps a CJK title legible in the branch name", async () => 
       assert.ok(a.branch.includes("给首页加一个空状态"), `title lost: ${a.branch}`);
       assert.ok(b.branch.includes("修复登录时的空指针"), `title lost: ${b.branch}`);
       assert.ok(
-        !/^council\/-+/.test(a.branch),
+        !/^todoagent\/-+/.test(a.branch),
         `the name must not collapse to dashes: ${a.branch}`,
       );
 
@@ -304,7 +304,7 @@ test("createWorktree gives two identical titles distinct branches", async () => 
      * serialising the git command does not separate the names it was handed. With
      * two subtasks sharing a title the second add failed outright:
      *
-     *   fatal: a branch named 'council/Add-tests-ms9cx928' already exists
+     *   fatal: a branch named 'todoagent/Add-tests-ms9cx928' already exists
      *
      * Reachable in practice: a plan is model-generated and nothing enforces
      * distinct titles, so a planner emitting "Add tests" twice would lose that

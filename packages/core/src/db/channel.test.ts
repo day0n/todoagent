@@ -339,7 +339,7 @@ test("task: another channel's tasks are invisible", () => {
 async function withRawDb(
   fn: (store: Store, raw: DatabaseSync) => void | Promise<void>,
 ): Promise<void> {
-  const dir = await mkdtemp(join(tmpdir(), "council-channel-"));
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-channel-"));
   const path = join(dir, "t.db");
   const store = new Store(path);
   const raw = new DatabaseSync(path);

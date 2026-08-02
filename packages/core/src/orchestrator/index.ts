@@ -2,7 +2,7 @@
  * Orchestrator entry point.
  *
  * Declared in package.json's exports map but never created, so any
- * `import ... from "@council/core/orchestrator"` failed to resolve. Nothing
+ * `import ... from "@todoagent/core/orchestrator"` failed to resolve. Nothing
  * imported it yet, which is exactly why it went unnoticed.
  */
 export { bus, type BusEvent } from "./bus.ts";
