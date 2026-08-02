@@ -309,6 +309,78 @@ export async function diffAgainst(worktreePath: string, baseRef: string): Promis
   return un.code === 0 ? un.stdout : "";
 }
 
+/**
+ * Cap on a captured diff.
+ *
+ * Counted in UTF-16 code units rather than bytes, so a CJK-heavy diff can reach
+ * about three times this in UTF-8. That is deliberate: the number exists to keep an
+ * unbounded blob out of SQLite and out of the browser, and a byte-exact cap would
+ * mean re-encoding a multi-megabyte string to measure it.
+ */
+const DIFF_CAP = 2_000_000;
+
+/**
+ * Snapshot of everything uncommitted in a repository, at this instant.
+ *
+ * Called the moment a direct run finishes, because the agent works in the user's
+ * actual working tree — not a worktree — so the diff is only true until the next
+ * keystroke. Capturing it later would show the user's own subsequent edits mixed
+ * into what the agent did, with no way to tell them apart.
+ *
+ * Two commands, and both halves matter:
+ *
+ *   status --porcelain   every path git knows is different, INCLUDING untracked
+ *                        ones. `git diff` omits untracked files entirely, so a run
+ *                        whose whole output was new files would otherwise produce
+ *                        an empty diff and read as "did nothing".
+ *   diff HEAD            the actual content changes for tracked files.
+ *
+ * Only names are reported for untracked files, never contents: a new file can be a
+ * 50MB build artefact, and the status section is what says it exists.
+ *
+ * Never throws, and each command's exit code is checked INDEPENDENTLY — `git diff
+ * HEAD` fails in a repository with no commits, where `status` still usefully lists
+ * every untracked file. Failing both halves together would turn a fresh `git init`
+ * into an empty snapshot.
+ */
+export async function captureWorkingDiff(repoPath: string): Promise<string> {
+  const [status, diff] = await Promise.all([
+    // -uall, not the default -unormal: an untracked DIRECTORY is otherwise
+    // collapsed to `src/new/`, hiding how many files are in it and what they are.
+    git(["status", "--porcelain", "-uall"], repoPath),
+    git(["diff", "HEAD"], repoPath),
+  ]);
+
+  const sections: string[] = [];
+  if (status.code === 0 && status.stdout.trim().length > 0) {
+    sections.push(`# git status --porcelain\n${status.stdout.trimEnd()}`);
+  }
+  if (diff.code === 0 && diff.stdout.trim().length > 0) {
+    sections.push(diff.stdout.trimEnd());
+  }
+  if (sections.length === 0) return "";
+
+  const joined = sections.join("\n\n");
+  if (joined.length <= DIFF_CAP) return joined;
+
+  /*
+   * Truncated at the END, so the status section survives.
+   *
+   * When a diff is too big to read in full, the list of files that changed is the
+   * part still worth having — and it sits first precisely so this cut cannot take
+   * it. The marker is explicit because a silently shortened diff would look like a
+   * complete one that simply ended.
+   */
+  let cut = joined.slice(0, DIFF_CAP);
+  // A blind slice can land between the halves of a surrogate pair and leave an
+  // unpaired one behind, which is not valid text to store or serve.
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+
+  const dropped = joined.length - cut.length;
+  return `${cut}\n\n[diff truncated: ${dropped.toLocaleString()} more characters not shown]`;
+}
+
 export async function mergeBranch(repoPath: string, branch: string): Promise<GitResult> {
   return git(
     [

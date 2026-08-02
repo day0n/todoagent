@@ -434,6 +434,53 @@ app.get("/api/runs/:id/attempts/:attemptId", (c) => {
   return c.json({ ...attempt, expertName: expert?.name ?? attempt.expertId.slice(0, 8) });
 });
 
+/**
+ * Everything the result drawer needs, in one request.
+ *
+ * `diff` is read separately from the run rather than living on it: it is capped at
+ * 2M characters and `GET /api/runs` spreads whole Run objects for up to 100 rows,
+ * so carrying it on the type would put a hundred snapshots in one list response.
+ * Same lesson as `attempt.output`, which was 211 KB of a 292 KB payload for text
+ * that view never rendered.
+ *
+ * `null` and `""` are DIFFERENT answers and both reach the client:
+ *
+ *   null  no snapshot was taken — the run failed, was cancelled, or predates the
+ *         column. The UI must not claim the agent changed nothing.
+ *   ""    a snapshot was taken and the tree was clean. The agent genuinely
+ *         changed no files, which is a real and reportable outcome.
+ */
+app.get("/api/runs/:id/result", (c) => {
+  const id = c.req.param("id");
+  const run = store.getRun(id);
+  if (!run) return c.json({ error: "not found" }, 404);
+
+  /*
+   * The newest attempt that actually produced text.
+   *
+   * Not simply the last attempt: `runOneWithRetry` can add a failed attempt after
+   * a successful one, and a crashed retry has `output: null`. Taking the last row
+   * blindly would show an empty result for a run whose work is sitting in the
+   * attempt before it. Attempts come back ordered by `started_at`, so this walks
+   * backwards to the most recent one with content.
+   */
+  const attempts = store.listAttempts(id);
+  let output: string | null = null;
+  let executor: string | null = null;
+  for (let i = attempts.length - 1; i >= 0; i--) {
+    const a = attempts[i];
+    if (a === undefined) continue;
+    if (executor === null) executor = a.runtimeKind;
+    if (a.output !== null && a.output.trim() !== "") {
+      output = a.output;
+      executor = a.runtimeKind;
+      break;
+    }
+  }
+
+  return c.json({ run, diff: store.getRunDiff(id), output, executor });
+});
+
 const RunBody = z.object({
   projectId: z.string().min(1),
   goal: z.string().min(1).max(20000),

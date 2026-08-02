@@ -60,7 +60,17 @@ CREATE TABLE IF NOT EXISTS run (
   round         INTEGER NOT NULL DEFAULT 0,
   created_at    TEXT NOT NULL,
   ended_at      TEXT,
-  error         TEXT
+  error         TEXT,
+  -- Snapshot of the working tree taken the instant a direct run completed.
+  --
+  -- Captured then, not on demand, because a direct run's agent edits the user's
+  -- real working tree: by the time anyone opens the result the diff would also
+  -- contain their own later edits, with no way to separate the two.
+  --
+  -- Deliberately NOT part of the `Run` interface — see `getRunDiff`. It is capped
+  -- at 2M characters and `GET /api/runs` spreads whole Run objects for up to 100
+  -- rows, so putting it on the type would put 200MB in a list response.
+  diff          TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_created ON run (created_at DESC);

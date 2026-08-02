@@ -120,6 +120,7 @@ export class Store {
       { table: "task", column: "my_day", definition: "TEXT" },
       { table: "task", column: "needs_kind", definition: "TEXT" },
       { table: "task", column: "needs_text", definition: "TEXT" },
+      { table: "run", column: "diff", definition: "TEXT" },
     ];
 
     for (const { table, column, definition } of expected) {
@@ -374,6 +375,25 @@ export class Store {
     return r ? this.toRun(r as Row) : null;
   }
 
+  /**
+   * The run's working-tree snapshot, read on its own.
+   *
+   * Separate from `getRun` because it is up to 2M characters and is wanted in
+   * exactly one place — the result drawer, when a person asks to see what changed.
+   * `getRun` is called on nearly every request, `GET /api/runs` calls it for up to
+   * 100 rows, and the SSE path re-reads it constantly; none of them want this.
+   *
+   * Null means "nothing was captured" (the run failed, was cancelled, or predates
+   * the column). An empty string means "captured, and the tree was clean" — a
+   * distinction the caller has to keep, since the second is a real answer about a
+   * run that legitimately changed no files.
+   */
+  getRunDiff(id: string): string | null {
+    const r = this.db.prepare(`SELECT diff FROM run WHERE id=?`).get(id) as Row | undefined;
+    if (r === undefined) return null;
+    return strOrNull(r["diff"]);
+  }
+
   listRuns(limit = 50): Run[] {
     return this.db
       .prepare(`SELECT * FROM run ORDER BY created_at DESC LIMIT ?`)
@@ -401,7 +421,22 @@ export class Store {
 
   updateRun(
     id: string,
-    patch: Partial<Pick<Run, "status" | "phase" | "gate" | "round" | "endedAt" | "error" | "spentTokens">>,
+    patch: Partial<
+      Pick<Run, "status" | "phase" | "gate" | "round" | "endedAt" | "error" | "spentTokens">
+    > & {
+      /**
+       * Working-tree snapshot, written once when a direct run completes.
+       *
+       * An intersection rather than a member of `Run`, which is the point. `toRun`
+       * maps every field of that interface, and `GET /api/runs` spreads whole Run
+       * objects for up to 100 rows — so a 2M-character diff on the type would put
+       * up to 200MB in one list response. This codebase already learned that with
+       * `attempt.output`: measured at 211 KB of a 292 KB payload, for text the
+       * overview never rendered, refetched on every event. Read it deliberately
+       * through `getRunDiff` instead.
+       */
+      diff?: string;
+    },
   ): void {
     const cols: Record<keyof typeof patch, string> = {
       status: "status",
@@ -411,6 +446,7 @@ export class Store {
       endedAt: "ended_at",
       error: "error",
       spentTokens: "spent_tokens",
+      diff: "diff",
     };
     const sets: string[] = [];
     const vals: Array<string | number | null> = [];

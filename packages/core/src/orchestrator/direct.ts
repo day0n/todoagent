@@ -1,5 +1,6 @@
 import type { Store } from "../db/index.ts";
 import type { Expert, Run } from "../types.ts";
+import { captureWorkingDiff } from "../util/git.ts";
 import { BudgetExceededError, recordEvent, runOneWithRetry } from "./runner.ts";
 
 /**
@@ -39,8 +40,42 @@ export async function runDirect(opts: DirectRunOptions): Promise<DirectRunResult
   store.updateRun(runId, { status: "running", phase: "draft" });
   recordEvent(store, runId, null, "run:started", { mode: "direct", expert: expert.name });
 
-  const finish = (status: Run["status"], error: string | null): DirectRunResult => {
+  /**
+   * Settles the run, and for a completed one, snapshots the working tree.
+   *
+   * The snapshot is awaited INSIDE this function, so it is on disk before
+   * `runDirect` resolves. That ordering is load-bearing: the engine calls
+   * `syncTaskFromRun` in a `.finally()` after this promise settles, which is what
+   * moves the task to 待确认 and announces it over SSE. Capturing afterwards would
+   * let a client be told the work is ready, open the result, and find no diff — a
+   * race that would reproduce only on a slow repository.
+   */
+  const finish = async (status: Run["status"], error: string | null): Promise<DirectRunResult> => {
+    /*
+     * The terminal status lands FIRST, before the snapshot.
+     *
+     * `captureWorkingDiff` spawns git, and git can block on another process's
+     * index lock. Writing the status first means the worst case is a run recorded
+     * as completed with no diff, rather than one left reading `running` — which
+     * the UI shows as permanently in progress and only a restart resolves.
+     */
     store.updateRun(runId, { status, error, endedAt: new Date().toISOString() });
+
+    /*
+     * Only a completed run is snapshotted, per the M3 spec.
+     *
+     * A failed or cancelled run leaves the tree in whatever half-finished state it
+     * reached, which is rarely worth reading and never worth trusting. The
+     * consequence is that `diff` stays NULL for those runs — distinct from the
+     * empty string, which means "captured, and nothing had changed". The result
+     * endpoint keeps that distinction so the UI can say "no snapshot was taken"
+     * instead of asserting the agent changed no files, which would be a false
+     * statement about a failed run that had in fact edited several.
+     */
+    if (status === "completed") {
+      store.updateRun(runId, { diff: await captureWorkingDiff(project.repoPath) });
+    }
+
     const eventType =
       status === "completed"
         ? "run:completed"

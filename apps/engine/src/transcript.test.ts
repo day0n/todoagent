@@ -29,12 +29,24 @@ const PORT = 8803; // distinct from the SSE (8799) and reconcile (8801) suites
 
 const BIG_OUTPUT = "x".repeat(20_000);
 
+/**
+ * A working-tree snapshot, large enough to matter in a payload.
+ *
+ * Same argument as `BIG_OUTPUT` one line up, and the same mistake waiting to be
+ * made: a diff is capped at 2M characters and `GET /api/runs` spreads whole Run
+ * objects for up to 100 rows, so a `diff` field on that type would be the
+ * `attempt.output` problem again at ten times the size.
+ */
+const BIG_DIFF = `# git status --porcelain\n M a.txt\n?? new.txt\n\ndiff --git a/a.txt b/a.txt\n${"+padding\n".repeat(2_000)}`;
+
 interface Fixture {
   dbPath: string;
   runId: string;
   attemptId: string;
   otherRunId: string;
   otherAttemptId: string;
+  /** A run whose newest attempt produced nothing, and whose tree was clean. */
+  retriedRunId: string;
   dispose: () => Promise<void>;
 }
 
@@ -94,6 +106,39 @@ async function fixture(): Promise<Fixture> {
     kind: "plan",
   });
   store.finishAttempt(otherAttempt.id, { status: "completed", output: "secret plan" });
+
+  // The main run carries a working-tree snapshot, as a completed direct run does.
+  store.updateRun(run.id, { diff: BIG_DIFF });
+
+  /*
+   * A run whose LAST attempt produced nothing.
+   *
+   * `runOneWithRetry` can append a failed attempt after a successful one, so the
+   * newest row is not necessarily the one holding the work. The two attempts use
+   * different runtimes on purpose, so "which executor is reported" has a wrong
+   * answer available.
+   */
+  const retried = store.createRun({ projectId: project.id, goal: "retried" });
+  const good = store.startAttempt({
+    runId: retried.id,
+    subTaskId: null,
+    expertId: expert.id,
+    runtimeKind: "codex",
+    kind: "draft",
+  });
+  store.finishAttempt(good.id, { status: "completed", output: "the work that counts" });
+  const crashed = store.startAttempt({
+    runId: retried.id,
+    subTaskId: null,
+    expertId: expert.id,
+    runtimeKind: "claude",
+    kind: "draft",
+  });
+  // No output: a crashed retry leaves the column null.
+  store.finishAttempt(crashed.id, { status: "failed" });
+  // Captured, and the tree was clean — the empty string, not null.
+  store.updateRun(retried.id, { diff: "" });
+
   store.close();
 
   return {
@@ -102,6 +147,7 @@ async function fixture(): Promise<Fixture> {
     attemptId: attempt.id,
     otherRunId: other.id,
     otherAttemptId: otherAttempt.id,
+    retriedRunId: retried.id,
     dispose: () => rm(dir, { recursive: true, force: true }),
   };
 }
@@ -232,6 +278,132 @@ test("unknown ids are 404, not a 500 or an empty success", async () => {
         `http://127.0.0.1:${PORT}/api/runs/does-not-exist/attempts/${f.attemptId}`,
       );
       assert.equal(badRun.status, 404);
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+// ── /result: what the drawer reads ──────────────────────────
+
+interface ResultBody {
+  run: Record<string, unknown>;
+  diff: string | null;
+  output: string | null;
+  executor: string | null;
+}
+
+test("the result endpoint serves the snapshot and the final output together", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/runs/${f.runId}/result`);
+      assert.equal(res.status, 200);
+      const body = (await res.json()) as ResultBody;
+
+      assert.equal(body.diff, BIG_DIFF, "the whole snapshot is served, uncapped by the endpoint");
+      assert.equal(body.output, BIG_OUTPUT, "and the attempt's final text alongside it");
+      assert.equal(body.executor, "claude");
+      assert.equal(body.run["goal"], "with transcripts");
+
+      // One request, because the drawer opens on a click and two round trips would
+      // show a header with an empty body under it.
+      assert.ok(body.run["status"] !== undefined, "the run itself travels with it");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("the run overview omits the diff, as it omits attempt output", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      /*
+       * The reason `diff` is not a field on the `Run` interface.
+       *
+       * `toRun` maps every field of that type, and `GET /api/runs` spreads whole Run
+       * objects for up to 100 rows — so a 2M-character snapshot on the type would put
+       * up to 200 MB in one list response. This is `attempt.output` again (211 KB of a
+       * 292 KB payload, refetched on every structural event) at ten times the scale,
+       * which is why it is asserted on the wire rather than argued about.
+       */
+      const detail = await fetch(`http://127.0.0.1:${PORT}/api/runs/${f.runId}`);
+      const detailRaw = await detail.text();
+      assert.ok(!detailRaw.includes("diff --git"), "the run detail payload carries no snapshot");
+
+      const list = await fetch(`http://127.0.0.1:${PORT}/api/runs`);
+      const listRaw = await list.text();
+      assert.ok(!listRaw.includes("diff --git"), "and neither does the run list");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("the result endpoint reads past a crashed retry to the attempt that worked", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const body = (await (
+        await fetch(`http://127.0.0.1:${PORT}/api/runs/${f.retriedRunId}/result`)
+      ).json()) as ResultBody;
+
+      /*
+       * `runOneWithRetry` can append a failed attempt AFTER a successful one, and a
+       * crashed attempt has `output: null`. Taking the newest row blindly would show
+       * an empty result for a run whose work sits in the attempt before it — the
+       * drawer would say the agent produced nothing on a run that produced plenty.
+       */
+      assert.equal(body.output, "the work that counts");
+      assert.equal(
+        body.executor,
+        "codex",
+        "the executor reported is the one that did the work, not the one that crashed",
+      );
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("an empty snapshot is not the same answer as no snapshot", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      /*
+       * The distinction the UI depends on to avoid stating something false.
+       *
+       *   ""    captured, and the tree was clean → "the agent changed no files",
+       *         which is a real and reportable outcome.
+       *   null  never captured — the run failed, was cancelled, or predates the
+       *         column → the UI must NOT claim nothing changed, because a failed run
+       *         may well have edited several files before dying.
+       *
+       * JSON preserves both, so this is really a check that nothing along the way
+       * coalesces one into the other.
+       */
+      const clean = (await (
+        await fetch(`http://127.0.0.1:${PORT}/api/runs/${f.retriedRunId}/result`)
+      ).json()) as ResultBody;
+      assert.equal(clean.diff, "", "a clean tree reports an empty snapshot");
+
+      const never = (await (
+        await fetch(`http://127.0.0.1:${PORT}/api/runs/${f.otherRunId}/result`)
+      ).json()) as ResultBody;
+      assert.equal(never.diff, null, "a run with no snapshot reports null");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("the result endpoint 404s an unknown run", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const res = await fetch(`http://127.0.0.1:${PORT}/api/runs/does-not-exist/result`);
+      assert.equal(res.status, 404);
     });
   } finally {
     await f.dispose();

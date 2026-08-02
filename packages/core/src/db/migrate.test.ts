@@ -54,9 +54,38 @@ async function legacyDb(): Promise<{ path: string; dispose: () => Promise<void> 
     ended_at TEXT
   )`);
 
+  /*
+   * A `run` table WITHOUT the `diff` column.
+   *
+   * It has to exist here for the migration to be tested at all. `Store` runs
+   * schema.sql before `migrate()`, and `CREATE TABLE IF NOT EXISTS` on a missing
+   * table creates it with every current column — so a fixture lacking the table
+   * entirely would exercise the create path and never the ALTER, while reporting
+   * success either way.
+   */
+  db.exec(`CREATE TABLE run (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    goal TEXT NOT NULL,
+    acceptance TEXT,
+    status TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    gate TEXT,
+    budget_tokens INTEGER NOT NULL DEFAULT 0,
+    spent_tokens INTEGER NOT NULL DEFAULT 0,
+    solo_mode INTEGER NOT NULL DEFAULT 0,
+    round INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    ended_at TEXT,
+    error TEXT
+  )`);
+
   db.prepare(
     `INSERT INTO subtask (id,run_id,stage,title,brief,status,created_at) VALUES (?,?,?,?,?,?,?)`,
   ).run("s1", "r1", 0, "legacy subtask", "brief", "done", "2026-01-01T00:00:00.000Z");
+  db.prepare(
+    `INSERT INTO run (id,project_id,goal,status,phase,created_at) VALUES (?,?,?,?,?,?)`,
+  ).run("r1", "p1", "legacy goal", "completed", "draft", "2026-01-01T00:00:00.000Z");
   db.prepare(
     `INSERT INTO attempt (id,run_id,subtask_id,expert_id,runtime_kind,kind,status,input_tokens,output_tokens,started_at)
      VALUES (?,?,?,?,?,?,?,?,?,?)`,
@@ -104,6 +133,39 @@ test("migrate: an old database gains cost_usd on attempt", async () => {
         store.finishAttempt("a1", { status: "completed", costUsd: 0.42, inputTokens: 100, outputTokens: 50 }),
       );
       assert.equal(store.listAttempts("r1")[0]?.costUsd, 0.42);
+    } finally {
+      store.close();
+    }
+  } finally {
+    await legacy.dispose();
+  }
+});
+
+test("migrate: an old database gains run.diff, and null stays distinct from empty", async () => {
+  const legacy = await legacyDb();
+  try {
+    const store = new Store(legacy.path);
+    try {
+      // The row survives the upgrade, and the write path is what used to throw
+      // `no such column: diff`.
+      assert.equal(store.getRun("r1")?.goal, "legacy goal", "the legacy run survives");
+      assert.equal(store.getRunDiff("r1"), null, "a pre-existing run has no snapshot");
+
+      assert.doesNotThrow(() => store.updateRun("r1", { diff: "diff --git a/x b/x\n+one" }));
+      assert.match(store.getRunDiff("r1") ?? "", /diff --git/);
+
+      /*
+       * The distinction the result endpoint depends on.
+       *
+       * NULL means no snapshot was taken (the run failed, was cancelled, or predates
+       * the column). An empty string means one WAS taken and the tree was clean.
+       * Collapsing them would make the UI assert "this run changed no files" about a
+       * failed run that had in fact edited several.
+       */
+      store.updateRun("r1", { diff: "" });
+      assert.equal(store.getRunDiff("r1"), "", "an empty snapshot is not null");
+
+      assert.equal(store.getRunDiff("no-such-run"), null, "an unknown id is null, not a throw");
     } finally {
       store.close();
     }

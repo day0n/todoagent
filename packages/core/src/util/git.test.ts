@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  captureWorkingDiff,
   commitAll,
   createWorktree,
   currentHead,
@@ -475,5 +476,148 @@ test("git() never throws on a failed command", async () => {
     assert.notEqual(missing.code, 0);
   } finally {
     await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// ── captureWorkingDiff ──────────────────────────────────────
+//
+// The snapshot a direct run leaves behind. It runs against the user's REAL
+// working tree — not a worktree — so it is taken the instant the run finishes and
+// is the only record of what the agent did before the user's own edits land on
+// top. Real git here for the same reason as everything above: the failure being
+// guarded against is a diff that silently reports less than actually changed.
+
+test("captureWorkingDiff: a modified file and an untracked file both appear", async () => {
+  const dir = await repo();
+  try {
+    await writeFile(join(dir, "a.txt"), "one\ntwo\n", "utf8");
+    await writeFile(join(dir, "brand-new.txt"), "fresh content\n", "utf8");
+
+    const out = await captureWorkingDiff(dir);
+
+    // The tracked edit shows as a real diff, with its content.
+    assert.match(out, /diff --git a\/a\.txt b\/a\.txt/, "the modified file's diff is present");
+    assert.match(out, /^\+two$/m, "the added line is visible");
+
+    /*
+     * The untracked file is the load-bearing half.
+     *
+     * `git diff` omits untracked files entirely, so a run whose whole output was
+     * new files — a new module, a new test, a generated report — would produce an
+     * empty diff and read as "the agent did nothing". The status section is what
+     * makes such a run legible at all.
+     */
+    assert.match(out, /brand-new\.txt/, "the untracked file is named");
+    assert.match(out, /# git status --porcelain/, "the status section is labelled");
+    assert.match(out, /\?\? brand-new\.txt/, "with git's own untracked marker");
+
+    // Names only, never contents: a new file can be a 50MB build artefact.
+    assert.ok(!out.includes("fresh content"), "an untracked file's contents are not inlined");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("captureWorkingDiff: a clean tree is empty, not noise", async () => {
+  const dir = await repo();
+  try {
+    /*
+     * The empty string is a real answer, distinct from null.
+     *
+     * A completed run over a clean tree means "the agent changed no files", which
+     * the UI states plainly. Null means no snapshot was taken at all. The result
+     * endpoint keeps the two apart, so this must not return a header with nothing
+     * under it.
+     */
+    assert.equal(await captureWorkingDiff(dir), "");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("captureWorkingDiff: untracked files survive a repo with no commits", async () => {
+  /*
+   * The reason each command's exit code is checked INDEPENDENTLY.
+   *
+   * `git diff HEAD` fails outright in a repository with no commits — there is no
+   * HEAD to diff against — while `status` still lists every untracked file. Bailing
+   * out when either command failed would turn a fresh `git init` into an empty
+   * snapshot, which is exactly the state a brand-new project is in the first time
+   * someone dispatches a task at it.
+   */
+  const dir = await mkdtemp(join(tmpdir(), "todoagent-git-empty-"));
+  try {
+    await git(["init", "-q", "-b", "main", "."], dir);
+    await writeFile(join(dir, "first.txt"), "hello\n", "utf8");
+
+    // Confirms the premise rather than assuming it.
+    assert.notEqual((await git(["diff", "HEAD"], dir)).code, 0, "git diff HEAD fails with no HEAD");
+
+    const out = await captureWorkingDiff(dir);
+    assert.match(out, /first\.txt/, "the file is still reported");
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("captureWorkingDiff: a directory of new files is listed file by file", async () => {
+  // `-uall` rather than git's default: the default collapses an untracked
+  // directory to `src/new/`, hiding both how many files are in it and what they
+  // are — which is the most interesting case for an agent that scaffolded a module.
+  const dir = await repo();
+  try {
+    await mkdir(join(dir, "generated"), { recursive: true });
+    await writeFile(join(dir, "generated", "one.ts"), "export const a = 1;\n", "utf8");
+    await writeFile(join(dir, "generated", "two.ts"), "export const b = 2;\n", "utf8");
+
+    const out = await captureWorkingDiff(dir);
+    assert.match(out, /generated\/one\.ts/);
+    assert.match(out, /generated\/two\.ts/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("captureWorkingDiff: an oversized diff is truncated, and says so", async () => {
+  const dir = await repo();
+  try {
+    // Comfortably past the 2M-character cap.
+    await writeFile(join(dir, "a.txt"), `one\n${"x".repeat(2_400_000)}\n`, "utf8");
+
+    const out = await captureWorkingDiff(dir);
+
+    assert.ok(out.length < 2_100_000, `expected a capped result, got ${out.length} chars`);
+    /*
+     * The marker is not decoration. A silently shortened diff looks exactly like a
+     * complete one that happened to end there, and a person reading it would
+     * conclude the agent stopped where the text stops.
+     */
+    assert.match(out, /\[diff truncated: [\d,]+ more characters not shown\]/);
+
+    /*
+     * The status section survives the cut.
+     *
+     * It is placed first precisely so that when a diff is too large to read, the
+     * list of files that changed — the part still worth having — is what is kept.
+     */
+    assert.match(out, /# git status --porcelain/, "the file list survives truncation");
+    assert.match(out, /a\.txt/);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("captureWorkingDiff: a non-repository yields empty rather than throwing", async () => {
+  /*
+   * Called from a `finally`-adjacent path as a run settles, so a throw here would
+   * turn "the run finished" into "the engine crashed while recording it". Every
+   * git helper in this file follows the same rule.
+   */
+  const plain = await mkdtemp(join(tmpdir(), "todoagent-plain-diff-"));
+  try {
+    assert.equal(await captureWorkingDiff(plain), "");
+    assert.equal(await captureWorkingDiff("/nonexistent/path/xyz"), "");
+  } finally {
+    await rm(plain, { recursive: true, force: true });
   }
 });
