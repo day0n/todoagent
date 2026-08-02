@@ -1,17 +1,19 @@
 import type {
   AttemptTranscript,
-  Channel,
+  ChatMessage,
   DetectedRuntime,
   Expert,
-  Message,
-  MessageWithThread,
+  ListsResponse,
   Project,
   Run,
   RunDetail,
+  SettableTaskStatus,
   StreamEvent,
   Task,
-  TaskStatus,
+  TasksResponse,
   Team,
+  TodoList,
+  ViewKey,
 } from "./types.ts";
 
 export const ENGINE =
@@ -88,8 +90,6 @@ export const api = {
   createProject: (body: { name: string; repoPath: string; teamId: string }) =>
     req<Project>("/api/projects", { method: "POST", body: JSON.stringify(body) }),
 
-  runs: () => req<Run[]>("/api/runs"),
-
   run: (id: string) => req<RunDetail>(`/api/runs/${id}`),
 
   /**
@@ -122,80 +122,75 @@ export const api = {
 
   cancel: (id: string) => req<{ ok: true }>(`/api/runs/${id}/cancel`, { method: "POST" }),
 
-  // ── Channels ────────────────────────────────────────────────
-
-  channels: () => req<Channel[]>("/api/channels"),
-
-  createChannel: (body: {
-    name: string;
-    purpose?: string;
-    kind?: "channel" | "dm";
-    projectId?: string | null;
-    dmExpertId?: string | null;
-  }) => req<Channel>("/api/channels", { method: "POST", body: JSON.stringify(body) }),
+  // ── Lists ───────────────────────────────────────────────────
 
   /**
-   * A channel's root messages with their thread summaries.
+   * Every unarchived list, plus the three aggregate counts.
    *
-   * The engine clamps `limit` to 1..500 rather than trusting it, so asking for
-   * more than that quietly returns 500 instead of erroring.
+   * One request rather than two: the counts change on the same writes the lists
+   * do, and fetching them separately would let the sidebar show a badge that
+   * disagrees with the list beside it.
    */
-  messages: (channelId: string, limit?: number) =>
-    req<{ channel: Channel; messages: MessageWithThread[] }>(
-      `/api/channels/${channelId}/messages${limit === undefined ? "" : `?limit=${limit}`}`,
-    ),
+  lists: () => req<ListsResponse>("/api/lists"),
 
   /**
-   * Posts a message, optionally creating a board card from it.
+   * Creates a list, optionally bound to a repository.
    *
-   * `asTask` is the join between chat and the board: one action both says the
-   * thing and tracks it, in a single transaction, so a request never has to be
-   * restated by hand.
+   * `repoPath` is validated by the engine — it must be an existing git
+   * repository — so a bad path comes back as a 400 with a sentence to show,
+   * never as a list that silently cannot execute anything.
    */
-  postMessage: (
-    channelId: string,
-    body: {
-      body: string;
-      authorKind?: "human" | "expert";
-      authorId?: string | null;
-      parentId?: string | null;
-      asTask?: boolean;
+  createList: (body: { name: string; color?: string | null; repoPath?: string | null }) =>
+    req<TodoList>("/api/lists", { method: "POST", body: JSON.stringify(body) }),
+
+  /** Renames, recolours, or archives a list. Archiving keeps its tasks. */
+  patchList: (
+    id: string,
+    patch: { name?: string; color?: string | null; archived?: boolean },
+  ) => req<TodoList>(`/api/lists/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+
+  // ── Tasks ───────────────────────────────────────────────────
+
+  /**
+   * One view's tasks, pre-grouped by status.
+   *
+   * Grouped by the engine so `GROUP_ORDER` here decides only the reading order,
+   * not the membership — two places deciding which group a task belongs to is
+   * how a task ends up rendered twice or not at all.
+   */
+  tasks: (view: ViewKey) => req<TasksResponse>(`/api/tasks?view=${encodeURIComponent(view)}`),
+
+  /** Quick add. Absent `listId` lands the task in the default 收件箱 list. */
+  createTask: (body: { title: string; note?: string; listId?: string | null }) =>
+    req<Task>("/api/tasks", { method: "POST", body: JSON.stringify(body) }),
+
+  /**
+   * Patches a task.
+   *
+   * `status` is `SettableTaskStatus`: the engine rejects `needs_you` because that
+   * status is a conclusion a runtime reached and always carries a `needsKind`.
+   * Typing it out here means the UI cannot even ask.
+   */
+  patchTask: (
+    taskId: string,
+    patch: {
+      title?: string;
+      status?: SettableTaskStatus;
+      note?: string;
+      myDay?: string | null;
     },
-  ) =>
-    req<{ message: Message; task: Task | null }>(`/api/channels/${channelId}/messages`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    }),
+  ) => req<Task>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
-  /** One thread's replies. Threads are one level deep. */
-  replies: (messageId: string) =>
-    req<{ root: Message; replies: Message[] }>(`/api/messages/${messageId}/replies`),
+  deleteTask: (taskId: string) =>
+    req<{ ok: true }>(`/api/tasks/${taskId}`, { method: "DELETE" }),
 
   /**
-   * A channel's board.
+   * Dispatches a task to one agent, directly.
    *
-   * Every column is present even when empty — a Kanban board with a missing
-   * column is a layout bug rather than a state worth rendering.
-   */
-  tasks: (channelId: string) =>
-    req<{ channel: Channel; board: Record<TaskStatus, Task[]>; tasks: Task[] }>(
-      `/api/channels/${channelId}/tasks`,
-    ),
-
-  /** Creates one or more cards. All or none: a partial batch is never stored. */
-  createTasks: (channelId: string, titles: string[]) =>
-    req<Task[]>(`/api/channels/${channelId}/tasks`, {
-      method: "POST",
-      body: JSON.stringify({ titles }),
-    }),
-
-  /**
-   * Starts a pipeline run for a card.
-   *
-   * Never optimistic: this spawns real CLI processes and spends real tokens, and
-   * the engine can refuse it (no repository on the channel, another run already
-   * holding the repository lock, this card already running). The caller has to
-   * await the answer and show it.
+   * Never optimistic: this spawns a real CLI process and spends real tokens, and
+   * the engine can refuse it (no repository on the list, another run already
+   * holding the repository lock, this task already running, no agent installed).
+   * The caller has to await the answer and show the refusal.
    */
   runTask: (taskId: string, opts: { budgetTokens?: number } = {}) =>
     req<{ run: Run; task: Task }>(`/api/tasks/${taskId}/run`, {
@@ -203,21 +198,12 @@ export const api = {
       body: JSON.stringify(opts),
     }),
 
-  /**
-   * Patches a card.
-   *
-   * `assignee` is one unit rather than two fields: `expert` with no id, or an id
-   * with no kind, are both unresolvable, and accepting them separately would let
-   * the UI build exactly those states across two requests. `null` unclaims.
-   */
-  patchTask: (
-    taskId: string,
-    patch: {
-      title?: string;
-      status?: TaskStatus;
-      assignee?: { kind: "human" | "expert"; id?: string | null } | null;
-    },
-  ) => req<Task>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(patch) }),
+  /** Aborts a task's live run. The task returns to todo. */
+  cancelTask: (taskId: string) =>
+    req<{ ok: true; task: Task }>(`/api/tasks/${taskId}/cancel`, { method: "POST" }),
+
+  /** The main-agent conversation. Empty until M4 wires posting. */
+  chatHistory: () => req<ChatMessage[]>("/api/chat/history"),
 };
 
 /**

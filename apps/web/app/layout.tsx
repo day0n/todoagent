@@ -1,58 +1,36 @@
 import type { Metadata, Viewport } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";
-import { WorkspaceShell } from "../components/shell.tsx";
 
 /**
- * Geist Sans and Geist Mono.
+ * Root layout.
  *
- * The reference site computes `GeistSans` for body text, and it is the natural
- * pairing for a white shadcn/zinc surface. Both ship inside next/font/google, so
- * this needs no extra dependency and is self-hosted and preloaded — the weights
- * this UI leans on are present on first paint instead of swapping in late.
+ * Deliberately thin: `body` is itself the three-pane flex container (see
+ * globals.css), so the home page renders the sidebar, task pane and chat pane as
+ * its direct children. There is no shell component wrapping every route — the
+ * previous one drew an icon rail and a channel sidebar that no longer exist, and
+ * the two secondary pages opt into `.page` instead.
  *
- * The mono face is not decorative here: transcripts, diffs, repo paths and agent
- * ids all need columns that line up.
+ * No `next/font` here either. The prototype's type is the system stack
+ * (-apple-system → PingFang SC), which is what a Mac-native-feeling app should
+ * use and which needs no download; the two Geist faces this used to load existed
+ * for a design that is gone.
  */
-const geistSans = Geist({
-  subsets: ["latin"],
-  variable: "--font-geist-sans",
-  display: "swap",
-});
-
-const geistMono = Geist_Mono({
-  subsets: ["latin"],
-  variable: "--font-geist-mono",
-  display: "swap",
-});
 
 export const metadata: Metadata = {
   title: "TodoAgent",
-  description:
-    "把本地的 Claude / Codex / Cursor / Kiro / Grok 组成一支有分工、会互相挑错的专家团队。",
+  description: "一个会自己完成任务的待办清单。",
 };
 
 export const viewport: Viewport = {
-  // The app is light-only, so the browser chrome is pinned to the same white
-  // rather than following the OS into a colour the UI never uses.
-  themeColor: "#ffffff",
+  // Matches the desktop grey the panes sit on, so the browser chrome does not
+  // frame the app in a colour it never uses.
+  themeColor: "#f3f3f5",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" className={`${geistSans.variable} ${geistMono.variable}`}>
-      {/*
-        Fixed, non-scrolling body. The workspace is a shell — icon rail, channel
-        sidebar, panel with its own scroll region — like a chat client, not a
-        document that scrolls as a whole.
-
-        `h-dvh` rather than `h-screen`: on mobile Safari the latter is the larger
-        viewport, so the composer at the bottom of a channel ends up under the
-        browser's own toolbar.
-      */}
-      <body className="h-dvh overflow-hidden">
-        <WorkspaceShell>{children}</WorkspaceShell>
-      </body>
+    <html lang="zh-CN">
+      <body>{children}</body>
     </html>
   );
 }

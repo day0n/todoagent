@@ -1,86 +1,167 @@
 "use client";
 
-import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
-import { api, ApiError, fmtRelative, fmtTokens } from "../lib/api.ts";
-import type { Project, Run } from "../lib/types.ts";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { api, ApiError } from "../lib/api.ts";
+import type {
+  ChatMessage,
+  Expert,
+  Task,
+  TaskGroups,
+  TodoList,
+  ViewCounts,
+  ViewKey,
+} from "../lib/types.ts";
 import {
-  BudgetMeter,
-  Dot,
-  Empty,
-  ErrorBox,
-  Meta,
-  PhaseBadge,
-  SectionHeader,
-  Spinner,
-  StatusBadge,
-} from "../components/atoms.tsx";
+  applyOptimistic,
+  applyPoll,
+  applyServerRow,
+  hasLiveRun,
+  insertTask,
+  removeTask,
+} from "../lib/todo-state.ts";
+import { Sidebar } from "../components/sidebar.tsx";
+import { TaskPane } from "../components/task-pane.tsx";
+import { ChatPane } from "../components/chat-pane.tsx";
 
 /**
- * Home is a composer plus history — deliberately NOT a board.
+ * The whole product surface: sidebar, task list, agent conversation.
  *
- * A kanban front page tells the user "you have a backlog to manage", which is right
- * for Multica and Raft: they are team workspaces where work accumulates. This is a
- * one-shot commission — you state a goal, a team works it, it ends. So the page has
- * exactly one obvious action, and everything else is a record of past ones.
+ * This page owns all server state and every mutation; the three panes are
+ * rendering. That is deliberate — a task's status is read by the sidebar counts,
+ * the group it renders in, and the polling cadence at once, so exactly one place
+ * gets to decide what it currently is.
+ *
+ * Refresh is polling, not SSE. The engine has an event bus and M3 moves to it;
+ * until then a 4-second tick while something is running is honest and cheap, and
+ * the reconciliation rules in `todo-state.ts` are what keep a slow response from
+ * reverting a click.
  */
-export default function HomePage() {
-  const [projects, setProjects] = useState<Project[] | null>(null);
-  const [runs, setRuns] = useState<Run[] | null>(null);
-  const [error, setError] = useState<string | null>(null);
 
-  const [goal, setGoal] = useState("");
-  const [projectId, setProjectId] = useState("");
-  const [acceptance, setAcceptance] = useState("");
-  const [budgetM, setBudgetM] = useState(2);
-  const [soloMode, setSoloMode] = useState(false);
-  const [autoApprove, setAutoApprove] = useState(false);
-  const [advanced, setAdvanced] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+/** While a run is live the view changes without the user touching anything. */
+const POLL_FAST_MS = 4_000;
+/** Otherwise only another window can change it. */
+const POLL_IDLE_MS = 15_000;
 
-  const load = useCallback(async () => {
-    setError(null);
-    try {
-      const [ps, rs] = await Promise.all([api.projects(), api.runs()]);
-      setProjects(ps);
-      setRuns(rs);
-      setProjectId((cur) => cur || (ps[0]?.id ?? ""));
-    } catch (err) {
-      setError(err instanceof ApiError ? err.message : String(err));
-      setProjects([]);
-      setRuns([]);
-    }
-  }, []);
+export default function Page() {
+  const [view, setView] = useState<ViewKey>("today");
+  const [groups, setGroups] = useState<TaskGroups | null>(null);
+  const [lists, setLists] = useState<TodoList[]>([]);
+  const [counts, setCounts] = useState<ViewCounts>({ today: 0, needs: 0, done: 0 });
+  const [loading, setLoading] = useState(true);
+  const [toast, setToast] = useState<string | null>(null);
+  /*
+   * A load failure that is still true, as distinct from the toast.
+   *
+   * Without this the pane rendered "今天很干净" whenever the engine was
+   * unreachable — stating as fact that there is no work, when in truth nothing
+   * could be read. The toast alone was not enough: it dismisses itself after six
+   * seconds and leaves the false sentence sitting there.
+   */
+  const [loadError, setLoadError] = useState<string | null>(null);
 
-  useEffect(() => {
-    void load();
-  }, [load]);
+  // Loaded once: none of these change while the app is open. Runtimes are what
+  // the machine has installed; experts are configured on /team.
+  const [runtimeNames, setRuntimeNames] = useState<string[]>([]);
+  const [runtimeCount, setRuntimeCount] = useState<number | null>(null);
+  const [experts, setExperts] = useState<Expert[]>([]);
+  const [chat, setChat] = useState<ChatMessage[] | null>(null);
 
   /*
-   * Coarse polling for the history list, paused while the tab is hidden.
-   *
-   * The run page uses SSE; this only needs to notice that something finished
-   * elsewhere. Chat and the board both pause on `visibilitychange` and this did
-   * not — so a backgrounded tab kept asking the engine every 8s indefinitely for a
-   * list nobody was looking at. The listener also forces a refresh on return,
-   * which is exactly when the list is most likely to be stale.
-   *
-   * No stale-response guard needed here, unlike the board and the chat stream:
-   * this page holds no local mutation for a slow response to overwrite. Submitting
-   * navigates away with `window.location.href`, so there is nothing to lose.
+   * Counts local changes, so a poll that went out before one can be recognised as
+   * describing a view that no longer exists. A ref rather than state: bumping it
+   * must not itself trigger a render, and the polling closure has to read the
+   * value at the moment the response lands rather than at the moment it subscribed.
    */
+  const mutations = useRef(0);
+
+  const showError = useCallback((err: unknown): void => {
+    setToast(err instanceof ApiError || err instanceof Error ? err.message : String(err));
+  }, []);
+
+  /** Re-reads the current view and the sidebar together. */
+  const refresh = useCallback(
+    async (opts: { guard?: boolean } = {}): Promise<void> => {
+      const requestedAt = mutations.current;
+      try {
+        const [tasks, sidebar] = await Promise.all([api.tasks(view), api.lists()]);
+        // The sidebar is never guarded: its counts are derived server-side from
+        // every task, so a fresher copy is always the better one.
+        setLists(sidebar.lists);
+        setCounts(sidebar.counts);
+        setGroups((current) =>
+          opts.guard === false
+            ? tasks.groups
+            : applyPoll(current, tasks.groups, requestedAt, mutations.current),
+        );
+        // Anything on screen now came from the engine, so a previous failure is
+        // no longer describing reality.
+        setLoadError(null);
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 404) {
+          // The list behind `view` is gone — archived in another window. Fall
+          // back rather than showing an empty pane titled after nothing.
+          setView("today");
+          return;
+        }
+        throw err;
+      }
+    },
+    [view],
+  );
+
+  // First paint, and again whenever the view changes. Unguarded: a view switch is
+  // itself the user's request for that view's contents.
+  useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setGroups(null);
+    refresh({ guard: false })
+      .catch((err: unknown) => {
+        if (!alive) return;
+        showError(err);
+        // Recorded as well as toasted: the toast is transient, and an empty pane
+        // must not go on claiming there is no work when nothing could be read.
+        setLoadError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => {
+        if (alive) setLoading(false);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [refresh, showError]);
+
+  useEffect(() => {
+    void Promise.all([api.runtimes(), api.experts(), api.chatHistory()])
+      .then(([rt, ex, history]) => {
+        setRuntimeNames(rt.detected.map((d) => d.kind));
+        setRuntimeCount(rt.detected.length);
+        setExperts(ex);
+        setChat(history);
+      })
+      // A missing runtime list degrades the subtitle and the chat header; it is
+      // not worth a toast over, and the task list works regardless.
+      .catch(() => setChat([]));
+  }, []);
+
+  /*
+   * Polling, paused while the tab is hidden.
+   *
+   * Keyed on the cadence so a run starting or finishing re-arms the timer at the
+   * other interval, and on `refresh` so it always fetches the visible view. The
+   * `visibilitychange` listener also forces an immediate poll on return, which is
+   * exactly when the data is most likely to be stale.
+   */
+  const fast = hasLiveRun(groups);
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
 
     const poll = (): void => {
-      api
-        .runs()
-        .then(setRuns)
-        .catch(() => undefined);
+      refresh().catch(() => undefined);
     };
     const start = (): void => {
       if (timer !== null) return;
-      timer = setInterval(poll, 8000);
+      timer = setInterval(poll, fast ? POLL_FAST_MS : POLL_IDLE_MS);
     };
     const stop = (): void => {
       if (timer === null) return;
@@ -101,291 +182,209 @@ export default function HomePage() {
       stop();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, []);
+  }, [refresh, fast]);
 
-  const submit = async (): Promise<void> => {
-    if (goal.trim().length === 0 || projectId.length === 0) return;
-    setSubmitting(true);
-    setError(null);
+  // Toasts dismiss themselves; an engine refusal is worth reading once, not
+  // worth a click to clear.
+  useEffect(() => {
+    if (toast === null) return;
+    const t = setTimeout(() => setToast(null), 6_000);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  // ── Mutations ───────────────────────────────────────────────
+
+  const addTask = async (title: string): Promise<void> => {
+    mutations.current += 1;
     try {
-      const run = await api.createRun({
-        projectId,
-        goal: goal.trim(),
-        acceptance: acceptance.trim().length > 0 ? acceptance.trim() : null,
-        budgetTokens: Math.round(budgetM * 1_000_000),
-        soloMode,
-        autoApprovePlan: autoApprove,
+      /*
+       * The server's row is inserted, not a placeholder.
+       *
+       * A truly optimistic insert needs a fake id, and every action on that row
+       * (tick, dispatch, delete) would address a task the engine has never heard
+       * of until the id is swapped. Against a loopback engine the round trip is a
+       * couple of milliseconds, so the honest version is also the fast one.
+       */
+      const created = await api.createTask({
+        title,
+        listId: view.startsWith("list:") ? view.slice("list:".length) : null,
       });
-      window.location.href = `/runs/${run.id}`;
+      setGroups((current) => insertTask(current, created));
+      void refresh().catch(() => undefined);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : String(err));
-      setSubmitting(false);
+      showError(err);
     }
   };
 
-  const loading = projects === null || runs === null;
-  const canSubmit = !submitting && goal.trim().length > 0 && projectId.length > 0;
-  const activeProject = projects?.find((p) => p.id === projectId);
+  const toggleDone = (task: Task): void => {
+    const next = task.status === "done" ? "todo" : "done";
+    mutations.current += 1;
+    setGroups((current) => applyOptimistic(current, view, task.id, { status: next }));
+
+    void api
+      .patchTask(task.id, { status: next })
+      .then((row) => {
+        setGroups((current) => applyServerRow(current, view, row));
+        void refresh().catch(() => undefined);
+      })
+      .catch((err: unknown) => {
+        showError(err);
+        // The guess was wrong; the server is authoritative.
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
+  /**
+   * Dispatch is never optimistic: it spawns a real CLI process and spends real
+   * tokens, and the engine refuses it for reasons only it knows — the repository
+   * is locked by another run, no agent is installed, this task is already running.
+   * Those refusals are the whole reason the button waits for an answer.
+   */
+  const dispatch = (task: Task): void => {
+    mutations.current += 1;
+    void api
+      .runTask(task.id)
+      .then(({ task: row }) => {
+        setGroups((current) => applyServerRow(current, view, row));
+        void refresh().catch(() => undefined);
+      })
+      .catch(showError);
+  };
+
+  const cancel = (task: Task): void => {
+    mutations.current += 1;
+    void api
+      .cancelTask(task.id)
+      .then(({ task: row }) => {
+        setGroups((current) => applyServerRow(current, view, row));
+        void refresh().catch(() => undefined);
+      })
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
+  const remove = (task: Task): void => {
+    mutations.current += 1;
+    setGroups((current) => removeTask(current, task.id));
+    void api
+      .deleteTask(task.id)
+      .then(() => refresh())
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
+  const createList = async (input: {
+    name: string;
+    color: string | null;
+    repoPath: string | null;
+  }): Promise<void> => {
+    // Not caught: the inline form shows the engine's message next to the path
+    // field that caused it, which is more useful than a toast across the screen.
+    const created = await api.createList(input);
+    await refresh({ guard: false }).catch(() => undefined);
+    setView(`list:${created.id}`);
+  };
+
+  const renameList = (id: string, name: string): void => {
+    setLists((current) => current.map((l) => (l.id === id ? { ...l, name } : l)));
+    void api
+      .patchList(id, { name })
+      .then(() => refresh())
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
+  const archiveList = (id: string): void => {
+    setLists((current) => current.filter((l) => l.id !== id));
+    // Leave a view that is about to stop existing before the request lands.
+    if (view === `list:${id}`) setView("today");
+    void api
+      .patchList(id, { archived: true })
+      .then(() => refresh())
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
+  // ── Derived ─────────────────────────────────────────────────
+
+  const activeList = view.startsWith("list:")
+    ? (lists.find((l) => l.id === view.slice("list:".length)) ?? null)
+    : null;
+
+  const title =
+    view === "today"
+      ? "我的一天"
+      : view === "needs"
+        ? "需要你"
+        : view === "done"
+          ? "已完成"
+          : (activeList?.name ?? "清单");
+
+  /** Who is executing a task, by name. Null when nothing can be resolved. */
+  const executorFor = (task: Task): string | null => {
+    if (task.assigneeKind !== "expert" || task.assigneeId === null) return null;
+    const expert = experts.find((e) => e.id === task.assigneeId);
+    if (expert === undefined) return null;
+    // The runtime kind is the recognisable half — a person knows "codex", not the
+    // expert name they typed on /team six weeks ago.
+    return expert.runtimeKind;
+  };
 
   return (
-    <div className="mx-auto w-full max-w-[760px]">
-      {/* ── Composer ── */}
-      <section className="pt-14">
-        <h1 className="t-hero text-balance">你想完成什么？</h1>
-        <p className="mt-2.5 max-w-[52ch] text-balance t-meta">
-          交代一件事，一支本地专家团队会拆解它、并行执行、互相评审，最后交回被审查过的结果。
-        </p>
-
-        <div className="card mt-7 p-1.5">
-          <textarea
-            className="min-h-[7.5rem] w-full resize-y bg-transparent px-3.5 pt-3 text-[0.9375rem] leading-relaxed outline-none placeholder:text-[var(--color-subtle-fg)]"
-            placeholder="例如：给设置页加深色模式，跟系统偏好同步，切换时不要闪白屏"
-            value={goal}
-            onChange={(e) => setGoal(e.target.value)}
-            onKeyDown={(e) => {
-              // Cmd/Ctrl+Enter submits. This box is the whole point of the page.
-              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") void submit();
-            }}
-            autoFocus
-          />
-
-          <div className="flex flex-wrap items-center gap-2 px-2 pb-1.5 pt-1">
-            {projects !== null && projects.length > 0 ? (
-              <select
-                className="field btn-sm w-auto"
-                style={{ background: "var(--color-surface)" }}
-                value={projectId}
-                onChange={(e) => setProjectId(e.target.value)}
-                aria-label="目标仓库"
-              >
-                {projects.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-            ) : null}
-
-            <button
-              type="button"
-              className="btn btn-ghost btn-sm"
-              onClick={() => setAdvanced((v) => !v)}
-              aria-expanded={advanced}
-            >
-              <span aria-hidden className="text-[0.6875rem]">
-                {advanced ? "▾" : "▸"}
-              </span>
-              选项
-            </button>
-
-            {soloMode ? <Meta>单专家</Meta> : null}
-            {autoApprove ? <Meta>自动通过拆解</Meta> : null}
-
-            <div className="ml-auto flex items-center gap-2.5">
-              <kbd className="hidden t-meta sm:block">⌘↵</kbd>
-              <button
-                type="button"
-                className="btn btn-primary"
-                disabled={!canSubmit}
-                onClick={() => void submit()}
-              >
-                {submitting ? "启动中…" : "开始"}
-              </button>
-            </div>
-          </div>
-
-          {advanced ? (
-            <div
-              className="rise mt-1.5 space-y-4 border-t px-3.5 pb-3 pt-3.5"
-              style={{ borderColor: "var(--color-line)" }}
-            >
-              <label className="block">
-                <span className="t-label">验收标准（可选）</span>
-                <textarea
-                  className="field mt-2 min-h-[4.5rem] resize-y"
-                  placeholder="怎样算做完了？写具体一点，评审者会照这个检查。"
-                  value={acceptance}
-                  onChange={(e) => setAcceptance(e.target.value)}
-                />
-              </label>
-
-              <div className="grid gap-5 sm:grid-cols-2">
-                <div>
-                  <div className="flex items-baseline justify-between">
-                    <span className="t-label">预算上限</span>
-                    <span className="text-[0.8125rem] font-medium tabular-nums">{budgetM}M</span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0.25}
-                    max={20}
-                    step={0.25}
-                    value={budgetM}
-                    onChange={(e) => setBudgetM(Number(e.target.value))}
-                    className="mt-2.5 w-full accent-[var(--color-accent)]"
-                    aria-label="预算上限（百万 token）"
-                  />
-                  <p className="mt-1.5 t-meta">硬上限。超出即停，并把中间产物交给你。</p>
-                </div>
-
-                <div className="space-y-3">
-                  <Toggle
-                    checked={soloMode}
-                    onChange={setSoloMode}
-                    title="单专家直通"
-                    hint="小改动派一队人纯属浪费。跳过拆解与评审，但仍然跑验证。"
-                  />
-                  <Toggle
-                    checked={autoApprove}
-                    onChange={setAutoApprove}
-                    title="自动通过拆解"
-                    hint="不停下来等你确认。拆错了会连带浪费后面的并行执行。"
-                  />
-                </div>
-              </div>
-            </div>
-          ) : null}
-        </div>
-
-        {activeProject ? (
-          <p className="mono mt-2.5 truncate px-1 text-[var(--color-subtle-fg)]">
-            {activeProject.repoPath}
-          </p>
-        ) : null}
-
-        {error !== null ? (
-          <div className="mt-5">
-            <ErrorBox message={error} onRetry={() => void load()} />
-          </div>
-        ) : null}
-
-        {projects !== null && projects.length === 0 && error === null ? (
-          <div className="mt-5">
-            <Empty
-              icon="◇"
-              title="还没有配置项目"
-              hint="在 todoagent 目录运行 pnpm seed <你的仓库路径>，它会按本机已安装的 CLI 自动组一支团队。"
-            />
-          </div>
-        ) : null}
-      </section>
-
-      {/* ── History ── */}
-      <section className="mt-14">
-        <SectionHeader title="历史委托" count={runs?.length ?? 0} />
-
-        <div className="space-y-2.5">
-          {loading ? (
-            <div className="card p-5">
-              <Spinner />
-            </div>
-          ) : runs !== null && runs.length === 0 ? (
-            <Empty icon="◷" title="还没有委托记录" hint="上面写一句目标就能开始。" />
-          ) : (
-            runs?.map((run) => <RunRow key={run.id} run={run} />)
-          )}
-        </div>
-      </section>
-    </div>
-  );
-}
-
-function Toggle({
-  checked,
-  onChange,
-  title,
-  hint,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  title: string;
-  hint: string;
-}) {
-  return (
-    <label className="flex cursor-pointer items-start gap-2.5">
-      <input
-        type="checkbox"
-        checked={checked}
-        onChange={(e) => onChange(e.target.checked)}
-        className="mt-[0.1875rem] h-3.5 w-3.5 shrink-0 accent-[var(--color-accent)]"
+    <>
+      <Sidebar
+        lists={lists}
+        counts={counts}
+        view={view}
+        onSelect={setView}
+        onCreate={createList}
+        onRename={renameList}
+        onArchive={archiveList}
       />
-      <span>
-        <span className="block text-[0.8125rem] font-medium">{title}</span>
-        <span className="mt-0.5 block t-meta">{hint}</span>
-      </span>
-    </label>
-  );
-}
 
-function RunRow({ run }: { run: Run }) {
-  const needsYou = run.status === "blocked_on_human";
-  return (
-    <Link
-      href={`/runs/${run.id}`}
-      className="card-hover p-4"
-      style={
-        needsYou
-          ? {
-              borderColor: "color-mix(in oklch, var(--color-warn) 34%, transparent)",
-              background: "color-mix(in oklch, var(--color-warn) 5%, var(--color-surface))",
-            }
-          : undefined
-      }
-    >
-      <div className="flex items-start gap-4">
-        <div className="min-w-0 flex-1">
-          {/* The goal is the point of the row, so it gets real size — the old design
-              rendered it at the same 14px as its own metadata. */}
-          <p className="line-clamp-2 font-medium leading-snug">{run.goal}</p>
+      <TaskPane
+        view={view}
+        title={title}
+        groups={groups}
+        lists={lists}
+        runtimeCount={runtimeCount}
+        executorFor={executorFor}
+        loading={loading}
+        error={loadError}
+        onRetry={() => {
+          setLoading(true);
+          refresh({ guard: false })
+            .catch((err: unknown) => {
+              showError(err);
+              setLoadError(err instanceof Error ? err.message : String(err));
+            })
+            .finally(() => setLoading(false));
+        }}
+        onAdd={addTask}
+        onToggleDone={toggleDone}
+        onDispatch={dispatch}
+        onCancel={cancel}
+        onDelete={remove}
+      />
 
-          <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1.5">
-            <StatusBadge status={run.status} />
-            {run.status === "running" ? <PhaseBadge phase={run.phase} /> : null}
-            {run.soloMode ? <Meta>单专家</Meta> : null}
-            {run.projectName ? (
-              <>
-                <Dot />
-                <Meta>{run.projectName}</Meta>
-              </>
-            ) : null}
-            <Dot />
-            <Meta>{fmtRelative(run.createdAt)}</Meta>
-            {run.spentTokens > 0 ? (
-              <>
-                <Dot />
-                <Meta title={`${run.spentTokens.toLocaleString()} tokens`}>
-                  {fmtTokens(run.spentTokens)} tokens
-                </Meta>
-              </>
-            ) : null}
-          </div>
+      <ChatPane messages={chat} runtimeNames={runtimeNames} />
+
+      {toast !== null ? (
+        <div className="toast" role="alert">
+          <span>{toast}</span>
+          <button type="button" className="x" aria-label="关闭" onClick={() => setToast(null)}>
+            ×
+          </button>
         </div>
-
-        {run.budgetTokens > 0 ? (
-          <div className="w-24 shrink-0 pt-2">
-            <BudgetMeter spent={run.spentTokens} budget={run.budgetTokens} />
-          </div>
-        ) : null}
-      </div>
-
-      {needsYou ? (
-        <p
-          className="mt-2.5 flex items-center gap-1.5 text-[0.8125rem] font-medium"
-          style={{ color: "var(--color-warn)" }}
-        >
-          <span aria-hidden>→</span>
-          {run.gate === "plan_approval" ? "等你确认拆解方案" : "有一处分歧需要你裁决"}
-        </p>
       ) : null}
-
-      {run.error !== null && run.status === "failed" ? (
-        <p
-          className="mt-2.5 line-clamp-2 text-[0.8125rem]"
-          style={{ color: "var(--color-bad)" }}
-        >
-          {run.error}
-        </p>
-      ) : null}
-    </Link>
+    </>
   );
 }
