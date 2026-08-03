@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api.ts";
 import type { RunResult, Task } from "../lib/types.ts";
 import { IconCaret, IconCheck, IconX } from "./icons.tsx";
@@ -102,14 +102,61 @@ export function ResultDrawer({
     };
   }, [runId]);
 
-  // Escape closes. Registered on the document rather than the panel so it works
-  // before anything inside has been focused.
+  const panelRef = useRef<HTMLElement>(null);
+
+  /*
+   * Focus management for a modal dialog.
+   *
+   * `aria-modal="true"` is a claim about behaviour, and without this it was a false
+   * one: focus stayed on the 看结果 button behind the scrim, so Tab walked the task
+   * list underneath a panel covering it and a screen-reader user was never told the
+   * dialog existed.
+   *
+   * Three parts, all required together:
+   *   move focus in on open, so the panel is where the keyboard is
+   *   trap Tab inside, so it cannot wander behind the scrim
+   *   restore focus to the trigger on close, so the list does not jump to the top
+   */
   useEffect(() => {
+    const previous = document.activeElement as HTMLElement | null;
+    // The panel itself, not its first button: landing on 关闭 would read the exit
+    // before the title. `tabindex="-1"` on the panel makes this possible.
+    panelRef.current?.focus();
+
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") {
+        onClose();
+        return;
+      }
+      if (e.key !== "Tab") return;
+
+      const panel = panelRef.current;
+      if (panel === null) return;
+      // Queried per keystroke, not cached: the footer's 完成 button and the output
+      // section appear and disappear while the drawer is open.
+      const focusable = panel.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), a[href], input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      );
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (first === undefined || last === undefined) return;
+
+      if (e.shiftKey && document.activeElement === first) {
+        e.preventDefault();
+        last.focus();
+      } else if (!e.shiftKey && document.activeElement === last) {
+        e.preventDefault();
+        first.focus();
+      }
     };
+
     document.addEventListener("keydown", onKey);
-    return () => document.removeEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      // Guarded: the trigger may have left the DOM, which is normal here — 完成 and
+      // 重派 both change the task's status and can evict its row from the view.
+      if (previous !== null && document.contains(previous)) previous.focus();
+    };
   }, [onClose]);
 
   const lines = useMemo(() => {
@@ -128,7 +175,16 @@ export function ResultDrawer({
       {/* Clicking away closes, which is the fastest exit for a glance. */}
       <div className="scrim" onClick={onClose} aria-hidden="true" />
 
-      <aside className="drawer" role="dialog" aria-modal="true" aria-label="执行结果">
+      {/* `tabIndex={-1}` is what makes the panel programmatically focusable without
+          putting it in the tab order. */}
+      <aside
+        className="drawer"
+        ref={panelRef}
+        tabIndex={-1}
+        role="dialog"
+        aria-modal="true"
+        aria-label="执行结果"
+      >
         <header className="dhead">
           <div className="grow">
             <div className="dtitle">{task.title}</div>

@@ -357,10 +357,21 @@ function Row({
             }}
           />
         ) : (
-          <div
+          /*
+           * A real `<button>`, not a div carrying a double-click handler.
+           *
+           * Double-click has no keyboard equivalent, so renaming was pointer-only,
+           * and a plain div announces neither a role nor that it does anything. A
+           * button gets Enter and Space from the platform and needs no ARIA at all.
+           *
+           * Single click now opens the field, which is what Reminders and Things do
+           * and is more discoverable than a double-click nothing advertises.
+           */
+          <button
+            type="button"
             className="tt"
-            title="双击改标题"
-            onDoubleClick={() => {
+            title="改标题"
+            onClick={() => {
               // Seeded HERE rather than from initial state: a poll may have
               // changed the title since this row mounted, and editing a stale
               // draft would silently revert someone else's rename.
@@ -369,7 +380,7 @@ function Row({
             }}
           >
             {task.title}
-          </div>
+          </button>
         )}
         <Subline task={task} executor={executor} />
       </div>

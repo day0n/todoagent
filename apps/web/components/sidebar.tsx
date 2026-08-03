@@ -24,8 +24,13 @@ import {
  */
 const PRESET_COLORS = ["#007aff", "#34c759", "#ff9500", "#ff3b30", "#af52de", "#8e8e93"] as const;
 
-/** The prototype's default swatch, for a list created without a colour. */
-const DEFAULT_SWATCH = "#3a3a3c";
+/**
+ * The prototype's default swatch, for a list created without a colour.
+ *
+ * The token rather than the hex it holds, so the graphite exists in exactly one
+ * place. Custom properties resolve in inline styles like anywhere else.
+ */
+const DEFAULT_SWATCH = "var(--ink-1)";
 
 export function Sidebar({
   lists,
