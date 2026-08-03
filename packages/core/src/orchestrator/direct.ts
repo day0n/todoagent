@@ -21,6 +21,18 @@ export interface DirectRunOptions {
   runId: string;
   expert: Expert;
   signal?: AbortSignal;
+  /**
+   * Continue the CLI session this id names, rather than starting cold.
+   *
+   * Set by the answer endpoint when a parked question is answered and the runtime
+   * supports real resume (claude, cursor). Everything else — including a first
+   * dispatch — leaves it unset and the prompt carries whatever context is needed.
+   *
+   * The caller decides whether resume is appropriate, not this function: adapters
+   * that do not support it ignore the flag in silence, so a wrong guess here would
+   * drop the entire prior conversation while looking like it worked.
+   */
+  resumeSessionId?: string | null;
 }
 
 export interface DirectRunResult {
@@ -29,7 +41,7 @@ export interface DirectRunResult {
 }
 
 export async function runDirect(opts: DirectRunOptions): Promise<DirectRunResult> {
-  const { store, runId, expert, signal } = opts;
+  const { store, runId, expert, signal, resumeSessionId } = opts;
 
   const run = store.getRun(runId);
   if (!run) throw new Error(`run not found: ${runId}`);
@@ -98,6 +110,7 @@ export async function runDirect(opts: DirectRunOptions): Promise<DirectRunResult
       prompt: run.goal,
       cwd: project.repoPath,
       signal,
+      resumeSessionId,
     });
     if (res.ok) return finish("completed", null);
     if (res.status === "cancelled") return finish("cancelled", res.error);

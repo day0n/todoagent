@@ -42,6 +42,18 @@ export interface RunOneOptions {
   /** Native structured output — codex only; others fall back to reparsing. */
   outputSchemaPath?: string | null;
   /**
+   * Continue a previous CLI session instead of starting cold.
+   *
+   * The id comes from `attempt.sessionId`, which every adapter has been recording
+   * since M0 — and which nothing read until M5's answer loop. Only claude and
+   * cursor act on it (`--resume`); the rest ignore it, so a caller that cannot tell
+   * which runtime it is dealing with may always pass it. That silence is the reason
+   * the answer endpoint decides between real and stitched resume by runtime kind
+   * rather than by hoping: passing this to codex looks like it worked and quietly
+   * loses the entire prior conversation.
+   */
+  resumeSessionId?: string | null;
+  /**
    * Global cap on live agent processes for this run.
    *
    * Held here because this is the SINGLE point where a CLI is spawned. Capping at
@@ -227,6 +239,11 @@ export async function runOne(opts: RunOneOptions): Promise<RunOneResult> {
       ...(opts.idleTimeoutMs !== undefined ? { idleTimeoutMs: opts.idleTimeoutMs } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
       ...(opts.outputSchemaPath ? { outputSchemaPath: opts.outputSchemaPath } : {}),
+      // The last link in a chain that was complete at both ends and joined in the
+      // middle by nothing: the adapters have pushed `--resume` since M0, and the
+      // session id has been recorded since M0, but no caller could get one to the
+      // other.
+      ...(opts.resumeSessionId ? { resumeSessionId: opts.resumeSessionId } : {}),
     });
 
     // Drain the stream concurrently with waiting on the result: the adapter closes

@@ -27,7 +27,8 @@ const BLOCKED: Readonly<Record<string, BlockedArgMode>> = {
   "--verbose": "standalone",
 };
 
-function buildArgs(prompt: string, opts: ExecOptions): string[] {
+/** Exported for tests: the arg list is the whole contract with the CLI. */
+export function buildArgs(prompt: string, opts: ExecOptions): string[] {
   const args = [
     "-p",
     prompt,
