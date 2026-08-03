@@ -415,6 +415,19 @@ export const TASK_STATUSES: readonly TaskStatus[] = [
  */
 export type NeedsKind = "question" | "blocked" | "failed";
 
+/**
+ * What a completed worker turn actually amounted to.
+ *
+ * A single-turn CLI cannot ask for help except by saying so in its final output, so
+ * "the process exited 0" and "the work is finished" are different claims. This is
+ * the second one.
+ *
+ * Two of the three map onto `NeedsKind`; `done` has no needs state because there is
+ * nothing to need. `failed` is deliberately absent — that is the run's own status,
+ * not a judgement about its output.
+ */
+export type RunOutcomeKind = "done" | "question" | "blocked";
+
 export interface Task {
   id: string;
   channelId: string;

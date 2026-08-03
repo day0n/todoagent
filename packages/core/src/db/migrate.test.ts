@@ -174,6 +174,51 @@ test("migrate: an old database gains run.diff, and null stays distinct from empt
   }
 });
 
+test("migrate: an old database gains run.outcome_*, and unclassified stays distinct", async () => {
+  const legacy = await legacyDb();
+  try {
+    const store = new Store(legacy.path);
+    try {
+      /*
+       * `kind: null` is a real answer, not a missing one.
+       *
+       * It means "nothing classified this run" — an old row, a failed run, or a
+       * classifier that has not answered yet — and `syncTaskFromRun` reads it as the
+       * M0 behaviour: a completed run becomes 待确认. If this returned a default of
+       * `done` instead, the distinction would still hold today, but a future reader
+       * could not tell "judged finished" from "never judged".
+       */
+      assert.deepEqual(store.getRunOutcome("r1"), { kind: null, text: null });
+
+      // The write path is what used to throw `no such column: outcome_kind`.
+      assert.doesNotThrow(() =>
+        store.updateRun("r1", { outcomeKind: "question", outcomeText: "用哪个数据库？" }),
+      );
+      assert.deepEqual(store.getRunOutcome("r1"), {
+        kind: "question",
+        text: "用哪个数据库？",
+      });
+
+      /*
+       * An unrecognised stored value degrades to null rather than passing through.
+       *
+       * The column is plain TEXT, so a future version writing a fourth kind — or a
+       * hand-edited database — would otherwise put a card into a status no part of
+       * the UI can render. Falling back to "a person looks at it" is the safe
+       * direction.
+       */
+      store.updateRun("r1", { outcomeKind: "something_new" });
+      assert.equal(store.getRunOutcome("r1").kind, null, "an unknown kind reads as unclassified");
+
+      assert.deepEqual(store.getRunOutcome("no-such-run"), { kind: null, text: null });
+    } finally {
+      store.close();
+    }
+  } finally {
+    await legacy.dispose();
+  }
+});
+
 test("migrate: reopening is idempotent", async () => {
   const legacy = await legacyDb();
   try {

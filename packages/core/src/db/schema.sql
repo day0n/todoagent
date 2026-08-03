@@ -70,7 +70,23 @@ CREATE TABLE IF NOT EXISTS run (
   -- Deliberately NOT part of the `Run` interface — see `getRunDiff`. It is capped
   -- at 2M characters and `GET /api/runs` spreads whole Run objects for up to 100
   -- rows, so putting it on the type would put 200MB in a list response.
-  diff          TEXT
+  diff          TEXT,
+  -- What the worker's final output amounted to: 'done' | 'question' | 'blocked'.
+  --
+  -- A single-turn CLI has no way to ask for help other than saying so in its last
+  -- words, so a run can complete successfully and still not be finished.
+  --
+  -- Persisted rather than kept in the classifier's return value because
+  -- `syncTaskFromRun` maps (run, task) to a card state from eleven call sites and
+  -- has to reach the same answer every time. With the verdict living only in a
+  -- local variable, the first call parked a question in needs_you and the next one
+  -- — a cancel, a reconcile, a resumed gate — saw `completed`, mapped it to
+  -- 待确认 and discarded the question.
+  --
+  -- Deliberately NOT on the `Run` interface, for the same reason as `diff` above:
+  -- read it through `getRunOutcome` at the one point a card's fate is decided.
+  outcome_kind  TEXT,
+  outcome_text  TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_created ON run (created_at DESC);

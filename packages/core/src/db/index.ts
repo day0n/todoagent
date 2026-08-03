@@ -21,6 +21,7 @@ import type {
   Rebuttal,
   Review,
   Run,
+  RunOutcomeKind,
   RunStatus,
   SubTask,
   SubTaskStatus,
@@ -121,6 +122,8 @@ export class Store {
       { table: "task", column: "needs_kind", definition: "TEXT" },
       { table: "task", column: "needs_text", definition: "TEXT" },
       { table: "run", column: "diff", definition: "TEXT" },
+      { table: "run", column: "outcome_kind", definition: "TEXT" },
+      { table: "run", column: "outcome_text", definition: "TEXT" },
     ];
 
     for (const { table, column, definition } of expected) {
@@ -394,6 +397,27 @@ export class Store {
     return strOrNull(r["diff"]);
   }
 
+  /**
+   * What a completed run's output amounted to, if anything classified it.
+   *
+   * `kind: null` means "never classified" — an older run, a failed one, or a
+   * classifier that has not answered yet — and callers must read that as the M0
+   * behaviour (a completed run becomes 待确认). An unrecognised stored value is
+   * coerced to null for the same reason: degrading to "a person looks at it" is
+   * safe, whereas passing an unknown string through would put a card into a state
+   * no part of the UI can render.
+   */
+  getRunOutcome(id: string): { kind: RunOutcomeKind | null; text: string | null } {
+    const r = this.db
+      .prepare(`SELECT outcome_kind, outcome_text FROM run WHERE id=?`)
+      .get(id) as Row | undefined;
+    if (r === undefined) return { kind: null, text: null };
+    const raw = strOrNull(r["outcome_kind"]);
+    const kind =
+      raw === "done" || raw === "question" || raw === "blocked" ? raw : null;
+    return { kind, text: strOrNull(r["outcome_text"]) };
+  }
+
   listRuns(limit = 50): Run[] {
     return this.db
       .prepare(`SELECT * FROM run ORDER BY created_at DESC LIMIT ?`)
@@ -422,7 +446,10 @@ export class Store {
   updateRun(
     id: string,
     patch: Partial<
-      Pick<Run, "status" | "phase" | "gate" | "round" | "endedAt" | "error" | "spentTokens">
+      Pick<
+        Run,
+        "status" | "phase" | "gate" | "round" | "endedAt" | "error" | "spentTokens" | "goal"
+      >
     > & {
       /**
        * Working-tree snapshot, written once when a direct run completes.
@@ -436,6 +463,16 @@ export class Store {
        * through `getRunDiff` instead.
        */
       diff?: string;
+      /**
+       * What the worker's final output amounted to, and the text explaining it.
+       *
+       * Off the `Run` interface for the same reason as `diff`, though not for size:
+       * a card's fate is decided in exactly one place, and a field on the type would
+       * invite every reader of a run to form its own opinion about whether the work
+       * is really finished. Read it through `getRunOutcome`.
+       */
+      outcomeKind?: string;
+      outcomeText?: string;
     },
   ): void {
     const cols: Record<keyof typeof patch, string> = {
@@ -446,7 +483,13 @@ export class Store {
       endedAt: "ended_at",
       error: "error",
       spentTokens: "spent_tokens",
+      // Rewritten in exactly one situation: a resumed run whose CLI rejected the
+      // session id, retried cold with a prompt that carries the context the session
+      // would have supplied. The row must describe the prompt actually sent.
+      goal: "goal",
       diff: "diff",
+      outcomeKind: "outcome_kind",
+      outcomeText: "outcome_text",
     };
     const sets: string[] = [];
     const vals: Array<string | number | null> = [];
