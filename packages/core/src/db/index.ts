@@ -1229,6 +1229,7 @@ export class Store {
         | "assigneeKind"
         | "assigneeId"
         | "runId"
+        | "channelId"
       >
     >,
   ): void {
@@ -1242,6 +1243,7 @@ export class Store {
       assigneeKind: "assignee_kind",
       assigneeId: "assignee_id",
       runId: "run_id",
+      channelId: "channel_id",
     };
     const sets: string[] = [];
     const vals: Array<string | null> = [];

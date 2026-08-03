@@ -37,6 +37,12 @@ export interface BoardEvent {
  */
 const BOARD_CHANNEL = "board:changed";
 
+export type ChatBusEvent =
+  | { type: "chat:message" }
+  | { type: "chat:thinking"; on: boolean };
+
+const CHAT_CHANNEL = "chat:event";
+
 /**
  * In-process fan-out for live run events.
  *
@@ -87,6 +93,22 @@ class RunBus {
   subscribeBoard(fn: (ev: BoardEvent) => void): () => void {
     this.emitter.on(BOARD_CHANNEL, fn);
     return () => this.emitter.off(BOARD_CHANNEL, fn);
+  }
+
+  /**
+   * Chat traffic, on its own channel for the same reason the board has one:
+   * `/api/runs/:id/events` must never see it. Same invalidation philosophy too —
+   * `chat:message` tells the client to re-read history, it does not carry the
+   * message. `chat:thinking` is the one exception (a boolean), because "the
+   * agent is typing" is ephemeral UI state with nothing to re-read.
+   */
+  publishChat(ev: ChatBusEvent): void {
+    this.emitter.emit(CHAT_CHANNEL, ev);
+  }
+
+  subscribeChat(fn: (ev: ChatBusEvent) => void): () => void {
+    this.emitter.on(CHAT_CHANNEL, fn);
+    return () => this.emitter.off(CHAT_CHANNEL, fn);
   }
 }
 
