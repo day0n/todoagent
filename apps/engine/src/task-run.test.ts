@@ -199,7 +199,7 @@ test("run: a channel with no repository is refused, not attempted", async () => 
        * composer already promised this would not execute.
        */
       assert.equal(res.status, 400);
-      assert.match((await json<{ error: string }>(res)).error, /未关联仓库/);
+      assert.match((await json<{ error: string }>(res)).error, /未绑定仓库/);
 
       // And the card is untouched, so nothing looks like it started.
       const board = await json<{ tasks: Array<{ status: string; runId: string | null }> }>(

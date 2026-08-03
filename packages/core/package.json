@@ -20,6 +20,6 @@
     "e2e": "tsx src/cli/e2e.ts"
   },
   "dependencies": {
-    "zod": "3.24.1"
+    "zod": "3.25.76"
   }
 }

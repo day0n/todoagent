@@ -27,6 +27,7 @@ import {
   type Task,
   type TaskStatus,
 } from "@todoagent/core/types";
+import { createSecretary, type SecretaryInit } from "./agent/secretary.ts";
 import { isAllowedOrigin } from "./origin.ts";
 
 const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
@@ -888,6 +889,9 @@ app.get("/api/stream", (c) => {
         // naming it would require the client to keep a list that silently drifts.
         write(`data: ${JSON.stringify(ev)}\n\n`);
       });
+      const unsubChat = bus.subscribeChat((ev) => {
+        write(`data: ${JSON.stringify(ev)}\n\n`);
+      });
 
       // A comment frame, so an idle connection is not dropped by the browser or a
       // proxy. 25s is under the usual 30s idle timeouts and cheap enough to ignore.
@@ -897,6 +901,7 @@ app.get("/api/stream", (c) => {
         closed = true;
         clearInterval(heartbeat);
         unsub();
+        unsubChat();
         try {
           controller.close();
         } catch {
@@ -1523,31 +1528,135 @@ function abortRun(runId: string): boolean {
   return false;
 }
 
-/** The main-agent conversation timeline. Posting into it arrives with M4. */
-app.get("/api/chat/history", (c) => c.json(store.listAgentChat()));
+// ── Main agent (chat) ───────────────────────────────────────
+
+/**
+ * Lazy, cached, retryable-on-config-change initialization.
+ *
+ * Keyed by the env fingerprint so a user who fixes TODOAGENT_MODEL and hits
+ * send again gets a fresh attempt without restarting — but an unchanged bad
+ * config is not re-probed on every request.
+ */
+let secretaryInit: { key: string; promise: Promise<SecretaryInit> } | null = null;
+
+function secretaryConfigKey(): string {
+  return [
+    process.env["TODOAGENT_MODEL"] ?? "",
+    process.env["TODOAGENT_API_KEY"] ?? "",
+    process.env["TODOAGENT_AGENT_DIR"] ?? "",
+  ].join("\u0000");
+}
+
+function getSecretary(): Promise<SecretaryInit> {
+  const key = secretaryConfigKey();
+  if (secretaryInit === null || secretaryInit.key !== key) {
+    secretaryInit = {
+      key,
+      promise: createSecretary({
+        store,
+        dispatch: async (taskId) => {
+          const res = dispatchCard(taskId, 2_000_000);
+          return res.ok ? { ok: true } : { ok: false, error: res.error };
+        },
+        defaultListId: () => defaultList().id,
+        publishBoard: (taskId) => bus.publishBoard(taskId),
+      }),
+    };
+  }
+  return secretaryInit.promise;
+}
+
+/** Whether chat can work right now, and if not, exactly why. */
+app.get("/api/chat/status", async (c) => {
+  const init = await getSecretary();
+  return c.json(init.ready ? { ready: true, model: init.secretary.model } : { ready: false, reason: init.reason });
+});
+
+/**
+ * The conversation timeline, plus a resolution map for the task cards
+ * embedded in it. Resolved here because a `taskRefs` id is useless to the
+ * client without a title, and the client's current view may not contain the
+ * task at all.
+ */
+app.get("/api/chat/history", (c) => {
+  const messages = store.listAgentChat();
+  const tasks: Record<string, { id: string; title: string; status: string; channelId: string }> = {};
+  for (const m of messages) {
+    for (const id of m.taskRefs) {
+      if (tasks[id] !== undefined) continue;
+      const t = store.getTask(id);
+      if (t) tasks[id] = { id: t.id, title: t.title, status: t.status, channelId: t.channelId };
+    }
+  }
+  return c.json({ messages, tasks });
+});
+
+const ChatBody = z.object({ body: z.string().min(1).max(4000) });
+
+app.post("/api/chat", async (c) => {
+  const parsed = ChatBody.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+
+  const init = await getSecretary();
+  if (!init.ready) return c.json({ error: init.reason }, 503);
+  const secretary = init.secretary;
+
+  // One turn at a time. steer/followUp queueing exists in the SDK, but silently
+  // splicing a second request into a running turn muddles taskRefs attribution;
+  // an honest 409 is better until a real need shows up.
+  if (secretary.isBusy()) return c.json({ error: "上一轮还没结束，稍等几秒再发。" }, 409);
+
+  const userRow = store.appendAgentChat({ role: "user", body: parsed.data.body });
+  bus.publishChat({ type: "chat:message" });
+  bus.publishChat({ type: "chat:thinking", on: true });
+
+  try {
+    const turn = await secretary.turn(parsed.data.body);
+    const agentRow = store.appendAgentChat({
+      role: "agent",
+      body: turn.reply,
+      taskRefs: turn.taskRefs,
+    });
+    bus.publishChat({ type: "chat:message" });
+    return c.json({ user: userRow, agent: agentRow }, 201);
+  } catch (err) {
+    // The failure is recorded IN the conversation: a chat where the agent
+    // silently says nothing looks like the app ate the message.
+    const message = err instanceof Error ? err.message : String(err);
+    const agentRow = store.appendAgentChat({
+      role: "agent",
+      body: `这轮出错了：${message}`,
+    });
+    bus.publishChat({ type: "chat:message" });
+    return c.json({ user: userRow, agent: agentRow, error: message }, 500);
+  } finally {
+    bus.publishChat({ type: "chat:thinking", on: false });
+  }
+});
 
 const TaskRunBody = z.object({
   budgetTokens: z.number().int().min(0).max(200_000_000).default(2_000_000),
 });
 
+type DispatchResult =
+  | { ok: true; run: Run; task: Task }
+  | { ok: false; code: 400 | 404 | 409; error: string; busyRunId?: string };
+
 /**
- * Dispatches a board card to one agent, directly.
+ * Dispatches a board card to one agent, directly — the ONE dispatch path.
  *
- * The todoagent default path: no decomposition, no cross-review, no
- * verification. The card's assigned expert (or the first expert on file) gets
- * the task text and works in the repository itself; the card's status then
- * tracks the run's outcome. The six-phase pipeline still exists behind
+ * Shared by the HTTP route and the secretary's `dispatch_task` tool, so every
+ * guard (repository lock, expert resolution, needs_you consumption) holds no
+ * matter who asks. The todoagent default path: no decomposition, no
+ * cross-review, no verification. The six-phase pipeline still exists behind
  * `POST /api/runs` for a future deep mode.
  */
-app.post("/api/tasks/:id/run", async (c) => {
-  const task = store.getTask(c.req.param("id"));
-  if (!task) return c.json({ error: "unknown task" }, 404);
-
-  const parsed = TaskRunBody.safeParse(await c.req.json().catch(() => ({})));
-  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+function dispatchCard(taskId: string, budgetTokens: number): DispatchResult {
+  const task = store.getTask(taskId);
+  if (!task) return { ok: false, code: 404, error: "unknown task" };
 
   const channel = store.getChannel(task.channelId);
-  if (!channel) return c.json({ error: "the card's channel is gone" }, 409);
+  if (!channel) return { ok: false, code: 409, error: "the card's channel is gone" };
 
   /*
    * A channel with no repository cannot execute anything: the agent needs a
@@ -1555,25 +1664,21 @@ app.post("/api/tasks/:id/run", async (c) => {
    * created; this is the enforcement.
    */
   if (channel.projectId === null) {
-    return c.json(
-      { error: "此频道未关联仓库，任务无法执行。把任务放到关联了仓库的频道里。" },
-      400,
-    );
+    return { ok: false, code: 400, error: "此清单未绑定仓库，任务无法执行。把任务移到绑定了仓库的清单里。" };
   }
-  // Captured after the null check so the closure below keeps the narrowing; TS
-  // widens a property back to `string | null` inside a callback.
-  const projectId = channel.projectId;
-  const project = store.getProject(projectId);
-  if (!project) return c.json({ error: "the channel's project is gone" }, 409);
+  const project = store.getProject(channel.projectId);
+  if (!project) return { ok: false, code: 409, error: "the channel's project is gone" };
 
   // Same repository lock as a direct run: two runs merging into one branch
   // interleave and corrupt the result, which the user cannot undo.
   const busy = projectBusyWith(channel.projectId);
   if (busy !== null) {
-    return c.json(
-      { error: `another run is already working in this repository (run ${busy})`, busyRunId: busy },
-      409,
-    );
+    return {
+      ok: false,
+      code: 409,
+      error: `another run is already working in this repository (run ${busy})`,
+      busyRunId: busy,
+    };
   }
 
   // An already-running card must not start a second run: the first would keep
@@ -1581,7 +1686,7 @@ app.post("/api/tasks/:id/run", async (c) => {
   if (task.runId !== null) {
     const existing = store.getRun(task.runId);
     if (existing !== null && (existing.status === "running" || existing.status === "blocked_on_human")) {
-      return c.json({ error: "这张卡已经在执行了", runId: task.runId }, 409);
+      return { ok: false, code: 409, error: "这张卡已经在执行了" };
     }
   }
 
@@ -1607,7 +1712,7 @@ app.post("/api/tasks/:id/run", async (c) => {
       : null;
   const expert = assigned ?? store.listExperts()[0] ?? null;
   if (expert === null) {
-    return c.json({ error: "没有可用的 agent。先运行 pnpm seed 或在团队页创建一个专家。" }, 400);
+    return { ok: false, code: 400, error: "没有可用的 agent。先运行 pnpm seed 或在团队页创建一个专家。" };
   }
 
   // One transaction: a run whose card was never updated would execute with
@@ -1617,7 +1722,7 @@ app.post("/api/tasks/:id/run", async (c) => {
       projectId: channel.projectId as string,
       goal,
       acceptance: null,
-      budgetTokens: parsed.data.budgetTokens,
+      budgetTokens,
       soloMode: true,
     });
     store.updateTask(task.id, {
@@ -1634,7 +1739,22 @@ app.post("/api/tasks/:id/run", async (c) => {
   });
 
   launchDirect(run.id, expert);
-  return c.json({ run, task: store.getTask(task.id) }, 201);
+  const after = store.getTask(task.id);
+  return { ok: true, run, task: after ?? task };
+}
+
+app.post("/api/tasks/:id/run", async (c) => {
+  const parsed = TaskRunBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+
+  const res = dispatchCard(c.req.param("id"), parsed.data.budgetTokens);
+  if (!res.ok) {
+    return c.json(
+      res.busyRunId === undefined ? { error: res.error } : { error: res.error, busyRunId: res.busyRunId },
+      res.code,
+    );
+  }
+  return c.json({ run: res.run, task: res.task }, 201);
 });
 
 // ── Launch ──────────────────────────────────────────────────
