@@ -99,9 +99,39 @@ function classesIn(src) {
     // String branches of a ternary, and the static halves of a template.
     for (const q of expr.matchAll(/(["'])((?:(?!\1)[\s\S])*?)\1/g)) spans.push(q[2]);
     for (const t of expr.matchAll(/`((?:[^`\\]|\\[\s\S])*?)`/g)) {
-      // Interpolations dropped entirely: what they evaluate to is not knowable
-      // here, and their contents are code, not class names.
-      spans.push(t[1].replace(/\$\{[^}]*\}/g, " "));
+      /*
+       * Interpolations are dropped — but HOW depends on whether the token they
+       * follow is a complete class name or half of one.
+       *
+       *   `item${cond ? " on" : ""}`   `item` is a whole class; the interpolation
+       *                                adds a separate one
+       *   `st st-${t.status}`          `st-` is a PREFIX completed at runtime, so
+       *                                the only class written here is `st`
+       *
+       * A trailing `-` or `_` is the signal: no rule in this codebase is named with
+       * one, so a token ending that way is always waiting for a suffix. Such tokens
+       * collapse to `$`, which the reject filter below drops; everything else
+       * collapses to a space so the completed token beside it is still checked.
+       *
+       * Both directions of this have been wrong before. Replacing every
+       * interpolation with a space reported `.st-` as undefined (a false positive);
+       * replacing every one with `$` stopped checking `.item` (a false negative,
+       * strictly worse — a checker nobody trusts gets ignored, and one that misses
+       * things gets believed).
+       *
+       * A LEADING interpolation — `${base}-hot` — needs no special case: the leftover
+       * `-hot` does not start with a letter and the token filter rejects it.
+       *
+       * String literals inside an interpolation are unaffected either way: the loop
+       * above collects those from the expression directly, which is what keeps
+       * `${cond ? " on" : ""}` reporting `on`.
+       */
+      spans.push(
+        t[1].replace(/\$\{[^}]*\}/g, (_m, offset, whole) => {
+          const before = whole.slice(0, offset);
+          return /[-_]$/.test(before) ? "$" : " ";
+        }),
+      );
     }
   }
 
