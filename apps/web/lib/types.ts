@@ -391,3 +391,19 @@ export interface ChatMessage {
   taskRefs: string[];
   createdAt: string;
 }
+
+/** What a `taskRefs` id resolves to, for the inline card in the chat. */
+export interface ChatTaskCard {
+  id: string;
+  title: string;
+  status: TaskStatus;
+  channelId: string;
+}
+
+export interface ChatHistory {
+  messages: ChatMessage[];
+  tasks: Record<string, ChatTaskCard>;
+}
+
+/** Whether the main agent can run, and if not, the banner text explaining why. */
+export type ChatStatus = { ready: true; model: string } | { ready: false; reason: string };

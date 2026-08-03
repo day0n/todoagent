@@ -28,7 +28,11 @@
   --color-surface-2: #f3f3f5;
   --color-muted: rgba(118, 118, 128, 0.1);
   --color-muted-fg: #6e6e73;
-  --color-subtle-fg: #98989d;
+  /* Kept in step with `--ink-3` below, and for the same measured reason: the
+     retained pages read this one for repo paths, transcript gutters and timeline
+     labels, so leaving it at the mockup's #98989d would fix the contrast on the
+     three-pane surface and leave /runs and /team failing. */
+  --color-subtle-fg: #6f6f74;
   --color-line: rgba(60, 60, 67, 0.12);
   --color-line-strong: rgba(60, 60, 67, 0.2);
 
@@ -90,8 +94,28 @@
   --glass: rgba(248, 248, 250, 0.76);
   --card: rgba(255, 255, 255, 0.96);
   --ink: #1d1d1f;
+  /* The prototype's `#3a3a3c` nav ink. Named because it was a literal in three
+     places — twice here and once as `DEFAULT_SWATCH` in sidebar.tsx. */
+  --ink-1: #3a3a3c;
   --ink-2: #6e6e73;
-  --ink-3: #98989d;
+  /*
+   * Darkened from the prototype's `#98989d`.
+   *
+   * Measured (WCAG 2, sRGB) against the four backgrounds this token lands on —
+   * page grey #f3f3f5, the composited glass sidebar, a composited card, white:
+   *
+   *   #98989d (mockup)  2.61 / 2.68 / 2.87 / 2.87   fails even the 3:1 large-text floor
+   *   #6f6f74 (here)    4.51 / 4.67 / 5.00 / 5.00   clears 4.5:1 everywhere
+   *
+   * Not decorative: the empty-state line, the repo tag, the sidebar counts, 清单,
+   * every placeholder and the drawer's subtitle all read in it.
+   *
+   * The cost is real and worth stating. `--ink-2` is #6e6e73, one hex step away, so
+   * the palette's third grey is now nearly the second. Legible-but-flat beat
+   * layered-but-unreadable; if mockup fidelity matters more, this is the one line
+   * to revert.
+   */
+  --ink-3: #6f6f74;
   --line: rgba(60, 60, 67, 0.1);
   --line-strong: rgba(60, 60, 67, 0.16);
   --fill: rgba(118, 118, 128, 0.1);
@@ -100,6 +124,25 @@
   --white: #ffffff;
   --accent: #007aff;
   --accent-pressed: #0062cc;
+  /*
+   * Blue as TEXT, distinct from blue as a fill. One hue, two roles, two tokens.
+   *
+   * Measured on white/card and on the composited `--accent-tint`:
+   *
+   *   #007aff  4.02 / 3.48   fails 4.5:1
+   *   #0062cc  5.80 / 5.02   clears it
+   *
+   * Every place the design SAYS something in blue reads in this one: the 需要你
+   * subline, 进行中, the 恢复 action, an active nav row, the drawer's note.
+   *
+   * KNOWN LIMITATION, deliberately left: white text ON the `--accent` fill measures
+   * 4.02:1 and also misses 4.5:1 — the 需要你 row's primary pill, the hot badge,
+   * `.btn-primary`, a user chat bubble. Fixing that means moving the fill off Apple's
+   * system blue, which is the platform colour this entire design is built on and the
+   * mockup's reference; that is a product decision, not a polish one. Icons on the
+   * fill are fine either way (non-text needs 3:1).
+   */
+  --accent-text: #0062cc;
   --accent-tint: rgba(0, 122, 255, 0.11);
   --accent-line: rgba(0, 122, 255, 0.18);
   --mono: ui-monospace, "SF Mono", monospace;
@@ -285,7 +328,7 @@
     border: 0;
     border-radius: 10px;
     background: transparent;
-    color: #3a3a3c;
+    color: var(--ink-1);
     cursor: pointer;
     font-size: 13.5px;
     text-align: left;
@@ -368,7 +411,7 @@
   }
   .item.on {
     background: var(--accent-tint);
-    color: var(--accent);
+    color: var(--accent-text);
     font-weight: 600;
   }
   .item svg {
@@ -399,7 +442,7 @@
     text-align: center;
   }
   .item.on .n {
-    color: var(--accent);
+    color: var(--accent-text);
     opacity: 0.72;
   }
   .item .n.hot {
@@ -418,9 +461,13 @@
 
   /* Per-list overflow menu, revealed on hover or keyboard focus. The count moves
      out of the way rather than sitting behind it. */
+  /* 24px, not the 22px this started at: WCAG 2.5.8's AA baseline is a 24×24 target,
+     and the spacing exception does not apply because `.pick` ends flush against
+     this button. Grown visually rather than with a pseudo-element — an extended hit
+     area here would overlap `.pick`, which the same rule forbids. */
   .item .more {
-    width: 22px;
-    height: 22px;
+    width: 24px;
+    height: 24px;
     margin-left: auto;
     display: grid;
     place-items: center;
@@ -503,7 +550,7 @@
     border: 0;
     border-radius: 999px;
     background: transparent;
-    color: var(--accent);
+    color: var(--accent-text);
     cursor: pointer;
     font-size: 12px;
     font-weight: 600;
@@ -516,7 +563,7 @@
     height: 8px;
     flex-shrink: 0;
     border-radius: 50%;
-    background: #3a3a3c;
+    background: var(--ink-1);
   }
   .side-foot {
     margin-top: auto;
@@ -759,7 +806,7 @@
     font-weight: 600;
   }
   .glabel.attention {
-    color: var(--accent);
+    color: var(--accent-text);
   }
   .glabel .gn {
     color: var(--ink-3);
@@ -842,11 +889,27 @@
     display: grid;
     place-items: center;
     padding: 0;
+    position: relative;
     border: 1.5px solid #b8b8bd;
     border-radius: 50%;
     background: transparent;
     cursor: pointer;
     transition: border-color 0.12s ease;
+  }
+  /*
+   * Hit area to WCAG 2.5.8's 24×24 baseline, without touching the 20px circle the
+   * design draws. A pseudo-element is the right tool here and was the wrong one for
+   * the sidebar's overflow button: this row has a 13px gap to the title, so 2px of
+   * growth on each side collides with nothing.
+   */
+  .ring::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 24px;
+    height: 24px;
+    transform: translate(-50%, -50%);
   }
   .row:hover .ring:not(:disabled) {
     border-color: var(--accent);
@@ -871,9 +934,24 @@
     flex: 1;
     min-width: 0;
   }
+  /*
+   * A `<button>`, reset to read as the text it holds.
+   *
+   * It became one so renaming has a keyboard path (see task-pane.tsx). The row
+   * already carries three real controls, so this must not look like a fourth:
+   * no box, no weight change, left-aligned, and `cursor: text` because what a
+   * click actually produces is a text field.
+   */
   .tt {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: text;
     font-size: 14.5px;
     line-height: 1.45;
+    text-align: left;
   }
   /* Inline title edit, opened by double-click. Sized to match `.tt` exactly so
      the row does not change height when it opens. */
@@ -908,7 +986,7 @@
     line-height: normal;
   }
   .mm.attention {
-    color: var(--accent);
+    color: var(--accent-text);
   }
   .repo {
     color: var(--ink-3);
@@ -932,7 +1010,7 @@
     background: #8e8e93;
   }
   .st.run {
-    color: var(--accent);
+    color: var(--accent-text);
   }
   .st.run i {
     background: var(--accent);
@@ -1151,6 +1229,115 @@
     background: #e9e9eb;
     color: var(--ink);
   }
+  /* One message plus its inline task cards; alignment lives here so the cards
+     hang under the bubble on the same side. */
+  .mrow {
+    display: flex;
+    flex-direction: column;
+  }
+  .mrow.u {
+    align-items: flex-end;
+  }
+  .mrow.a {
+    align-items: flex-start;
+  }
+  .mrow .m {
+    margin-bottom: 4px;
+  }
+  .trefs {
+    max-width: 94%;
+    margin: 2px 0 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .tref {
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    padding: 9px 13px;
+    border: 0.5px solid rgba(0, 0, 0, 0.06);
+    border-radius: 13px;
+    background: var(--card);
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+    font-size: 12.5px;
+    text-align: left;
+    cursor: pointer;
+    transition: box-shadow 0.15s ease;
+  }
+  .tref:hover {
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.07);
+  }
+  .tref .o {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    border: 1.4px solid #b8b8bd;
+    border-radius: 50%;
+  }
+  .tref .tt {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tref .st {
+    flex-shrink: 0;
+    color: var(--ink-3);
+    font-size: 11px;
+  }
+  .tref .st-in_progress {
+    color: var(--accent);
+  }
+  .tref .st-needs_you {
+    color: var(--accent);
+    font-weight: 600;
+  }
+  /* iMessage-style typing dots. */
+  .m.thinking {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 13px 15px;
+  }
+  .m.thinking i {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ink-3);
+    animation: think 1.2s ease-in-out infinite;
+  }
+  .m.thinking i:nth-child(2) {
+    animation-delay: 0.18s;
+  }
+  .m.thinking i:nth-child(3) {
+    animation-delay: 0.36s;
+  }
+  @keyframes think {
+    50% {
+      opacity: 0.25;
+      transform: translateY(-2px);
+    }
+  }
+  /* "Chat cannot run yet, and this is why." Informational, not an error. */
+  .cbanner {
+    margin: 12px 16px 0;
+    padding: 9px 13px;
+    border: 0.5px solid var(--accent-line);
+    border-radius: 12px;
+    background: var(--accent-tint);
+    color: var(--ink-2);
+    font-size: 12px;
+    line-height: 1.55;
+    overflow-wrap: anywhere;
+  }
+  .chead .t i.on {
+    background: #34c759;
+  }
+  .cinput.busy {
+    opacity: 0.65;
+  }
   /* Waiting for the main agent (M4). Centred rather than a bubble, so it reads as
      the pane's state and not as something an agent said. */
   .cempty {
@@ -1310,7 +1497,7 @@
     padding: 9px 12px;
     border-radius: 10px;
     background: var(--accent-tint);
-    color: var(--accent);
+    color: var(--accent-text);
     font-size: 12.5px;
     line-height: 1.55;
   }
@@ -1723,7 +1910,7 @@
     padding: 0.375rem 0.625rem;
     border-radius: 9px;
     font-size: 13px;
-    color: #3a3a3c;
+    color: var(--ink-1);
     transition:
       background 0.14s ease,
       color 0.14s ease;
@@ -1733,7 +1920,7 @@
   }
   .nav-row[data-active="true"] {
     background: var(--accent-tint);
-    color: var(--accent);
+    color: var(--accent-text);
     font-weight: 600;
   }
 }

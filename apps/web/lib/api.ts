@@ -1,6 +1,8 @@
 import type {
   AttemptTranscript,
+  ChatHistory,
   ChatMessage,
+  ChatStatus,
   DetectedRuntime,
   Expert,
   ListsResponse,
@@ -220,8 +222,22 @@ export const api = {
    */
   runResult: (runId: string) => req<RunResult>(`/api/runs/${runId}/result`),
 
-  /** The main-agent conversation. Empty until M4 wires posting. */
-  chatHistory: () => req<ChatMessage[]>("/api/chat/history"),
+  /** The main-agent conversation, plus title resolution for its inline cards. */
+  chatHistory: () => req<ChatHistory>("/api/chat/history"),
+
+  /** Whether the main agent can run right now, with the banner text when not. */
+  chatStatus: () => req<ChatStatus>("/api/chat/status"),
+
+  /**
+   * One chat turn. Resolves when the agent has answered — tool calls included —
+   * so the caller should show the thinking state from the stream, not a spinner
+   * on this promise alone.
+   */
+  chatSend: (body: string) =>
+    req<{ user: ChatMessage; agent: ChatMessage }>("/api/chat", {
+      method: "POST",
+      body: JSON.stringify({ body }),
+    }),
 };
 
 /**
@@ -276,6 +292,7 @@ export function subscribeRun(
 export function subscribeBoard(
   onChange: () => void,
   onHealth?: (open: boolean) => void,
+  onChat?: (ev: { type: "chat:message" } | { type: "chat:thinking"; on: boolean }) => void,
 ): () => void {
   const source = new EventSource(`${ENGINE}/api/stream`);
 
@@ -312,8 +329,10 @@ export function subscribeBoard(
     // leave the caller polling at the fallback rate over a working stream.
     markHealthy();
     try {
-      const ev = JSON.parse(e.data) as { type?: string };
+      const ev = JSON.parse(e.data) as { type?: string; on?: boolean };
       if (ev.type === "board:changed") onChange();
+      else if (ev.type === "chat:message") onChat?.({ type: "chat:message" });
+      else if (ev.type === "chat:thinking") onChat?.({ type: "chat:thinking", on: ev.on === true });
       // `stream:ready` needs no action beyond the health signal above: its only job
       // is to start the response body so the browser fires `onopen`.
     } catch {

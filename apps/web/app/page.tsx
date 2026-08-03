@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, subscribeBoard } from "../lib/api.ts";
 import type {
-  ChatMessage,
+  ChatHistory,
+  ChatStatus,
   Expert,
   Task,
   TaskGroups,
@@ -102,7 +103,9 @@ export default function Page() {
   const [runtimeNames, setRuntimeNames] = useState<string[]>([]);
   const [runtimeCount, setRuntimeCount] = useState<number | null>(null);
   const [experts, setExperts] = useState<Expert[]>([]);
-  const [chat, setChat] = useState<ChatMessage[] | null>(null);
+  const [chat, setChat] = useState<ChatHistory | null>(null);
+  const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
+  const [thinking, setThinking] = useState(false);
 
   /*
    * Counts local changes, so a poll that went out before one can be recognised as
@@ -196,17 +199,23 @@ export default function Page() {
     };
   }, [refresh, showError]);
 
+  /** Re-reads the conversation; the SSE `chat:message` signal calls this. */
+  const loadChat = useCallback(async (): Promise<void> => {
+    setChat(await api.chatHistory());
+  }, []);
+
   useEffect(() => {
-    void Promise.all([api.runtimes(), api.experts(), api.chatHistory()])
-      .then(([rt, ex, history]) => {
+    void Promise.all([api.runtimes(), api.experts(), api.chatHistory(), api.chatStatus()])
+      .then(([rt, ex, history, status]) => {
         setRuntimeNames(rt.detected.map((d) => d.kind));
         setRuntimeCount(rt.detected.length);
         setExperts(ex);
         setChat(history);
+        setChatStatus(status);
       })
       // A missing runtime list degrades the subtitle and the chat header; it is
       // not worth a toast over, and the task list works regardless.
-      .catch(() => setChat([]));
+      .catch(() => setChat({ messages: [], tasks: {} }));
 
     // Its own request, and its own failure: an empty archived section is the
     // normal case, so a failure here must not disturb the task list.
@@ -236,6 +245,10 @@ export default function Page() {
           refreshRef.current().catch(() => undefined);
         },
         (ok) => setStreamOk(ok),
+        (ev) => {
+          if (ev.type === "chat:message") void loadChat().catch(() => undefined);
+          else setThinking(ev.on);
+        },
       );
     };
     const close = (): void => {
@@ -259,7 +272,9 @@ export default function Page() {
       close();
       document.removeEventListener("visibilitychange", onVisibility);
     };
-  }, []);
+    // `loadChat` is a stable useCallback; listing it keeps the linter honest
+    // without ever tearing the connection down.
+  }, [loadChat]);
 
   /*
    * Polling, now a backstop rather than the mechanism.
@@ -564,7 +579,24 @@ export default function Page() {
         onDelete={remove}
       />
 
-      <ChatPane messages={chat} runtimeNames={runtimeNames} />
+      <ChatPane
+        history={chat}
+        status={chatStatus}
+        thinking={thinking}
+        runtimeNames={runtimeNames}
+        onSend={async (body) => {
+          try {
+            await api.chatSend(body);
+          } catch (err) {
+            showError(err);
+          } finally {
+            // The stream usually beat us to it; this covers a dropped stream and
+            // the error path, where the engine records the failure as a message.
+            await loadChat().catch(() => undefined);
+          }
+        }}
+        onOpenTask={(t) => setView(`list:${t.channelId}`)}
+      />
 
       {drawerTask !== null ? (
         <ResultDrawer

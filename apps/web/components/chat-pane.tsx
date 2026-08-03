@@ -1,73 +1,145 @@
 "use client";
 
-import { useEffect, useRef } from "react";
-import type { ChatMessage } from "../lib/types.ts";
+import { useEffect, useRef, useState } from "react";
+import type { ChatHistory, ChatStatus, ChatTaskCard } from "../lib/types.ts";
+import { TASK_STATUS_LABEL } from "../lib/types.ts";
 import { IconSend } from "./icons.tsx";
 
 /**
  * The right pane: the main agent's conversation.
  *
- * Read-only in M2. The composer is rendered and disabled rather than omitted,
- * because this pane IS the product's promise — "say a thing, it becomes a task" —
- * and an empty column would not say so. Posting arrives with M4, once the main
- * agent has credentials; the endpoint that would receive it does not exist yet.
+ * Live as of M4. The composer stays visible even when the agent is not
+ * configured — this pane IS the product's promise, "say a thing, it becomes a
+ * task" — but submitting then only surfaces the setup banner. Task cards the
+ * agent creates render inline under its reply, resolved through
+ * `history.tasks` because the current board view may not contain them.
  *
- * Hidden entirely below 1050px by the stylesheet: at that width the task list is
- * the working surface and this is the first thing that can go.
+ * Hidden entirely below 1050px by the stylesheet: at that width the task list
+ * is the working surface and this is the first thing that can go.
  */
 export function ChatPane({
-  messages,
+  history,
+  status,
+  thinking,
   runtimeNames,
+  onSend,
+  onOpenTask,
 }: {
-  messages: ChatMessage[] | null;
+  history: ChatHistory | null;
+  /** Null while the probe is in flight; the banner waits for a real answer. */
+  status: ChatStatus | null;
+  thinking: boolean;
   /** Detected local CLIs, e.g. ["codex", "claude"]. */
   runtimeNames: string[];
+  /** Resolves when the turn is over; rejections carry the engine's message. */
+  onSend: (body: string) => Promise<void>;
+  onOpenTask: (task: ChatTaskCard) => void;
 }) {
   const bodyRef = useRef<HTMLDivElement>(null);
-  const count = messages?.length ?? 0;
+  const [draft, setDraft] = useState("");
+  const [sending, setSending] = useState(false);
 
-  // Pinned to the newest message, like any messaging client. Harmless while the
-  // history is empty, and correct the moment M4 starts appending to it.
+  const messages = history?.messages ?? [];
+  const ready = status?.ready === true;
+
+  // Pinned to the newest message, like any messaging client. Thinking state is
+  // in the dependency list so the indicator's appearance also scrolls into view.
   useEffect(() => {
     const el = bodyRef.current;
     if (el !== null) el.scrollTop = el.scrollHeight;
-  }, [count]);
+  }, [messages.length, thinking]);
+
+  const submit = (): void => {
+    const text = draft.trim();
+    if (text === "" || sending) return;
+    setDraft("");
+    setSending(true);
+    onSend(text).finally(() => setSending(false));
+  };
 
   return (
     <aside className="chat">
       <div className="chead">
         <div className="face" aria-hidden="true" />
         <div className="t">
-          <i />
+          <i className={ready ? "on" : ""} />
           Agent
         </div>
-        {/* The runtimes actually installed on this machine. Honest about zero:
-            without a CLI there is nothing to dispatch to. */}
+        {/* Configured model when live; otherwise the installed CLIs, honest about zero. */}
         <div className="s">
-          {runtimeNames.length > 0 ? runtimeNames.join(" · ") : "未检测到 CLI"}
+          {status?.ready === true
+            ? status.model
+            : runtimeNames.length > 0
+              ? runtimeNames.join(" · ")
+              : "未检测到 CLI"}
         </div>
       </div>
 
+      {status !== null && !status.ready && (
+        <div className="cbanner" role="note">
+          {status.reason}
+        </div>
+      )}
+
       <div className="cbody" ref={bodyRef}>
-        {count === 0 ? (
+        {messages.length === 0 && !thinking ? (
           <p className="cempty">和 agent 说件事，它会变成任务</p>
         ) : (
-          (messages ?? []).map((m) => (
-            <div key={m.id} className={`m ${m.role === "user" ? "u" : "a"}`}>
-              {m.body}
+          messages.map((m) => (
+            <div key={m.id} className={`mrow ${m.role === "user" ? "u" : "a"}`}>
+              <div className={`m ${m.role === "user" ? "u" : "a"}`}>{m.body}</div>
+              {m.taskRefs.length > 0 && (
+                <div className="trefs">
+                  {m.taskRefs.map((id) => {
+                    const t = history?.tasks[id];
+                    if (t === undefined) return null;
+                    return (
+                      <button
+                        key={id}
+                        type="button"
+                        className="tref"
+                        onClick={() => onOpenTask(t)}
+                        title="在清单中查看"
+                      >
+                        <span className="o" aria-hidden="true" />
+                        <span className="tt">{t.title}</span>
+                        <span className={`st st-${t.status}`}>{TASK_STATUS_LABEL[t.status]}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           ))
+        )}
+        {thinking && (
+          <div className="m a thinking" aria-label="agent 正在处理">
+            <i />
+            <i />
+            <i />
+          </div>
         )}
       </div>
 
       <div className="cinput-wrap">
-        <div className="cinput off">
+        <div className={`cinput ${sending ? "busy" : ""}`}>
           <input
-            placeholder="主 agent 即将上线"
+            placeholder={ready ? "说件事，自动变成任务…" : "先配置模型（见上方提示）"}
             aria-label="给 Agent 发送消息"
-            disabled
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.nativeEvent.isComposing) submit();
+            }}
+            disabled={sending}
           />
-          <button type="button" className="send" disabled aria-label="发送">
+          <button
+            type="button"
+            className="send"
+            onClick={submit}
+            disabled={sending || draft.trim() === ""}
+            aria-label="发送"
+          >
             <IconSend />
           </button>
         </div>
