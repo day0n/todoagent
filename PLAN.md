@@ -135,8 +135,15 @@ Store 已有 migrate 机制（`db/index.ts`），按既有模式加列/建表 + 
 | M2 | 前端三栏重做（照 v1d 原型，接 M1 API）| UI 与原型一致，增删勾选/派发/取消可用 | ✅ `3e46360`…`dfd4bed`，452 测试全绿 |
 | M3 | 执行反馈打磨 + M2 遗留缺口 | SSE、看结果抽屉（diff+transcript）、失败重派、CORS/归档修复、任务改标题 | ✅ `4b5066d`…`286a4e8`，490 测试全绿 |
 | M4 | 主 agent chat（完全嵌入 pi SDK）| 说一句话 → 建卡出现在清单 + 关联提示；无 key 时优雅降级 | ✅ 代码与测试完成；真实模型路径待 key 验证（脚本化假模型已穿透生产路径）|
-| M5 | 需要你闭环 | 产出分类（模型+启发式双层）进 needs_you；回答 → resume 真续/假续 → 再分类 | 📋 prompt: `plans/M5-needs-you-loop.md` |
-| M6 | 打磨 | 空状态/快捷键/响应式/已完成折叠；e2e 更新 | 待写 prompt |
+| M5 | 需要你闭环 | 产出分类（模型+启发式双层）进 needs_you；回答 → resume 真续/假续 → 再分类 | ✅ `e7c82cd`…`2a7a960`，527 测试全绿 |
+| M6 | 打磨与收尾 | e2e 重写、seed 收简、移动清单/我的一天入口、快捷键、README 重写 | 📋 prompt: `plans/M6-polish.md` |
+
+### 待 key 验证清单（编码之外，key 到位后人工执行）
+
+1. M4 真模型：配置 `TODOAGENT_MODEL` + key，chat 说「加两个任务」验证建卡与关联提示
+2. M5 真续跑：用真 claude/cursor 触发提问→回答，确认 `--resume` 真的重载会话（观察它是否记得上一轮）
+3. M5 模型分类：验证 question/blocked 判定质量，校准分类 prompt
+4. 降级路径：删掉 session 文件后回答，确认自动落假续
 
 顺序说明:M2 在 M1 后立即做，让每个后续里程碑都能在真 UI 里看到；M4/M5 依赖 pi 凭据到位。
 
@@ -148,6 +155,11 @@ Store 已有 migrate 机制（`db/index.ts`），按既有模式加列/建表 + 
 4. **旧频道聊天 UI**：直接删，engine 代码保留。
 > M3 验收补记（2026-08-02）：diff 快照不进 `Run` 接口（列表载荷会爆），读取走独立查询；SSE 发布走中间件
 > 跳过 GET/4xx/5xx；`needsKind=question` 的任务在 M5 落地前没有可用动作（已知死路，M5 解）。
+
+> M5 验收补记（2026-08-03）：产出判定持久化在 `run.outcome_kind/text`（syncTaskFromRun 有 11 个
+> 调用点，必须保持 (run,task) 纯映射，判定放局部变量会被后续同步冲掉——实现者的方案优于计划原稿）；
+> session 失效只能靠文本匹配（两家 CLI 都无结构化错误码），匹配刻意收窄；启发式不产 blocked，
+> 该 kind 仅模型路径可达。
 
 6. **M4 架构决策（2026-08-03，用户拍板）**：主 agent **完全嵌入 pi SDK**（`@earendil-works` 系），
    不走「pi-ai + 自写循环」。理由：总管的演进路线（读 diff 验收、读仓库补上下文、review 文件、
