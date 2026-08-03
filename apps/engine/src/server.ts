@@ -12,6 +12,7 @@ import {
   deliverMessage,
   detectAll,
   isGitRepo,
+  recordEvent,
   resolveEscalationAndContinue,
   runDirect,
   runPipeline,
@@ -27,6 +28,7 @@ import {
   type Task,
   type TaskStatus,
 } from "@todoagent/core/types";
+import { classifyOutcome } from "./agent/classifier.ts";
 import { createSecretary, type SecretaryInit } from "./agent/secretary.ts";
 import { isAllowedOrigin } from "./origin.ts";
 
@@ -451,34 +453,50 @@ app.get("/api/runs/:id/attempts/:attemptId", (c) => {
  *   ""    a snapshot was taken and the tree was clean. The agent genuinely
  *         changed no files, which is a real and reportable outcome.
  */
-app.get("/api/runs/:id/result", (c) => {
-  const id = c.req.param("id");
-  const run = store.getRun(id);
-  if (!run) return c.json({ error: "not found" }, 404);
-
-  /*
-   * The newest attempt that actually produced text.
-   *
-   * Not simply the last attempt: `runOneWithRetry` can add a failed attempt after
-   * a successful one, and a crashed retry has `output: null`. Taking the last row
-   * blindly would show an empty result for a run whose work is sitting in the
-   * attempt before it. Attempts come back ordered by `started_at`, so this walks
-   * backwards to the most recent one with content.
-   */
-  const attempts = store.listAttempts(id);
+/**
+ * The newest attempt that actually produced text, and who ran it.
+ *
+ * Not simply the last attempt: `runOneWithRetry` can add a failed attempt after a
+ * successful one, and a crashed retry has `output: null`. Taking the last row
+ * blindly would show an empty result for a run whose work is sitting in the attempt
+ * before it. Attempts come back ordered by `started_at`, so this walks backwards to
+ * the most recent one with content.
+ *
+ * Shared by the result endpoint and by classification, which must judge the same
+ * text the user will read. Two copies of this walk would eventually disagree, and
+ * the failure would be a card parked on a question the drawer does not show.
+ */
+function finalOutputOf(runId: string): {
+  output: string | null;
+  executor: string | null;
+  sessionId: string | null;
+} {
+  const attempts = store.listAttempts(runId);
   let output: string | null = null;
   let executor: string | null = null;
+  let sessionId: string | null = null;
   for (let i = attempts.length - 1; i >= 0; i--) {
     const a = attempts[i];
     if (a === undefined) continue;
     if (executor === null) executor = a.runtimeKind;
+    // The newest session id wins even when that attempt produced no text: resuming
+    // is about the conversation, not about who said something last.
+    if (sessionId === null && a.sessionId !== null) sessionId = a.sessionId;
     if (a.output !== null && a.output.trim() !== "") {
       output = a.output;
       executor = a.runtimeKind;
       break;
     }
   }
+  return { output, executor, sessionId };
+}
 
+app.get("/api/runs/:id/result", (c) => {
+  const id = c.req.param("id");
+  const run = store.getRun(id);
+  if (!run) return c.json({ error: "not found" }, 404);
+
+  const { output, executor } = finalOutputOf(id);
   return c.json({ run, diff: store.getRunDiff(id), output, executor });
 });
 
@@ -1743,6 +1761,185 @@ function dispatchCard(taskId: string, budgetTokens: number): DispatchResult {
   return { ok: true, run, task: after ?? task };
 }
 
+/** Runtimes whose CLI can continue a prior session by id. */
+const RESUMABLE_RUNTIMES = new Set(["claude", "cursor"]);
+
+/** Tail of the previous output carried into a stitched prompt. */
+const STITCH_TAIL = 6_000;
+
+/**
+ * The prompt for a run that continues after a human answered.
+ *
+ * Two shapes, chosen by whether the CLI can reload its own session:
+ *
+ *   real resume — the answer, with the question quoted for orientation. The model
+ *     still has the entire conversation, so restating it would only add noise.
+ *   stitched — goal, previous output, answer, and an instruction to continue.
+ *     Everything the worker knew is gone, so it all has to be in the text. This
+ *     costs tokens twice over and is accepted deliberately (PLAN.md §7-3).
+ */
+function answerPrompt(opts: {
+  resumed: boolean;
+  goal: string;
+  previousOutput: string;
+  question: string | null;
+  answer: string;
+}): string {
+  if (opts.resumed) {
+    return opts.question === null || opts.question === ""
+      ? opts.answer
+      : `你上一轮问：${opts.question}\n\n我的回答：${opts.answer}\n\n按这个回答继续完成任务。`;
+  }
+  const tail =
+    opts.previousOutput.length > STITCH_TAIL
+      ? opts.previousOutput.slice(-STITCH_TAIL)
+      : opts.previousOutput;
+  return [
+    `你之前在做这个任务：${opts.goal}`,
+    "",
+    "你上一轮的输出（含你提出的问题）：",
+    tail,
+    "",
+    `用户的回答：${opts.answer}`,
+    "",
+    "按回答继续完成任务。",
+  ].join("\n");
+}
+
+const AnswerBody = z.object({ answer: z.string().min(1).max(4000) });
+
+/**
+ * Answers a parked question and continues the work.
+ *
+ * This is the return leg of the product's central promise: a task that got stuck
+ * comes back to you, and what you type goes to the agent that asked. Before it
+ * existed a `question` card had no action at all — the M3 delivery notes recorded
+ * it as a known dead end.
+ *
+ * A NEW run is created rather than reopening the old one. The previous run is a
+ * finished, immutable record with its own diff, transcript and cost; continuing to
+ * append to it would make "what did this run do" unanswerable. The card follows the
+ * new run, and its history stays walkable through the runs it pointed at.
+ */
+app.post("/api/tasks/:id/answer", async (c) => {
+  const parsed = AnswerBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const answer = parsed.data.answer.trim();
+  if (answer === "") return c.json({ error: "回答不能为空。" }, 400);
+
+  const task = store.getTask(c.req.param("id"));
+  if (!task) return c.json({ error: "unknown task" }, 404);
+
+  /*
+   * Only a parked QUESTION can be answered.
+   *
+   * `blocked` and `failed` are refused here on purpose: nobody asked anything, so
+   * there is no question for the text to answer. Those cards offer 重派, which is a
+   * different action with a different prompt — feeding a reply into a run that never
+   * asked would produce an agent responding to a conversation it did not have.
+   */
+  if (task.status !== "needs_you" || task.needsKind !== "question") {
+    return c.json(
+      { error: "只有「需要你」里 agent 提问的任务可以回答。失败或受阻的任务用重派。" },
+      409,
+    );
+  }
+  if (task.runId === null) {
+    return c.json({ error: "这张卡没有关联的执行记录，无法续跑。" }, 409);
+  }
+
+  const previous = store.getRun(task.runId);
+  if (!previous) return c.json({ error: "关联的执行记录已不存在。" }, 409);
+
+  // Same repository lock as dispatch: two agents writing one working tree
+  // interleave their edits, and the user cannot untangle the result.
+  const busy = projectBusyWith(previous.projectId);
+  if (busy !== null) {
+    return c.json(
+      { error: `这个仓库正在跑另一个任务（run ${busy}），等它结束再回答。`, busyRunId: busy },
+      409,
+    );
+  }
+
+  const expert =
+    (task.assigneeKind === "expert" && task.assigneeId !== null
+      ? store.getExpert(task.assigneeId)
+      : null) ?? store.listExperts()[0] ?? null;
+  if (expert === null) {
+    return c.json({ error: "没有可用的 agent。先运行 pnpm seed 或在团队页创建一个专家。" }, 400);
+  }
+
+  const { output, sessionId } = finalOutputOf(task.runId);
+  const previousOutput = output ?? "";
+
+  /*
+   * Real resume needs three things to line up, not one.
+   *
+   * A session id alone is not enough: it belongs to a specific CLI's on-disk
+   * conversation store, so replaying it under a different runtime resolves to
+   * nothing. And `resumeSessionId` is ignored in SILENCE by every adapter that does
+   * not support it — codex would start cold with a prompt that assumes shared
+   * context, which looks like it worked and quietly drops the whole conversation.
+   */
+  const canResume =
+    sessionId !== null && sessionId !== "" && RESUMABLE_RUNTIMES.has(expert.runtimeKind);
+  const question = task.needsText;
+  const goal = answerPrompt({
+    resumed: canResume,
+    goal: previous.goal,
+    previousOutput,
+    question,
+    answer,
+  });
+
+  // One transaction: a run whose card was never repointed would execute with
+  // nothing on the board tracking it, and the card would keep offering 回答.
+  const run = store.tx(() => {
+    const created = store.createRun({
+      projectId: previous.projectId,
+      goal,
+      acceptance: null,
+      budgetTokens: previous.budgetTokens,
+      soloMode: true,
+    });
+    store.updateTask(task.id, {
+      runId: created.id,
+      status: "in_progress",
+      // The question has been answered, so it stops being something you owe.
+      needsKind: null,
+      needsText: null,
+      assigneeKind: "expert",
+      assigneeId: expert.id,
+    });
+    return created;
+  });
+
+  /*
+   * The answer is recorded as an event on the new run.
+   *
+   * Without it the transcript starts mid-conversation: a resumed run's prompt is
+   * just "我的回答：…" and the question it answers lives on a different run entirely.
+   * This is the only durable link between the two.
+   */
+  recordEvent(store, run.id, null, "run:answer", {
+    question,
+    answer,
+    resumed: canResume,
+    previousRunId: previous.id,
+  });
+
+  launchDirect(run.id, expert, canResume ? sessionId : null, {
+    // Prepared even when resuming succeeds, and used only if the CLI rejects the
+    // session id — see `launchDirect`.
+    fallbackPrompt: canResume
+      ? answerPrompt({ resumed: false, goal: previous.goal, previousOutput, question, answer })
+      : null,
+  });
+
+  const after = store.getTask(task.id);
+  return c.json({ run, task: after ?? task, resumed: canResume }, 201);
+});
+
 app.post("/api/tasks/:id/run", async (c) => {
   const parsed = TaskRunBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
@@ -1778,9 +1975,28 @@ function syncTaskFromRun(runId: string): void {
   const run = store.getRun(runId);
   if (!run) return;
 
+  /*
+   * A completed run is not necessarily finished work.
+   *
+   * The classifier writes its verdict onto the run before this is called, and it is
+   * read from the row rather than passed in as an argument — that is what keeps this
+   * function a pure mapping of (run, task) to a card state. It has eleven call sites
+   * (a cancel, a reconcile on boot, a resumed plan gate, two launch drivers) and any
+   * of them can fire after the first one. With the verdict held only in a local
+   * variable, the first call parked a question in 需要你 and the next call saw
+   * `completed`, mapped it to 待确认 and threw the question away.
+   *
+   * `kind: null` — an older run, or classification that never ran — means the M0
+   * behaviour, which is why that case reads as `in_review`.
+   */
+  const outcome = run.status === "completed" ? store.getRunOutcome(runId) : { kind: null, text: null };
+  const parked = outcome.kind === "question" || outcome.kind === "blocked";
+
   const next =
     run.status === "completed"
-      ? "in_review"
+      ? parked
+        ? "needs_you"
+        : "in_review"
       : run.status === "cancelled"
         ? "todo"
         : run.status === "failed" || run.status === "budget_exceeded"
@@ -1792,10 +2008,20 @@ function syncTaskFromRun(runId: string): void {
   if (next === null || task.status === next) return;
 
   if (next === "needs_you") {
+    /*
+     * Three ways to land here, and they are not interchangeable.
+     *
+     * A classified question or obstacle carries the worker's own words and offers
+     * 回答 or 重派 in the UI. A failure carries the run's error and offers 重派 only.
+     * Labelling a question as `failed` would hide the answer path entirely — the
+     * dead end this milestone exists to close.
+     */
     store.updateTask(task.id, {
       status: next,
-      needsKind: "failed",
-      needsText: (run.error ?? "执行失败，看看日志再决定。").slice(0, 500),
+      needsKind: parked ? (outcome.kind as "question" | "blocked") : "failed",
+      needsText: parked
+        ? (outcome.text ?? "").slice(0, 500)
+        : (run.error ?? "执行失败，看看日志再决定。").slice(0, 500),
     });
   } else {
     store.updateTask(task.id, { status: next, needsKind: null, needsText: null });
@@ -1818,13 +2044,103 @@ function syncTaskFromRun(runId: string): void {
  * `active` so cancel and shutdown reach it, and the card is synced in
  * `finally` so a crash moves it too.
  */
-function launchDirect(runId: string, expert: Expert): void {
+/**
+ * Did this failure come from an unusable session id?
+ *
+ * Matched on prose because that is all a CLI gives us: neither claude nor cursor
+ * has an exit code or a structured field for "that session is gone". The match is
+ * kept narrow — only failures that mention the session machinery — because the
+ * consequence of a false positive is one wasted cold retry, while retrying every
+ * failure would respawn a CLI that is simply not installed.
+ */
+function isSessionError(error: string | null): boolean {
+  if (error === null) return false;
+  return /session|resume|conversation/i.test(error);
+}
+
+function launchDirect(
+  runId: string,
+  expert: Expert,
+  resumeSessionId?: string | null,
+  opts: { fallbackPrompt?: string | null } = {},
+): void {
   const controller = new AbortController();
   active.set(runId, controller);
-  void runDirect({ store, runId, expert, signal: controller.signal })
-    .then((res) => {
-      console.log(`[run ${runId}] ${res.status}${res.error ? `: ${res.error}` : ""}`);
-    })
+  void (async () => {
+    let res = await runDirect({
+      store,
+      runId,
+      expert,
+      signal: controller.signal,
+      ...(resumeSessionId ? { resumeSessionId } : {}),
+    });
+    console.log(`[run ${runId}] ${res.status}${res.error ? `: ${res.error}` : ""}`);
+
+    /*
+     * Real resume failed — retry cold, once, with the context the session would
+     * have carried.
+     *
+     * A session store gets pruned, a machine gets a fresh checkout, a CLI upgrades
+     * its format: the id we recorded is simply no longer loadable. Handing the user
+     * `claude exited 1: no conversation found for …` would be reporting our own
+     * implementation detail as their problem, when the work is still perfectly
+     * doable — the stitched prompt exists for exactly this.
+     *
+     * The retry reuses THIS run rather than creating another. Its attempt list then
+     * shows both tries, which is the honest record, and the card keeps pointing at
+     * one run. `goal` is rewritten because it must describe the prompt actually
+     * sent; leaving the resume-shaped prompt there would make the transcript
+     * unreadable.
+     */
+    const fallbackPrompt = opts.fallbackPrompt ?? null;
+    if (
+      res.status === "failed" &&
+      resumeSessionId !== null &&
+      resumeSessionId !== undefined &&
+      resumeSessionId !== "" &&
+      fallbackPrompt !== null &&
+      isSessionError(res.error) &&
+      !controller.signal.aborted
+    ) {
+      console.log(`[run ${runId}] resume rejected, retrying without a session`);
+      recordEvent(store, runId, null, "run:resume_degraded", { error: res.error });
+      store.updateRun(runId, { goal: fallbackPrompt, error: null, endedAt: null });
+      res = await runDirect({ store, runId, expert, signal: controller.signal });
+      console.log(`[run ${runId}] retry ${res.status}${res.error ? `: ${res.error}` : ""}`);
+    }
+
+    /*
+     * Deregistered BEFORE classification, not in the `finally` alone.
+     *
+     * Classification can take up to fifteen seconds, and for that whole window the
+     * run is already `completed` while its controller is still in `active`. A
+     * cancel arriving in the gap would find it, write `status: cancelled` over a
+     * finished run and send the card back to 待办 — losing work that is sitting on
+     * disk. The `finally` below still deletes, harmlessly.
+     */
+    active.delete(runId);
+    if (res.status !== "completed") return;
+
+    /*
+     * Classify before the card moves.
+     *
+     * The verdict is persisted on the run rather than handed to `syncTaskFromRun`,
+     * so every one of its other call sites reaches the same answer later. This
+     * cannot throw — `classifyOutcome` resolves to the heuristic on any failure —
+     * but it is still guarded, because the one thing that must not happen here is
+     * a card stranded at 进行中 by a side-channel LLM call.
+     */
+    try {
+      const { output } = finalOutputOf(runId);
+      const outcome = await classifyOutcome(output ?? "");
+      store.updateRun(runId, { outcomeKind: outcome.kind, outcomeText: outcome.text });
+      if (outcome.kind !== "done") {
+        console.log(`[run ${runId}] ${outcome.kind} (${outcome.via}): ${outcome.text.slice(0, 80)}`);
+      }
+    } catch (err) {
+      console.error(`[run ${runId}] classification failed, treating as done:`, err);
+    }
+  })()
     .catch((err: unknown) => {
       console.error(`[run ${runId}] crashed:`, err);
       store.updateRun(runId, {
