@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 import type { Task, TaskGroups, TaskStatus, TodoList, ViewKey } from "../lib/types.ts";
 import { TASK_STATUS_LABEL } from "../lib/types.ts";
 import { visibleGroups } from "../lib/todo-state.ts";
@@ -16,6 +16,22 @@ import { IconCaret, IconCheck, IconPlus, IconX } from "./icons.tsx";
 
 /** Weekday names, indexed by `Date.getDay()`. */
 const WEEKDAYS = ["日", "一", "二", "三", "四", "五", "六"] as const;
+
+/**
+ * Everything the answer bar needs, as one prop.
+ *
+ * Bundled rather than threaded as four separate props through three component
+ * levels — and, more importantly, `activeId` lives in the page rather than in each
+ * row: the drawer's 回答 button opens the same bar, so exactly one place gets to
+ * decide which row is currently asking.
+ */
+export interface AnswerControls {
+  /** Which task's answer bar is open, if any. */
+  activeId: string | null;
+  onStart: (task: Task) => void;
+  onSubmit: (task: Task, answer: string) => void;
+  onCancel: () => void;
+}
 
 export function TaskPane({
   view,
@@ -34,6 +50,7 @@ export function TaskPane({
   onCancel,
   onDelete,
   onOpenResult,
+  answer,
 }: {
   view: ViewKey;
   title: string;
@@ -57,6 +74,7 @@ export function TaskPane({
   onDelete: (task: Task) => void;
   /** Opens the result drawer for a finished or failed task. */
   onOpenResult: (task: Task) => void;
+  answer: AnswerControls;
 }) {
   const shown = visibleGroups(groups);
   const repoByList = new Map(lists.map((l) => [l.id, l.repoPath]));
@@ -82,6 +100,7 @@ export function TaskPane({
             onCancel={onCancel}
             onDelete={onDelete}
             onOpenResult={onOpenResult}
+            answer={answer}
           />
         ))}
 
@@ -220,6 +239,7 @@ function Group({
   onCancel,
   onDelete,
   onOpenResult,
+  answer,
 }: {
   status: TaskStatus;
   tasks: Task[];
@@ -231,6 +251,7 @@ function Group({
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
   onOpenResult: (task: Task) => void;
+  answer: AnswerControls;
 }) {
   // 已完成 starts collapsed: it grows without bound and is the one group nobody
   // opens the app to read.
@@ -262,8 +283,16 @@ function Group({
       {open ? (
         <div className={`tgroup${attention ? " priority" : ""}`}>
           {tasks.map((task) => (
+            /*
+             * The answer bar is a SIBLING of the row, not a child.
+             *
+             * `.row` is a flex container with centred items, so a bar rendered inside
+             * it would sit in the same line as the tick and the action pills rather
+             * than below them. Rendered here rather than inside `Row` for the same
+             * reason the active id lives in the page: one place decides.
+             */
+            <Fragment key={task.id}>
             <Row
-              key={task.id}
               task={task}
               repoPath={repoByList.get(task.channelId) ?? null}
               executor={executorFor(task)}
@@ -273,7 +302,12 @@ function Group({
               onCancel={onCancel}
               onDelete={onDelete}
               onOpenResult={onOpenResult}
+              answer={answer}
             />
+            {answer.activeId === task.id ? (
+              <AnswerBar task={task} onSubmit={answer.onSubmit} onCancel={answer.onCancel} />
+            ) : null}
+            </Fragment>
           ))}
         </div>
       ) : null}
@@ -291,6 +325,7 @@ function Row({
   onCancel,
   onDelete,
   onOpenResult,
+  answer,
 }: {
   task: Task;
   repoPath: string | null;
@@ -301,6 +336,7 @@ function Row({
   onCancel: (task: Task) => void;
   onDelete: (task: Task) => void;
   onOpenResult: (task: Task) => void;
+  answer: AnswerControls;
 }) {
   const done = task.status === "done";
   const running = task.status === "in_progress";
@@ -405,6 +441,7 @@ function Row({
         onDispatch={onDispatch}
         onCancel={onCancel}
         onOpenResult={onOpenResult}
+        onStartAnswer={answer.onStart}
       />
 
       <button
@@ -453,13 +490,17 @@ const NEEDS_FALLBACK: Record<string, string> = {
 /**
  * The actions a row offers, by status.
  *
- * One pill for every status except a FAILED needs_you row, which gets two: the
- * thing you almost always want (重派) and the thing you need first if you don't
- * (查看). That exception is the whole point — a failed task's most common next
- * step should not be two clicks behind a drawer.
+ * One pill for most statuses, two for every 需要你 row — the thing you almost always
+ * want, plus the thing you need first if you don't. Which pair depends on why it is
+ * parked, and the distinction is the point:
  *
- * A needs_you row whose `needsKind` is `question` keeps a single 查看: answering it
- * is M5, and offering 重派 there would discard the question the agent asked.
+ *   question  回答 + 查看   the agent asked something; replying is the way forward
+ *   blocked   重派 + 查看   nothing was asked, so there is nothing to reply to
+ *   failed    重派 + 查看   same shape: run it again, or read what happened
+ *
+ * Offering 重派 on a question would discard the question, and offering 回答 on a
+ * failure would open a box for a question nobody asked — which is why the engine
+ * refuses that call with a 409 rather than trusting the UI to get it right.
  */
 function RowAction({
   task,
@@ -467,12 +508,14 @@ function RowAction({
   onDispatch,
   onCancel,
   onOpenResult,
+  onStartAnswer,
 }: {
   task: Task;
   canDispatch: boolean;
   onDispatch: (task: Task) => void;
   onCancel: (task: Task) => void;
   onOpenResult: (task: Task) => void;
+  onStartAnswer: (task: Task) => void;
 }) {
   if (task.status === "todo") {
     // No repository on the list means no working directory, so there is nothing
@@ -518,10 +561,29 @@ function RowAction({
   }
 
   if (task.status === "needs_you") {
-    const failed = task.needsKind === "failed";
+    /*
+     * A question is answerable; an obstacle or a failure is not.
+     *
+     * `question` means the agent asked something and is waiting, so 回答 is the
+     * primary action and the answer goes back to the run that asked. `blocked` and
+     * `failed` share the other shape — nobody asked anything, so the only ways
+     * forward are to run it again or to read what happened.
+     */
+    if (task.needsKind === "question") {
+      return (
+        <>
+          <button type="button" className="act" onClick={() => onStartAnswer(task)}>
+            回答
+          </button>
+          <button type="button" className="act" onClick={() => onOpenResult(task)}>
+            查看
+          </button>
+        </>
+      );
+    }
     return (
       <>
-        {failed && canDispatch ? (
+        {canDispatch ? (
           <button type="button" className="act" onClick={() => onDispatch(task)}>
             重派
           </button>
@@ -533,6 +595,78 @@ function RowAction({
     );
   }
   return null;
+}
+
+/**
+ * The inline answer bar, below the row that is asking.
+ *
+ * In the flow rather than in a dialog: the question is one line of text and the
+ * answer is usually one sentence, so a modal would be more furniture than the
+ * exchange deserves — and the row above stays readable while typing, which is where
+ * the question is.
+ */
+function AnswerBar({
+  task,
+  onSubmit,
+  onCancel,
+}: {
+  task: Task;
+  onSubmit: (task: Task, answer: string) => void;
+  onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    ref.current?.focus();
+  }, []);
+
+  const commit = (): void => {
+    const answer = draft.trim();
+    // An empty answer would be refused by the engine anyway, and sending it would
+    // replace the question with a toast for no reason.
+    if (answer === "") return;
+    onSubmit(task, answer);
+  };
+
+  return (
+    <div className="abar">
+      {task.needsText !== null && task.needsText !== "" ? (
+        <p className="aq">{task.needsText}</p>
+      ) : null}
+      <textarea
+        ref={ref}
+        className="ain"
+        value={draft}
+        rows={2}
+        placeholder="回答它，agent 会接着做"
+        aria-label={`回答「${task.title}」`}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => {
+          // Enter sends, Shift+Enter breaks a line: the messaging convention, and
+          // the answer is usually one sentence.
+          if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            commit();
+          }
+          if (e.key === "Escape") onCancel();
+        }}
+      />
+      <div className="aacts">
+        <button
+          type="button"
+          className="btn btn-primary btn-sm"
+          disabled={draft.trim() === ""}
+          onClick={commit}
+        >
+          发送
+        </button>
+        <button type="button" className="btn btn-ghost btn-sm" onClick={onCancel}>
+          取消
+        </button>
+      </div>
+    </div>
+  );
 }
 
 /** Last path segment, for the row's repo tag. Trailing slashes tolerated. */

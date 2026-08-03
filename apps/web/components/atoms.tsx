@@ -1,5 +1,5 @@
-import type { Phase, RunStatus, RuntimeKind, SubTaskStatus } from "../lib/types.ts";
-import { PHASE_LABEL, STATUS_LABEL } from "../lib/types.ts";
+import type { RunStatus, RuntimeKind, SubTaskStatus } from "../lib/types.ts";
+import { STATUS_LABEL } from "../lib/types.ts";
 
 /**
  * Semantic tones.
@@ -215,10 +215,6 @@ export function SeverityBadge({
       )}
     </span>
   );
-}
-
-export function PhaseBadge({ phase }: { phase: Phase }) {
-  return <Badge tone="accent">{PHASE_LABEL[phase] ?? phase}</Badge>;
 }
 
 export function Spinner({ label }: { label?: string }) {

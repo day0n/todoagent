@@ -89,6 +89,15 @@ export default function Page() {
    */
   const [drawerTaskId, setDrawerTaskId] = useState<string | null>(null);
   /*
+   * Which task's answer bar is open.
+   *
+   * Held here rather than in each row because the drawer opens the same bar: a
+   * question can be answered from the list or after reading the diff, and two
+   * independent pieces of state would let both be open at once with different
+   * drafts.
+   */
+  const [answeringId, setAnsweringId] = useState<string | null>(null);
+  /*
    * A load failure that is still true, as distinct from the toast.
    *
    * Without this the pane rendered "今天很干净" whenever the engine was
@@ -430,6 +439,49 @@ export default function Page() {
       });
   };
 
+  /**
+   * Sends an answer to a parked question and lets the work continue.
+   *
+   * Optimistic, unlike `dispatch` — and the difference is worth stating, since both
+   * spawn a CLI. Dispatch is a decision a person is making right now, so a refusal
+   * ("that repository is busy") has to arrive before the row changes. Answering is
+   * the reply to a question the agent already asked: the bar closes, the row moves,
+   * and if the engine refuses, the error lands in a toast and `refresh` restores the
+   * truth — the answer text is the only thing lost, and it is one sentence the
+   * person still has on screen.
+   */
+  const answerTask = (task: Task, answer: string): void => {
+    setAnsweringId(null);
+    mutations.current += 1;
+    /*
+     * The needs fields are cleared alongside the status, matching what the engine
+     * writes in its transaction.
+     *
+     * Patching only `status` would leave a local row that is `in_progress` and still
+     * carries `needsKind: "question"` — a combination the engine never produces. It
+     * happens to render correctly today because every consumer branches on status
+     * first, but a guess should not depend on the order of someone else's if-chain.
+     */
+    setGroups((current) =>
+      applyOptimistic(current, view, task.id, {
+        status: "in_progress",
+        needsKind: null,
+        needsText: null,
+      }),
+    );
+
+    void api
+      .answerTask(task.id, answer)
+      .then(({ task: row }) => {
+        setGroups((current) => applyServerRow(current, view, row));
+        void refresh().catch(() => undefined);
+      })
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
   const remove = (task: Task): void => {
     mutations.current += 1;
     setGroups((current) => removeTask(current, task.id));
@@ -577,6 +629,18 @@ export default function Page() {
         onDispatch={dispatch}
         onCancel={cancel}
         onDelete={remove}
+        answer={{
+          activeId: answeringId,
+          onStart: (t) => {
+            // Opening the bar closes the drawer: they are two views of the same
+            // question, and leaving the panel over the row being answered would
+            // hide what is being typed.
+            setDrawerTaskId(null);
+            setAnsweringId(t.id);
+          },
+          onSubmit: answerTask,
+          onCancel: () => setAnsweringId(null),
+        }}
       />
 
       <ChatPane
@@ -612,6 +676,16 @@ export default function Page() {
           onRedispatch={(t) => {
             dispatch(t);
             setDrawerTaskId(null);
+          }}
+          /*
+           * Answering from the drawer hands off to the inline bar rather than
+           * embedding a second textarea. One answer box, reachable from both places:
+           * two would each need their own draft, focus handling and Esc behaviour,
+           * and could disagree about which question is being answered.
+           */
+          onAnswer={(t) => {
+            setDrawerTaskId(null);
+            setAnsweringId(t.id);
           }}
         />
       ) : null}

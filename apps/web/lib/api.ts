@@ -213,6 +213,24 @@ export const api = {
     req<{ ok: true; task: Task }>(`/api/tasks/${taskId}/cancel`, { method: "POST" }),
 
   /**
+   * Answers a parked question and continues the work.
+   *
+   * Accepted only for a `needs_you` task whose `needsKind` is `question` — a
+   * failure or an obstacle has no question to answer and takes 重派 instead. Like
+   * `runTask` this spawns a real CLI, so the engine can refuse it (repository busy,
+   * no agent installed) and the caller has to show that refusal.
+   *
+   * `resumed` reports whether the runtime continued its own session or the prompt
+   * had to carry the context. Nothing renders it today; it is the one signal that
+   * distinguishes the two paths when reading a log.
+   */
+  answerTask: (taskId: string, answer: string) =>
+    req<{ run: Run; task: Task; resumed: boolean }>(`/api/tasks/${taskId}/answer`, {
+      method: "POST",
+      body: JSON.stringify({ answer }),
+    }),
+
+  /**
    * What a finished run left behind: the working-tree snapshot and the final output.
    *
    * One request rather than two, because the drawer opens on a click and a second

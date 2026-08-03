@@ -1116,6 +1116,63 @@
     color: var(--color-bad);
   }
 
+  /* ── Answer bar ─────────────────────────────────────────────
+     Below the row that is asking, inside the same group card. Inline rather than a
+     dialog: the question is one line and the answer is usually one sentence, so a
+     modal would be more furniture than the exchange deserves — and the row above
+     stays readable while typing, which is where the question is. */
+  .abar {
+    padding: 2px 17px 15px;
+    /* Indented to the row's TEXT column (17px padding + 20px ring + 13px gap), so
+       the exchange reads as belonging to the title above rather than to the card. */
+    padding-left: 50px;
+    animation: rise 160ms ease-out;
+  }
+  /* The question, restated above the field. The row's subline truncates to one line
+     and the drawer may not be open, so this is the only place the full text is
+     guaranteed to be visible while answering it. */
+  .abar .aq {
+    margin: 0 0 8px;
+    padding: 8px 11px;
+    border-radius: 10px;
+    background: var(--accent-tint);
+    color: var(--accent-text);
+    font-size: 12.5px;
+    line-height: 1.55;
+  }
+  .abar .ain {
+    width: 100%;
+    padding: 8px 11px;
+    display: block;
+    border: 1px solid rgba(0, 0, 0, 0.11);
+    border-radius: 10px;
+    outline: 0;
+    background: var(--white);
+    color: var(--ink);
+    font-family: inherit;
+    font-size: 13.5px;
+    line-height: 1.5;
+    /* Vertical only: horizontal resizing inside a fixed-width card just breaks the
+       layout, and the field already spans it. */
+    resize: vertical;
+    transition:
+      border-color 0.12s ease,
+      box-shadow 0.12s ease;
+  }
+  .abar .ain::placeholder {
+    color: var(--ink-3);
+  }
+  .abar .ain:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+  }
+  .abar .aacts {
+    margin-top: 9px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+  }
+
   /* Empty view. One quiet line — an illustration would overstate the moment. */
   .gempty {
     padding: 64px 20px;
@@ -1500,6 +1557,17 @@
     color: var(--accent-text);
     font-size: 12.5px;
     line-height: 1.55;
+  }
+  /* "agent 的问题" above the text. A question and a failure reason both land in this
+     block, and they call for different reactions — the text alone does not always
+     say which one you are reading. */
+  .dnote .dnl {
+    margin-bottom: 3px;
+    display: block;
+    opacity: 0.72;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
   }
   .dempty {
     padding: 40px 12px;

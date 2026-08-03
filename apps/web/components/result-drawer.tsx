@@ -70,6 +70,7 @@ export function ResultDrawer({
   onClose,
   onComplete,
   onRedispatch,
+  onAnswer,
 }: {
   task: Task;
   onClose: () => void;
@@ -77,6 +78,14 @@ export function ResultDrawer({
   onComplete: (task: Task) => void;
   /** Runs it again: POST run, then close. */
   onRedispatch: (task: Task) => void;
+  /**
+   * Hands off to the inline answer bar on the row.
+   *
+   * Not a textarea in here: one answer box reachable from two places beats two
+   * boxes that each need their own draft, focus handling and Esc behaviour, and
+   * that could disagree about which question is being answered.
+   */
+  onAnswer: (task: Task) => void;
 }) {
   const [result, setResult] = useState<RunResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -202,9 +211,14 @@ export function ResultDrawer({
 
         <div className="dbody">
           {/* The parked question or failure reason, in full — the row only had space
-              for one line of it. */}
+              for one line of it. Labelled when it is a question, because "the agent
+              asked you this" and "this is why it stopped" call for different
+              reactions and the text alone does not always say which it is. */}
           {task.needsText !== null && task.needsText !== "" ? (
-            <p className="dnote">{task.needsText}</p>
+            <div className="dnote">
+              {task.needsKind === "question" ? <span className="dnl">agent 的问题</span> : null}
+              {task.needsText}
+            </div>
           ) : null}
 
           {error !== null ? (
@@ -273,8 +287,17 @@ export function ResultDrawer({
             </button>
           ) : null}
 
-          {/* Available in both states: accepting work you then want changed, and
-              retrying a failure, are the same action. */}
+          {/* A question's primary action is answering it. Offered here as well as on
+              the row so reading the diff and then replying is one continuous move. */}
+          {task.needsKind === "question" ? (
+            <button type="button" className="btn btn-primary" onClick={() => onAnswer(task)}>
+              回答
+            </button>
+          ) : null}
+
+          {/* Available in every state: accepting work you then want changed, retrying
+              a failure, and abandoning a question you would rather not answer are the
+              same action — run it again. */}
           <button type="button" className="btn" onClick={() => onRedispatch(task)}>
             重派
           </button>
