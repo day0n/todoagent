@@ -72,7 +72,10 @@ const SYSTEM_PROMPT = `你是 TodoAgent 的任务秘书。你管理的是任务�
 4. 回复惜字如金：一两句确认即可，不要复述任务内容（卡片自己会展示），不要用列表和标题排版。
 5. 永远不要编造任务状态，状态只来自工具返回值。
 6. 用户问现状时用 list_state，照实转述。
-7. 需要看文件内容时可以用 read/grep/find/ls（只读）。`;
+7. 需要看文件内容时可以用 read/grep/find/ls（只读）。
+8. 截止日期：用户明确说了时间才填 dueDate，格式必须是 YYYY-MM-DD。每条用户消息开头会给你今天的日期，
+   相对时间（明天、下周五、月底）都从那个日期算。用户没提时间就不要自己编一个截止日期——
+   大多数待办本来就没有截止日期。`;
 
 /** Truncates tool feedback so a pathological title cannot flood the context. */
 function clip(s: string, max = 400): string {
@@ -81,7 +84,41 @@ function clip(s: string, max = 400): string {
 
 function taskLine(store: Store, t: Task): string {
   const list = store.getChannel(t.channelId);
-  return `[${t.id}] ${clip(t.title, 80)}（清单:${list?.name ?? "?"} 状态:${t.status}）`;
+  // The due date is included so the model can see existing deadlines in
+  // `find_related` and `list_state` output — otherwise it would have to ask, or
+  // worse, overwrite one it did not know about.
+  const due = t.dueDate === null ? "" : ` 截止:${t.dueDate}`;
+  return `[${t.id}] ${clip(t.title, 80)}（清单:${list?.name ?? "?"} 状态:${t.status}${due}）`;
+}
+
+/** Today as `YYYY-MM-DD`, local time — the format every date field here uses. */
+function todayIso(): string {
+  const now = new Date();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${m}-${d}`;
+}
+
+/** Weekday name for the prompt, so "下周五" has an anchor to count from. */
+const WEEKDAYS = ["日", "一", "二", "三", "四", "五", "六"] as const;
+
+/**
+ * Validates a date the MODEL produced.
+ *
+ * It is generating a string, so it can generate `2026-13-45`, `明天`, or a
+ * plausible-looking date with the wrong year. A bad value would be stored verbatim
+ * and then compared as a string against today, so it would silently never match —
+ * a deadline that exists in the database and does nothing. Rejected loudly instead,
+ * with the reason fed back so the model can correct itself.
+ */
+function validDate(value: string): boolean {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false;
+  const [y, m, d] = value.split("-").map(Number) as [number, number, number];
+  const probe = new Date(y, m - 1, d);
+  // Round-trip check: `new Date(2026, 12, 45)` silently rolls over into the next
+  // month rather than failing, so the only reliable test is whether the parts
+  // survive construction unchanged.
+  return probe.getFullYear() === y && probe.getMonth() === m - 1 && probe.getDate() === d;
 }
 
 function buildTools(
@@ -101,6 +138,11 @@ function buildTools(
           title: Type.String({ description: "任务标题，一行" }),
           note: Type.Optional(Type.String({ description: "补充说明，可空" })),
           listId: Type.Optional(Type.String({ description: "目标清单 id" })),
+          dueDate: Type.Optional(
+            Type.String({
+              description: "截止日期，必须是 YYYY-MM-DD。用户没提到时间就不要填。",
+            }),
+          ),
         }),
         { minItems: 1, maxItems: 10 },
       ),
@@ -113,11 +155,25 @@ function buildTools(
           lines.push(`跳过「${clip(t.title, 60)}」：清单 ${t.listId} 不存在`);
           continue;
         }
+        /*
+         * A bad date is refused rather than stored.
+         *
+         * The model is generating a string, so it can produce `2026-13-45` or the
+         * word 明天. Either would be written verbatim and then compared as a string
+         * against today — silently never matching, which is a deadline that exists
+         * in the database and does nothing. Skipping the whole card is deliberate:
+         * creating it without the date the user asked for is a quiet half-success.
+         */
+        if (t.dueDate !== undefined && !validDate(t.dueDate)) {
+          lines.push(`跳过「${clip(t.title, 60)}」：截止日期 ${t.dueDate} 不是合法的 YYYY-MM-DD`);
+          continue;
+        }
         const task = store.createTask({
           channelId: listId,
           title: t.title.trim(),
           note: t.note ?? "",
           status: "todo",
+          ...(t.dueDate !== undefined ? { dueDate: t.dueDate } : {}),
           assigneeKind: null,
           assigneeId: null,
           creatorKind: "expert",
@@ -173,12 +229,17 @@ function buildTools(
   const updateTask = defineTool({
     name: "update_task",
     label: "修改任务",
-    description: "修改一张任务卡的标题、说明或所属清单。",
+    description: "修改一张任务卡的标题、说明、所属清单或截止日期。",
     parameters: Type.Object({
       taskId: Type.String(),
       title: Type.Optional(Type.String()),
       note: Type.Optional(Type.String()),
       listId: Type.Optional(Type.String({ description: "移动到的清单 id" })),
+      dueDate: Type.Optional(
+        Type.String({
+          description: "截止日期 YYYY-MM-DD。传空字符串清除截止日期。不改就不要传这个字段。",
+        }),
+      ),
     }),
     execute: async (_id, params) => {
       const task = store.getTask(params.taskId);
@@ -188,10 +249,31 @@ function buildTools(
       if (params.listId !== undefined && store.getChannel(params.listId) === null) {
         return { content: [{ type: "text", text: `清单 ${params.listId} 不存在` }], details: {}, isError: true };
       }
+      /*
+       * The empty string clears the deadline; anything else must be a real date.
+       *
+       * An empty string rather than `null` because TypeBox's nullable union becomes
+       * `type: ["string", "null"]` in JSON Schema, and support for that across
+       * function-calling providers is uneven — a schema one provider rejects would
+       * take the whole tool down. No real date is ever empty, so the encoding is
+       * unambiguous.
+       */
+      if (params.dueDate !== undefined && params.dueDate !== "" && !validDate(params.dueDate)) {
+        return {
+          content: [
+            { type: "text", text: `截止日期 ${params.dueDate} 不是合法的 YYYY-MM-DD，没有改动` },
+          ],
+          details: {},
+          isError: true,
+        };
+      }
       store.updateTask(task.id, {
         ...(params.title !== undefined ? { title: params.title.trim() } : {}),
         ...(params.note !== undefined ? { note: params.note } : {}),
         ...(params.listId !== undefined ? { channelId: params.listId } : {}),
+        ...(params.dueDate !== undefined
+          ? { dueDate: params.dueDate === "" ? null : params.dueDate }
+          : {}),
       });
       pendingRefs.push(task.id);
       deps.publishBoard(task.id);
@@ -350,7 +432,22 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
       }, TURN_TIMEOUT_MS);
 
       try {
-        await session.prompt(userText);
+        /*
+         * Today's date is stamped on every turn, not baked into the system prompt.
+         *
+         * The session is created once when the engine starts and lives as long as the
+         * process — a local tool people leave running for days. A date in the system
+         * prompt would be correct until midnight and then quietly wrong, and "明天"
+         * resolving to yesterday is the kind of error nobody notices until a deadline
+         * is already missed.
+         *
+         * Stamped on the text sent to the MODEL only. The `agent_chat` row the UI
+         * renders is written by the caller from the original message, so the user
+         * never sees this line.
+         */
+        const now = new Date();
+        const stamp = `[今天是 ${todayIso()} 星期${WEEKDAYS[now.getDay()]}]`;
+        await session.prompt(`${stamp}\n\n${userText}`);
       } finally {
         clearTimeout(timeout);
         unsubscribe();

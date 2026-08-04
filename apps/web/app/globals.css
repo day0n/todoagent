@@ -1139,6 +1139,89 @@
   }
 
   /*
+   * Deadline field.
+   *
+   * A native `<input type="date">`, styled down to row furniture. Two states with
+   * different rules, which is the whole reason this block is not two lines:
+   *
+   *   unset — the calendar icon alone, hover-revealed like the other row actions.
+   *           An empty date input renders "年/月/日" in WebKit, ~90px of placeholder
+   *           for a field most rows never use, so the text half is hidden and only
+   *           the picker indicator remains.
+   *   set   — the date, permanently visible. A deadline is information, not an
+   *           action; a row carrying one has to say so without being hovered.
+   */
+  .due {
+    height: 26px;
+    flex-shrink: 0;
+    padding: 0 4px;
+    border: 0;
+    border-radius: 7px;
+    outline: 0;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    opacity: 0;
+    transition:
+      opacity 0.18s ease,
+      background 0.18s ease,
+      color 0.18s ease;
+  }
+  /* The text half, hidden while empty so the control collapses to its icon. */
+  .due:not(.set)::-webkit-datetime-edit {
+    display: none;
+  }
+  .due::-webkit-calendar-picker-indicator {
+    padding: 0;
+    cursor: pointer;
+    opacity: 0.55;
+  }
+  .due:hover::-webkit-calendar-picker-indicator {
+    opacity: 1;
+  }
+  /* WebKit renders these sub-fields with their own colours; inherit instead so the
+     overdue red below actually reaches the digits. */
+  .due::-webkit-datetime-edit,
+  .due::-webkit-datetime-edit-fields-wrapper {
+    color: inherit;
+    padding: 0;
+  }
+  .due:hover {
+    background: var(--fill-hover);
+    color: var(--ink-2);
+  }
+  .row:hover .due,
+  .row:focus-within .due {
+    opacity: 1;
+  }
+  /* A set deadline stays visible; these override `.act`-style hover reveal. */
+  .due.set,
+  .row:hover .due.set {
+    opacity: 1;
+    color: var(--ink-2);
+  }
+  /*
+   * Overdue.
+   *
+   * `--color-bad` rather than the warn amber the sun uses: a missed deadline is the
+   * one thing in a row that is genuinely wrong. `isOverdue` returns false for a done
+   * task, so a finished row never sits here.
+   */
+  .due.late,
+  .due.late.set,
+  .row:hover .due.late {
+    opacity: 1;
+    color: var(--color-bad);
+    font-weight: 600;
+  }
+  .due.late::-webkit-calendar-picker-indicator {
+    opacity: 0.8;
+  }
+
+  /*
    * Move-to-list picker.
    *
    * A native `<select>`, styled down to look like the other row actions: it gets

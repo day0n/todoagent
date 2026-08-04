@@ -342,6 +342,14 @@ export interface Task {
   status: TaskStatus;
   note: string;
   myDay: string | null;
+  /**
+   * ISO date (`YYYY-MM-DD`) this task is due. Null means no deadline.
+   *
+   * A date, not a timestamp — "Friday" is what a deadline means to a person. The
+   * engine puts anything due today or overdue into 我的一天 automatically, so a
+   * deadline changes what you see rather than only decorating a row.
+   */
+  dueDate: string | null;
   needsKind: NeedsKind | null;
   needsText: string | null;
   assigneeKind: ActorKind | null;

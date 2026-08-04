@@ -160,7 +160,15 @@ export function applyOptimistic(
   patch: Partial<
     Pick<
       Task,
-      "status" | "title" | "note" | "runId" | "needsKind" | "needsText" | "channelId" | "myDay"
+      | "status"
+      | "title"
+      | "note"
+      | "runId"
+      | "needsKind"
+      | "needsText"
+      | "channelId"
+      | "myDay"
+      | "dueDate"
     >
   >,
 ): TaskGroups | null {

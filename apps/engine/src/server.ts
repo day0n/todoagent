@@ -1237,6 +1237,14 @@ const TaskPatch = z.object({
   /** ISO date to pin into 我的一天, or null to unpin. */
   myDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
   /**
+   * ISO date the task is due, or null to clear it.
+   *
+   * Same shape as `myDay` and for the same reason: a deadline people care about is
+   * a day, not an instant. No range check — a date in the past is exactly what an
+   * overdue task has, and one far in the future is a legitimate someday.
+   */
+  dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
+  /**
    * Move the task to another list.
    *
    * `store.updateTask` has accepted `channelId` since M1; the HTTP surface simply
@@ -1282,6 +1290,7 @@ app.patch("/api/tasks/:id", async (c) => {
   }
   if (body.note !== undefined) patch.note = body.note;
   if (body.myDay !== undefined) patch.myDay = body.myDay;
+  if (body.dueDate !== undefined) patch.dueDate = body.dueDate;
 
   if (body.listId !== undefined) {
     const target = store.getChannel(body.listId);
@@ -1357,14 +1366,42 @@ function sameLocalDay(iso: string, now: Date): boolean {
 }
 
 /**
+ * Today as `YYYY-MM-DD` in the SERVER's timezone.
+ *
+ * Not `toISOString().slice(0, 10)`, which is UTC and therefore a different day from
+ * the user's for part of every day outside Greenwich. Engine and browser run on the
+ * same machine here, so the local calendar day is the one both agree on — the web
+ * client computes the identical string in `localDayIso`.
+ */
+function localDayIso(now: Date): string {
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${m}-${d}`;
+}
+
+/**
  * 我的一天, derived (方案 B):
  * everything alive right now (needs_you / in_progress / in_review), plus todos
- * created today, plus tasks finished today so the day's wins stay visible.
- * `myDay` is a manual pin on top of that, not the mechanism.
+ * created today, plus tasks finished today so the day's wins stay visible, plus
+ * anything DUE today or already overdue. `myDay` is a manual pin on top of that,
+ * not the mechanism.
  */
 function inToday(t: Task, now: Date): boolean {
   if (t.status === "needs_you" || t.status === "in_progress" || t.status === "in_review") return true;
   if (t.myDay !== null && sameLocalDay(`${t.myDay}T00:00:00`, now)) return true;
+  /*
+   * Due today or overdue — but NOT once it is done.
+   *
+   * This is what makes a deadline mean something: a task due Friday appears in
+   * 我的一天 on Friday without anyone pinning it, and keeps appearing while it is
+   * late. Excluding `done` is what stops that being a trap — a task finished last
+   * month with a past deadline would otherwise reappear in 我的一天 forever, and
+   * the more overdue history accumulated the more useless the view would become.
+   *
+   * String comparison is sound because the format is zero-padded `YYYY-MM-DD`,
+   * which sorts lexicographically the same way it sorts chronologically.
+   */
+  if (t.status !== "done" && t.dueDate !== null && t.dueDate <= localDayIso(now)) return true;
   if (t.status === "todo" && sameLocalDay(t.createdAt, now)) return true;
   if (t.status === "done" && sameLocalDay(t.updatedAt, now)) return true;
   return false;
@@ -1517,6 +1554,8 @@ const QuickTaskBody = z.object({
   note: z.string().max(2000).default(""),
   /** Absent means the 收件箱 default list. */
   listId: z.string().min(1).nullable().default(null),
+  /** Optional deadline, `YYYY-MM-DD`. Absent means no deadline. */
+  dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().default(null),
 });
 
 app.post("/api/tasks", async (c) => {
@@ -1532,6 +1571,7 @@ app.post("/api/tasks", async (c) => {
     title: body.title.trim(),
     note: body.note,
     status: "todo",
+    dueDate: body.dueDate,
     assigneeKind: null,
     assigneeId: null,
     creatorKind: "human",

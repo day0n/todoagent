@@ -14,6 +14,7 @@ import type {
   StreamEvent,
   Task,
   TasksResponse,
+  TaskStatus,
   Team,
   TodoList,
   ViewKey,
@@ -188,6 +189,8 @@ export const api = {
       status?: SettableTaskStatus;
       note?: string;
       myDay?: string | null;
+      /** Deadline as `YYYY-MM-DD`, or null to clear it. */
+      dueDate?: string | null;
       /**
        * Move the task to another list.
        *
@@ -409,6 +412,58 @@ export function localDayIso(now: Date = new Date()): string {
 /** Is this task pinned to today? A past pin is stale and reads as unpinned. */
 export function isPinnedToday(myDay: string | null, now: Date = new Date()): boolean {
   return myDay !== null && myDay === localDayIso(now);
+}
+
+/**
+ * Whole days from today to a `YYYY-MM-DD` date. Negative means the past.
+ *
+ * Both sides are normalised to UTC midnight from their calendar parts, which makes
+ * this immune to daylight saving: subtracting two local `Date`s across a DST
+ * boundary is off by an hour, and dividing by 86_400_000 then rounds to the wrong
+ * day. Returns null for a malformed date rather than NaN, so callers cannot render
+ * "逾期 NaN 天".
+ */
+export function daysUntil(dueDate: string, now: Date = new Date()): number | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dueDate);
+  if (m === null) return null;
+  const due = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const today = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((due - today) / 86_400_000);
+}
+
+/**
+ * Is this deadline already past?
+ *
+ * `status` is part of the question, not a caller's concern to remember: a task
+ * finished last month with a past deadline is not overdue, it is done. Getting this
+ * wrong would paint completed rows red forever.
+ */
+export function isOverdue(
+  dueDate: string | null,
+  status: TaskStatus,
+  now: Date = new Date(),
+): boolean {
+  if (dueDate === null || status === "done") return false;
+  const days = daysUntil(dueDate, now);
+  return days !== null && days < 0;
+}
+
+/**
+ * The deadline in words, for a tooltip and an accessible name.
+ *
+ * Relative near today because that is how people think about deadlines, absolute
+ * further out because "17 天后" is not something anyone can act on.
+ */
+export function dueLabel(dueDate: string, now: Date = new Date()): string {
+  const days = daysUntil(dueDate, now);
+  if (days === null) return dueDate;
+  if (days === 0) return "今天到期";
+  if (days === 1) return "明天到期";
+  if (days === -1) return "昨天到期";
+  if (days < 0) return `逾期 ${-days} 天`;
+  if (days <= 7) return `${days} 天后到期`;
+  const [, , m, d] = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dueDate) ?? [];
+  return m !== undefined && d !== undefined ? `${Number(m)}月${Number(d)}日到期` : `${dueDate} 到期`;
 }
 
 export function fmtTokens(n: number): string {

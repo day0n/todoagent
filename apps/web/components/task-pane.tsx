@@ -4,7 +4,7 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import type { Task, TaskGroups, TaskStatus, TodoList, ViewKey } from "../lib/types.ts";
 import { TASK_STATUS_LABEL } from "../lib/types.ts";
 import { visibleGroups } from "../lib/todo-state.ts";
-import { isPinnedToday } from "../lib/api.ts";
+import { dueLabel, isOverdue, isPinnedToday } from "../lib/api.ts";
 import { IconCaret, IconCheck, IconPlus, IconToday, IconX } from "./icons.tsx";
 
 /**
@@ -45,6 +45,8 @@ export interface RowOps {
   onMove: (task: Task, listId: string) => void;
   /** Pins to 我的一天, or unpins. */
   onToggleMyDay: (task: Task) => void;
+  /** Sets the deadline, or clears it with null. `YYYY-MM-DD`. */
+  onSetDue: (task: Task, dueDate: string | null) => void;
 }
 
 export function TaskPane({
@@ -420,6 +422,14 @@ function Row({
    * midnight, and the sun has to agree or the row claims a membership it no longer has.
    */
   const pinned = isPinnedToday(task.myDay);
+  /*
+   * Both derived per render, like `pinned`, because both are questions about TODAY.
+   *
+   * A deadline is a stored date; whether it is late changes at midnight with nothing
+   * writing to the row. Computing it here means the answer cannot go stale in state.
+   */
+  const overdue = isOverdue(task.dueDate, task.status);
+  const dueText = task.dueDate === null ? "" : dueLabel(task.dueDate);
 
   /*
    * Inline title editing, opened by double-click.
@@ -513,6 +523,33 @@ function Row({
           待确认
         </span>
       ) : null}
+
+      {/*
+        Deadline.
+
+        A native `<input type="date">`: no dependency, a real calendar picker on
+        every platform, keyboard-operable, and it enforces the `YYYY-MM-DD` shape
+        the engine's regex demands rather than trusting typed text.
+
+        Hover-revealed while empty, permanently visible once set — a deadline is
+        information, not an action, so a row carrying one has to say so at a glance.
+        Red when overdue; `isOverdue` returns false for a done task, so a finished
+        row does not stay alarming forever.
+      */}
+      <input
+        type="date"
+        className={`due${task.dueDate !== null ? " set" : ""}${overdue ? " late" : ""}`}
+        value={task.dueDate ?? ""}
+        aria-label={
+          task.dueDate === null ? `给「${task.title}」设置截止日期` : `截止日期：${dueText}`
+        }
+        title={task.dueDate === null ? "设置截止日期" : dueText}
+        onChange={(e) => {
+          // An empty value is the picker's own clear button, which is the only way
+          // to remove a deadline — so it maps to null rather than being ignored.
+          rowOps.onSetDue(task, e.target.value === "" ? null : e.target.value);
+        }}
+      />
 
       {/*
         Pin to 我的一天.

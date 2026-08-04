@@ -1,6 +1,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fmtDuration, fmtRelative, fmtTokens, fmtUsd, isPinnedToday, localDayIso } from "./api.ts";
+import {
+  daysUntil,
+  dueLabel,
+  fmtDuration,
+  fmtRelative,
+  fmtTokens,
+  fmtUsd,
+  isOverdue,
+  isPinnedToday,
+  localDayIso,
+} from "./api.ts";
 
 /**
  * Tests for the display formatters.
@@ -147,4 +157,71 @@ test("isPinnedToday: yesterday's pin is not today's", () => {
   // engine stops counting it toward 我的一天 at midnight, and the row must agree.
   assert.equal(isPinnedToday("2026-08-03", now), false);
   assert.equal(isPinnedToday(null, now), false);
+});
+
+// ── Due dates ───────────────────────────────────────────────
+
+test("daysUntil: counts whole calendar days in both directions", () => {
+  const now = new Date(2026, 7, 4, 15, 30); // 4 Aug, mid-afternoon
+  assert.equal(daysUntil("2026-08-04", now), 0, "today is zero regardless of the hour");
+  assert.equal(daysUntil("2026-08-05", now), 1);
+  assert.equal(daysUntil("2026-08-03", now), -1);
+  assert.equal(daysUntil("2026-09-01", now), 28, "across a month boundary");
+  assert.equal(daysUntil("2025-08-04", now), -365, "across a year");
+});
+
+test("daysUntil: a DST boundary does not shift the count", () => {
+  /*
+   * The reason both sides are normalised to UTC midnight from their calendar parts.
+   *
+   * Subtracting two LOCAL Date objects across a daylight-saving change is off by an
+   * hour, and dividing by 86_400_000 then rounds to the wrong day — so a task due in
+   * seven days would read as six. US DST starts 8 March 2026; this passes in any
+   * timezone because the arithmetic never touches local offsets.
+   */
+  const before = new Date(2026, 2, 6, 12);
+  assert.equal(daysUntil("2026-03-13", before), 7);
+  assert.equal(daysUntil("2026-03-07", before), 1);
+});
+
+test("daysUntil: a malformed date is null, never NaN", () => {
+  // NaN would render as "逾期 NaN 天" — a number the user cannot act on.
+  const now = new Date(2026, 7, 4);
+  for (const bad of ["", "tomorrow", "2026-8-4", "2026/08/04", "20260804"]) {
+    assert.equal(daysUntil(bad, now), null, JSON.stringify(bad));
+  }
+});
+
+test("isOverdue: yesterday is late, today is not, and done is never late", () => {
+  const now = new Date(2026, 7, 4, 9);
+  assert.equal(isOverdue("2026-08-03", "todo", now), true);
+  assert.equal(isOverdue("2026-08-04", "todo", now), false, "due today is not yet overdue");
+  assert.equal(isOverdue("2026-08-05", "todo", now), false);
+  assert.equal(isOverdue(null, "todo", now), false);
+
+  /*
+   * A finished task with a past deadline is not overdue, it is done.
+   *
+   * Without the status check every completed row with an old date would stay red
+   * forever, and the 已完成 group would fill up with alarm.
+   */
+  assert.equal(isOverdue("2026-01-01", "done", now), false);
+  // Every other status can be late, including one waiting on a person.
+  for (const s of ["todo", "in_progress", "needs_you", "in_review"] as const) {
+    assert.equal(isOverdue("2026-08-01", s, now), true, s);
+  }
+});
+
+test("dueLabel: relative near today, absolute further out", () => {
+  const now = new Date(2026, 7, 4, 10);
+  assert.equal(dueLabel("2026-08-04", now), "今天到期");
+  assert.equal(dueLabel("2026-08-05", now), "明天到期");
+  assert.equal(dueLabel("2026-08-03", now), "昨天到期");
+  assert.equal(dueLabel("2026-08-01", now), "逾期 3 天");
+  assert.equal(dueLabel("2026-08-09", now), "5 天后到期");
+  // Past a week, "17 天后" is not something anyone can act on.
+  assert.equal(dueLabel("2026-08-21", now), "8月21日到期");
+  assert.equal(dueLabel("2026-12-31", now), "12月31日到期");
+  // A malformed value degrades to the raw string rather than throwing.
+  assert.equal(dueLabel("nope", now), "nope");
 });

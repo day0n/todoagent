@@ -537,6 +537,31 @@ export default function Page() {
       });
   };
 
+  /**
+   * Sets or clears a task's deadline.
+   *
+   * `refresh` afterwards is not decoration: the engine puts anything due today or
+   * overdue into 我的一天, so setting a date can change which view a task belongs to
+   * and every sidebar count with it. The optimistic patch alone would leave 我的一天
+   * showing a stale membership until the next poll.
+   */
+  const setDue = (task: Task, dueDate: string | null): void => {
+    if (dueDate === task.dueDate) return;
+    mutations.current += 1;
+    setGroups((current) => applyOptimistic(current, view, task.id, { dueDate }));
+
+    void api
+      .patchTask(task.id, { dueDate })
+      .then((row) => {
+        setGroups((current) => applyServerRow(current, view, row));
+        void refresh().catch(() => undefined);
+      })
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
   const remove = (task: Task): void => {
     mutations.current += 1;
     setGroups((current) => removeTask(current, task.id));
@@ -684,7 +709,7 @@ export default function Page() {
         onDispatch={dispatch}
         onCancel={cancel}
         onDelete={remove}
-        rowOps={{ onMove: moveTask, onToggleMyDay: toggleMyDay }}
+        rowOps={{ onMove: moveTask, onToggleMyDay: toggleMyDay, onSetDue: setDue }}
         answer={{
           activeId: answeringId,
           onStart: (t) => {

@@ -290,6 +290,13 @@ CREATE TABLE IF NOT EXISTS task (
   -- ISO date (YYYY-MM-DD) for a manual "my day" pin; automatic membership
   -- (needs_you / in_progress / in_review / created today) is derived, not stored.
   my_day        TEXT,
+  -- ISO date (YYYY-MM-DD) the task is due. NULL means no deadline, which is the
+  -- normal case — most todos never get one and a default would be a lie.
+  --
+  -- A DATE, not a timestamp. "Friday" is what people mean by a deadline; storing
+  -- 23:59:59 would invent a precision nobody asked for and make every comparison
+  -- timezone-dependent. Compared against the local calendar day, same as my_day.
+  due_date      TEXT,
   -- Why the task sits in needs_you: 'question' | 'blocked' | 'failed'.
   needs_kind    TEXT,
   -- The agent's question or blocking reason, shown on the card.

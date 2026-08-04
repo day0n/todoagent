@@ -437,6 +437,14 @@ export interface Task {
   note: string;
   /** ISO date (YYYY-MM-DD) for a manual "my day" pin. Automatic membership is derived. */
   myDay: string | null;
+  /**
+   * ISO date (YYYY-MM-DD) this task is due. Null means no deadline.
+   *
+   * A date rather than a timestamp: "Friday" is what a deadline means to a person,
+   * and inventing 23:59:59 would make every comparison timezone-dependent for no
+   * gain. Read against the local calendar day, like `myDay`.
+   */
+  dueDate: string | null;
   /** Set exactly when status is `needs_you`. */
   needsKind: NeedsKind | null;
   /** The agent's question or the blocking reason, verbatim or summarised. */

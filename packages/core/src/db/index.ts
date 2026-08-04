@@ -119,6 +119,7 @@ export class Store {
       { table: "channel", column: "archived_at", definition: "TEXT" },
       { table: "task", column: "note", definition: "TEXT NOT NULL DEFAULT ''" },
       { table: "task", column: "my_day", definition: "TEXT" },
+      { table: "task", column: "due_date", definition: "TEXT" },
       { table: "task", column: "needs_kind", definition: "TEXT" },
       { table: "task", column: "needs_text", definition: "TEXT" },
       { table: "run", column: "diff", definition: "TEXT" },
@@ -1157,11 +1158,19 @@ export class Store {
   createTask(
     t: Omit<
       Task,
-      "id" | "createdAt" | "updatedAt" | "note" | "myDay" | "needsKind" | "needsText"
+      | "id"
+      | "createdAt"
+      | "updatedAt"
+      | "note"
+      | "myDay"
+      | "dueDate"
+      | "needsKind"
+      | "needsText"
     > & {
       id?: string;
       note?: string;
       myDay?: string | null;
+      dueDate?: string | null;
       needsKind?: Task["needsKind"];
       needsText?: string | null;
     },
@@ -1172,6 +1181,7 @@ export class Store {
       id: t.id ?? newId(),
       note: t.note ?? "",
       myDay: t.myDay ?? null,
+      dueDate: t.dueDate ?? null,
       needsKind: t.needsKind ?? null,
       needsText: t.needsText ?? null,
       createdAt: at,
@@ -1180,10 +1190,10 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO task
-           (id,channel_id,title,status,note,my_day,needs_kind,needs_text,
+           (id,channel_id,title,status,note,my_day,due_date,needs_kind,needs_text,
             assignee_kind,assignee_id,creator_kind,creator_id,
             source_message_id,run_id,created_at,updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         row.id,
@@ -1192,6 +1202,7 @@ export class Store {
         row.status,
         row.note,
         row.myDay,
+        row.dueDate,
         row.needsKind,
         row.needsText,
         row.assigneeKind,
@@ -1267,6 +1278,7 @@ export class Store {
         | "status"
         | "note"
         | "myDay"
+        | "dueDate"
         | "needsKind"
         | "needsText"
         | "assigneeKind"
@@ -1281,6 +1293,7 @@ export class Store {
       status: "status",
       note: "note",
       myDay: "my_day",
+      dueDate: "due_date",
       needsKind: "needs_kind",
       needsText: "needs_text",
       assigneeKind: "assignee_kind",
@@ -1318,6 +1331,7 @@ export class Store {
         : "todo",
       note: str(r["note"] ?? ""),
       myDay: strOrNull(r["my_day"]),
+      dueDate: strOrNull(r["due_date"]),
       needsKind:
         needsKind === "question" || needsKind === "blocked" || needsKind === "failed"
           ? needsKind

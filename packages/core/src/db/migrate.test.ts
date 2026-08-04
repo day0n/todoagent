@@ -80,9 +80,44 @@ async function legacyDb(): Promise<{ path: string; dispose: () => Promise<void> 
     error TEXT
   )`);
 
+  /*
+   * A `task` table as M1 first shipped it: no `note`, `my_day`, `due_date`,
+   * `needs_kind` or `needs_text`.
+   *
+   * All five are in `migrate()`'s expected list and none of them was covered until
+   * now — this fixture simply had no task table, so every one of those ALTERs took
+   * the create path described above and reported success without running.
+   */
+  db.exec(`CREATE TABLE task (
+    id TEXT PRIMARY KEY,
+    channel_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'todo',
+    assignee_kind TEXT,
+    assignee_id TEXT,
+    creator_kind TEXT NOT NULL DEFAULT 'human',
+    creator_id TEXT,
+    source_message_id TEXT,
+    run_id TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+  )`);
+
   db.prepare(
     `INSERT INTO subtask (id,run_id,stage,title,brief,status,created_at) VALUES (?,?,?,?,?,?,?)`,
   ).run("s1", "r1", 0, "legacy subtask", "brief", "done", "2026-01-01T00:00:00.000Z");
+  db.prepare(
+    `INSERT INTO task (id,channel_id,title,status,creator_kind,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?)`,
+  ).run(
+    "t1",
+    "ch1",
+    "legacy task",
+    "todo",
+    "human",
+    "2026-01-01T00:00:00.000Z",
+    "2026-01-01T00:00:00.000Z",
+  );
   db.prepare(
     `INSERT INTO run (id,project_id,goal,status,phase,created_at) VALUES (?,?,?,?,?,?)`,
   ).run("r1", "p1", "legacy goal", "completed", "draft", "2026-01-01T00:00:00.000Z");
@@ -166,6 +201,67 @@ test("migrate: an old database gains run.diff, and null stays distinct from empt
       assert.equal(store.getRunDiff("r1"), "", "an empty snapshot is not null");
 
       assert.equal(store.getRunDiff("no-such-run"), null, "an unknown id is null, not a throw");
+    } finally {
+      store.close();
+    }
+  } finally {
+    await legacy.dispose();
+  }
+});
+
+test("migrate: an old task table gains every column added since M1", async () => {
+  const legacy = await legacyDb();
+  try {
+    const store = new Store(legacy.path);
+    try {
+      /*
+       * The legacy row survives, and reads back with defaults rather than crashing.
+       *
+       * `note` is NOT NULL DEFAULT '' so SQLite backfills it; the four date and
+       * needs columns are nullable and read as null. All five are what `toTask`
+       * expects to find, and a missing one used to surface as
+       * `no such column: due_date` on the WRITE path while reads degraded quietly.
+       */
+      const task = store.getTask("t1");
+      assert.ok(task, "the legacy task survives the upgrade");
+      assert.equal(task.title, "legacy task");
+      assert.equal(task.note, "", "NOT NULL DEFAULT '' is backfilled");
+      assert.equal(task.myDay, null);
+      assert.equal(task.dueDate, null, "no deadline is the honest default for old rows");
+      assert.equal(task.needsKind, null);
+      assert.equal(task.needsText, null);
+
+      // The write path is the half that used to throw.
+      assert.doesNotThrow(() =>
+        store.updateTask("t1", { dueDate: "2026-08-10", myDay: "2026-08-04", note: "补的说明" }),
+      );
+      const after = store.getTask("t1");
+      assert.equal(after?.dueDate, "2026-08-10");
+      assert.equal(after?.myDay, "2026-08-04");
+      assert.equal(after?.note, "补的说明");
+
+      /*
+       * Clearing is distinct from never having set one, and both are null here —
+       * which is correct: "no deadline" has exactly one representation, unlike
+       * `run.diff` where empty and null mean different things.
+       */
+      store.updateTask("t1", { dueDate: null });
+      assert.equal(store.getTask("t1")?.dueDate, null, "a deadline can be removed");
+
+      // A brand-new task on the upgraded database carries the column too.
+      const fresh = store.createTask({
+        channelId: "ch1",
+        title: "新任务",
+        status: "todo",
+        dueDate: "2026-12-31",
+        assigneeKind: null,
+        assigneeId: null,
+        creatorKind: "human",
+        creatorId: null,
+        sourceMessageId: null,
+        runId: null,
+      });
+      assert.equal(store.getTask(fresh.id)?.dueDate, "2026-12-31");
     } finally {
       store.close();
     }

@@ -38,6 +38,7 @@ function task(id: string, status: TaskStatus, over: Partial<Task> = {}): Task {
     status,
     note: "",
     myDay: null,
+    dueDate: null,
     needsKind: null,
     needsText: null,
     assigneeKind: null,
