@@ -136,14 +136,14 @@ Store 已有 migrate 机制（`db/index.ts`），按既有模式加列/建表 + 
 | M3 | 执行反馈打磨 + M2 遗留缺口 | SSE、看结果抽屉（diff+transcript）、失败重派、CORS/归档修复、任务改标题 | ✅ `4b5066d`…`286a4e8`，490 测试全绿 |
 | M4 | 主 agent chat（完全嵌入 pi SDK）| 说一句话 → 建卡出现在清单 + 关联提示；无 key 时优雅降级 | ✅ 代码与测试完成；真实模型路径待 key 验证（脚本化假模型已穿透生产路径）|
 | M5 | 需要你闭环 | 产出分类（模型+启发式双层）进 needs_you；回答 → resume 真续/假续 → 再分类 | ✅ `e7c82cd`…`2a7a960`，527 测试全绿 |
-| M6 | 打磨与收尾 | e2e 重写、seed 收简、移动清单/我的一天入口、快捷键、README 重写 | 📋 prompt: `plans/M6-polish.md` |
+| M6 | 打磨与收尾 | e2e 重写、seed 收简、移动清单/我的一天入口、快捷键、README 重写 | ✅ `ee306a1`…`d772567`（含 .env/代理支持），542 测试全绿 |
 
-### 待 key 验证清单（编码之外，key 到位后人工执行）
+### 待 key 验证清单（key = google/gemini-3.6-flash，2026-08-04 执行）
 
-1. M4 真模型：配置 `TODOAGENT_MODEL` + key，chat 说「加两个任务」验证建卡与关联提示
-2. M5 真续跑：用真 claude/cursor 触发提问→回答，确认 `--resume` 真的重载会话（观察它是否记得上一轮）
-3. M5 模型分类：验证 question/blocked 判定质量，校准分类 prompt
-4. 降级路径：删掉 session 文件后回答，确认自动落假续
+1. ✅ M4 真模型：真实 Gemini 一轮 6s，两卡创建、taskRefs 正确、遵守「先别派发」
+2. ✅ M5 真续跑：`pnpm e2e --ask` 19/19——真 claude 提问→回答→`resumed=true` 真续→按回答建文件→待确认
+3. ◐ M5 模型分类：e2e 引擎是隔离环境走的启发式（正确）；真 Gemini 分类质量待 dogfood 中首次真实派发观察
+4. ⏳ 降级路径（删 session 文件→假续）：边缘用例，dogfood 期间顺手验
 
 顺序说明:M2 在 M1 后立即做，让每个后续里程碑都能在真 UI 里看到；M4/M5 依赖 pi 凭据到位。
 
