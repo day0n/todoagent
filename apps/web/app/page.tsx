@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, subscribeBoard } from "../lib/api.ts";
+import { api, ApiError, isPinnedToday, localDayIso, subscribeBoard } from "../lib/api.ts";
 import type {
   ChatHistory,
   ChatStatus,
@@ -482,6 +482,61 @@ export default function Page() {
       });
   };
 
+  /**
+   * Moves a task to another list.
+   *
+   * Optimistic, and the local patch carries `channelId` because that is what the
+   * current view's membership is checked against — `belongsInView` evicts the row
+   * from a list view the moment it stops belonging, which is what makes the move
+   * look like it happened. From 我的一天 the row stays, correctly: it is still
+   * today's work, just filed elsewhere.
+   */
+  const moveTask = (task: Task, listId: string): void => {
+    if (listId === task.channelId) return;
+    mutations.current += 1;
+    setGroups((current) => applyOptimistic(current, view, task.id, { channelId: listId }));
+
+    void api
+      .patchTask(task.id, { listId })
+      .then((row) => {
+        setGroups((current) => applyServerRow(current, view, row));
+        // The sidebar's per-list counts both changed, so re-read them.
+        void refresh().catch(() => undefined);
+      })
+      .catch((err: unknown) => {
+        // The engine refuses an unknown or archived target. Show why and put the
+        // row back where it actually is.
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
+  /**
+   * Pins a task into 我的一天, or unpins it.
+   *
+   * `localDayIso` rather than `toISOString().slice(0,10)`: the engine compares the
+   * stored date against the LOCAL day, so a UTC date is the wrong value for most of
+   * the world for part of every day.
+   */
+  const toggleMyDay = (task: Task): void => {
+    const next = isPinnedToday(task.myDay) ? null : localDayIso();
+    mutations.current += 1;
+    setGroups((current) => applyOptimistic(current, view, task.id, { myDay: next }));
+
+    void api
+      .patchTask(task.id, { myDay: next })
+      .then((row) => {
+        setGroups((current) => applyServerRow(current, view, row));
+        // 我的一天's count changes, and if that is the current view its membership
+        // does too — unpinning a task there should remove the row.
+        void refresh().catch(() => undefined);
+      })
+      .catch((err: unknown) => {
+        showError(err);
+        void refresh({ guard: false }).catch(() => undefined);
+      });
+  };
+
   const remove = (task: Task): void => {
     mutations.current += 1;
     setGroups((current) => removeTask(current, task.id));
@@ -629,6 +684,7 @@ export default function Page() {
         onDispatch={dispatch}
         onCancel={cancel}
         onDelete={remove}
+        rowOps={{ onMove: moveTask, onToggleMyDay: toggleMyDay }}
         answer={{
           activeId: answeringId,
           onStart: (t) => {

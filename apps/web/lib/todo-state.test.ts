@@ -362,16 +362,59 @@ test("hasLiveRun: decides the polling cadence", () => {
 
 // ── View membership ─────────────────────────────────────────
 
-test("belongsInView: only the status-defined views can evict", () => {
+test("belongsInView: status evicts from the status views, never from 我的一天", () => {
   assert.equal(belongsInView("needs", task("a", "needs_you")), true);
   assert.equal(belongsInView("needs", task("a", "todo")), false);
   assert.equal(belongsInView("done", task("a", "done")), true);
   assert.equal(belongsInView("done", task("a", "in_review")), false);
 
-  // Aggregate and list views keep their members through any status change; the
-  // next poll is authoritative for those.
+  /*
+   * `today` keeps its members through any status change, deliberately.
+   *
+   * Its membership rule lives in the engine (`inToday`) and is allowed to evolve;
+   * re-deriving it here would be a second copy that drifts. A list view is the
+   * opposite case — see below.
+   */
   for (const status of ["todo", "in_progress", "needs_you", "in_review", "done"] as TaskStatus[]) {
     assert.equal(belongsInView("today", task("a", status)), true);
     assert.equal(belongsInView("list:list-1", task("a", status)), true);
   }
+});
+
+test("belongsInView: a list view evicts a task that changed lists", () => {
+  /*
+   * Membership of a list IS `channelId`, by definition, so checking it duplicates
+   * no rule the engine could change later.
+   *
+   * Without this, moving a task to another list left the row sitting in the list it
+   * had just left until the next poll replaced the whole view — for up to a minute
+   * with the stream connected, which reads as a move that silently failed.
+   */
+  assert.equal(belongsInView("list:list-1", task("a", "todo")), true);
+  assert.equal(
+    belongsInView("list:list-1", task("a", "todo", { channelId: "list-2" })),
+    false,
+    "a task whose channelId moved away is no longer a member",
+  );
+
+  // The aggregate views do not care which list a task lives in.
+  assert.equal(belongsInView("today", task("a", "todo", { channelId: "list-2" })), true);
+  assert.equal(belongsInView("needs", task("a", "needs_you", { channelId: "list-2" })), true);
+});
+
+test("applyOptimistic: moving a task out of the visible list removes the row", () => {
+  const groups = emptyGroups();
+  groups.todo = [task("a", "todo"), task("b", "todo")];
+
+  const after = applyOptimistic(groups, "list:list-1", "a", { channelId: "list-2" });
+  assert.deepEqual(
+    (after?.todo ?? []).map((t) => t.id),
+    ["b"],
+    "the moved task leaves the view it was moved out of",
+  );
+
+  // Seen from 我的一天, the same move keeps the task on screen — it is still today's
+  // work, just filed elsewhere.
+  const inToday = applyOptimistic(groups, "today", "a", { channelId: "list-2" });
+  assert.equal((inToday?.todo ?? []).length, 2);
 });

@@ -188,6 +188,14 @@ export const api = {
       status?: SettableTaskStatus;
       note?: string;
       myDay?: string | null;
+      /**
+       * Move the task to another list.
+       *
+       * Not nullable: every task belongs to exactly one list. The engine refuses an
+       * unknown or archived target with a 400 — an archived list's view is a 404, so
+       * a task moved there would look deleted while still counting in the sidebar.
+       */
+      listId?: string;
     },
   ) => req<Task>(`/api/tasks/${taskId}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
@@ -380,6 +388,27 @@ export function subscribeBoard(
   };
 
   return () => source.close();
+}
+
+/**
+ * Today as `YYYY-MM-DD` in the BROWSER's timezone.
+ *
+ * Not `toISOString().slice(0, 10)`, which is UTC. The engine decides membership of
+ * 我的一天 with `sameLocalDay(myDay + "T00:00:00", now)` — a local-time comparison —
+ * so a UTC date is simply the wrong value east or west of Greenwich. Pinning at
+ * 08:00 in Shanghai would send yesterday's date and the task would not appear;
+ * pinning at 20:00 in Los Angeles would send tomorrow's.
+ */
+export function localDayIso(now: Date = new Date()): string {
+  const y = now.getFullYear();
+  const m = String(now.getMonth() + 1).padStart(2, "0");
+  const d = String(now.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+/** Is this task pinned to today? A past pin is stale and reads as unpinned. */
+export function isPinnedToday(myDay: string | null, now: Date = new Date()): boolean {
+  return myDay !== null && myDay === localDayIso(now);
 }
 
 export function fmtTokens(n: number): string {

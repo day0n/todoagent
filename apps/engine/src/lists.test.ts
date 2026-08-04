@@ -330,3 +330,69 @@ test("tasks: delete removes the row; cancel without a live run is a 409", async 
     await f.dispose();
   }
 });
+
+// ── Moving a task between lists ──────────────────────────────
+
+test("tasks: a task moves to another list, and refuses unusable targets", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const other = await json<{ id: string }>(
+        await req("POST", "/api/lists", { name: "以后再说", color: null }),
+      );
+      const task = await json<Task>(
+        await req("POST", "/api/tasks", { title: "放错清单了", listId: f.listId }),
+      );
+
+      /*
+       * `store.updateTask` has accepted `channelId` since M1 — the HTTP surface
+       * simply never exposed it, so a task added to the wrong list could only be
+       * fixed by deleting and retyping it.
+       */
+      const moved = await json<Task>(
+        await req("PATCH", `/api/tasks/${task.id}`, { listId: other.id }),
+      );
+      assert.equal(moved.channelId, other.id, "the response reports the new list");
+
+      // And it is reachable there, which is the part a user cares about.
+      const target = await json<{ groups: Groups }>(
+        await req("GET", `/api/tasks?view=list:${other.id}`),
+      );
+      assert.deepEqual(
+        target.groups.todo.map((t) => t.id),
+        [task.id],
+        "the task shows up in the destination list's view",
+      );
+      const source = await json<{ groups: Groups }>(
+        await req("GET", `/api/tasks?view=list:${f.listId}`),
+      );
+      assert.equal(source.groups.todo.length, 0, "and is gone from the one it left");
+
+      // A list that does not exist. 400, not 404: the task URL is correct, it is
+      // the body that names something unusable — matching the assignee check.
+      const unknown = await req("PATCH", `/api/tasks/${task.id}`, { listId: "no-such-list" });
+      assert.equal(unknown.status, 400);
+      assert.match((await json<{ error: string }>(unknown)).error, /unknown list/);
+
+      /*
+       * An archived list is refused, and this one matters more than it looks.
+       *
+       * `GET /api/tasks?view=list:<id>` 404s an archived list, so a task moved into
+       * one would be unreachable from every view — it would look deleted while
+       * still counting toward the sidebar totals.
+       */
+      await req("PATCH", `/api/lists/${other.id}`, { archived: true });
+      const archived = await req("PATCH", `/api/tasks/${task.id}`, { listId: other.id });
+      assert.equal(archived.status, 400);
+      assert.match((await json<{ error: string }>(archived)).error, /归档/);
+
+      // The failures changed nothing: the task is still where the move put it.
+      const still = await json<{ groups: Groups }>(
+        await req("GET", `/api/tasks?view=list:${f.listId}`),
+      );
+      assert.equal(still.groups.todo.length, 0, "a rejected move must not move anything");
+    });
+  } finally {
+    await f.dispose();
+  }
+});

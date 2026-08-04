@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { fmtDuration, fmtRelative, fmtTokens, fmtUsd } from "./api.ts";
+import { fmtDuration, fmtRelative, fmtTokens, fmtUsd, isPinnedToday, localDayIso } from "./api.ts";
 
 /**
  * Tests for the display formatters.
@@ -110,4 +110,41 @@ test("fmtRelative: a future timestamp does not read as a past one", () => {
   // Clock skew again: "-2 分钟前" would be worse than treating it as just now.
   const future = new Date(Date.now() + 120_000).toISOString();
   assert.equal(fmtRelative(future), "刚刚");
+});
+
+// ── localDayIso / isPinnedToday ─────────────────────────────
+
+test("localDayIso: reads the LOCAL calendar day, not the UTC one", () => {
+  /*
+   * The bug this exists to prevent, and it is invisible on a machine at UTC.
+   *
+   * The engine decides membership of 我的一天 with
+   * `sameLocalDay(myDay + "T00:00:00", now)`, a local-time comparison. So the
+   * client has to send its own calendar day. `toISOString().slice(0,10)` sends
+   * UTC's, which is a different day for most of the world for part of every day:
+   * pinning at 08:00 in Shanghai (UTC+8) would send YESTERDAY and the task would
+   * simply not appear.
+   *
+   * Constructed with the local-time `Date` constructor, so this asserts the same
+   * thing wherever it runs.
+   */
+  const morning = new Date(2026, 7, 4, 8, 30);
+  assert.equal(localDayIso(morning), "2026-08-04");
+
+  // Late evening: the hour that trips a UTC-based implementation the other way.
+  const evening = new Date(2026, 7, 4, 23, 59);
+  assert.equal(localDayIso(evening), "2026-08-04");
+
+  // Month and day are zero-padded — the engine's regex demands YYYY-MM-DD.
+  assert.equal(localDayIso(new Date(2026, 0, 9, 12)), "2026-01-09");
+  assert.match(localDayIso(new Date(2026, 11, 31, 12)), /^\d{4}-\d{2}-\d{2}$/);
+});
+
+test("isPinnedToday: yesterday's pin is not today's", () => {
+  const now = new Date(2026, 7, 4, 12);
+  assert.equal(isPinnedToday("2026-08-04", now), true);
+  // A stale pin reads as unpinned rather than keeping the sun lit forever: the
+  // engine stops counting it toward 我的一天 at midnight, and the row must agree.
+  assert.equal(isPinnedToday("2026-08-03", now), false);
+  assert.equal(isPinnedToday(null, now), false);
 });

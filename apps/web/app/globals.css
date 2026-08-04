@@ -1115,6 +1115,68 @@
     background: var(--fill-hover);
     color: var(--color-bad);
   }
+  /*
+   * 我的一天 toggle.
+   *
+   * Hover-revealed like every other row action UNTIL it is on, and then it stays
+   * lit — the rules below override `.act`'s `opacity: 0`, so a pinned row says so
+   * without being hovered. Amber rather than the accent blue: blue in this UI means
+   * "needs you", and a pin is the user's own decision, not something owed.
+   *
+   * The delete × is the other `.act.ghost` in this row and turns red on hover, so
+   * the sun's own hover colour has to be stated or it would inherit that.
+   */
+  .act.ghost.sun:hover,
+  .row.needs .act.ghost.sun:hover {
+    background: var(--fill-hover);
+    color: var(--color-warn);
+  }
+  .act.sun.on,
+  .row:hover .act.sun.on,
+  .row.needs .act.sun.on {
+    opacity: 1;
+    color: var(--color-warn);
+  }
+
+  /*
+   * Move-to-list picker.
+   *
+   * A native `<select>`, styled down to look like the other row actions: it gets
+   * keyboard access, outside-click dismissal and correct mobile rendering from the
+   * platform, none of which a custom menu would have for free.
+   *
+   * `max-width` matters — a long list name would otherwise stretch the control and
+   * push the action pills out of the row.
+   */
+  .move {
+    height: 26px;
+    max-width: 104px;
+    padding: 0 6px;
+    flex-shrink: 0;
+    border: 0;
+    border-radius: 7px;
+    outline: 0;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    text-overflow: ellipsis;
+    /* Hover-revealed, matching `.act`. `:focus-visible` is in the reveal list
+       below so it is reachable by keyboard. */
+    opacity: 0;
+    transition:
+      opacity 0.18s ease,
+      background 0.18s ease;
+  }
+  .move:hover {
+    background: var(--fill-hover);
+    color: var(--ink-2);
+  }
+  .row:hover .move,
+  .row:focus-within .move {
+    opacity: 1;
+  }
 
   /* ── Answer bar ─────────────────────────────────────────────
      Below the row that is asking, inside the same group card. Inline rather than a

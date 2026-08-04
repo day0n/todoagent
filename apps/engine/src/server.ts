@@ -1237,6 +1237,15 @@ const TaskPatch = z.object({
   /** ISO date to pin into 我的一天, or null to unpin. */
   myDay: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().optional(),
   /**
+   * Move the task to another list.
+   *
+   * `store.updateTask` has accepted `channelId` since M1; the HTTP surface simply
+   * never exposed it, so a task created in the wrong list could not be moved
+   * without editing the database. Not nullable: every task belongs to exactly one
+   * list, and "no list" is not a state the board can render.
+   */
+  listId: z.string().min(1).optional(),
+  /**
    * Assignment, as one unit.
    *
    * Kind and id are a pair — `expert` with no id, or an id with no kind, are both
@@ -1273,6 +1282,26 @@ app.patch("/api/tasks/:id", async (c) => {
   }
   if (body.note !== undefined) patch.note = body.note;
   if (body.myDay !== undefined) patch.myDay = body.myDay;
+
+  if (body.listId !== undefined) {
+    const target = store.getChannel(body.listId);
+    // 400 rather than 404, following the assignee check below: the task URL is
+    // correct, it is the body that names something unusable.
+    if (!target || target.kind !== "channel") {
+      return c.json({ error: `unknown list ${body.listId}` }, 400);
+    }
+    /*
+     * An archived list is refused.
+     *
+     * `GET /api/tasks?view=list:<id>` 404s an archived list, so a task moved into
+     * one would be unreachable from every view except by un-archiving — the task
+     * would look deleted while still counting toward totals.
+     */
+    if (target.archivedAt !== null) {
+      return c.json({ error: "这个清单已归档。先恢复它，或者选另一个清单。" }, 400);
+    }
+    patch.channelId = target.id;
+  }
 
   if (body.assignee !== undefined) {
     if (body.assignee === null) {

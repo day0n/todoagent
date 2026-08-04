@@ -130,6 +130,16 @@ export function insertTask(current: TaskGroups | null, task: Task): TaskGroups |
 export function belongsInView(view: ViewKey, task: Task): boolean {
   if (view === "needs") return task.status === "needs_you";
   if (view === "done") return task.status === "done";
+  /*
+   * A list view evicts a task that left the list.
+   *
+   * Unlike `today`, this is not a rule that can drift: a list's membership IS
+   * `channelId`, by definition, so checking it here duplicates nothing the engine
+   * might change later. Without it, moving a task to another list left the row
+   * sitting in the list it had just left until the next poll replaced the whole
+   * view — the move looked like it had failed.
+   */
+  if (view.startsWith("list:")) return task.channelId === view.slice("list:".length);
   return true;
 }
 
@@ -147,7 +157,12 @@ export function applyOptimistic(
   current: TaskGroups | null,
   view: ViewKey,
   id: string,
-  patch: Partial<Pick<Task, "status" | "title" | "note" | "runId" | "needsKind" | "needsText">>,
+  patch: Partial<
+    Pick<
+      Task,
+      "status" | "title" | "note" | "runId" | "needsKind" | "needsText" | "channelId" | "myDay"
+    >
+  >,
 ): TaskGroups | null {
   if (current === null) return current;
   const existing = findTask(current, id);

@@ -4,7 +4,8 @@ import { Fragment, useEffect, useRef, useState } from "react";
 import type { Task, TaskGroups, TaskStatus, TodoList, ViewKey } from "../lib/types.ts";
 import { TASK_STATUS_LABEL } from "../lib/types.ts";
 import { visibleGroups } from "../lib/todo-state.ts";
-import { IconCaret, IconCheck, IconPlus, IconX } from "./icons.tsx";
+import { isPinnedToday } from "../lib/api.ts";
+import { IconCaret, IconCheck, IconPlus, IconToday, IconX } from "./icons.tsx";
 
 /**
  * The middle pane: one view's tasks, grouped.
@@ -33,6 +34,19 @@ export interface AnswerControls {
   onCancel: () => void;
 }
 
+/**
+ * Per-row operations that are not status changes.
+ *
+ * Bundled for the same reason as `AnswerControls`: threading two more callbacks
+ * through three component levels adds noise at every one of them.
+ */
+export interface RowOps {
+  /** Moves the task to another list. The engine refuses unknown or archived ones. */
+  onMove: (task: Task, listId: string) => void;
+  /** Pins to 我的一天, or unpins. */
+  onToggleMyDay: (task: Task) => void;
+}
+
 export function TaskPane({
   view,
   title,
@@ -51,6 +65,7 @@ export function TaskPane({
   onDelete,
   onOpenResult,
   answer,
+  rowOps,
 }: {
   view: ViewKey;
   title: string;
@@ -75,9 +90,44 @@ export function TaskPane({
   /** Opens the result drawer for a finished or failed task. */
   onOpenResult: (task: Task) => void;
   answer: AnswerControls;
+  rowOps: RowOps;
 }) {
   const shown = visibleGroups(groups);
   const repoByList = new Map(lists.map((l) => [l.id, l.repoPath]));
+
+  /*
+   * Quick-add's open state lives HERE, not inside `QuickAdd`.
+   *
+   * The `/` and `n` shortcuts have to be able to open it, and a keydown listener
+   * cannot reach into a child's private state. The input ref is lifted for the same
+   * reason: `autoFocus` only fires on mount, so pressing `/` while the field is
+   * already open but unfocused would otherwise do nothing.
+   */
+  const [addOpen, setAddOpen] = useState(false);
+  const addInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent): void => {
+      if (e.key !== "/" && e.key !== "n") return;
+      // Never steal a keystroke from a field. `isContentEditable` covers the case
+      // no tag check does, and the answer bar is a textarea.
+      const el = document.activeElement;
+      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) return;
+      if (el instanceof HTMLElement && el.isContentEditable) return;
+      // A modifier means the user is reaching for a browser or OS command.
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+      // A dialog owns the keyboard while it is open.
+      if (document.querySelector(".drawer") !== null) return;
+
+      // Prevented so `/` does not open Firefox's quick-find and `n` does not type
+      // itself into the field we are about to focus.
+      e.preventDefault();
+      setAddOpen(true);
+      addInputRef.current?.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
 
   return (
     <main className="main">
@@ -85,13 +135,15 @@ export function TaskPane({
         <h1>{title}</h1>
         <Subtitle runtimeCount={runtimeCount} />
 
-        <QuickAdd onAdd={onAdd} />
+        <QuickAdd onAdd={onAdd} open={addOpen} setOpen={setAddOpen} inputRef={addInputRef} />
 
         {shown.map(({ status, tasks }) => (
           <Group
             key={status}
             status={status}
             tasks={tasks}
+            lists={lists}
+            rowOps={rowOps}
             repoByList={repoByList}
             executorFor={executorFor}
             onToggleDone={onToggleDone}
@@ -173,10 +225,19 @@ function Subtitle({ runtimeCount }: { runtimeCount: number | null }) {
  * and keyboard-reachable. Open it is an input that stays open after each Enter,
  * so a person can type several tasks without reaching for the mouse again.
  */
-function QuickAdd({ onAdd }: { onAdd: (title: string) => Promise<void> }) {
-  const [open, setOpen] = useState(false);
+function QuickAdd({
+  onAdd,
+  open,
+  setOpen,
+  inputRef,
+}: {
+  onAdd: (title: string) => Promise<void>;
+  /** Owned by the pane so the `/` and `n` shortcuts can open it. */
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  inputRef: React.RefObject<HTMLInputElement | null>;
+}) {
   const [draft, setDraft] = useState("");
-  const inputRef = useRef<HTMLInputElement>(null);
 
   if (!open) {
     return (
@@ -240,9 +301,13 @@ function Group({
   onDelete,
   onOpenResult,
   answer,
+  rowOps,
+  lists,
 }: {
   status: TaskStatus;
   tasks: Task[];
+  lists: TodoList[];
+  rowOps: RowOps;
   repoByList: Map<string, string | null>;
   executorFor: (task: Task) => string | null;
   onToggleDone: (task: Task) => void;
@@ -303,6 +368,8 @@ function Group({
               onDelete={onDelete}
               onOpenResult={onOpenResult}
               answer={answer}
+              rowOps={rowOps}
+              lists={lists}
             />
             {answer.activeId === task.id ? (
               <AnswerBar task={task} onSubmit={answer.onSubmit} onCancel={answer.onCancel} />
@@ -326,10 +393,14 @@ function Row({
   onDelete,
   onOpenResult,
   answer,
+  rowOps,
+  lists,
 }: {
   task: Task;
   repoPath: string | null;
   executor: string | null;
+  lists: TodoList[];
+  rowOps: RowOps;
   onToggleDone: (task: Task) => void;
   onRenameTask: (task: Task, title: string) => void;
   onDispatch: (task: Task) => void;
@@ -341,6 +412,14 @@ function Row({
   const done = task.status === "done";
   const running = task.status === "in_progress";
   const needs = task.status === "needs_you";
+  /*
+   * Computed per render rather than stored.
+   *
+   * `myDay` is a date, not a flag, so "pinned" is a question about today — and a pin
+   * from yesterday is stale. The engine already stops counting it toward 我的一天 at
+   * midnight, and the sun has to agree or the row claims a membership it no longer has.
+   */
+  const pinned = isPinnedToday(task.myDay);
 
   /*
    * Inline title editing, opened by double-click.
@@ -433,6 +512,52 @@ function Row({
           <i />
           待确认
         </span>
+      ) : null}
+
+      {/*
+        Pin to 我的一天.
+
+        A toggle rather than a menu item because it is the one row operation people
+        use repeatedly. Stays lit once pinned — see `.act.sun.on` — so the row says
+        what it is without being hovered; `isPinnedToday` treats yesterday's pin as
+        unpinned, matching the engine, which stops counting it at midnight.
+      */}
+      <button
+        type="button"
+        className={`act ghost sun${pinned ? " on" : ""}`}
+        aria-pressed={pinned}
+        aria-label={pinned ? `从我的一天移出「${task.title}」` : `加入我的一天：「${task.title}」`}
+        title={pinned ? "从我的一天移出" : "加入我的一天"}
+        onClick={() => rowOps.onToggleMyDay(task)}
+      >
+        <IconToday />
+      </button>
+
+      {/*
+        Move to another list.
+
+        A native `<select>` rather than a custom menu: it is keyboard-accessible for
+        free, needs no outside-click handling or focus trap, and the platform renders
+        it correctly on every viewport. `.move` keeps it hover-revealed like the
+        other row actions.
+      */}
+      {lists.length > 1 ? (
+        <select
+          className="move"
+          value={task.channelId}
+          aria-label={`移动「${task.title}」到别的清单`}
+          title="移动到别的清单"
+          onChange={(e) => {
+            const next = e.target.value;
+            if (next !== task.channelId) rowOps.onMove(task, next);
+          }}
+        >
+          {lists.map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.name}
+            </option>
+          ))}
+        </select>
       ) : null}
 
       <RowAction
@@ -547,10 +672,23 @@ function RowAction({
     );
   }
 
-  // Both remaining states point at a run. `runId` can be null on a needs_you task
-  // that never ran, which is why this is a guard and not a cast — a 查看 button
-  // there would link at `/runs/null`.
-  if (task.runId === null) return null;
+  /*
+   * A parked card with no run behind it.
+   *
+   * Reachable when a task is moved into 需要你 by something other than a finished
+   * run — and until M6 it offered NOTHING, which the M3 notes recorded as a known
+   * dead row: visibly waiting on you, with no way to act on it. 查看 cannot be the
+   * answer because there is no result to show; dispatching is what actually
+   * unsticks it, and 重派 would be the wrong word for work that never started.
+   */
+  if (task.runId === null) {
+    if (task.status !== "needs_you" || !canDispatch) return null;
+    return (
+      <button type="button" className="act" onClick={() => onDispatch(task)}>
+        派发
+      </button>
+    );
+  }
 
   if (task.status === "in_review") {
     return (
