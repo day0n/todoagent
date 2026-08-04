@@ -3,7 +3,7 @@
 > **工作方式**：本文档是总纲和唯一事实来源。每个里程碑有一份独立的执行 prompt 放在 `plans/` 目录下，
 > 直接复制给编码 agent 执行。每完成一个里程碑：更新 §6 的状态列、把决策沉淀进 §7、再写下一份 prompt。
 
-设计基准：`mockups/v1d-apple.html`（用户修订版）。产品承诺：**一个会自己完成任务的待办清单**——添加任务或和 agent 说一句话，任务被派给本地 CLI agent 执行，卡住的任务带着问题回来找你，完成的任务等你确认。
+设计基准：`mockups/opt-h2-sunsama-refined.html`（2026-08-04 用户定稿，M7 落地中；旧基准 v1d-apple 已废弃）。产品承诺：**一个会自己完成任务的待办清单**——添加任务或和 agent 说一句话，任务被派给本地 CLI agent 执行，卡住的任务带着问题回来找你，完成的任务等你确认。
 
 ## 0. 目标闭环（V1 全景）
 
@@ -137,6 +137,7 @@ Store 已有 migrate 机制（`db/index.ts`），按既有模式加列/建表 + 
 | M4 | 主 agent chat（完全嵌入 pi SDK）| 说一句话 → 建卡出现在清单 + 关联提示；无 key 时优雅降级 | ✅ 代码与测试完成；真实模型路径待 key 验证（脚本化假模型已穿透生产路径）|
 | M5 | 需要你闭环 | 产出分类（模型+启发式双层）进 needs_you；回答 → resume 真续/假续 → 再分类 | ✅ `e7c82cd`…`2a7a960`，527 测试全绿 |
 | M6 | 打磨与收尾 | e2e 重写、seed 收简、移动清单/我的一天入口、快捷键、README 重写 | ✅ `ee306a1`…`d772567`（含 .env/代理支持），542 测试全绿 |
+| M7 | UI 重制：Sunsama 风日看板 + 常驻秘书 | 视觉对齐 `mockups/opt-h2-sunsama-refined.html`；四列日看板（due_date 分列）；秘书面板常驻含 needs_you 上下文卡；全链路与测试不回归 | 📋 prompt 就绪（`plans/M7-ui-dayboard.md`），前置：先提交工作区 due_date 改动 |
 
 ### 待 key 验证清单（key = google/gemini-3.6-flash，2026-08-04 执行）
 
