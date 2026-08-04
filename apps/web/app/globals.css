@@ -305,6 +305,18 @@
     height: 100%;
     display: grid;
     grid-template-columns: 216px minmax(0, 1fr) 336px;
+    /*
+     * The single row is pinned to the shell's own height, NOT left implicit.
+     *
+     * An implicit row is `auto`, which sizes to the tallest pane's min-content —
+     * so one pane that refuses to shrink (see `.cbody`) stretched the row to
+     * 1205px in a 900px window and pushed the bottom of ALL THREE panes past the
+     * fold: the secretary's composer and the sidebar's settings row were both
+     * clipped by `body { overflow: hidden }`, present in the DOM and unreachable.
+     * `minmax(0, 1fr)` makes the row exactly the container's height and lets the
+     * panes' own scroll regions absorb the overflow, which is where it belongs.
+     */
+    grid-template-rows: minmax(0, 1fr);
     background: var(--bg);
   }
 
@@ -2203,6 +2215,18 @@
 
   .cbody {
     flex: 1;
+    /*
+     * The automatic minimum size, defeated — the same floor `.side-scroll`,
+     * `.cols` and `.dbody` already carry.
+     *
+     * Without it a column flex item will not shrink below its CONTENT height, so
+     * `flex: 1` and `overflow-y: auto` both quietly stop working: a stream of a
+     * dozen messages made this box 1065px tall, pushed the composer 305px past the
+     * bottom of the window, and `body { overflow: hidden }` cut it off. The panel
+     * looked like it had no composer at all. Scrolling only ever begins once the
+     * box is allowed to be smaller than what it holds.
+     */
+    min-height: 0;
     overflow-y: auto;
     padding: 21px 18px;
     display: flex;
