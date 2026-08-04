@@ -12,8 +12,9 @@
  *   2. Shrinking the root font size so a rem-based query resolves smaller — by
  *      spec, `rem` inside a media query is fixed to the INITIAL root size,
  *      otherwise the query would depend on its own result.
- *   3. Grepping for the authored text — the minifier rewrites it, so a search for
- *      `(max-width: 1050px)` with its space can never match.
+ *   3. Grepping for one fixed spelling of the text — dev and production output are
+ *      formatted differently, so a needle written for either one alone fails
+ *      against the other. See `canonical()`.
  *
  * Rewritten twice, and the reason is the same both times. It first required
  * `md:static` and `xl:grid-cols-4` from the icon-rail shell deleted in M2; then
@@ -30,12 +31,12 @@
  *    720px  the sidebar track narrows to 68px; labels, calendar and the new-list
  *           form go; per-row repo and status tags go
  *
- * Every needle is a LITERAL substring of the MINIFIED output, which is why they
- * carry no spaces after colons. Building regexes for this through a shell into
- * `node -e` is how attempt 3 went wrong twice. Needles are also selector-anchored
- * rather than full declarations wherever the minifier is free to reorder
- * properties: `.side{width:244px` matches nothing in practice, because it emits
- * that rule's properties in its own order.
+ * Every needle is a literal substring of the CANONICAL form (see `canonical()`),
+ * which is the minified spelling: no spaces after colons or commas. Building
+ * regexes for this through a shell into `node -e` is how attempt 3 went wrong
+ * twice. Needles are also selector-anchored rather than full declarations wherever
+ * the minifier is free to reorder properties: `.side{width:244px` matches nothing
+ * in practice, because it emits that rule's properties in its own order.
  *
  *   node scripts/check-breakpoints.mjs <stylesheet.css>
  */
@@ -49,7 +50,43 @@ if (cssPath === undefined) {
   exit(2);
 }
 
-const css = readFileSync(cssPath, "utf8");
+/**
+ * One spelling for two stylesheets.
+ *
+ * `check-all` passes whichever compiled sheet exists — "run a build or load a
+ * page" — and those two are formatted differently. Dev output is pretty-printed
+ * with comments; production is minified. Needles written for one alone fail
+ * against the other, and the failure LOOKS like missing responsive rules rather
+ * than like a formatting mismatch: this checker reported 13 problems against a dev
+ * sheet whose media queries were all present and correct.
+ *
+ * Canonical form is the minified spelling, reached by:
+ *   - dropping comments, so a needle can never match commentary ABOUT the rule
+ *   - collapsing whitespace runs, keeping the single space that means "descendant"
+ *     in `.srow .dot-badge` and "next value" in `216px minmax(0,1fr)`
+ *   - removing space around `{ } ; : ,`
+ *   - dropping the last semicolon in a block, which dev keeps and the minifier
+ *     does not — without this, `display:none}` matches only one of the two sheets
+ *   - dropping a leading zero, which is what makes `0.01ms` and `.01ms` one needle
+ *
+ * Idempotent: already-minified input comes back unchanged, so both sheets meet in
+ * the same form rather than one being converted toward the other.
+ *
+ * Deliberately NOT a CSS parser. It only has to make two spellings of the same
+ * sheet comparable; `blockRange` still does the containment test on braces.
+ */
+function canonical(source) {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*([{};:,])\s*/g, "$1")
+    .replace(/;}/g, "}")
+    .replace(/\b0(\.\d)/g, "$1")
+    .trim();
+}
+
+const raw = readFileSync(cssPath, "utf8");
+const css = canonical(raw);
 
 /**
  * The `[start, end)` character range of a media block's body.
@@ -168,7 +205,12 @@ const OVERRIDES = [
 
 let bad = 0;
 
-console.log(`stylesheet: ${cssPath} (${css.length} bytes)\n`);
+// Both sizes: the raw one identifies WHICH sheet this is (a dev sheet is far
+// larger than the minified one), and a canonical size close to it means the input
+// was already minified.
+console.log(
+  `stylesheet: ${cssPath} (${raw.length} bytes, ${css.length} canonical)\n`,
+);
 
 console.log("breakpoint blocks:");
 for (const bp of BREAKPOINTS) {
