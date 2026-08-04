@@ -156,4 +156,7 @@ packages/core   适配器、runDirect、Store（SQLite）
 
 ## 设计基准
 
-界面照 `mockups/v1d-apple.html` 实现。`PLAN.md` 是总纲和决策记录，`plans/` 下是每个里程碑的执行 prompt。
+界面布局照 `opt-h2-sunsama-refined` 原型实现（2026-08-04 定稿），配色与字体留在实现里。`PLAN.md` 是总纲和决策记录。
+
+设计原型（HTML）和里程碑 prompt 未纳入版本库 —— 原型里带有第三方产品的截图素材，不适合公开分发。代码注释中出现的
+`mockups/xxx.html` 指的是这批本地文件，记录设计出处，不是仓库里的路径。
