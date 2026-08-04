@@ -1388,23 +1388,69 @@ function localDayIso(now: Date): string {
  */
 function inToday(t: Task, now: Date): boolean {
   if (t.status === "needs_you" || t.status === "in_progress" || t.status === "in_review") return true;
+  // Finished work stays visible for the rest of the day it was finished, and no longer.
+  if (t.status === "done") return sameLocalDay(t.updatedAt, now);
   if (t.myDay !== null && sameLocalDay(`${t.myDay}T00:00:00`, now)) return true;
   /*
-   * Due today or overdue — but NOT once it is done.
+   * An explicit deadline DECIDES, and that includes deciding against today.
    *
-   * This is what makes a deadline mean something: a task due Friday appears in
-   * 我的一天 on Friday without anyone pinning it, and keeps appearing while it is
-   * late. Excluding `done` is what stops that being a trap — a task finished last
-   * month with a past deadline would otherwise reappear in 我的一天 forever, and
-   * the more overdue history accumulated the more useless the view would become.
+   * Due today or overdue is today's business — which is what makes a deadline mean
+   * something: a task due Friday appears on Friday without anyone pinning it, and
+   * keeps appearing while it is late.
+   *
+   * The `return` rather than a fallthrough is the load-bearing half. A task created
+   * today but due next week used to land in 我的一天 on the created-today rule
+   * below, which was defensible for a single aggregate view and is plainly wrong on
+   * a day board: the user said when they want it, and that is not now. An explicit
+   * date is a stronger signal than the accident of when the card was typed.
    *
    * String comparison is sound because the format is zero-padded `YYYY-MM-DD`,
    * which sorts lexicographically the same way it sorts chronologically.
    */
-  if (t.status !== "done" && t.dueDate !== null && t.dueDate <= localDayIso(now)) return true;
-  if (t.status === "todo" && sameLocalDay(t.createdAt, now)) return true;
-  if (t.status === "done" && sameLocalDay(t.updatedAt, now)) return true;
-  return false;
+  if (t.dueDate !== null) return t.dueDate <= localDayIso(now);
+  return sameLocalDay(t.createdAt, now);
+}
+
+/** The board's columns, in display order. */
+const BOARD_KEYS = ["today", "tomorrow", "dayAfter", "later"] as const;
+type BoardKey = (typeof BOARD_KEYS)[number];
+
+/** `YYYY-MM-DD`, `n` days from `now`, local time. */
+function dayOffset(now: Date, n: number): string {
+  // Constructed from calendar parts so month and year rollover and daylight-saving
+  // transitions are the platform's problem rather than arithmetic on milliseconds.
+  return localDayIso(new Date(now.getFullYear(), now.getMonth(), now.getDate() + n));
+}
+
+/**
+ * Which column a task belongs in, or null when it belongs on no column at all.
+ *
+ * Exactly one column per task, decided here rather than in the client. Two places
+ * deciding membership is how a card renders twice or not at all — the same reason
+ * `/api/tasks` groups by status server-side.
+ *
+ * Precedence, and every step of it is a judgement worth stating:
+ *
+ *   live status   — a task running right now, or waiting on you, is today's business
+ *                   whatever its deadline says. You are watching it.
+ *   done          — only the day it was finished, so the day's wins stay visible
+ *                   without last month's history piling up.
+ *   manual pin    — 我的一天. Beats the deadline, and that ordering is deliberate:
+ *                   a deadline says "must be done BY", a pin says "I am doing this
+ *                   today". Starting something due Thursday on Tuesday is ordinary,
+ *                   and the pin is an explicit click the user just made. A stale pin
+ *                   (yesterday's) does not count, so it falls through.
+ *   deadline      — the user named a day. Overdue rolls into today.
+ *   created today — the weakest signal, and the last resort.
+ */
+function boardColumn(t: Task, now: Date): BoardKey | null {
+  if (inToday(t, now)) return "today";
+  // Finished on an earlier day: it is done, and the board is about what is not.
+  if (t.status === "done") return null;
+  if (t.dueDate === dayOffset(now, 1)) return "tomorrow";
+  if (t.dueDate === dayOffset(now, 2)) return "dayAfter";
+  // Everything else: due further out, or carrying no deadline at all.
+  return "later";
 }
 
 app.get("/api/lists", (c) => {
@@ -1547,6 +1593,83 @@ app.get("/api/tasks", (c) => {
   for (const t of picked) (groups[t.status] ?? groups.todo).push(t);
   groups.done.reverse(); // finished list reads newest-first
   return c.json({ view, groups });
+});
+
+/**
+ * The day board: every uncompleted task bucketed into four columns.
+ *
+ * A separate endpoint rather than another `view=` on `/api/tasks`, because the shape
+ * genuinely differs — that one groups by status inside one view, this one buckets by
+ * day and each column needs its own date and counts. Squeezing both into one
+ * response would make every caller branch on which kind it got.
+ *
+ * `/api/tasks` stays for the list and status views, which are still status-grouped.
+ */
+app.get("/api/board", (c) => {
+  const now = new Date();
+  const all = store.listAllTasks();
+
+  const columns = BOARD_KEYS.map((key, i) => ({
+    key,
+    /*
+     * The date is computed HERE and sent down.
+     *
+     * The client could derive it, but then two implementations of "what day is the
+     * third column" would have to agree — including across midnight, when the
+     * engine's answer changes and a browser tab left open overnight would still be
+     * bucketing against yesterday. One source, sent with the data it describes.
+     *
+     * `later` carries no date: it is a bucket, not a day.
+     */
+    date: key === "later" ? null : dayOffset(now, i),
+    /** `Date.getDay()`, so the client renders 周二 without parsing the string. */
+    weekday: key === "later" ? null : new Date(now.getFullYear(), now.getMonth(), now.getDate() + i).getDay(),
+    tasks: [] as Task[],
+  }));
+  const byKey = new Map(columns.map((col) => [col.key, col]));
+
+  for (const t of all) {
+    const key = boardColumn(t, now);
+    if (key === null) continue;
+    byKey.get(key)?.tasks.push(t);
+  }
+
+  /*
+   * Within a column: what needs a person first, then what is moving, then the rest.
+   *
+   * Same precedence the status groups use in the old pane, so the two views cannot
+   * disagree about which card is most urgent. Ties keep `listAllTasks`'s created_at
+   * order, which is stable — a card must not jump position between polls.
+   */
+  const rank: Record<TaskStatus, number> = {
+    needs_you: 0,
+    in_progress: 1,
+    in_review: 2,
+    todo: 3,
+    done: 4,
+  };
+  for (const col of columns) {
+    col.tasks.sort((a, b) => rank[a.status] - rank[b.status]);
+  }
+
+  return c.json({
+    today: localDayIso(now),
+    columns: columns.map((col) => ({
+      ...col,
+      /*
+       * Counts for the progress bar, computed server-side alongside the membership
+       * they describe.
+       *
+       * Only the today column can ever have a `done` count: a task finished on an
+       * earlier day leaves the board, and one finished today lands in today whatever
+       * its deadline was. So a future column's bar is structurally always empty —
+       * the client should render it only where it means something rather than
+       * showing three bars at 0% that read as failure instead of "not yet due".
+       */
+      done: col.tasks.filter((t) => t.status === "done").length,
+      total: col.tasks.length,
+    })),
+  });
 });
 
 const QuickTaskBody = z.object({
