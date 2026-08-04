@@ -1,68 +1,128 @@
 #!/usr/bin/env node
 /**
- * End-to-end check against the REAL local CLIs.
+ * End-to-end check of the todoagent loop, against a REAL local CLI.
  *
- * This is the acceptance evidence for the whole system, so it deliberately does
- * not mock anything: it creates a throwaway git repo, seeds a genuine
- * multi-vendor team, runs one goal through the full pipeline, and then asserts
- * on what actually landed in the database.
+ * This is the acceptance evidence for the product as it now exists, so it mocks
+ * nothing: it starts the actual engine over HTTP, creates a list bound to a
+ * throwaway git repository, adds a card, dispatches it to an installed agent, and
+ * then asserts on what the API reports back.
  *
- * The assertions target the properties that distinguish this design, not just
- * "it did not crash":
- *   - several DIFFERENT runtimes participated (cross-vendor, not self-review)
- *   - work was decomposed and executed in isolated worktrees
- *   - reviewers produced findings independently of the author
- *   - the verifiable/unverifiable split actually routed disputes
- *   - the run terminated by itself rather than looping
+ * Driven through the HTTP surface rather than by calling the orchestrator directly.
+ * That is the point — the web app has no other way in, so a check that bypassed it
+ * could pass while the product was unusable. It also covers the pieces that only
+ * exist at that layer: the repository lock, outcome classification, and the answer
+ * endpoint's guards.
+ *
+ * `--ask` runs the other half of the loop: a worker that asks a question, a card
+ * parked in 需要你, an answer, and a resumed run that finishes.
+ *
+ * It spends real tokens, which is why it is a separate command and not part of
+ * `pnpm test`.
+ *
+ * The six-phase pipeline check this replaces asserted cross-vendor review,
+ * decomposition and worktree isolation — none of which the product does any more.
+ * That pipeline is still in the codebase behind `POST /api/runs`; it simply is not
+ * what a person uses, so it is no longer what the end-to-end check exercises.
  */
+import { spawn } from "node:child_process";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { detectAll } from "../adapters/index.ts";
-import { Store } from "../db/index.ts";
-import { runPipeline } from "../orchestrator/pipeline.ts";
 import { git } from "../util/git.ts";
-import type { ExpertRole, RuntimeKind } from "../types.ts";
+import type { RuntimeKind, Task } from "../types.ts";
 
-const GOAL =
-  "Add a `slugify(input: string): string` function to src/text.ts and a matching test. " +
-  "It must lowercase, trim, collapse whitespace and punctuation into single hyphens, " +
-  "and handle empty input and leading/trailing separators.";
+const HERE = dirname(fileURLToPath(import.meta.url));
+/** The engine's own entry point, four levels up out of packages/core. */
+const SERVER = join(HERE, "..", "..", "..", "..", "apps", "engine", "src", "server.ts");
 
-const ACCEPTANCE =
-  "src/text.ts exports slugify; a test file covers empty string, punctuation, " +
-  "repeated separators, and leading/trailing separators; `node --test` passes.";
+/** Distinct from every test suite's port (8799–8817) so both can run at once. */
+const PORT = Number(process.env["TODOAGENT_E2E_PORT"] ?? 8850);
+const BASE = `http://127.0.0.1:${PORT}`;
+
+/** Runtimes that can continue a session by id, so `--ask` can predict `resumed`. */
+const RESUMABLE = new Set<RuntimeKind>(["claude", "cursor"]);
+
+/**
+ * One agent turn against a real CLI, plus classification.
+ *
+ * Generous because it is bounded by somebody else's model: a cold `claude` turn
+ * that reads a file and writes another routinely takes over a minute, and a
+ * failure here should mean "wedged", not "slower than I guessed".
+ */
+const TURN_TIMEOUT_MS = 10 * 60 * 1000;
+
+/*
+ * The goal is the card TITLE, capped at 500 characters by `QuickTaskBody`.
+ *
+ * A quick-added card has no source message, so `dispatchCard` uses the title
+ * verbatim as the run's goal — which makes the title the entire prompt. Both of
+ * these are written to fit.
+ */
+const PLAIN_GOAL =
+  "在 src/text.ts 里新建并导出 slugify(input: string): string：转小写、去首尾空白、" +
+  "把连续空白和标点压成单个连字符。直接做完，不要问任何问题。";
+
+/**
+ * A goal whose FIRST action must be a question.
+ *
+ * Phrased as mechanically as possible. "Do the work but ask if unsure" produces a
+ * worker that just does the work — it is a capable agent and the task is
+ * unambiguous — and then this check would fail for model compliance rather than for
+ * anything about the product. Making the question itself the first deliverable is
+ * what makes the run reproducible.
+ */
+const ASK_GOAL =
+  "分两步。第一步：只输出一个问题——src/config.ts 的配置项用扁平结构还是嵌套结构？" +
+  "问完立刻停下，这一步禁止创建或修改任何文件。第二步（等我回答后）：按我的回答创建 src/config.ts。";
+
+const ANSWER = "用扁平结构，键名用 snake_case。";
 
 interface Check {
   name: string;
   ok: boolean;
   detail: string;
-  /** A soft check records a real limitation without failing the suite. */
-  soft?: boolean;
 }
 
 const checks: Check[] = [];
-function check(name: string, ok: boolean, detail: string, soft = false): void {
-  checks.push({ name, ok, detail, soft });
-  const mark = ok ? "PASS" : soft ? "WARN" : "FAIL";
-  console.log(`  [${mark}] ${name}${detail ? ` — ${detail}` : ""}`);
+function check(name: string, ok: boolean, detail = ""): boolean {
+  checks.push({ name, ok, detail });
+  console.log(`  [${ok ? "PASS" : "FAIL"}] ${name}${detail ? ` — ${detail}` : ""}`);
+  return ok;
 }
 
-/** A minimal but real repo, so agents have somewhere honest to work. */
+async function req<T>(method: string, path: string, body?: unknown): Promise<{ status: number; body: T }> {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    signal: AbortSignal.timeout(60_000),
+  });
+  let parsed: unknown = null;
+  try {
+    parsed = await res.json();
+  } catch {
+    /* 204, or a non-JSON error page */
+  }
+  return { status: res.status, body: parsed as T };
+}
+
+/** A real repository with something to read, so the agent has honest work. */
 async function scaffoldRepo(): Promise<string> {
   const dir = await mkdtemp(join(tmpdir(), "todoagent-e2e-"));
   await writeFile(
     join(dir, "package.json"),
-    JSON.stringify(
+    `${JSON.stringify(
       { name: "todoagent-e2e-fixture", version: "1.0.0", type: "module", scripts: { test: "node --test" } },
       null,
       2,
-    ),
+    )}\n`,
     "utf8",
   );
   await writeFile(
     join(dir, "README.md"),
-    "# Fixture\n\nA scratch repository used by TodoAgent's end-to-end test.\n",
+    "# Fixture\n\nA scratch repository used by TodoAgent's end-to-end check.\n",
     "utf8",
   );
   await git(["init", "-q", "-b", "main", "."], dir);
@@ -74,316 +134,383 @@ async function scaffoldRepo(): Promise<string> {
   return dir;
 }
 
-/**
- * Builds a team from whatever is actually installed.
- *
- * Roles are assigned so the AUTHOR and the REVIEWERS are different vendors
- * whenever more than one exists — same-vendor review would defeat the point of
- * the exercise, since the value being tested is independent perspective.
- */
-function seedTeam(
-  store: Store,
-  runtimes: RuntimeKind[],
-): { teamId: string; assignments: Array<{ name: string; kind: RuntimeKind; roles: ExpertRole[] }> } {
-  const team = store.createTeam(`e2e-${Date.now().toString(36)}`);
-  const assignments: Array<{ name: string; kind: RuntimeKind; roles: ExpertRole[] }> = [];
-
-  // Prefer the runtimes verified working on this machine, in this order.
-  const preference: RuntimeKind[] = ["claude", "codex", "kiro", "grok", "cursor", "gemini"];
-  const ordered = [...runtimes].sort((a, b) => preference.indexOf(a) - preference.indexOf(b));
-
-  const primary = ordered[0];
-  if (primary === undefined) throw new Error("no runtimes available");
-
-  const plan: Array<{ kind: RuntimeKind; roles: ExpertRole[] }> = [];
-  if (ordered.length === 1) {
-    plan.push({ kind: primary, roles: ["orchestrator", "maker", "reviewer", "verifier"] });
-  } else {
-    plan.push({ kind: primary, roles: ["orchestrator", "maker"] });
-    const second = ordered[1];
-    if (second !== undefined) plan.push({ kind: second, roles: ["reviewer", "verifier"] });
-    const third = ordered[2];
-    if (third !== undefined) plan.push({ kind: third, roles: ["reviewer"] });
-  }
-
-  for (const [i, entry] of plan.entries()) {
-    const expert = store.createExpert({
-      name: `E2E-${entry.kind}-${i}`,
-      description: `end-to-end fixture expert on ${entry.kind}`,
-      runtimeKind: entry.kind,
-      model: null,
-      systemPrompt:
-        "You are working inside an automated end-to-end test. Be concise and concrete. " +
-        "Verify claims by running commands rather than asserting them.",
-      capabilities: ["general", "typescript", "correctness"],
-    });
-    for (const role of entry.roles) store.addTeamMember(team.id, expert.id, role);
-    assignments.push({ name: expert.name, kind: entry.kind, roles: entry.roles });
-  }
-  return { teamId: team.id, assignments };
+interface Engine {
+  stop: () => void;
+  /** Engine stdout+stderr, for the classification line and failure diagnosis. */
+  log: () => string;
 }
 
-/**
- * A goal engineered to provoke a JUDGMENT-CALL dispute rather than a factual one.
- *
- * Discussion only engages on findings a test cannot settle, so the default
- * slugify goal almost never reaches it: every disagreement about slugify is
- * decidable by running the function. Naming and API-shape choices are the
- * opposite — reviewers hold real opinions and no reproduction can arbitrate,
- * which is precisely the path that needs observing.
- */
-const DISCUSS_GOAL =
-  "Create src/config.ts exporting a single configuration object for a small CLI tool. " +
-  "It needs settings for output verbosity, a retry count, a timeout, and an output format. " +
-  "You choose the key names, the value types, and whether settings are flat or nested. " +
-  "Also export a `defaults` constant and a `merge(partial)` helper.";
+async function startEngine(dbPath: string): Promise<Engine> {
+  const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
+    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let log = "";
+  child.stdout.on("data", (d: Buffer) => (log += d.toString()));
+  child.stderr.on("data", (d: Buffer) => (log += d.toString()));
 
-const DISCUSS_ACCEPTANCE =
-  "src/config.ts exports a config type, a `defaults` constant, and a `merge` helper. " +
-  "The naming and structure should be defensible choices a reviewer might reasonably disagree with.";
+  const deadline = Date.now() + 30_000;
+  for (;;) {
+    if (child.exitCode !== null) throw new Error(`engine exited ${child.exitCode}:\n${log}`);
+    if (Date.now() > deadline) {
+      child.kill("SIGKILL");
+      throw new Error(`engine did not answer on ${BASE} within 30s:\n${log}`);
+    }
+    try {
+      if ((await fetch(`${BASE}/api/health`, { signal: AbortSignal.timeout(2_000) })).ok) break;
+    } catch {
+      /* not listening yet */
+    }
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return { stop: () => child.kill("SIGKILL"), log: () => log };
+}
+
+/** Reads one card back through the view the UI uses. */
+async function card(listId: string, taskId: string): Promise<Task> {
+  const { body } = await req<{ groups: Record<string, Task[]> }>(
+    "GET",
+    `/api/tasks?view=list:${listId}`,
+  );
+  for (const rows of Object.values(body.groups ?? {})) {
+    const hit = rows.find((t) => t.id === taskId);
+    if (hit) return hit;
+  }
+  throw new Error(`card ${taskId} is not in list ${listId} at all`);
+}
+
+/** Waits until the card is neither queued nor running. */
+async function settle(listId: string, taskId: string, label: string): Promise<Task> {
+  const deadline = Date.now() + TURN_TIMEOUT_MS;
+  let last = "";
+  for (;;) {
+    const t = await card(listId, taskId);
+    if (t.status !== "in_progress" && t.status !== "todo") return t;
+    if (t.status !== last) {
+      console.log(`    …${label}: ${t.status}`);
+      last = t.status;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`${label}: still ${t.status} after ${TURN_TIMEOUT_MS / 1000}s`);
+    }
+    await new Promise((r) => setTimeout(r, 2_000));
+  }
+}
+
+interface RunResult {
+  run: { id: string; status: string; goal: string };
+  diff: string | null;
+  output: string | null;
+  executor: string | null;
+}
 
 async function main(): Promise<void> {
   const args = process.argv.slice(2);
-  const soloOnly = args.includes("--solo");
-  const discussMode = args.includes("--discuss");
-  const budgetM = Number(args.find((a) => a.startsWith("--budget="))?.split("=")[1] ?? "3");
+  const askMode = args.includes("--ask");
+  const keep = args.includes("--keep");
+  const wanted = args.find((a) => a.startsWith("--runtime="))?.split("=")[1] ?? null;
+  const budgetM = Number(args.find((a) => a.startsWith("--budget="))?.split("=")[1] ?? "2");
 
-  console.log("TodoAgent end-to-end test\n");
+  console.log(`TodoAgent end-to-end check${askMode ? " (--ask: question → answer → resume)" : ""}\n`);
 
+  /*
+   * No CLI is a hard error, not a skip.
+   *
+   * A green run that tested nothing is worse than a red one: this command exists to
+   * be believed.
+   */
   const detected = await detectAll();
   if (detected.length === 0) {
-    console.error("No coding CLIs on PATH — cannot run an end-to-end test.");
+    console.error(
+      "PATH 上没有编码 CLI，无法做端到端验证。先装一个并登录（claude / codex / cursor-agent / gemini / kiro-cli / grok）。",
+    );
     process.exitCode = 1;
     return;
   }
-  console.log(`Runtimes detected: ${detected.map((d) => `${d.kind}@${d.version.split(" ")[0]}`).join(", ")}\n`);
+
+  const preference: RuntimeKind[] = ["claude", "codex", "cursor", "kiro", "grok", "gemini"];
+  const available = [...detected].sort(
+    (a, b) => preference.indexOf(a.kind) - preference.indexOf(b.kind),
+  );
+  const picked = wanted === null ? available[0] : available.find((d) => d.kind === wanted);
+  if (picked === undefined) {
+    console.error(
+      `--runtime=${wanted} 不在已装列表里：${available.map((d) => d.kind).join(", ")}`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
+  console.log(`Detected: ${detected.map((d) => d.kind).join(", ")}`);
+  console.log(`Using:    ${picked.kind} (${picked.version})`);
+  const hasModel = (process.env["TODOAGENT_MODEL"] ?? "").trim() !== "";
+  console.log(`Classify: ${hasModel ? `model (${process.env["TODOAGENT_MODEL"]})` : "heuristic (no TODOAGENT_MODEL)"}`);
+  if (askMode) {
+    console.log(`Resume:   ${RESUMABLE.has(picked.kind) ? "real session resume expected" : "stitched prompt expected"}`);
+  }
 
   const repo = await scaffoldRepo();
-  // Isolated DB per run: the e2e must never touch the operator's real history.
-  const dbPath = join(repo, "e2e.db");
-  const store = new Store(dbPath);
+  /*
+   * The database lives OUTSIDE the fixture repository.
+   *
+   * Inside it, sqlite's three files (`e2e.db`, `-wal`, `-shm`) showed up as
+   * untracked entries in the captured snapshot — noise in the one artifact whose
+   * whole purpose is showing what the agent changed.
+   */
+  const dbPath = join(dirname(repo), `${repo.split("/").at(-1) ?? "e2e"}.db`);
+  console.log(`\nRepo: ${repo}`);
 
+  let engine: Engine | null = null;
   try {
-    const { teamId, assignments } = seedTeam(store, detected.map((d) => d.kind));
-    console.log("Team:");
-    for (const a of assignments) {
-      console.log(`  ${a.name.padEnd(20)} ${a.kind.padEnd(8)} ${a.roles.join(", ")}`);
-    }
+    engine = await startEngine(dbPath);
 
-    const project = store.createProject({ name: "e2e-fixture", repoPath: repo, teamId });
-    const run = store.createRun({
-      projectId: project.id,
-      goal: discussMode ? DISCUSS_GOAL : GOAL,
-      acceptance: discussMode ? DISCUSS_ACCEPTANCE : ACCEPTANCE,
-      budgetTokens: Math.round(budgetM * 1_000_000),
-      soloMode: soloOnly,
+    // ── Setup, through the same API the UI uses ──
+    const expert = await req<{ id: string }>("POST", "/api/experts", {
+      name: `E2E-${picked.kind}`,
+      description: "end-to-end fixture agent",
+      runtimeKind: picked.kind,
+      systemPrompt:
+        "You are running inside an automated end-to-end check. Be concise and concrete, and follow the task's instructions about ordering exactly.",
+      capabilities: ["general"],
     });
+    if (!check("expert created", expert.status === 201, `HTTP ${expert.status}`)) return;
 
-    console.log(`\nRepo: ${repo}`);
-    console.log(`Run:  ${run.id}`);
-    console.log(
-      `Mode: ${soloOnly ? "solo" : discussMode ? "discussion (judgment-call goal)" : "team"}`,
-    );
-    console.log(`\nExecuting pipeline (autoApprovePlan, budget ${budgetM}M)...\n`);
+    const list = await req<{ id: string; name: string }>("POST", "/api/lists", {
+      name: "e2e",
+      repoPath: repo,
+    });
+    if (!check("list bound to the repository", list.status === 201, `HTTP ${list.status}`)) return;
+    const listId = list.body.id;
 
+    const task = await req<Task>("POST", "/api/tasks", {
+      title: askMode ? ASK_GOAL : PLAIN_GOAL,
+      listId,
+    });
+    if (!check("card created", task.status === 201, `HTTP ${task.status}`)) return;
+    const taskId = task.body.id;
+
+    // ── Dispatch ──
+    console.log("\nDispatching…");
     const started = Date.now();
-    const outcome = await runPipeline({
-      store,
-      runId: run.id,
-      autoApprovePlan: true,
-      // Bounded so a wedged CLI fails the test instead of hanging CI forever.
-      perAttemptTimeoutMs: 12 * 60 * 1000,
-    });
-    const elapsed = ((Date.now() - started) / 1000).toFixed(0);
+    const dispatched = await req<{ run: { id: string }; error?: string }>(
+      "POST",
+      `/api/tasks/${taskId}/run`,
+      { budgetTokens: Math.round(budgetM * 1_000_000) },
+    );
+    if (
+      !check(
+        "dispatch accepted",
+        dispatched.status === 201,
+        dispatched.status === 201 ? `run ${dispatched.body.run.id.slice(0, 8)}` : `HTTP ${dispatched.status}: ${dispatched.body.error ?? ""}`,
+      )
+    ) {
+      return;
+    }
+    const firstRunId = dispatched.body.run.id;
 
-    console.log(`\nPipeline finished in ${elapsed}s: ${outcome.status}${outcome.error ? ` (${outcome.error})` : ""}\n`);
+    const settled = await settle(listId, taskId, "first run");
+    const elapsed = ((Date.now() - started) / 1000).toFixed(0);
+    console.log(`\nFirst run settled in ${elapsed}s → ${settled.status}\n`);
     console.log("Assertions:");
 
-    const final = store.getRun(run.id);
-    const subtasks = store.listSubTasks(run.id);
-    const attempts = store.listAttempts(run.id);
-    const reviews = store.listReviews(run.id);
-    const adjudications = store.listAdjudications(run.id);
-    const discussion = store.listDiscussion(run.id);
-    const events = store.eventsAfter(run.id, 0, 20000);
-
-    // ── Termination ──
-    check(
-      "run reached a terminal state on its own",
-      final !== null && final.status !== "running",
-      `status=${final?.status ?? "missing"}`,
-    );
-
-    // ── Connectivity: the headline requirement ──
-    const okAttempts = attempts.filter((a) => a.status === "completed");
-    const usedKinds = new Set(okAttempts.map((a) => a.runtimeKind));
-    check(
-      "at least one real agent turn completed",
-      okAttempts.length > 0,
-      `${okAttempts.length}/${attempts.length} attempts completed`,
-    );
-    check(
-      "claude and/or codex actually executed",
-      usedKinds.has("claude") || usedKinds.has("codex"),
-      `runtimes used: ${[...usedKinds].join(", ") || "none"}`,
-    );
-
-    // ── Cross-vendor collaboration ──
-    if (detected.length > 1 && !soloOnly) {
+    if (askMode) {
+      // ── The question half of the loop ──
+      const parked = check(
+        "card parked in 需要你",
+        settled.status === "needs_you",
+        `status=${settled.status}`,
+      );
+      if (!parked) {
+        console.log(
+          "        (the worker may simply not have asked — check the output below before blaming the product)",
+        );
+      }
       check(
-        "more than one vendor participated",
-        usedKinds.size > 1,
-        `${usedKinds.size} distinct runtimes: ${[...usedKinds].join(", ")}`,
+        "classified as a question, not a failure",
+        settled.needsKind === "question",
+        `needsKind=${String(settled.needsKind)}`,
       );
-      const authorIds = new Set(
-        attempts.filter((a) => a.kind === "draft").map((a) => a.expertId),
-      );
-      const reviewerIds = new Set(reviews.map((r) => r.reviewerExpertId));
-      const overlap = [...reviewerIds].filter((r) => authorIds.has(r));
       check(
-        "reviewers were not the author",
-        reviewerIds.size === 0 || overlap.length === 0,
-        reviewerIds.size === 0 ? "no reviews produced" : `${reviewerIds.size} reviewer(s), ${overlap.length} self-review`,
-        reviewerIds.size === 0,
+        "the question text is on the card",
+        (settled.needsText ?? "").trim() !== "",
+        JSON.stringify((settled.needsText ?? "").slice(0, 90)),
       );
+
+      // The run itself succeeded; only the CARD is parked. Conflating the two would
+      // make a question look like a failure everywhere a run status is shown.
+      const first = await req<RunResult>("GET", `/api/runs/${firstRunId}/result`);
+      check(
+        "the run stayed completed",
+        first.body.run?.status === "completed",
+        `status=${String(first.body.run?.status)}`,
+      );
+      console.log(`\n  worker said: ${JSON.stringify((first.body.output ?? "").slice(-220))}\n`);
+
+      // ── Answering guards, then the answer ──
+      const unknown = await req("POST", "/api/tasks/does-not-exist/answer", { answer: "x" });
+      check("answering an unknown card is 404", unknown.status === 404, `HTTP ${unknown.status}`);
+      const empty = await req("POST", `/api/tasks/${taskId}/answer`, { answer: "   " });
+      check("an empty answer is refused", empty.status === 400, `HTTP ${empty.status}`);
+
+      console.log("\nAnswering…");
+      const answered = await req<{ run: { id: string; goal: string }; task: Task; resumed: boolean; error?: string }>(
+        "POST",
+        `/api/tasks/${taskId}/answer`,
+        { answer: ANSWER },
+      );
+      if (
+        !check(
+          "answer accepted",
+          answered.status === 201,
+          answered.status === 201 ? "" : `HTTP ${answered.status}: ${answered.body.error ?? ""}`,
+        )
+      ) {
+        return;
+      }
+
+      check(
+        "a NEW run was created",
+        answered.body.run.id !== firstRunId,
+        "the finished run stays an immutable record",
+      );
+      check(
+        "the card is running again with the question cleared",
+        answered.body.task.status === "in_progress" &&
+          answered.body.task.needsKind === null &&
+          answered.body.task.needsText === null,
+        `status=${answered.body.task.status} needsKind=${String(answered.body.task.needsKind)}`,
+      );
+      check(
+        `resume path matches the runtime (${picked.kind})`,
+        answered.body.resumed === RESUMABLE.has(picked.kind),
+        `resumed=${answered.body.resumed}`,
+      );
+      if (answered.body.resumed) {
+        // A resumed prompt carries the answer; the model still holds the rest.
+        check(
+          "the resumed prompt carries the answer",
+          answered.body.run.goal.includes(ANSWER),
+          JSON.stringify(answered.body.run.goal.slice(0, 90)),
+        );
+      } else {
+        /*
+         * The stitched prompt has to carry everything the session would have: the
+         * original goal, the worker's own previous output, and the answer. This is
+         * the codex path (PLAN.md §7-3).
+         */
+        const goal = answered.body.run.goal;
+        check(
+          "the stitched prompt carries goal, previous output and answer",
+          goal.includes(ANSWER) && goal.includes("你之前在做这个任务") && goal.length > 200,
+          `${goal.length} chars`,
+        );
+      }
+
+      const finished = await settle(listId, taskId, "resumed run");
+      check(
+        "the resumed run finishes into 待确认",
+        finished.status === "in_review",
+        `status=${finished.status}`,
+      );
+      check("no question left on the card", finished.needsKind === null, String(finished.needsKind));
+
+      const second = await req<RunResult>("GET", `/api/runs/${answered.body.run.id}/result`);
+      check(
+        "the resumed run left a snapshot",
+        typeof second.body.diff === "string",
+        second.body.diff === null ? "diff is null" : `${second.body.diff.length} chars`,
+      );
+      check(
+        "and it created the file the answer asked for",
+        (second.body.diff ?? "").includes("config.ts"),
+        JSON.stringify((second.body.diff ?? "").slice(0, 120)),
+      );
+    } else {
+      // ── The plain half: work delivered, waiting for a person ──
+      check(
+        "card lands in 待确认, not done",
+        settled.status === "in_review",
+        `status=${settled.status} (nobody reviewed it yet, so it must not auto-complete)`,
+      );
+      check("no needs state on a clean completion", settled.needsKind === null, String(settled.needsKind));
+
+      const result = await req<RunResult>("GET", `/api/runs/${firstRunId}/result`);
+      check("the result endpoint answers", result.status === 200, `HTTP ${result.status}`);
+      check("the run completed", result.body.run?.status === "completed", String(result.body.run?.status));
+      /*
+       * `diff` distinguishes two answers the drawer must not conflate: null means no
+       * snapshot was taken, "" means one was taken and the tree was clean.
+       */
+      check(
+        "a working-tree snapshot was captured",
+        typeof result.body.diff === "string",
+        result.body.diff === null ? "diff is null — nothing was captured" : `${result.body.diff.length} chars`,
+      );
+      check(
+        "the snapshot shows the file the agent was asked to create",
+        (result.body.diff ?? "").includes("text.ts"),
+        JSON.stringify((result.body.diff ?? "").slice(0, 120)),
+      );
+      check(
+        "the transcript is readable",
+        (result.body.output ?? "").trim() !== "",
+        `${(result.body.output ?? "").length} chars`,
+      );
+      check(
+        "the executor is reported",
+        result.body.executor === picked.kind,
+        `executor=${String(result.body.executor)}`,
+      );
+
+      /*
+       * The work is genuinely on disk, not merely described in a payload.
+       *
+       * `-uall` is required, not decorative: plain `--porcelain` collapses an
+       * untracked directory to `?? src/` and never names the files inside it, so
+       * this check reported "the file does not exist" for work that plainly did.
+       * `captureWorkingDiff` passes the same flag for the same reason.
+       */
+      const status = await git(["status", "--porcelain", "-uall"], repo);
+      check(
+        "the file exists in the working tree",
+        status.stdout.includes("text.ts"),
+        JSON.stringify(status.stdout.trim().slice(0, 120)),
+      );
+
+      // Completing it is the last step of the loop the user performs by hand.
+      const done = await req<Task>("PATCH", `/api/tasks/${taskId}`, { status: "done" });
+      check("confirming moves it to 已完成", done.body?.status === "done", String(done.body?.status));
     }
 
-    // ── Decomposition and isolation ──
-    if (!soloOnly) {
-      check("goal was decomposed into subtasks", subtasks.length > 0, `${subtasks.length} subtask(s)`);
-      const isolated = subtasks.filter((s) => s.worktreePath !== null);
-      check(
-        "each executed subtask got its own worktree",
-        subtasks.length === 0 || isolated.length > 0,
-        `${isolated.length}/${subtasks.length} isolated`,
-      );
-      const paths = new Set(isolated.map((s) => s.worktreePath));
-      check(
-        "worktree paths were distinct",
-        paths.size === isolated.length,
-        `${paths.size} unique path(s)`,
-      );
-      const barriers = events.filter((e) => e.type === "stage:barrier_cleared");
-      check(
-        "stage barrier fired",
-        barriers.length > 0,
-        `${barriers.length} barrier(s) cleared`,
-        subtasks.length === 0,
-      );
-    }
-
-    // ── Review and the verifiable/unverifiable split ──
-    const verifiable = reviews.filter((r) => r.verifiable);
-    const settled = verifiable.filter((r) => r.reproOutcome !== null);
-    check(
-      "reviews carry the verifiable flag",
-      reviews.length === 0 || reviews.every((r) => typeof r.verifiable === "boolean"),
-      `${reviews.length} finding(s), ${verifiable.length} verifiable`,
-      reviews.length === 0,
-    );
-    // A clean diff legitimately produces no findings, so this is soft.
-    check(
-      "checkable claims were settled by reproduction",
-      verifiable.length === 0 || settled.length > 0,
-      verifiable.length === 0
-        ? "no verifiable claims raised"
-        : `${settled.length}/${verifiable.length} reproduced or refuted`,
-      true,
-    );
-
-    // ── Discussion mode ──
-    check(
-      "discussion stayed within its round cap",
-      discussion.every((m) => m.round <= 2),
-      `${discussion.length} message(s), max round ${Math.max(0, ...discussion.map((m) => m.round))}`,
-    );
-    // Discussion only triggers when a dispute survives that no test can settle.
-    check(
-      "discussion engaged when an unresolvable dispute existed",
-      true,
-      discussion.length > 0
-        ? `${discussion.length} turn(s) across ${new Set(discussion.map((m) => m.authorExpertId)).size} expert(s)`
-        : "not triggered this run (no unresolvable dispute)",
-      true,
-    );
-
-    // ── Budget ──
-    check(
-      "spend was recorded",
-      final !== null && final.spentTokens > 0,
-      `${(final?.spentTokens ?? 0).toLocaleString()} tokens`,
-    );
-    check(
-      "budget ceiling was respected",
-      final !== null && (final.budgetTokens === 0 || final.spentTokens <= final.budgetTokens * 1.5),
-      `${final?.spentTokens ?? 0} vs ceiling ${final?.budgetTokens ?? 0}`,
-    );
-
-    // ── Event log integrity, which SSE replay depends on ──
-    const seqs = events.map((e) => e.seq);
-    const strictlyIncreasing = seqs.every((s, i) => i === 0 || s > (seqs[i - 1] ?? -1));
-    check(
-      "event log is ordered and gapless",
-      events.length > 0 && strictlyIncreasing,
-      `${events.length} event(s)`,
-    );
-
-    // ── Did the work actually land? ──
-    const lsFiles = await git(["ls-files"], repo);
-    const branches = await git(["branch", "--list", "todoagent/*"], repo);
-    // Untracked files count. Solo mode edits the repository directly and
-    // deliberately does NOT commit — it is the operator's working tree, and
-    // auto-committing to their branch would be worse than leaving a diff to
-    // review. `git ls-files` lists only TRACKED paths, so checking it alone
-    // reported "work not reachable" for a solo run that had in fact produced
-    // the file.
-    const untracked = await git(["status", "--porcelain"], repo);
-    const branchList = branches.stdout.trim().split("\n").filter((l) => l.trim().length > 0);
-
-    const inIndex = lsFiles.stdout.includes("src/text.ts");
-    const inWorkingTree = untracked.stdout.includes("src/text.ts");
-    check(
-      "agent work is reachable",
-      inIndex || inWorkingTree || branchList.length > 0,
-      inIndex
-        ? "src/text.ts committed on the main branch"
-        : inWorkingTree
-          ? "src/text.ts present as an uncommitted change (expected for solo mode)"
-          : `left on branch(es): ${branchList.length}`,
-      true,
-    );
-
-    // ── Summary ──
-    const hard = checks.filter((c) => c.soft !== true);
-    const failed = hard.filter((c) => !c.ok);
-    const warned = checks.filter((c) => c.soft === true && !c.ok);
-
-    console.log(`\n${hard.length - failed.length}/${hard.length} required checks passed.`);
-    if (warned.length > 0) console.log(`${warned.length} soft check(s) did not hold.`);
-
-    console.log("\nRun shape:");
-    console.log(`  subtasks:      ${subtasks.length}`);
-    console.log(`  agent turns:   ${attempts.length} (${okAttempts.length} completed)`);
-    console.log(`  findings:      ${reviews.length} (${verifiable.length} verifiable, ${settled.length} settled)`);
-    console.log(`  adjudications: ${adjudications.length}`);
-    console.log(`  discussion:    ${discussion.length}`);
-    console.log(`  events:        ${events.length}`);
-    console.log(`\nArtifacts kept for inspection: ${repo}`);
-    console.log(`  database: ${dbPath}`);
-
-    if (failed.length > 0) {
-      console.log("\nFailures:");
-      for (const f of failed) console.log(`  ${f.name}: ${f.detail}`);
-      process.exitCode = 1;
-    }
+    // Classification is announced in the engine log either way, which is the only
+    // place the model-vs-heuristic path is visible.
+    const classifyLine = (engine.log().match(/\[classify\].*|\] (question|blocked) \(\w+\).*/g) ?? []).at(-1);
+    console.log(`\nEngine classify line: ${classifyLine ?? "(none — a plain completion says nothing)"}`);
   } finally {
-    store.close();
-    // The repo is intentionally NOT deleted on failure — a passing test that
-    // destroys its own evidence cannot be debugged.
-    if (process.exitCode !== 1) {
-      await rm(repo, { recursive: true, force: true }).catch(() => undefined);
-      console.log("\n(fixture cleaned up)");
+    engine?.stop();
+  }
+
+  const failed = checks.filter((c) => !c.ok);
+  console.log(`\n${checks.length - failed.length}/${checks.length} checks passed.`);
+  if (failed.length > 0) {
+    console.log("\nFailures:");
+    for (const f of failed) console.log(`  ${f.name}${f.detail ? `: ${f.detail}` : ""}`);
+    console.log(`\nFixture kept for inspection: ${repo}`);
+    process.exitCode = 1;
+    return;
+  }
+
+  if (keep) {
+    console.log(`\nFixture kept: ${repo}`);
+    console.log(`Database:     ${dbPath}`);
+  } else {
+    await rm(repo, { recursive: true, force: true }).catch(() => undefined);
+    // The database sits outside the repo now, so it needs removing separately —
+    // along with sqlite's WAL and shared-memory sidecars.
+    for (const suffix of ["", "-wal", "-shm"]) {
+      await rm(`${dbPath}${suffix}`, { force: true }).catch(() => undefined);
     }
+    console.log("\n(fixture cleaned up — pass --keep to inspect it)");
   }
 }
 
