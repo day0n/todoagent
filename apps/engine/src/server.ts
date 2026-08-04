@@ -31,6 +31,16 @@ import {
 import { classifyOutcome } from "./agent/classifier.ts";
 import { createSecretary, type SecretaryInit } from "./agent/secretary.ts";
 import { isAllowedOrigin } from "./origin.ts";
+import { installProxyDispatcher } from "./proxy.ts";
+
+/*
+ * Before any model call can happen.
+ *
+ * Here rather than in `dev.ts` because a proxy is a property of the machine, not of
+ * development mode — `pnpm start` needs it too. A no-op when no proxy is configured,
+ * and inert in the test suites: they set no API key, so nothing dials out.
+ */
+installProxyDispatcher();
 
 const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());

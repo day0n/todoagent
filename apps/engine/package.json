@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tsx watch src/server.ts",
+    "// dev": "Goes through dev.ts, which loads the repo-root .env before starting the server. `start` and the test suites use server.ts directly, so a real API key never reaches the suites — see dev.ts. Proxy handling is in src/proxy.ts, not here: it has to run inside the process to reach the undici instance pi uses.",
+    "dev": "tsx watch src/dev.ts",
     "start": "tsx src/server.ts",
     "typecheck": "tsc -p tsconfig.json",
     "test": "node --test --experimental-strip-types 'src/**/*.test.ts'"
@@ -15,6 +16,7 @@
     "@todoagent/core": "workspace:*",
     "hono": "4.6.20",
     "typebox": "1.3.7",
+    "undici": "8.5.0",
     "zod": "3.25.76"
   }
 }
