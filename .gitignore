@@ -7,3 +7,6 @@ dist/
 # Local secrets. The engine reads these; they must never be committed.
 .env
 .env.local
+
+# TypeScript incremental build state — machine-local, churns on every typecheck.
+*.tsbuildinfo
