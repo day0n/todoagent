@@ -15,17 +15,20 @@
  *   3. Grepping for the authored text — the minifier rewrites it, so a search for
  *      `(max-width: 1050px)` with its space can never match.
  *
- * Rewritten for the v1d layout. It previously required `md:static`,
- * `md:translate-x-0` and `xl:grid-cols-4`, which belonged to the icon-rail shell
- * and the channel Kanban board — both deleted in M2. Those assertions did not
- * become wrong when the layout changed, they became assertions about nothing,
- * which is worse: a passing check on a layout that no longer exists reads as
- * coverage.
+ * Rewritten twice, and the reason is the same both times. It first required
+ * `md:static` and `xl:grid-cols-4` from the icon-rail shell deleted in M2; then
+ * `.side{width:68px` and `.item .n.hot` from the flex three-pane layout replaced
+ * in M7. Neither set became WRONG when the layout changed — they became
+ * assertions about nothing, which is worse: a passing check on a layout that no
+ * longer exists reads as coverage.
  *
- * The two breakpoints are the prototype's own (mockups/v1d-apple.html):
+ * The M7 shell is a CSS grid, so what collapses at each breakpoint is the COLUMN
+ * TRACK, not a width on the panel. `.chat{display:none}` alone would leave a
+ * 336px empty gutter, which is why both halves are asserted.
  *
- *   1050px  the chat pane is hidden; the task list is the working surface
- *    720px  the sidebar collapses to icons; per-row repo and status tags go
+ *   1050px  the secretary column's track is dropped and the panel hidden
+ *    720px  the sidebar track narrows to 68px; labels, calendar and the new-list
+ *           form go; per-row repo and status tags go
  *
  * Every needle is a LITERAL substring of the MINIFIED output, which is why they
  * carry no spaces after colons. Building regexes for this through a shell into
@@ -87,9 +90,16 @@ const RULES = [
     what: "chat pane hidden",
   },
   {
-    decl: ".side{width:68px",
+    // Both halves of hiding the secretary: the panel AND its grid track. Without
+    // the track, `display:none` leaves a 336px empty gutter.
+    decl: ".shell{grid-template-columns:216px",
+    inside: "@media (max-width:1050px)",
+    what: "secretary column's track dropped",
+  },
+  {
+    decl: ".shell{grid-template-columns:68px",
     inside: "@media (max-width:720px)",
-    what: "sidebar collapsed to icons",
+    what: "sidebar track narrowed to icons",
   },
   {
     decl: ".main-in{padding:32px",
@@ -102,11 +112,24 @@ const RULES = [
     what: "per-row repo and status tags dropped",
   },
   {
-    // The needs-you count survives as a bare dot. It is the one badge that still
-    // has to be visible once there is no room for a number.
-    decl: ".item .n.hot{",
+    /*
+     * The needs-you dot survives, repositioned. It is the one signal that still
+     * has to be visible once there is no label for it to sit beside.
+     *
+     * Anchored on the selector alone: the minifier reorders this rule's properties
+     * (`margin:0;position:absolute;top:5px;right:12px`), so a needle carrying any
+     * declaration would match by luck rather than by contract.
+     */
+    decl: ".srow .dot-badge{",
     inside: "@media (max-width:720px)",
-    what: "needs-you badge kept as a dot",
+    what: "needs-you dot repositioned, not dropped",
+  },
+  {
+    // The calendar and the new-list form have no icon to fall back on: a month
+    // grid at 68px is unreadable and the form is two text fields.
+    decl: ".cal,.nlform{display:none}",
+    inside: "@media (max-width:720px)",
+    what: "calendar and new-list form dropped",
   },
   {
     decl: "animation-duration:.01ms",
@@ -118,8 +141,8 @@ const RULES = [
 /**
  * The base rules the narrow overrides have to beat.
  *
- * Same specificity, so source order decides. `.chat` at 360px wide emitted AFTER
- * `.chat{display:none}` would silently restore the pane at every width — the
+ * Same specificity, so source order decides. A base `.chat` rule emitted AFTER
+ * `.chat{display:none}` would silently restore the panel at every width — the
  * failure this pair exists to catch.
  *
  * `base` is a bare selector, matched at its FIRST occurrence. If the base rule
@@ -127,8 +150,20 @@ const RULES = [
  * indices would be equal, and the check fails — which is the right verdict.
  */
 const OVERRIDES = [
-  { base: ".chat{", override: ".chat{display:none}", what: "chat pane" },
-  { base: ".side{", override: ".side{width:68px", what: "sidebar width" },
+  { base: ".chat{", override: ".chat{display:none}", what: "secretary panel" },
+  /*
+   * The grid's own track definition, which every breakpoint overrides.
+   *
+   * The base `.shell{` is the three-column rule; the first match lands on it
+   * because the media blocks are emitted last. If the base were missing the match
+   * would land on an override, the indices would compare equal, and the check
+   * fails — which is the right verdict.
+   */
+  {
+    base: ".shell{",
+    override: ".shell{grid-template-columns:68px",
+    what: "sidebar track width",
+  },
 ];
 
 let bad = 0;

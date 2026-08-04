@@ -1,5 +1,6 @@
 import type {
   AttemptTranscript,
+  BoardResponse,
   ChatHistory,
   ChatMessage,
   ChatStatus,
@@ -170,6 +171,16 @@ export const api = {
    * how a task ends up rendered twice or not at all.
    */
   tasks: (view: ViewKey) => req<TasksResponse>(`/api/tasks?view=${encodeURIComponent(view)}`),
+
+  /**
+   * The day board: every uncompleted task bucketed into four day columns.
+   *
+   * Bucketing lives in the engine for the same reason status grouping does — two
+   * places deciding which column a card belongs to is how it renders twice or not
+   * at all. The precedence (live status → done-today → manual pin → deadline →
+   * created today) is documented at `boardColumn` in the engine.
+   */
+  board: () => req<BoardResponse>("/api/board"),
 
   /** Quick add. Absent `listId` lands the task in the default 收件箱 list. */
   createTask: (body: { title: string; note?: string; listId?: string | null }) =>

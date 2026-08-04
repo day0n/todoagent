@@ -3,34 +3,23 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { TodoList, ViewCounts, ViewKey } from "../lib/types.ts";
-import {
-  IconCaret,
-  IconDone,
-  IconGear,
-  IconMore,
-  IconNeeds,
-  IconPlus,
-  IconToday,
-} from "./icons.tsx";
+import { IconCaret, IconGear, IconMore, IconPlus, IconToday } from "./icons.tsx";
 
 /**
  * The six colours offered when creating a list.
  *
  * A fixed palette rather than a colour picker: the swatch is 8px of sidebar
  * furniture whose only job is to tell two lists apart at a glance, and an
- * arbitrary hex would let a person choose one that vanishes against the glass.
- * `null` is the seventh option — the default graphite, which is what the
- * prototype shows.
+ * arbitrary hex would let a person choose one that vanishes against the surface.
+ * `null` is the seventh option — the default graphite.
  */
 const PRESET_COLORS = ["#007aff", "#34c759", "#ff9500", "#ff3b30", "#af52de", "#8e8e93"] as const;
 
-/**
- * The prototype's default swatch, for a list created without a colour.
- *
- * The token rather than the hex it holds, so the graphite exists in exactly one
- * place. Custom properties resolve in inline styles like anywhere else.
- */
+/** The default swatch, for a list created without a colour. */
 const DEFAULT_SWATCH = "var(--ink-1)";
+
+/** Column headers of the mini calendar, `Date.getDay()`-indexed. */
+const DOW = ["日", "一", "二", "三", "四", "五", "六"] as const;
 
 export function Sidebar({
   lists,
@@ -60,51 +49,29 @@ export function Sidebar({
 
   return (
     <nav className="side">
-      <div className="brand">
-        <div className="mark" aria-hidden="true" />
-        <div className="t">TodoAgent</div>
+      <div className="side-head">
+        <div className="brand">
+          <span className="mark" aria-hidden="true" />
+          {/* Wrapped so the narrow breakpoint can hide the word and keep the mark.
+              A bare text node has no selector. */}
+          <span className="t">TodoAgent</span>
+        </div>
       </div>
 
-      <button
-        type="button"
-        className={`item${view === "today" ? " on" : ""}`}
-        onClick={() => onSelect("today")}
-        aria-current={view === "today"}
-      >
-        <IconToday />
-        <span className="label">我的一天</span>
-        <Count n={counts.today} />
-      </button>
-
-      <button
-        type="button"
-        className={`item${view === "needs" ? " on" : ""}`}
-        onClick={() => onSelect("needs")}
-        aria-current={view === "needs"}
-      >
-        <IconNeeds />
-        <span className="label">需要你</span>
-        {/* Hot only when there is something: a blue "0" would demand attention
-            for the one state that has none. */}
-        {counts.needs > 0 ? (
-          <span className="n hot" aria-label={`${counts.needs} 项需要你`}>
-            {counts.needs}
-          </span>
-        ) : null}
-      </button>
-
-      <button
-        type="button"
-        className={`item${view === "done" ? " on" : ""}`}
-        onClick={() => onSelect("done")}
-        aria-current={view === "done"}
-      >
-        <IconDone />
-        <span className="label">已完成</span>
-        <Count n={counts.done} />
-      </button>
-
       <div className="side-scroll">
+        <MiniCalendar />
+
+        <button
+          type="button"
+          className={`npill${view === "today" ? " on" : ""}`}
+          aria-current={view === "today"}
+          onClick={() => onSelect("today")}
+        >
+          <IconToday />
+          <span className="label">我的一天</span>
+          {counts.today > 0 ? <span className="count">{counts.today}</span> : null}
+        </button>
+
         <div className="side-label">清单</div>
 
         {lists.map((list) => (
@@ -121,7 +88,7 @@ export function Sidebar({
         {composing ? (
           <NewListForm onCancel={() => setComposing(false)} onCreate={onCreate} />
         ) : (
-          <button type="button" className="item" onClick={() => setComposing(true)}>
+          <button type="button" className="srow add" onClick={() => setComposing(true)}>
             <IconPlus />
             <span className="label">新建清单</span>
           </button>
@@ -136,28 +103,21 @@ export function Sidebar({
           <>
             <button
               type="button"
-              className="item arch-toggle"
+              className="srow arch-toggle"
               aria-expanded={showArchived}
               onClick={() => setShowArchived((v) => !v)}
             >
               <IconCaret className="caret" />
               <span className="label">已归档</span>
-              <span className="n">{archived.length}</span>
+              <span className="count">{archived.length}</span>
             </button>
 
             {showArchived
               ? archived.map((list) => (
-                  <div className="item arch" key={list.id}>
-                    <span
-                      className="swatch"
-                      style={{ background: list.color ?? DEFAULT_SWATCH }}
-                    />
+                  <div className="srow arch" key={list.id}>
+                    <span className="swatch" style={{ background: list.color ?? DEFAULT_SWATCH }} />
                     <span className="label">{list.name}</span>
-                    <button
-                      type="button"
-                      className="restore"
-                      onClick={() => onRestore(list.id)}
-                    >
+                    <button type="button" className="restore" onClick={() => onRestore(list.id)}>
                       恢复
                     </button>
                   </div>
@@ -165,25 +125,166 @@ export function Sidebar({
               : null}
           </>
         ) : null}
+
+        <div className="side-label">状态</div>
+
+        {/*
+          The status views.
+
+          需要你 gets a dot rather than a number, and only when there is something:
+          it is the one state that is about attention rather than volume, and a
+          grey "0" beside it would demand a reading every time you glance at it.
+          The amber follows the mockup's semantics — needs-you and running have to
+          be told apart at a glance, which one shared accent colour cannot do — but
+          uses this app's existing warn token rather than the mockup's own orange.
+        */}
+        <button
+          type="button"
+          className={`srow${view === "needs" ? " on" : ""}`}
+          aria-current={view === "needs"}
+          onClick={() => onSelect("needs")}
+        >
+          <span className="label">需要你</span>
+          {counts.needs > 0 ? (
+            <span className="dot-badge" aria-label={`${counts.needs} 项需要你`} />
+          ) : null}
+        </button>
+
+        <button
+          type="button"
+          className={`srow${view === "running" ? " on" : ""}`}
+          aria-current={view === "running"}
+          onClick={() => onSelect("running")}
+        >
+          <span className="label">进行中</span>
+          {counts.running > 0 ? <span className="count run">{counts.running}</span> : null}
+        </button>
+
+        <button
+          type="button"
+          className={`srow${view === "done" ? " on" : ""}`}
+          aria-current={view === "done"}
+          onClick={() => onSelect("done")}
+        >
+          <span className="label">已完成</span>
+          {counts.done > 0 ? <span className="count">{counts.done}</span> : null}
+        </button>
       </div>
 
       <div className="side-foot">
-        <div className="avatar" aria-hidden="true">
-          N
-        </div>
-        <div className="name">Niko</div>
-        <Link href="/team" className="gear" title="Agent 管理" aria-label="Agent 管理">
+        <Link href="/team" className="foot-link" title="Agent 管理">
           <IconGear />
+          设置
         </Link>
       </div>
     </nav>
   );
 }
 
-/** A plain count. Zero renders nothing rather than a "0" that reads as broken. */
-function Count({ n }: { n: number }) {
-  if (n <= 0) return null;
-  return <span className="n">{n}</span>;
+/**
+ * The current month, with today marked.
+ *
+ * Display-only by design (V1 takes no date navigation), but not decoration: the
+ * three tinted days ARE the board's three dated columns, so the calendar answers
+ * "which days am I looking at" rather than merely showing that a month exists.
+ *
+ * Rendered only after mount, following `Subtitle`'s precedent: the date comes from
+ * the browser's clock and time zone, and emitting it during SSR would produce a
+ * different grid on a server elsewhere — a hydration mismatch React resolves by
+ * blanking the node.
+ */
+function MiniCalendar() {
+  const [now, setNow] = useState<Date | null>(null);
+  /** Months away from the current one. Zero is this month. */
+  const [offset, setOffset] = useState(0);
+
+  useEffect(() => {
+    setNow(new Date());
+  }, []);
+
+  if (now === null) {
+    // A fixed-height placeholder, so the nav below it does not jump on hydration.
+    return <div className="cal" aria-hidden="true" />;
+  }
+
+  const shown = new Date(now.getFullYear(), now.getMonth() + offset, 1);
+  const year = shown.getFullYear();
+  const month = shown.getMonth();
+
+  // Sunday-first, matching the DOW header.
+  const lead = new Date(year, month, 1).getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  /** Local `YYYY-MM-DD`, the same string the engine buckets against. */
+  const iso = (d: Date): string =>
+    `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  const todayIso = iso(now);
+  // The board's other two columns. Constructed from calendar parts so month
+  // rollover is the platform's problem rather than millisecond arithmetic.
+  const boardDays = new Set([
+    iso(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)),
+    iso(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2)),
+  ]);
+
+  const cells: Array<{ key: string; day: number; iso: string | null }> = [];
+  for (let i = 0; i < lead; i++) {
+    const d = new Date(year, month, i - lead + 1);
+    cells.push({ key: `lead-${i}`, day: d.getDate(), iso: null });
+  }
+  for (let d = 1; d <= daysInMonth; d++) {
+    cells.push({ key: `d-${d}`, day: d, iso: iso(new Date(year, month, d)) });
+  }
+  // Fill to a whole week so the grid does not end ragged.
+  while (cells.length % 7 !== 0) {
+    const i = cells.length - lead - daysInMonth;
+    cells.push({ key: `tail-${i}`, day: new Date(year, month + 1, i + 1).getDate(), iso: null });
+  }
+
+  return (
+    <div className="cal">
+      <div className="cal-head">
+        <button
+          type="button"
+          className="arrow"
+          aria-label="上一个月"
+          onClick={() => setOffset((v) => v - 1)}
+        >
+          ‹
+        </button>
+        <span>
+          {year}年{month + 1}月
+        </span>
+        <button
+          type="button"
+          className="arrow"
+          aria-label="下一个月"
+          onClick={() => setOffset((v) => v + 1)}
+        >
+          ›
+        </button>
+      </div>
+      <div className="cal-grid">
+        {DOW.map((d) => (
+          <span className="dow" key={d}>
+            {d}
+          </span>
+        ))}
+        {cells.map((c) => {
+          const isToday = c.iso === todayIso;
+          const onBoard = c.iso !== null && boardDays.has(c.iso);
+          return (
+            <span
+              key={c.key}
+              className={`day${c.iso === null ? " muted" : ""}${isToday ? " today" : ""}${onBoard ? " range" : ""}`}
+              aria-current={isToday ? "date" : undefined}
+            >
+              {c.day}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
 }
 
 function ListRow({
@@ -231,7 +332,7 @@ function ListRow({
 
   if (renaming) {
     return (
-      <div className="item">
+      <div className="srow">
         <span className="swatch" style={{ background: list.color ?? DEFAULT_SWATCH }} />
         <input
           className="rename"
@@ -253,7 +354,7 @@ function ListRow({
   }
 
   return (
-    <div className={`item${active ? " on" : ""}`} ref={rowRef}>
+    <div className={`srow${active ? " on" : ""}`} ref={rowRef}>
       <button
         type="button"
         className="pick"
@@ -261,11 +362,18 @@ function ListRow({
         aria-current={active}
         title={list.repoPath ?? undefined}
       >
-        <span className="swatch" style={{ background: list.color ?? DEFAULT_SWATCH }} />
+        {/*
+          The hash is the list marker, per the mockup, and the swatch rides on it —
+          the colour is the thing that tells two lists apart at a glance, and it was
+          the only marker before. `aria-hidden` because "#" read aloud is noise.
+        */}
+        <span className="hash" aria-hidden="true" style={{ color: list.color ?? DEFAULT_SWATCH }}>
+          #
+        </span>
         <span className="label">{list.name}</span>
       </button>
 
-      <Count n={list.openCount} />
+      {list.openCount > 0 ? <span className="count">{list.openCount}</span> : null}
 
       <button
         type="button"
@@ -386,7 +494,7 @@ function NewListForm({
 
       {/* A path is what makes the list's tasks dispatchable, so the consequence of
           leaving it empty is stated rather than implied. */}
-      <p className="err" style={{ color: "var(--ink-3)" }}>
+      <p className="err hint">
         {repoPath.trim() === "" ? "不绑仓库：纯待办，不能派发。" : "任务可以派发到这个仓库。"}
       </p>
 

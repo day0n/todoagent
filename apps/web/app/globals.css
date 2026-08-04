@@ -1,21 +1,33 @@
 @import "tailwindcss";
 
 /**
- * Design system: Apple-flavoured, extracted from mockups/v1d-apple.html.
+ * Design system.
  *
- * The `:root` block below is that file's own token set, carried over verbatim so
- * the prototype stays the reference a person can diff against. The three-pane
- * shell (sidebar / task pane / chat pane) is plain CSS in @layer components with
- * the prototype's class names, for the same reason.
+ * LAYOUT comes from mockups/opt-h2-sunsama-refined.html — three columns, aligned
+ * 54px top bars, the four-column day board, the always-on secretary panel.
+ *
+ * COLOUR, TYPE AND DETAIL stay on this implementation, deliberately and against
+ * that mockup's own palette. The mockup proposes a green accent, Inter, and
+ * `#f5f6f8`; adopting them would throw away three milestones of measured work
+ * that the mockup was drawn without knowledge of:
+ *
+ *   - every grey and accent here is measured against WCAG AA on the surfaces it
+ *     actually lands on (see `--ink-3` and `--accent-text` below); the mockup's
+ *     `#9aa0a8` on white is 2.6:1, which fails even the large-text floor
+ *   - the system font stack renders Chinese correctly at 13px without a webfont
+ *     download; Inter has no CJK coverage and would fall through to PingFang
+ *     anyway for most of this UI's text
+ *   - hue is spent only on state a person must act on, which is why "needs you"
+ *     and "running" are different colours rather than both being the accent
+ *
+ * So: the mockup decides where things are and what they do. This file decides
+ * what they look like.
  *
  * Tailwind stays because the retained pages (`/runs`, `/team`) and the shared
- * atoms are built on it. The `@theme` block is therefore kept and only re-tuned:
- * its greys and its accent now resolve to the Apple palette, so those pages sit
- * next to the new surface without looking like a different product. Their markup
- * is untouched.
+ * atoms are built on it. The `@theme` block feeds those; the `:root` block below
+ * feeds the hand-written shell.
  *
- * Light only, by request. Every colour here is chosen for contrast on the
- * #f3f3f5 desktop grey specifically.
+ * Light only, by request.
  */
 
 @theme {
@@ -145,7 +157,48 @@
   --accent-text: #0062cc;
   --accent-tint: rgba(0, 122, 255, 0.11);
   --accent-line: rgba(0, 122, 255, 0.18);
+  /* The focus/active ring, previously repeated as a literal in eight places. */
+  --accent-ring: rgba(0, 122, 255, 0.1);
   --mono: ui-monospace, "SF Mono", monospace;
+
+  /* ── M7 shell tokens ────────────────────────────────────────
+     Structure from opt-h2, values in this palette rather than the mockup's. */
+
+  /* The sidebar sits a shade off the board so the three columns read as
+     distinct surfaces without a heavy divider. */
+  --side-bg: #f8f8fa;
+
+  /*
+   * The three top bars share this height.
+   *
+   * Load-bearing rather than cosmetic: the sidebar, board and secretary each draw
+   * their own bottom divider, and they only form one unbroken line across the
+   * window if all three bars are exactly the same height. That single line is what
+   * makes the layout read as one surface instead of three panels.
+   */
+  --head-h: 54px;
+  --foot-h: 46px;
+
+  /*
+   * Four radii, and only four.
+   *
+   * The old surface used literals (7px, 10px, 12px, 15px, 18px) copied from a
+   * mockup that had no scale, so nested corners never quite agreed. A short named
+   * scale is what makes concentric radii checkable by eye.
+   */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 10px;
+  --r-lg: 14px;
+
+  /*
+   * A fourth grey, for text that is genuinely inert.
+   *
+   * Only for content that is not information: the neighbouring month's days in the
+   * calendar. Below AA on purpose — it exists so those cells recede rather than
+   * being read, and anything a person needs to read uses `--ink-3` or darker.
+   */
+  --ink-4: #c2c2c7;
 }
 
 @layer base {
@@ -236,117 +289,322 @@
 }
 
 @layer components {
+  /* ══ Shell ════════════════════════════════════════════════
+     Three columns: sidebar, board, secretary. The three top bars share
+     `--head-h` so their bottom dividers form one unbroken line across the
+     window — the detail that makes the mockup read as one surface rather than
+     three panels. Dividers are drawn with `box-shadow` rather than `border`, so
+     they never take part in the box model and cannot shift a column by 1px. */
+
+  .shell {
+    width: 100%;
+    height: 100%;
+    display: grid;
+    grid-template-columns: 216px minmax(0, 1fr) 336px;
+    background: var(--bg);
+  }
+
   /* ══ Sidebar ════════════════════════════════════════════════ */
 
   .side {
-    width: 244px;
-    flex-shrink: 0;
+    min-width: 0;
     display: flex;
     flex-direction: column;
-    padding: 26px 13px 17px;
-    border-right: 1px solid rgba(0, 0, 0, 0.055);
-    background: var(--glass);
-    backdrop-filter: blur(28px) saturate(1.35);
-    -webkit-backdrop-filter: blur(28px) saturate(1.35);
-    box-shadow: inset -0.5px 0 0 rgba(255, 255, 255, 0.62);
+    background: var(--side-bg);
+    box-shadow: 1px 0 0 var(--line);
+    font-size: 13px;
   }
-  /* The list section scrolls; the brand and the footer stay put. */
-  .side-scroll {
-    min-height: 0;
-    flex: 1;
-    overflow-y: auto;
-    margin-inline: -13px;
-    padding-inline: 13px;
+  .side-head {
+    height: var(--head-h);
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    padding: 0 16px;
+    box-shadow: 0 1px 0 var(--line);
   }
-
   .brand {
     display: flex;
     align-items: center;
-    gap: 10px;
-    padding: 0 10px 29px;
-  }
-  .brand .mark {
-    width: 30px;
-    height: 30px;
-    position: relative;
-    display: grid;
-    place-items: center;
-    border-radius: 9px;
-    background: linear-gradient(180deg, #343438, #1d1d1f);
-    box-shadow:
-      inset 0 0.5px 0 rgba(255, 255, 255, 0.3),
-      0 1px 2px rgba(0, 0, 0, 0.12),
-      0 5px 14px rgba(0, 0, 0, 0.08);
+    gap: 8px;
+    color: var(--ink);
+    font-size: 14.5px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
   }
   /* Three bullets and three rules — a checklist, drawn rather than shipped as an
      asset so it stays crisp at any density. */
+  .brand .mark {
+    width: 20px;
+    height: 20px;
+    flex-shrink: 0;
+    position: relative;
+    border-radius: var(--r-xs);
+    background: linear-gradient(160deg, #3a3a3e, var(--ink));
+    box-shadow:
+      inset 0 0.5px 0 rgba(255, 255, 255, 0.28),
+      0 1px 2px rgba(0, 0, 0, 0.14);
+  }
   .brand .mark::before {
     content: "";
-    width: 3px;
-    height: 3px;
+    width: 2px;
+    height: 2px;
     position: absolute;
-    left: 7px;
-    top: 7px;
+    left: 4.5px;
+    top: 5px;
     border-radius: 50%;
     background: rgba(255, 255, 255, 0.92);
     box-shadow:
-      0 6.5px 0 rgba(255, 255, 255, 0.92),
-      0 13px 0 rgba(255, 255, 255, 0.92);
+      0 4.5px 0 rgba(255, 255, 255, 0.92),
+      0 9px 0 rgba(255, 255, 255, 0.92);
   }
   .brand .mark::after {
     content: "";
-    width: 11px;
-    height: 1.5px;
+    width: 7px;
+    height: 1px;
     position: absolute;
-    left: 13px;
-    top: 7.75px;
+    left: 9px;
+    top: 5.5px;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.92);
+    background: rgba(255, 255, 255, 0.82);
     box-shadow:
-      0 6.5px 0 rgba(255, 255, 255, 0.92),
-      0 13px 0 rgba(255, 255, 255, 0.92);
-  }
-  .brand .t {
-    font-size: 14px;
-    font-weight: 650;
-    letter-spacing: -0.02em;
+      0 4.5px 0 rgba(255, 255, 255, 0.82),
+      0 9px 0 rgba(255, 255, 255, 0.82);
   }
 
-  /*
-   * Nav entry. A `<button>` for the fixed views, a wrapping `<div>` for a list —
-   * a list row carries its own overflow-menu button, and a button inside a button
-   * is invalid markup that browsers recover from by dropping one of them.
-   */
-  .item {
-    width: 100%;
-    height: 40px;
-    padding: 0 10px;
-    position: relative;
+  .side-scroll {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 12px 10px 16px;
+  }
+
+  /* ── Mini calendar ──────────────────────────────────────────
+     Display-only, but not decoration: `today` and `range` mark the board's three
+     dated columns, so it answers "which days am I looking at". */
+  .cal {
+    /* Fixed height: the grid renders only after mount (the date is the browser's),
+       and without a reserved box the nav below it jumps on hydration. */
+    min-height: 132px;
+    padding: 2px 4px 14px;
+  }
+  .cal-head {
+    margin-bottom: 8px;
     display: flex;
     align-items: center;
-    gap: 10px;
+    justify-content: space-between;
+    color: var(--ink);
+    font-size: 12.5px;
+    font-weight: 600;
+  }
+  .cal-head .arrow {
+    width: 24px;
+    height: 24px;
+    display: grid;
+    place-items: center;
     border: 0;
-    border-radius: 10px;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+  }
+  .cal-head .arrow:hover {
+    background: var(--fill);
+    color: var(--ink-2);
+  }
+  .cal-grid {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    gap: 1px;
+    font-size: 10.5px;
+    text-align: center;
+  }
+  .cal-grid .dow {
+    padding-bottom: 4px;
+    color: var(--ink-3);
+    font-weight: 600;
+  }
+  .cal-grid .day {
+    padding: 3.5px 0;
+    border-radius: var(--r-xs);
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Leading and trailing days from the neighbouring months. */
+  .cal-grid .day.muted {
+    color: var(--ink-4);
+  }
+  /* The other two board columns. Tinted rather than filled, so today stays the
+     only strong mark in the grid. */
+  .cal-grid .day.range {
+    background: var(--accent-tint);
+    color: var(--accent-text);
+  }
+  .cal-grid .day.today {
+    background: var(--accent);
+    color: var(--white);
+    font-weight: 600;
+  }
+
+  /* ── Nav ────────────────────────────────────────────────────
+     我的一天 is the primary destination, so it gets a taller pill than the rows
+     below it. Selected state is a tint, not a fill: white on `--accent` measures
+     4.02:1, which fails AA for text this size — the same reason the retained
+     `--accent-text` token exists. */
+  .npill {
+    width: 100%;
+    height: 32px;
+    margin: 2px 0;
+    padding: 0 10px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    border: 0;
+    border-radius: var(--r-sm);
     background: transparent;
     color: var(--ink-1);
     cursor: pointer;
-    font-size: 13.5px;
+    font-size: 13px;
+    font-weight: 600;
     text-align: left;
     transition:
       background 0.14s ease,
       color 0.14s ease;
   }
-  .item:hover {
-    background: rgba(0, 0, 0, 0.04);
+  .npill:hover {
+    background: var(--fill);
+  }
+  .npill.on {
+    background: var(--accent-tint);
+    color: var(--accent-text);
+  }
+  .npill svg {
+    width: 15px;
+    height: 15px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    opacity: 0.85;
+  }
+  .npill.on svg {
+    opacity: 1;
+  }
+  .npill .label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .side-label {
+    padding: 16px 6px 6px;
+    color: var(--ink-3);
+    font-size: 10.5px;
+    font-weight: 700;
+    letter-spacing: 0.07em;
+    text-transform: uppercase;
+  }
+
+  /* ── Sidebar row ────────────────────────────────────────────
+     Lists and the status views. A `<button>` for a plain row, a wrapping `<div>`
+     for a list — a list row carries its own overflow-menu button, and a button
+     inside a button is invalid markup browsers recover from by dropping one. */
+  .srow {
+    width: 100%;
+    height: 29px;
+    padding: 0 8px;
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 0;
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--ink-2);
+    cursor: pointer;
+    font-size: 13px;
+    text-align: left;
+    transition:
+      background 0.14s ease,
+      color 0.14s ease;
+  }
+  .srow:hover {
+    background: var(--fill);
+    color: var(--ink);
+  }
+  .srow.on {
+    background: var(--accent-tint);
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+  .srow svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    opacity: 0.8;
+  }
+  .srow .label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /* The list marker, carrying the list's own colour — the thing that tells two
+     lists apart at a glance. */
+  .srow .hash {
+    width: 11px;
+    flex-shrink: 0;
+    font-size: 12.5px;
+    font-weight: 700;
+    text-align: center;
+  }
+  .srow .count {
+    margin-left: auto;
+    color: var(--ink-3);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .srow.on .count {
+    color: var(--accent-text);
+    opacity: 0.75;
+  }
+  /* A live run is worth its own colour: it is the one count that changes on its
+     own while you watch. */
+  .srow .count.run {
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+  /*
+   * 需要你 gets a dot, not a number.
+   *
+   * It is the one state about attention rather than volume, and amber separates it
+   * from the accent blue that means "running" two rows below — one colour for both
+   * would make the sidebar's two live signals indistinguishable at a glance.
+   */
+  .srow .dot-badge {
+    width: 6px;
+    height: 6px;
+    margin-left: auto;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--color-warn);
+    box-shadow: 0 0 0 3px var(--color-warn-soft);
   }
   /* The name half of a list row: everything except the overflow menu. */
-  .item .pick {
+  .srow .pick {
     min-width: 0;
     flex: 1;
     height: 100%;
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     padding: 0;
     border: 0;
     background: transparent;
@@ -356,123 +614,17 @@
     font-weight: inherit;
     text-align: left;
   }
-  /* Inline rename, in place of the name. Sized to the row so the sidebar does
-     not reflow while typing. */
-  .item .rename {
-    min-width: 0;
-    flex: 1;
-    height: 26px;
-    padding: 0 7px;
-    border: 1px solid var(--accent);
-    border-radius: 7px;
-    outline: 0;
-    background: var(--white);
-    color: var(--ink);
-    font-size: 13px;
-    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
-  }
-  /* Rename / archive. Anchored to the row's right edge, above the task pane. */
-  .item .lmenu {
-    position: absolute;
-    top: 34px;
-    right: 6px;
-    z-index: 30;
-    min-width: 116px;
-    padding: 5px;
-    display: flex;
-    flex-direction: column;
-    border: 0.5px solid rgba(0, 0, 0, 0.07);
-    border-radius: 11px;
-    background: rgba(255, 255, 255, 0.97);
-    backdrop-filter: blur(22px) saturate(1.3);
-    -webkit-backdrop-filter: blur(22px) saturate(1.3);
-    box-shadow:
-      0 1px 3px rgba(0, 0, 0, 0.07),
-      0 12px 32px rgba(0, 0, 0, 0.14);
-    animation: rise 140ms ease-out;
-  }
-  .item .lmenu button {
-    height: 30px;
-    padding: 0 9px;
-    display: flex;
-    align-items: center;
-    border: 0;
-    border-radius: 7px;
-    background: transparent;
-    color: var(--ink);
-    cursor: pointer;
-    font-size: 13px;
-    font-weight: 400;
-    text-align: left;
-  }
-  .item .lmenu button:hover {
-    background: var(--accent);
-    color: var(--white);
-  }
-  .item.on {
-    background: var(--accent-tint);
-    color: var(--accent-text);
-    font-weight: 600;
-  }
-  .item svg {
-    width: 16px;
-    height: 16px;
-    flex-shrink: 0;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.7;
-    opacity: 0.8;
-  }
-  .item.on svg {
-    opacity: 1;
-  }
-  .item .label {
-    min-width: 0;
-    flex: 1;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .item .n {
-    min-width: 20px;
-    margin-left: auto;
-    color: var(--ink-3);
-    font-size: 12px;
-    font-variant-numeric: tabular-nums;
-    text-align: center;
-  }
-  .item.on .n {
-    color: var(--accent-text);
-    opacity: 0.72;
-  }
-  .item .n.hot {
-    min-width: 20px;
-    padding: 1px 7px;
-    border-radius: 999px;
-    background: var(--accent);
-    color: var(--white);
-    font-size: 11px;
-    font-weight: 650;
-  }
-  .item.on .n.hot {
-    color: var(--white);
-    opacity: 1;
-  }
-
-  /* Per-list overflow menu, revealed on hover or keyboard focus. The count moves
-     out of the way rather than sitting behind it. */
-  /* 24px, not the 22px this started at: WCAG 2.5.8's AA baseline is a 24×24 target,
-     and the spacing exception does not apply because `.pick` ends flush against
-     this button. Grown visually rather than with a pseudo-element — an extended hit
-     area here would overlap `.pick`, which the same rule forbids. */
-  .item .more {
+  /* 24px, not smaller: WCAG 2.5.8's AA baseline is a 24×24 target, and the
+     spacing exception does not apply because `.pick` ends flush against it. */
+  .srow .more {
     width: 24px;
     height: 24px;
     margin-left: auto;
+    flex-shrink: 0;
     display: grid;
     place-items: center;
     border: 0;
-    border-radius: 6px;
+    border-radius: var(--r-xs);
     background: transparent;
     color: var(--ink-3);
     cursor: pointer;
@@ -481,70 +633,111 @@
       opacity 0.14s ease,
       background 0.14s ease;
   }
-  .item .more svg {
-    width: 14px;
-    height: 14px;
+  .srow .more svg {
+    width: 13px;
+    height: 13px;
     stroke-width: 2;
   }
-  .item:hover .more,
-  .item .more:focus-visible,
-  .item .more[data-open="true"] {
+  .srow:hover .more,
+  .srow .more:focus-visible,
+  .srow .more[data-open="true"] {
     opacity: 1;
   }
-  .item .more:hover {
-    background: rgba(0, 0, 0, 0.06);
+  .srow .more:hover {
+    background: var(--fill-hover);
   }
   /* The count yields to the overflow menu on hover. Scoped with `:has` to rows
-     that HAVE one — the fixed views do not, and hiding their count on hover
-     would just make it flicker. */
-  .item:has(.more):hover .n:not(.hot) {
+     that HAVE one — the status views do not, and hiding their count would just
+     make it flicker. */
+  .srow:has(.more):hover .count {
     display: none;
   }
-
-  .side-label {
-    padding: 27px 10px 8px;
+  /* Rename / archive. Anchored to the row's right edge, above the board. */
+  .srow .lmenu {
+    position: absolute;
+    top: 27px;
+    right: 4px;
+    z-index: 30;
+    min-width: 116px;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    border-radius: var(--r-md);
+    background: var(--white);
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 1px 3px rgba(0, 0, 0, 0.07),
+      0 12px 32px rgba(0, 0, 0, 0.14);
+    animation: rise 140ms ease-out;
+  }
+  .srow .lmenu button {
+    height: 30px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    border: 0;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    font-size: 13px;
+    text-align: left;
+  }
+  .srow .lmenu button:hover {
+    background: var(--accent);
+    color: var(--white);
+  }
+  /* Inline rename, sized to the row so the sidebar does not reflow while typing. */
+  .srow .rename {
+    min-width: 0;
+    flex: 1;
+    height: 24px;
+    padding: 0 7px;
+    border: 1px solid var(--accent);
+    border-radius: var(--r-xs);
+    outline: 0;
+    background: var(--white);
+    color: var(--ink);
+    font-size: 12.5px;
+    box-shadow: 0 0 0 3px var(--accent-ring);
+  }
+  .srow.add {
     color: var(--ink-3);
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.045em;
   }
 
   /* ── Archived lists ─────────────────────────────────────────
      A collapsed section at the foot of the list area. Archiving used to be
      one-way in the UI: the engine accepts `{archived:false}` but nothing could
      name a list you can no longer see. */
-  .item.arch-toggle {
-    height: 34px;
-    margin-top: 6px;
+  .srow.arch-toggle {
+    margin-top: 4px;
     color: var(--ink-3);
     font-size: 12.5px;
   }
-  .item .caret {
+  .srow .caret {
     width: 9px;
     height: 9px;
-    margin-left: 3px;
     stroke-width: 2.4;
     opacity: 0.6;
     transition: transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
-  .item[aria-expanded="true"] .caret {
+  .srow[aria-expanded="true"] .caret {
     transform: rotate(90deg);
   }
   /* A row, not a button: the list is archived, so selecting it is meaningless.
      Only the restore action is interactive. */
-  .item.arch {
-    height: 34px;
-    padding-left: 24px;
+  .srow.arch {
+    padding-left: 20px;
     color: var(--ink-3);
     cursor: default;
   }
-  .item.arch:hover {
+  .srow.arch:hover {
     background: transparent;
   }
-  .item.arch .swatch {
+  .srow.arch .swatch {
     opacity: 0.5;
   }
-  .item .restore {
+  .srow .restore {
     margin-left: auto;
     padding: 2px 8px;
     border: 0;
@@ -555,7 +748,7 @@
     font-size: 12px;
     font-weight: 600;
   }
-  .item .restore:hover {
+  .srow .restore:hover {
     background: var(--accent-tint);
   }
   .swatch {
@@ -565,85 +758,26 @@
     border-radius: 50%;
     background: var(--ink-1);
   }
-  .side-foot {
-    margin-top: auto;
-    padding: 13px 10px 9px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-  }
-  /*
-   * A drawn monogram, not a photo.
-   *
-   * The prototype points at ../../niuzj-blog/public/images/avatar-day.webp —
-   * a path outside this repository, which would 404 in the app.
-   */
-  .avatar {
-    width: 30px;
-    height: 30px;
-    flex-shrink: 0;
-    display: grid;
-    place-items: center;
-    border-radius: 50%;
-    background: #d1d1d6;
-    color: var(--white);
-    font-size: 12px;
-    font-weight: 650;
-    box-shadow: inset 0 0 0 0.5px rgba(0, 0, 0, 0.08);
-  }
-  .side-foot .name {
-    min-width: 0;
-    flex: 1;
-    overflow: hidden;
-    color: var(--ink-2);
-    font-size: 13px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-  .side-foot .gear {
-    width: 26px;
-    height: 26px;
-    flex-shrink: 0;
-    display: grid;
-    place-items: center;
-    border-radius: 7px;
-    color: var(--ink-3);
-    transition:
-      background 0.14s ease,
-      color 0.14s ease;
-  }
-  .side-foot .gear:hover {
-    background: rgba(0, 0, 0, 0.05);
-    color: var(--ink-2);
-  }
-  .side-foot .gear svg {
-    width: 15px;
-    height: 15px;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.7;
-  }
 
   /* Inline "new list" form. A sheet would be too much furniture for two fields. */
   .nlform {
     margin: 4px 0 2px;
-    padding: 11px 11px 12px;
-    border: 0.5px solid rgba(0, 0, 0, 0.06);
-    border-radius: 12px;
-    background: var(--card);
+    padding: 10px;
+    border-radius: var(--r-md);
+    background: var(--white);
     box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.03),
+      0 0 0 1px var(--line),
       0 6px 18px rgba(0, 0, 0, 0.05);
   }
   .nlform input {
     width: 100%;
-    height: 30px;
+    height: 29px;
     padding: 0 9px;
-    border: 1px solid rgba(0, 0, 0, 0.1);
-    border-radius: 8px;
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-xs);
     outline: 0;
     background: var(--white);
-    font-size: 13px;
+    font-size: 12.5px;
     transition:
       border-color 0.12s ease,
       box-shadow 0.12s ease;
@@ -653,15 +787,15 @@
   }
   .nlform input:focus {
     border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+    box-shadow: 0 0 0 3px var(--accent-ring);
   }
   .nlform input + input {
-    margin-top: 7px;
+    margin-top: 6px;
     font-family: var(--mono);
     font-size: 11.5px;
   }
   .nlform .dots {
-    margin-top: 10px;
+    margin-top: 9px;
     display: flex;
     align-items: center;
     gap: 7px;
@@ -690,7 +824,7 @@
     transform: scale(0.72);
   }
   .nlform .acts {
-    margin-top: 11px;
+    margin-top: 10px;
     display: flex;
     align-items: center;
     gap: 7px;
@@ -700,6 +834,47 @@
     color: var(--color-bad);
     font-size: 11.5px;
     line-height: 1.45;
+  }
+  /* The same block used for guidance rather than failure — it states the
+     consequence of leaving the repository field empty. */
+  .nlform .err.hint {
+    color: var(--ink-3);
+  }
+
+  .side-foot {
+    height: var(--foot-h);
+    flex-shrink: 0;
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    box-shadow: 0 -1px 0 var(--line);
+  }
+  .side-foot .foot-link {
+    height: 28px;
+    padding: 0 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    border-radius: var(--r-sm);
+    color: var(--ink-3);
+    font-size: 12px;
+    font-weight: 600;
+    text-decoration: none;
+    transition:
+      background 0.14s ease,
+      color 0.14s ease;
+  }
+  .side-foot .foot-link:hover {
+    background: var(--fill);
+    color: var(--ink-2);
+  }
+  .side-foot .foot-link svg {
+    width: 14px;
+    height: 14px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.6;
   }
 
   /* ══ Task pane ══════════════════════════════════════════════ */
@@ -1329,8 +1504,13 @@
   /* ══ Chat pane ══════════════════════════════════════════════ */
 
   .chat {
-    width: 360px;
-    flex-shrink: 0;
+    /*
+     * No fixed width: the shell's grid track owns it now (336px).
+     *
+     * It was `width: 360px` for the old flex body, which as a grid item in a 336px
+     * track would overflow its own column and push the board.
+     */
+    min-width: 0;
     display: flex;
     flex-direction: column;
     border-left: 1px solid rgba(0, 0, 0, 0.055);
@@ -2200,8 +2380,17 @@
  * declarations above regardless of how Tailwind orders its layers.
  */
 
-/* The chat pane is the first thing to go: the task list is the working surface. */
+/*
+ * The secretary panel is the first thing to go: the board is the working surface.
+ *
+ * The COLUMN TRACK is what collapses, not the panel's own width. `.chat` no longer
+ * carries a width — the grid owns it — so hiding the element without dropping its
+ * track would leave a 336px empty gutter.
+ */
 @media (max-width: 1050px) {
+  .shell {
+    grid-template-columns: 216px minmax(0, 1fr);
+  }
   .chat {
     display: none;
   }
@@ -2210,66 +2399,62 @@
 /*
  * Icon-only sidebar.
  *
- * One deliberate divergence from the prototype, which also carries
- * `.item:not(.on) { display: none }` — that hides every unselected entry, so at
- * this width three of the four views and every list become unreachable. The
- * prototype is a static screenshot of one selected state; this is a nav that has
- * to keep working, so all entries stay and only their labels collapse.
+ * Every entry stays reachable and only the labels collapse. The mockup and the old
+ * prototype both hide unselected rows at narrow widths, which would make three
+ * views and every list unreachable — fine for a static screenshot of one selected
+ * state, wrong for a nav that has to keep working.
  */
 @media (max-width: 720px) {
-  .side {
-    width: 68px;
-    padding-left: 9px;
-    padding-right: 9px;
+  .shell {
+    grid-template-columns: 68px minmax(0, 1fr);
   }
-  .brand {
+  .side {
+    /* The grid track sets the width; this only tightens the inner padding. */
+    padding-inline: 0;
+  }
+  .side-head,
+  .side-foot {
     justify-content: center;
-    padding-left: 0;
-    padding-right: 0;
+    padding-inline: 0;
   }
   .brand .t,
-  .item .label,
-  .item .n,
-  .item .more,
+  .npill .label,
+  .npill .count,
+  .srow .label,
+  .srow .count,
+  .srow .more,
+  .srow .hash,
   .side-label,
-  .side-foot .name {
+  .side-foot .foot-link span {
     display: none;
   }
-  .item {
+  .side-scroll {
+    padding-inline: 6px;
+  }
+  .npill,
+  .srow {
     justify-content: center;
     padding: 0;
     gap: 0;
   }
-  /* The hot badge survives as a bare dot: "needs you" is the one count that
-     still has to be visible when there is no room for a number. */
-  .item .n.hot {
-    display: block;
-    position: absolute;
-    min-width: 0;
-    width: 7px;
-    height: 7px;
-    margin: -13px 0 0 13px;
-    padding: 0;
-    overflow: hidden;
-    color: transparent;
-    font-size: 0;
-  }
-  .item {
+  /*
+   * The needs-you dot survives, anchored to the row rather than pushed by
+   * `margin-left: auto` — there is no label left for it to be pushed away from.
+   * It is the one signal that must stay visible when there is no room for a count.
+   */
+  .srow {
     position: relative;
   }
-  .side-scroll {
-    margin-inline: -9px;
-    padding-inline: 9px;
+  .srow .dot-badge {
+    position: absolute;
+    top: 5px;
+    right: 12px;
+    margin: 0;
   }
+  /* Two things with no icon to fall back on: a calendar at 68px is unreadable, and
+     the new-list form has two text fields. Both return above this width. */
+  .cal,
   .nlform {
-    display: none;
-  }
-  .side-foot {
-    justify-content: center;
-    padding-left: 0;
-    padding-right: 0;
-  }
-  .side-foot .gear {
     display: none;
   }
   .main-in {
@@ -2278,6 +2463,7 @@
   .page-in {
     padding: 24px 17px 70px;
   }
+  /* Row furniture that has nowhere to go once the board is this narrow. */
   .repo,
   .st {
     display: none;

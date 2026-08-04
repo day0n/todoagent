@@ -181,7 +181,14 @@ export function TaskPane({
             </p>
           ) : (
             <p className="gempty">
-              {EMPTY_LINE[view === "needs" || view === "done" ? view : "other"]}
+              {
+                EMPTY_LINE[
+                  // Every status view names itself; `other` covers 我的一天 and the
+                  // list views, whose emptiness is about today rather than a status.
+                  // A view missing from this guard silently renders the wrong line.
+                  view === "needs" || view === "running" || view === "done" ? view : "other"
+                ]
+              }
             </p>
           )
         ) : null}
@@ -192,6 +199,7 @@ export function TaskPane({
 
 const EMPTY_LINE = {
   needs: "没有等你的事。",
+  running: "现在没有 agent 在跑。",
   done: "还没有完成的任务。",
   other: "今天很干净。",
 } as const;

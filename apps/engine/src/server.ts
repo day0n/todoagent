@@ -1486,6 +1486,14 @@ app.get("/api/lists", (c) => {
   const counts = {
     today: tasks.filter((t) => t.status !== "done" && inToday(t, now)).length,
     needs: tasks.filter((t) => t.status === "needs_you").length,
+    /*
+     * Live runs, for the sidebar's 状态 section.
+     *
+     * Sent with the other counts rather than derived from the board, because the
+     * sidebar shows it in every view — including the list views, which never load
+     * board data.
+     */
+    running: tasks.filter((t) => t.status === "in_progress").length,
     done: tasks.filter((t) => t.status === "done").length,
   };
   return c.json({ lists, counts });
@@ -1566,6 +1574,9 @@ app.get("/api/tasks", (c) => {
   let picked: Task[];
   if (view === "today") picked = all.filter((t) => inToday(t, now));
   else if (view === "needs") picked = all.filter((t) => t.status === "needs_you");
+  // Everything with a live run, for the sidebar's 进行中 entry. A count with nothing
+  // to click would be the one number on screen that goes nowhere.
+  else if (view === "running") picked = all.filter((t) => t.status === "in_progress");
   else if (view === "done") picked = all.filter((t) => t.status === "done");
   else if (view.startsWith("list:")) {
     const id = view.slice("list:".length);

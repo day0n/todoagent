@@ -273,6 +273,8 @@ export interface TodoList {
 export interface ViewCounts {
   today: number;
   needs: number;
+  /** Tasks with a live run, for the sidebar's 状态 section. */
+  running: number;
   done: number;
 }
 
@@ -287,7 +289,20 @@ export interface ListsResponse {
  * A template literal rather than a plain string, so `view=list:` with no id — or
  * a typo'd aggregate name — is a compile error instead of a 400 at runtime.
  */
-export type ViewKey = "today" | "needs" | "done" | `list:${string}`;
+/**
+ * Which view the task pane is showing.
+ *
+ * `today` is the day board — four day columns rather than status groups, so it
+ * reads through `api.board()`. The rest are status-grouped lists through
+ * `api.tasks()`. That split is why `isBoardView` exists rather than callers
+ * comparing strings.
+ */
+export type ViewKey = "today" | "needs" | "running" | "done" | `list:${string}`;
+
+/** Does this view render as the day board? Only 我的一天 does. */
+export function isBoardView(view: ViewKey): boolean {
+  return view === "today";
+}
 
 /**
  * Task status.
@@ -360,6 +375,33 @@ export interface Task {
   runId: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/** The day board's four columns, in display order. */
+export type BoardKey = "today" | "tomorrow" | "dayAfter" | "later";
+
+export interface BoardColumn {
+  key: BoardKey;
+  /**
+   * `YYYY-MM-DD` for the three dated columns, null for 以后.
+   *
+   * Sent by the engine rather than derived here: the client would otherwise keep
+   * bucketing against yesterday in a tab left open overnight, and two
+   * implementations of "what day is the third column" would have to agree.
+   */
+  date: string | null;
+  /** `Date.getDay()`, so 周二 renders without parsing the date string. */
+  weekday: number | null;
+  tasks: Task[];
+  /** Only the today column can be non-zero — finishing a task moves it there. */
+  done: number;
+  total: number;
+}
+
+export interface BoardResponse {
+  /** The engine's idea of today, for comparing against a stale client clock. */
+  today: string;
+  columns: BoardColumn[];
 }
 
 /** Tasks for one view, pre-grouped by the engine. Every key is present. */

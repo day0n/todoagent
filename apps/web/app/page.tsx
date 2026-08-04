@@ -67,7 +67,7 @@ export default function Page() {
    * every few seconds and has no use for them.
    */
   const [archived, setArchived] = useState<TodoList[]>([]);
-  const [counts, setCounts] = useState<ViewCounts>({ today: 0, needs: 0, done: 0 });
+  const [counts, setCounts] = useState<ViewCounts>({ today: 0, needs: 0, running: 0, done: 0 });
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
   /*
@@ -644,9 +644,11 @@ export default function Page() {
       ? "我的一天"
       : view === "needs"
         ? "需要你"
-        : view === "done"
-          ? "已完成"
-          : (activeList?.name ?? "清单");
+        : view === "running"
+          ? "进行中"
+          : view === "done"
+            ? "已完成"
+            : (activeList?.name ?? "清单");
 
   /** Who is executing a task, by name. Null when nothing can be resolved. */
   const executorFor = (task: Task): string | null => {
@@ -672,6 +674,14 @@ export default function Page() {
 
   return (
     <>
+      {/*
+        The three-column grid.
+
+        A wrapper rather than making `body` the grid: `body` is also the flex parent
+        the retained pages (`/runs`, `/team`) opt into with `.page`, and switching it
+        to a grid would reshape those two pages as a side effect of this one.
+      */}
+      <div className="shell">
       <Sidebar
         lists={lists}
         archived={archived}
@@ -742,7 +752,11 @@ export default function Page() {
         }}
         onOpenTask={(t) => setView(`list:${t.channelId}`)}
       />
+      </div>
 
+      {/* Outside the grid: both are `position: fixed`, so they answer to the
+          viewport rather than to a column, and nesting them in a grid container
+          would only invite a stacking-context surprise later. */}
       {drawerTask !== null ? (
         <ResultDrawer
           // Remounts when the task changes, so no state from the previous task's
