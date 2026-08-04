@@ -2,26 +2,38 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError, isPinnedToday, localDayIso, subscribeBoard } from "../lib/api.ts";
+import { isBoardView } from "../lib/types.ts";
 import type {
+  BoardColumn,
+  BoardResponse,
   ChatHistory,
   ChatStatus,
   Expert,
   Task,
   TaskGroups,
+  TasksResponse,
   TodoList,
   ViewCounts,
   ViewKey,
 } from "../lib/types.ts";
 import {
+  applyBoardPoll,
   applyOptimistic,
   applyPoll,
   applyServerRow,
+  applyServerRowToBoard,
+  boardHasLiveRun,
+  findInBoard,
   findTask,
   hasLiveRun,
+  insertIntoBoard,
   insertTask,
+  patchInBoard,
+  removeFromBoard,
   removeTask,
 } from "../lib/todo-state.ts";
 import { Sidebar } from "../components/sidebar.tsx";
+import { BoardPane } from "../components/board-pane.tsx";
 import { TaskPane } from "../components/task-pane.tsx";
 import { ChatPane } from "../components/chat-pane.tsx";
 import { ResultDrawer } from "../components/result-drawer.tsx";
@@ -59,6 +71,15 @@ const POLL_IDLE_MS = 15_000;
 export default function Page() {
   const [view, setView] = useState<ViewKey>("today");
   const [groups, setGroups] = useState<TaskGroups | null>(null);
+  /*
+   * The day board, held separately from the grouped views.
+   *
+   * Two shapes rather than one because they answer different questions — four day
+   * columns versus five status groups — and exactly one is populated at a time. The
+   * unused one stays null, and every mutator below no-ops on null, which is what
+   * lets one set of handlers serve both renderers.
+   */
+  const [board, setBoard] = useState<BoardResponse | null>(null);
   const [lists, setLists] = useState<TodoList[]>([]);
   /*
    * Archived lists, fetched separately from the live ones.
@@ -145,16 +166,40 @@ export default function Page() {
     async (opts: { guard?: boolean } = {}): Promise<void> => {
       const requestedAt = mutations.current;
       try {
-        const [tasks, sidebar] = await Promise.all([api.tasks(view), api.lists()]);
+        /*
+         * One shape or the other, never both.
+         *
+         * 我的一天 reads the board; every other view is status-grouped. Fetching both
+         * would double the request rate for data one of the two renderers would
+         * throw away.
+         */
+        const onBoard = isBoardView(view);
+        const [data, sidebar] = await Promise.all([
+          onBoard ? api.board() : api.tasks(view),
+          api.lists(),
+        ]);
         // The sidebar is never guarded: its counts are derived server-side from
         // every task, so a fresher copy is always the better one.
         setLists(sidebar.lists);
         setCounts(sidebar.counts);
-        setGroups((current) =>
-          opts.guard === false
-            ? tasks.groups
-            : applyPoll(current, tasks.groups, requestedAt, mutations.current),
-        );
+        if (onBoard) {
+          const incoming = data as BoardResponse;
+          setBoard((current) =>
+            opts.guard === false
+              ? incoming
+              : applyBoardPoll(current, incoming, requestedAt, mutations.current),
+          );
+          // Cleared so a stale grouped view cannot flash when switching back.
+          setGroups(null);
+        } else {
+          const incoming = (data as TasksResponse).groups;
+          setBoard(null);
+          setGroups((current) =>
+            opts.guard === false
+              ? incoming
+              : applyPoll(current, incoming, requestedAt, mutations.current),
+          );
+        }
         // Anything on screen now came from the engine, so a previous failure is
         // no longer describing reality.
         setLoadError(null);
@@ -192,6 +237,7 @@ export default function Page() {
     let alive = true;
     setLoading(true);
     setGroups(null);
+    setBoard(null);
     refresh({ guard: false })
       .catch((err: unknown) => {
         if (!alive) return;
@@ -298,7 +344,14 @@ export default function Page() {
    * it was before — which is the reason the stream carries no data: losing it costs
    * latency, never correctness.
    */
-  const fast = hasLiveRun(groups);
+  /*
+   * A live run in EITHER shape speeds the poll up.
+   *
+   * Asking only about `groups` would leave the board polling at the idle rate with a
+   * run in flight — up to a minute to notice it finished, on the one view most
+   * likely to be watching.
+   */
+  const fast = hasLiveRun(groups) || boardHasLiveRun(board);
   const cadence = streamOk ? POLL_BACKSTOP_MS : fast ? POLL_FAST_MS : POLL_IDLE_MS;
   useEffect(() => {
     let timer: ReturnType<typeof setInterval> | null = null;
@@ -349,7 +402,33 @@ export default function Page() {
 
   // ── Mutations ───────────────────────────────────────────────
 
-  const addTask = async (title: string): Promise<void> => {
+  /**
+   * An optimistic local patch, applied to whichever shape is on screen.
+   *
+   * Both calls are made unconditionally: the shape that is not loaded is null, and
+   * every mutator returns its input unchanged for a null or an unknown id, so the
+   * other call costs one comparison. Branching on the view here instead would mean
+   * ten call sites each having to remember which state they are in.
+   */
+  const optimistic = (
+    id: string,
+    patch: Parameters<typeof patchInBoard>[2],
+  ): void => {
+    setGroups((current) => applyOptimistic(current, view, id, patch));
+    setBoard((current) => patchInBoard(current, id, patch));
+  };
+
+  /** The server's row, replacing whatever was guessed, in both shapes. */
+  const confirmRow = (row: Task): void => {
+    setGroups((current) => applyServerRow(current, view, row));
+    setBoard((current) => applyServerRowToBoard(current, row));
+  };
+
+  const addTask = async (
+    title: string,
+    dueDate: string | null = null,
+    key?: BoardColumn["key"],
+  ): Promise<void> => {
     mutations.current += 1;
     try {
       /*
@@ -363,8 +442,16 @@ export default function Page() {
       const created = await api.createTask({
         title,
         listId: view.startsWith("list:") ? view.slice("list:".length) : null,
+        ...(dueDate !== null ? { dueDate } : {}),
       });
       setGroups((current) => insertTask(current, created));
+      /*
+       * Inserted into the column that asked, which is the ONE place membership is
+       * decided locally — and safe because nothing is inferred: the per-column add
+       * button passed its own date and key, so the caller already knows where it
+       * goes. Everything else arrives through the refetch below.
+       */
+      if (key !== undefined) setBoard((current) => insertIntoBoard(current, key, created));
       void refresh().catch(() => undefined);
     } catch (err) {
       showError(err);
@@ -374,12 +461,12 @@ export default function Page() {
   const toggleDone = (task: Task): void => {
     const next = task.status === "done" ? "todo" : "done";
     mutations.current += 1;
-    setGroups((current) => applyOptimistic(current, view, task.id, { status: next }));
+    optimistic(task.id, { status: next });
 
     void api
       .patchTask(task.id, { status: next })
       .then((row) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
         void refresh().catch(() => undefined);
       })
       .catch((err: unknown) => {
@@ -395,12 +482,12 @@ export default function Page() {
     if (next === "" || next === task.title) return;
 
     mutations.current += 1;
-    setGroups((current) => applyOptimistic(current, view, task.id, { title: next }));
+    optimistic(task.id, { title: next });
 
     void api
       .patchTask(task.id, { title: next })
       .then((row) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
       })
       .catch((err: unknown) => {
         showError(err);
@@ -419,7 +506,7 @@ export default function Page() {
     void api
       .runTask(task.id)
       .then(({ task: row }) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
         void refresh().catch(() => undefined);
       })
       .catch(showError);
@@ -430,7 +517,7 @@ export default function Page() {
     void api
       .cancelTask(task.id)
       .then(({ task: row }) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
         void refresh().catch(() => undefined);
       })
       .catch((err: unknown) => {
@@ -462,18 +549,12 @@ export default function Page() {
      * happens to render correctly today because every consumer branches on status
      * first, but a guess should not depend on the order of someone else's if-chain.
      */
-    setGroups((current) =>
-      applyOptimistic(current, view, task.id, {
-        status: "in_progress",
-        needsKind: null,
-        needsText: null,
-      }),
-    );
+    optimistic(task.id, { status: "in_progress", needsKind: null, needsText: null });
 
     void api
       .answerTask(task.id, answer)
       .then(({ task: row }) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
         void refresh().catch(() => undefined);
       })
       .catch((err: unknown) => {
@@ -494,12 +575,12 @@ export default function Page() {
   const moveTask = (task: Task, listId: string): void => {
     if (listId === task.channelId) return;
     mutations.current += 1;
-    setGroups((current) => applyOptimistic(current, view, task.id, { channelId: listId }));
+    optimistic(task.id, { channelId: listId });
 
     void api
       .patchTask(task.id, { listId })
       .then((row) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
         // The sidebar's per-list counts both changed, so re-read them.
         void refresh().catch(() => undefined);
       })
@@ -521,12 +602,12 @@ export default function Page() {
   const toggleMyDay = (task: Task): void => {
     const next = isPinnedToday(task.myDay) ? null : localDayIso();
     mutations.current += 1;
-    setGroups((current) => applyOptimistic(current, view, task.id, { myDay: next }));
+    optimistic(task.id, { myDay: next });
 
     void api
       .patchTask(task.id, { myDay: next })
       .then((row) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
         // 我的一天's count changes, and if that is the current view its membership
         // does too — unpinning a task there should remove the row.
         void refresh().catch(() => undefined);
@@ -548,12 +629,12 @@ export default function Page() {
   const setDue = (task: Task, dueDate: string | null): void => {
     if (dueDate === task.dueDate) return;
     mutations.current += 1;
-    setGroups((current) => applyOptimistic(current, view, task.id, { dueDate }));
+    optimistic(task.id, { dueDate });
 
     void api
       .patchTask(task.id, { dueDate })
       .then((row) => {
-        setGroups((current) => applyServerRow(current, view, row));
+        confirmRow(row);
         void refresh().catch(() => undefined);
       })
       .catch((err: unknown) => {
@@ -565,6 +646,7 @@ export default function Page() {
   const remove = (task: Task): void => {
     mutations.current += 1;
     setGroups((current) => removeTask(current, task.id));
+    setBoard((current) => removeFromBoard(current, task.id));
     void api
       .deleteTask(task.id)
       .then(() => refresh())
@@ -670,7 +752,44 @@ export default function Page() {
    * status change the view filters on — rather than leaving a panel open over
    * something that is no longer there.
    */
-  const drawerTask = drawerTaskId === null ? null : findTask(groups, drawerTaskId);
+  const drawerTask =
+    drawerTaskId === null
+      ? null
+      : // Whichever shape is loaded holds it. Resolved fresh each render so the
+        // drawer cannot show a status the task has since left.
+        (findTask(groups, drawerTaskId) ?? findInBoard(board, drawerTaskId));
+
+  /**
+   * Retry after a failed load. Shared by both renderers.
+   *
+   * Extracted along with the two objects below because the board and the task pane
+   * take the same handlers — inline copies in each branch would be two things to
+   * keep in step, and the pair that drifted would be the one nobody tested.
+   */
+  const retryLoad = (): void => {
+    setLoading(true);
+    refresh({ guard: false })
+      .catch((err: unknown) => {
+        showError(err);
+        setLoadError(err instanceof Error ? err.message : String(err));
+      })
+      .finally(() => setLoading(false));
+  };
+
+  const rowOps = { onMove: moveTask, onToggleMyDay: toggleMyDay, onSetDue: setDue };
+
+  const answerControls = {
+    activeId: answeringId,
+    onStart: (t: Task) => {
+      // Opening the bar closes the drawer: they are two views of the same question,
+      // and leaving the panel over the card being answered would hide what is being
+      // typed.
+      setDrawerTaskId(null);
+      setAnsweringId(t.id);
+    },
+    onSubmit: answerTask,
+    onCancel: () => setAnsweringId(null),
+  };
 
   return (
     <>
@@ -694,45 +813,55 @@ export default function Page() {
         onRestore={restoreList}
       />
 
-      <TaskPane
-        view={view}
-        title={title}
-        groups={groups}
-        lists={lists}
-        runtimeCount={runtimeCount}
-        executorFor={executorFor}
-        loading={loading}
-        error={loadError}
-        onRetry={() => {
-          setLoading(true);
-          refresh({ guard: false })
-            .catch((err: unknown) => {
-              showError(err);
-              setLoadError(err instanceof Error ? err.message : String(err));
-            })
-            .finally(() => setLoading(false));
-        }}
-        onAdd={addTask}
-        onToggleDone={toggleDone}
-        onRenameTask={renameTask}
-        onOpenResult={(t) => setDrawerTaskId(t.id)}
-        onDispatch={dispatch}
-        onCancel={cancel}
-        onDelete={remove}
-        rowOps={{ onMove: moveTask, onToggleMyDay: toggleMyDay, onSetDue: setDue }}
-        answer={{
-          activeId: answeringId,
-          onStart: (t) => {
-            // Opening the bar closes the drawer: they are two views of the same
-            // question, and leaving the panel over the row being answered would
-            // hide what is being typed.
-            setDrawerTaskId(null);
-            setAnsweringId(t.id);
-          },
-          onSubmit: answerTask,
-          onCancel: () => setAnsweringId(null),
-        }}
-      />
+      {/*
+        Two renderers, one set of handlers.
+
+        我的一天 buckets by day; the status and list views group by status. They are
+        different shapes rather than different styling, so one component switching on
+        a flag internally would carry two layouts and two sets of empty states. The
+        mutations are shared, which is what keeps them from drifting.
+      */}
+      {isBoardView(view) ? (
+        <BoardPane
+          board={board}
+          lists={lists}
+          runtimeCount={runtimeCount}
+          executorFor={executorFor}
+          loading={loading}
+          error={loadError}
+          onRetry={retryLoad}
+          onAdd={addTask}
+          onToggleDone={toggleDone}
+          onRenameTask={renameTask}
+          onOpenResult={(t) => setDrawerTaskId(t.id)}
+          onDispatch={dispatch}
+          onCancel={cancel}
+          onDelete={remove}
+          rowOps={rowOps}
+          answer={answerControls}
+        />
+      ) : (
+        <TaskPane
+          view={view}
+          title={title}
+          groups={groups}
+          lists={lists}
+          runtimeCount={runtimeCount}
+          executorFor={executorFor}
+          loading={loading}
+          error={loadError}
+          onRetry={retryLoad}
+          onAdd={addTask}
+          onToggleDone={toggleDone}
+          onRenameTask={renameTask}
+          onOpenResult={(t) => setDrawerTaskId(t.id)}
+          onDispatch={dispatch}
+          onCancel={cancel}
+          onDelete={remove}
+          rowOps={rowOps}
+          answer={answerControls}
+        />
+      )}
 
       <ChatPane
         history={chat}

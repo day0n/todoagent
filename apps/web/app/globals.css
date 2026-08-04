@@ -130,6 +130,10 @@
   --ink-3: #6f6f74;
   --line: rgba(60, 60, 67, 0.1);
   --line-strong: rgba(60, 60, 67, 0.16);
+  /* Lighter than `--line`, for dividers that separate peers rather than regions:
+     the board's column gutters, and a completed card's outline. Four columns at
+     full strength would read as a table. */
+  --line-soft: rgba(60, 60, 67, 0.055);
   --fill: rgba(118, 118, 128, 0.1);
   --fill-hover: rgba(118, 118, 128, 0.15);
   --black: #1d1d1f;
@@ -1499,6 +1503,486 @@
     color: var(--ink-3);
     font-size: 13.5px;
     text-align: center;
+  }
+
+  /* ══ Day board ══════════════════════════════════════════════
+     The 我的一天 view. Layout from opt-h2: a 54px top bar over four day columns.
+     The status and list views keep the task pane above — only this view buckets
+     by day, which is why both renderers exist. */
+
+  .board {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+  }
+  /* White, unlike the board body, so the top bar reads as chrome shared with the
+     sidebar and secretary rather than as part of the scrolling content. */
+  .board-top {
+    height: var(--head-h);
+    flex-shrink: 0;
+    padding: 0 20px;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    background: var(--white);
+    box-shadow: 0 1px 0 var(--line);
+  }
+  .board-top .crumb {
+    color: var(--ink);
+    font-size: 15px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+  .board-top .crumb-sub {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    color: var(--ink-3);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /*
+   * The primary action, filled in ink rather than the accent.
+   *
+   * Straight from the mockup, and it earns its place here: the accent is spent on
+   * live state (running, needs-you), so a blue button competing with those would
+   * dilute the one signal the board exists to surface. Ink also clears AA for white
+   * text, which `--accent` does not at 4.02:1.
+   */
+  .board-top .add-btn {
+    height: 30px;
+    flex-shrink: 0;
+    padding: 0 12px;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    border: 0;
+    border-radius: var(--r-sm);
+    background: var(--ink);
+    color: var(--white);
+    cursor: pointer;
+    font-size: 12.5px;
+    font-weight: 600;
+    box-shadow: 0 1px 2px rgba(20, 22, 26, 0.2);
+    transition:
+      background 0.14s ease,
+      transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .board-top .add-btn:hover {
+    background: #000;
+  }
+  .board-top .add-btn:active {
+    transform: scale(0.97);
+  }
+  .board-top .add-btn svg {
+    width: 12px;
+    height: 12px;
+    flex-shrink: 0;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.4;
+  }
+
+  .cols {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    align-items: flex-start;
+  }
+  /*
+   * A fixed 258px per column, from the mockup.
+   *
+   * Not `1fr`: a card's title has to wrap at a predictable width, and four flexible
+   * columns would reflow every card on any window resize. The row scrolls instead,
+   * which is what a day board does when you add days.
+   */
+  .col {
+    width: 258px;
+    flex-shrink: 0;
+    padding: 16px 14px 20px;
+    box-shadow: 1px 0 0 var(--line-soft);
+  }
+  /* 以后 is real work with no date attached — present, but not competing with the
+     three days that have one. */
+  .col.faded {
+    opacity: 0.55;
+  }
+  .col.faded:hover,
+  .col.faded:focus-within {
+    opacity: 1;
+  }
+  .col-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .col-head .day {
+    color: var(--ink);
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: -0.01em;
+  }
+  .col-head .links {
+    color: var(--accent-text);
+    font-size: 11px;
+    font-weight: 600;
+  }
+  .col-date {
+    margin: 2px 0 10px;
+    color: var(--ink-3);
+    font-size: 12px;
+  }
+  .col-bar {
+    height: 4px;
+    margin-bottom: 12px;
+    overflow: hidden;
+    border-radius: 4px;
+    background: var(--fill);
+  }
+  .col-bar i {
+    display: block;
+    height: 100%;
+    border-radius: 4px;
+    background: var(--color-ok);
+    transition: width 0.3s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  /*
+   * Reserves the bar's box where no bar is drawn.
+   *
+   * Only today can have completions — finishing a task moves it there — so three
+   * columns would otherwise start 16px higher than the first, and the four headers
+   * would not share a baseline.
+   */
+  .col-bar-spacer {
+    height: 4px;
+    margin-bottom: 12px;
+  }
+
+  /* ── Task card ──────────────────────────────────────────────
+     Named `tcard` because `.card` is a retained atom on /team and /runs. */
+  .tcard {
+    margin-bottom: 7px;
+    padding: 9px 10px;
+    border-radius: var(--r-md);
+    background: var(--white);
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 1px 2px rgba(20, 22, 26, 0.04);
+    transition:
+      box-shadow 0.16s ease,
+      transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .tcard:hover {
+    box-shadow:
+      0 0 0 1px var(--line-strong),
+      0 2px 6px rgba(20, 22, 26, 0.07);
+  }
+  /* Waiting on a person: the one card state that should be legible from across the
+     room, so it takes a tinted surface rather than only a badge. */
+  .tcard.needs {
+    background: var(--color-warn-soft);
+    box-shadow:
+      0 0 0 1px rgba(154, 91, 0, 0.28),
+      0 1px 2px rgba(154, 91, 0, 0.08);
+  }
+  .tcard.needs:hover {
+    box-shadow:
+      0 0 0 1px rgba(154, 91, 0, 0.42),
+      0 2px 6px rgba(154, 91, 0, 0.12);
+  }
+  /* An inset bar rather than a border, so the card's own box never shifts by 1px
+     when a run starts. */
+  .tcard.run {
+    padding-left: 8px;
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 1px 2px rgba(20, 22, 26, 0.04),
+      inset 3px 0 0 var(--accent);
+  }
+  .tcard.done {
+    background: transparent;
+    box-shadow: 0 0 0 1px var(--line-soft);
+  }
+
+  .tcard-top {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+  }
+  /* 18px drawn, 24px target: WCAG 2.5.8's AA baseline, reached with a
+     pseudo-element so the circle stays the size the design wants. */
+  .tcard .ring {
+    width: 18px;
+    height: 18px;
+    margin-top: 1px;
+    flex-shrink: 0;
+    position: relative;
+    display: grid;
+    place-items: center;
+    padding: 0;
+    border: 1.5px solid var(--ink-4);
+    border-radius: 50%;
+    background: transparent;
+    cursor: pointer;
+    transition: border-color 0.12s ease;
+  }
+  .tcard .ring::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    width: 24px;
+    height: 24px;
+    transform: translate(-50%, -50%);
+  }
+  .tcard:hover .ring:not(:disabled) {
+    border-color: var(--accent);
+  }
+  .tcard .ring:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+  .tcard.done .ring {
+    border-color: var(--ink-2);
+    background: var(--ink-2);
+  }
+  .tcard.done .ring svg {
+    width: 9px;
+    height: 9px;
+    fill: none;
+    stroke: var(--white);
+    stroke-width: 2.8;
+  }
+
+  /* A `<button>` reset to read as the text it holds: renaming needs a keyboard
+     path, and a div carrying a click handler announces neither role nor purpose. */
+  .tcard .title {
+    flex: 1;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--ink);
+    cursor: text;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    /* 1.4, not tighter: a wrapped title is the normal case at 258px, and anything
+       below this crowds two lines of Chinese. */
+    line-height: 1.4;
+    text-align: left;
+    overflow-wrap: anywhere;
+  }
+  .tcard.done .title {
+    color: var(--ink-3);
+    text-decoration: line-through;
+    text-decoration-color: var(--ink-4);
+  }
+  .tcard .tt-edit {
+    flex: 1;
+    min-width: 0;
+    padding: 0;
+    border: 0;
+    border-bottom: 1px solid var(--accent);
+    outline: 0;
+    background: transparent;
+    color: var(--ink);
+    font-size: 13px;
+    font-weight: 600;
+    line-height: 1.4;
+  }
+
+  /* ── Badges ─────────────────────────────────────────────────
+     What the card IS, in one glance. At most one status badge, then context. */
+  .badges {
+    margin-top: 6px;
+    padding-left: 27px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    flex-wrap: wrap;
+  }
+  .badge {
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--fill);
+    color: var(--ink-2);
+    font-size: 10.5px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  /* The two states that change on their own while you watch get distinct hues; one
+     shared accent would make them indistinguishable at a glance. */
+  .badge.needs {
+    background: var(--color-warn-soft);
+    color: var(--color-warn);
+  }
+  .badge.run {
+    background: var(--accent-tint);
+    color: var(--accent-text);
+  }
+  .badge.review {
+    background: var(--color-ok-soft);
+    color: var(--color-ok);
+  }
+  .badge.late {
+    background: var(--color-bad-soft);
+    color: var(--color-bad);
+  }
+  /* The agent's own name: identity, not state, so it stays neutral. */
+  .badge.agent {
+    background: var(--fill);
+    color: var(--ink-2);
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 500;
+  }
+  .badges .time {
+    margin-left: auto;
+    color: var(--ink-3);
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* The parked question in full — the card is the only place it fits. */
+  .tcard-q {
+    margin: 7px 0 0;
+    padding-left: 27px;
+    color: var(--color-warn);
+    font-size: 12px;
+    line-height: 1.45;
+  }
+
+  /*
+   * Controls, revealed on hover or keyboard focus.
+   *
+   * `:focus-within` is not optional: an action that appears only on pointer hover is
+   * unreachable by keyboard. A needs-you card shows its row unconditionally — it is
+   * waiting on a person, so hiding the way to respond would be the wrong default.
+   */
+  .tcard-acts {
+    height: 0;
+    margin-top: 0;
+    padding-left: 27px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    opacity: 0;
+    transition:
+      height 0.16s ease,
+      margin-top 0.16s ease,
+      opacity 0.16s ease;
+  }
+  .tcard:hover .tcard-acts,
+  .tcard:focus-within .tcard-acts,
+  .tcard.needs .tcard-acts {
+    height: 28px;
+    margin-top: 5px;
+    opacity: 1;
+  }
+  /* Inside a card the pills are always visible once the row is — the row itself is
+     what hides, so the pills must not hide again within it. */
+  .tcard-acts .act {
+    height: 24px;
+    padding: 0 10px;
+    font-size: 11.5px;
+    opacity: 1;
+  }
+  .tcard-acts .act.ghost {
+    width: 22px;
+    height: 22px;
+    padding: 0;
+  }
+  .tcard-acts .act.ghost svg {
+    width: 12px;
+    height: 12px;
+  }
+  /* The date field, sized down for the card. Collapses to its picker icon while
+     empty — an empty date input renders 年/月/日 in WebKit, ~90px of placeholder on
+     every card that has no deadline. */
+  .tcard-acts .due {
+    height: 22px;
+    max-width: 92px;
+    font-size: 11px;
+  }
+
+  /* The answer bar, inside the card that is asking. */
+  .tcard .abar {
+    margin-top: 8px;
+    padding: 0;
+  }
+  .tcard .abar .ain {
+    font-size: 12.5px;
+  }
+  .tcard .abar .aacts {
+    margin-top: 7px;
+  }
+
+  /* ── Per-column add ─────────────────────────────────────────
+     Dashed while closed, so it reads as an affordance rather than a card. */
+  .add-task {
+    width: 100%;
+    height: 32px;
+    margin-top: 2px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    border: 1.3px dashed var(--line-strong);
+    border-radius: var(--r-md);
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    font-size: 12.5px;
+    text-align: left;
+    transition:
+      border-color 0.14s ease,
+      color 0.14s ease,
+      background 0.14s ease;
+  }
+  .add-task:hover {
+    border-color: var(--accent-line);
+    color: var(--accent-text);
+  }
+  .add-task.open {
+    border-style: solid;
+    border-color: var(--accent);
+    background: var(--white);
+    cursor: text;
+    box-shadow: 0 0 0 3px var(--accent-ring);
+  }
+  .add-task .p {
+    width: 15px;
+    height: 15px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border-radius: 50%;
+    box-shadow: 0 0 0 1.3px currentColor;
+  }
+  .add-task .p svg {
+    width: 9px;
+    height: 9px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 2.6;
+  }
+  .add-task input {
+    flex: 1;
+    min-width: 0;
+    border: 0;
+    outline: 0;
+    background: transparent;
+    color: var(--ink);
+    font-size: 12.5px;
+  }
+  .add-task input::placeholder {
+    color: var(--ink-3);
   }
 
   /* ══ Chat pane ══════════════════════════════════════════════ */

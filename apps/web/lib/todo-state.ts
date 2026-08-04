@@ -1,4 +1,4 @@
-import type { Task, TaskGroups, TaskStatus, ViewKey } from "./types.ts";
+import type { BoardColumn, BoardResponse, Task, TaskGroups, TaskStatus, ViewKey } from "./types.ts";
 import { GROUP_ORDER } from "./types.ts";
 
 /**
@@ -234,4 +234,171 @@ export function isRunLive(task: Task): boolean {
 /** Does anything on screen justify the fast poll? */
 export function hasLiveRun(groups: TaskGroups | null): boolean {
   return (groups?.in_progress ?? []).some(isRunLive);
+}
+
+// ══ Day board ═══════════════════════════════════════════════
+//
+// The board holds the same tasks in a different shape: four day columns instead of
+// five status groups. So it needs its own reconciliation, and the rule it follows is
+// the one `belongsInView` already established for 我的一天 — patch IN PLACE, never
+// re-bucket locally.
+//
+// Re-bucketing would mean reimplementing the engine's `boardColumn` here: live status
+// beats a deadline, a manual pin beats a deadline, an overdue task rolls into today,
+// a completion only counts on the day it happened. Two implementations of that would
+// eventually disagree, and the visible symptom is a card in two columns or none.
+//
+// Every mutation in `page.tsx` already calls `refresh()` immediately afterwards, and
+// against a loopback engine that lands in a few milliseconds. So the optimistic patch
+// makes the VISIBLE property change instantly (the tick, the title, the badge) and
+// the refetch decides where the card lives.
+
+/**
+ * Recomputes a column's counts from its own tasks.
+ *
+ * The engine sends `done`/`total` describing the membership it sent. After a local
+ * patch those numbers are stale — ticking a card off would leave the progress bar
+ * claiming the old figure until the refetch — and they are derivable from the array
+ * in one pass, so they are never carried forward.
+ */
+function withCounts(col: BoardColumn): BoardColumn {
+  return {
+    ...col,
+    done: col.tasks.filter((t) => t.status === "done").length,
+    total: col.tasks.length,
+  };
+}
+
+/** The task with this id, wherever it sits. Null when the board has no such row. */
+export function findInBoard(board: BoardResponse | null, id: string): Task | null {
+  if (board === null) return null;
+  for (const col of board.columns) {
+    const hit = col.tasks.find((t) => t.id === id);
+    if (hit !== undefined) return hit;
+  }
+  return null;
+}
+
+/** Every task on the board, in column then row order. */
+export function boardTasks(board: BoardResponse | null): Task[] {
+  return board === null ? [] : board.columns.flatMap((col) => col.tasks);
+}
+
+/**
+ * Is a run live anywhere on the board? Drives the polling cadence.
+ *
+ * Same question `hasLiveRun` answers for the grouped views, and it has to be asked
+ * of whichever shape is on screen — a board view holding a running task would
+ * otherwise poll at the idle rate and take up to a minute to notice it finished.
+ */
+export function boardHasLiveRun(board: BoardResponse | null): boolean {
+  return boardTasks(board).some(isRunLive);
+}
+
+/**
+ * An optimistic local change to one task, in the column it already occupies.
+ *
+ * `updatedAt` is deliberately not guessed: the server owns it, and inventing a
+ * timestamp would show a task as touched at a moment nothing happened.
+ */
+export function patchInBoard(
+  board: BoardResponse | null,
+  id: string,
+  patch: Partial<
+    Pick<Task, "status" | "title" | "note" | "runId" | "needsKind" | "needsText" | "channelId" | "myDay" | "dueDate">
+  >,
+): BoardResponse | null {
+  if (board === null) return board;
+  if (findInBoard(board, id) === null) return board;
+
+  return {
+    ...board,
+    columns: board.columns.map((col) =>
+      col.tasks.some((t) => t.id === id)
+        ? withCounts({ ...col, tasks: col.tasks.map((t) => (t.id === id ? { ...t, ...patch } : t)) })
+        : col,
+    ),
+  };
+}
+
+/**
+ * The authoritative row, replacing whatever was guessed for that task.
+ *
+ * Also in place, for the same reason as the patch above. A task absent from the
+ * board is ignored rather than inserted: the engine decides membership, and a row
+ * the board does not hold is one this view is not showing.
+ */
+export function applyServerRowToBoard(
+  board: BoardResponse | null,
+  row: Task,
+): BoardResponse | null {
+  if (board === null) return board;
+  if (findInBoard(board, row.id) === null) return board;
+
+  return {
+    ...board,
+    columns: board.columns.map((col) =>
+      col.tasks.some((t) => t.id === row.id)
+        ? withCounts({ ...col, tasks: col.tasks.map((t) => (t.id === row.id ? row : t)) })
+        : col,
+    ),
+  };
+}
+
+/** Drops a task from the board, for an optimistic delete. */
+export function removeFromBoard(board: BoardResponse | null, id: string): BoardResponse | null {
+  if (board === null) return board;
+  if (findInBoard(board, id) === null) return board;
+
+  return {
+    ...board,
+    columns: board.columns.map((col) =>
+      col.tasks.some((t) => t.id === id)
+        ? withCounts({ ...col, tasks: col.tasks.filter((t) => t.id !== id) })
+        : col,
+    ),
+  };
+}
+
+/**
+ * Inserts a freshly created task into the column it was created for.
+ *
+ * The ONE place membership is decided locally, and it is safe because there is no
+ * inference: the per-column add button sets `dueDate` to that column's own date, so
+ * the caller already knows which column it asked for. Anything else — a card from
+ * chat, a card whose date the engine adjusted — arrives through the refetch.
+ */
+export function insertIntoBoard(
+  board: BoardResponse | null,
+  key: BoardColumn["key"],
+  task: Task,
+): BoardResponse | null {
+  if (board === null) return board;
+  // Already present: the refetch beat the optimistic insert. Inserting again would
+  // render it twice.
+  if (findInBoard(board, task.id) !== null) return board;
+
+  return {
+    ...board,
+    columns: board.columns.map((col) =>
+      col.key === key ? withCounts({ ...col, tasks: [...col.tasks, task] }) : col,
+    ),
+  };
+}
+
+/**
+ * A poll response, guarded against landing on top of a newer local change.
+ *
+ * Same contract as `applyPoll` for the grouped views: a response that went out
+ * before a local mutation describes a board that no longer exists, so it is dropped
+ * rather than reverting the click that raced it.
+ */
+export function applyBoardPoll(
+  current: BoardResponse | null,
+  incoming: BoardResponse,
+  requestedAt: number,
+  mutationsNow: number,
+): BoardResponse {
+  if (current !== null && requestedAt !== mutationsNow) return current;
+  return { ...incoming, columns: incoming.columns.map(withCounts) };
 }
