@@ -758,6 +758,18 @@ export default function Page() {
       });
   };
 
+  /*
+   * Bind (or unbind) the repository that makes a list's tasks dispatchable.
+   *
+   * Async and re-throwing, unlike the handlers around it: the engine validates the
+   * path, and the row's inline editor is where the rejected path is still sitting,
+   * so the error belongs there rather than in the global toast.
+   */
+  const bindRepo = async (id: string, repoPath: string | null): Promise<void> => {
+    await api.patchList(id, { repoPath });
+    await refresh();
+  };
+
   const archiveList = (id: string): void => {
     setLists((current) => current.filter((l) => l.id !== id));
     // Leave a view that is about to stop existing before the request lands. The
@@ -903,6 +915,7 @@ export default function Page() {
         onSelect={setView}
         onCreate={createList}
         onRename={renameList}
+        onBindRepo={bindRepo}
         onArchive={archiveList}
         onRestore={restoreList}
       />

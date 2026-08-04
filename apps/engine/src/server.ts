@@ -1542,6 +1542,16 @@ const ListPatch = z.object({
   name: z.string().min(1).max(120).optional(),
   color: z.string().max(32).nullable().optional(),
   archived: z.boolean().optional(),
+  /**
+   * Bind (or unbind, with null) the repository that makes this list's tasks
+   * dispatchable.
+   *
+   * Creation has accepted a repo since M6, but a list made without one — the
+   * inbox every install starts with — had no way to gain a repo later. The user's
+   * first collision with dispatch is exactly there: capture a few tasks, try to
+   * hand one to an agent, and find no affordance anywhere that explains why not.
+   */
+  repoPath: z.string().min(1).nullable().optional(),
 });
 
 app.patch("/api/lists/:id", async (c) => {
@@ -1556,8 +1566,38 @@ app.patch("/api/lists/:id", async (c) => {
   if (body.name !== undefined) patch.name = body.name.trim();
   if (body.color !== undefined) patch.color = body.color;
   if (body.archived !== undefined) patch.archivedAt = body.archived ? new Date().toISOString() : null;
+  if (body.repoPath !== undefined) {
+    if (body.repoPath === null) {
+      patch.projectId = null;
+    } else {
+      // Same validation and project reuse as creation: one project row per
+      // absolute path, whichever list bound it first.
+      const abs = resolve(body.repoPath);
+      if (!(await isGitRepo(abs))) {
+        return c.json({ error: `${abs} 不是 git 仓库。先在那里运行 git init。` }, 400);
+      }
+      const existing = store.listProjects().find((p) => resolve(p.repoPath) === abs);
+      if (existing) {
+        patch.projectId = existing.id;
+      } else {
+        const team = store.listTeams()[0] ?? store.createTeam("todoagent");
+        patch.projectId = store.createProject({
+          name: body.name?.trim() ?? list.name,
+          repoPath: abs,
+          teamId: team.id,
+        }).id;
+      }
+    }
+  }
   store.updateChannel(list.id, patch);
-  return c.json(store.getChannel(list.id));
+  const after = store.getChannel(list.id);
+  if (!after) return c.json({ error: "unknown list" }, 404);
+  // Same shape the collection endpoint serves: the caller that just bound a repo
+  // is about to re-render the dispatch affordance, and needs the path to do it.
+  return c.json({
+    ...after,
+    repoPath: after.projectId === null ? null : (store.getProject(after.projectId)?.repoPath ?? null),
+  });
 });
 
 /**

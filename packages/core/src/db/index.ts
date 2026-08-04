@@ -1038,12 +1038,13 @@ export class Store {
 
   updateChannel(
     id: string,
-    patch: Partial<Pick<Channel, "name" | "color" | "archivedAt">>,
+    patch: Partial<Pick<Channel, "name" | "color" | "archivedAt" | "projectId">>,
   ): void {
     const cols: Record<keyof typeof patch, string> = {
       name: "name",
       color: "color",
       archivedAt: "archived_at",
+      projectId: "project_id",
     };
     const sets: string[] = [];
     const vals: Array<string | null> = [];

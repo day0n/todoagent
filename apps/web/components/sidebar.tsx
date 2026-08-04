@@ -29,6 +29,7 @@ export function Sidebar({
   onSelect,
   onCreate,
   onRename,
+  onBindRepo,
   onArchive,
   onRestore,
 }: {
@@ -41,6 +42,8 @@ export function Sidebar({
   /** Rejects with the engine's message when the repo path is not a git repo. */
   onCreate: (input: { name: string; color: string | null; repoPath: string | null }) => Promise<void>;
   onRename: (id: string, name: string) => void;
+  /** Same contract as onCreate's repoPath: rejects with the engine's sentence. Null unbinds. */
+  onBindRepo: (id: string, repoPath: string | null) => Promise<void>;
   onArchive: (id: string) => void;
   onRestore: (id: string) => void;
 }) {
@@ -81,6 +84,7 @@ export function Sidebar({
             active={view === `list:${list.id}`}
             onSelect={() => onSelect(`list:${list.id}`)}
             onRename={(name) => onRename(list.id, name)}
+            onBindRepo={(repoPath) => onBindRepo(list.id, repoPath)}
             onArchive={() => onArchive(list.id)}
           />
         ))}
@@ -292,17 +296,23 @@ function ListRow({
   active,
   onSelect,
   onRename,
+  onBindRepo,
   onArchive,
 }: {
   list: TodoList;
   active: boolean;
   onSelect: () => void;
   onRename: (name: string) => void;
+  onBindRepo: (repoPath: string | null) => Promise<void>;
   onArchive: () => void;
 }) {
   const [menu, setMenu] = useState(false);
   const [renaming, setRenaming] = useState(false);
   const [draft, setDraft] = useState(list.name);
+  const [binding, setBinding] = useState(false);
+  const [repoDraft, setRepoDraft] = useState(list.repoPath ?? "");
+  const [repoError, setRepoError] = useState<string | null>(null);
+  const [repoBusy, setRepoBusy] = useState(false);
   const rowRef = useRef<HTMLDivElement>(null);
 
   // Dismiss the menu on an outside click or Escape. Without this it survives
@@ -353,6 +363,59 @@ function ListRow({
     );
   }
 
+  if (binding) {
+    /*
+     * Same inline pattern as renaming, but async: the engine validates the path,
+     * and a rejected path stays in the field where it gets corrected. Empty means
+     * unbind — no separate menu item for an action this rare.
+     */
+    const commitRepo = (): void => {
+      if (repoBusy) return;
+      const path = repoDraft.trim() === "" ? null : repoDraft.trim();
+      if (path === (list.repoPath ?? null)) {
+        setBinding(false);
+        return;
+      }
+      setRepoBusy(true);
+      setRepoError(null);
+      onBindRepo(path)
+        .then(() => {
+          setRepoBusy(false);
+          setBinding(false);
+        })
+        .catch((err: unknown) => {
+          setRepoBusy(false);
+          setRepoError(err instanceof Error ? err.message : String(err));
+        });
+    };
+    return (
+      <div className="srow bind">
+        <span className="swatch" style={{ background: list.color ?? DEFAULT_SWATCH }} />
+        <div className="bindbox">
+          <input
+            className="rename"
+            value={repoDraft}
+            autoFocus
+            placeholder="仓库路径（留空解绑）"
+            aria-label={`「${list.name}」的仓库路径`}
+            spellCheck={false}
+            disabled={repoBusy}
+            onChange={(e) => setRepoDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitRepo();
+              if (e.key === "Escape") setBinding(false);
+            }}
+          />
+          {repoError !== null ? (
+            <p className="err" role="alert">
+              {repoError}
+            </p>
+          ) : null}
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className={`srow${active ? " on" : ""}`} ref={rowRef}>
       <button
@@ -398,6 +461,18 @@ function ListRow({
             }}
           >
             重命名
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              setMenu(false);
+              setRepoDraft(list.repoPath ?? "");
+              setRepoError(null);
+              setBinding(true);
+            }}
+          >
+            {list.repoPath === null ? "绑定仓库…" : "改绑仓库…"}
           </button>
           <button
             type="button"

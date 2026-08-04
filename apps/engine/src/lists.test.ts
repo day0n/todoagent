@@ -227,6 +227,46 @@ test("lists: a repo-bound list refuses a non-repo path", async () => {
   }
 });
 
+test("lists: an existing list can gain a repository, and lose it again", async () => {
+  const f = await fixture();
+  // This repository itself is the handiest git repo the test can point at.
+  const repo = fileURLToPath(new URL("../../..", import.meta.url));
+  try {
+    await withEngine(f.dbPath, async () => {
+      // The inbox scenario: a list created without a repo cannot dispatch, and
+      // before this endpoint existed there was no way to change that in place.
+      const bad = await req("PATCH", `/api/lists/${f.listId}`, { repoPath: "/tmp" });
+      assert.equal(bad.status, 400, "a non-repo path is refused on PATCH like on POST");
+      assert.match((await json<{ error: string }>(bad)).error, /git/);
+
+      const bound = await json<{ repoPath: string | null }>(
+        await req("PATCH", `/api/lists/${f.listId}`, { repoPath: repo }),
+      );
+      assert.notEqual(bound.repoPath, null, "the response carries the bound path");
+
+      // The collection view agrees — this is what the sidebar actually reads.
+      const lists = await json<{ lists: Array<{ id: string; repoPath: string | null }> }>(
+        await req("GET", "/api/lists"),
+      );
+      const row = lists.lists.find((l) => l.id === f.listId);
+      assert.notEqual(row?.repoPath ?? null, null);
+
+      // Binding the same path twice must reuse the project row, not mint another.
+      const again = await json<{ repoPath: string | null }>(
+        await req("PATCH", `/api/lists/${f.listId}`, { repoPath: repo }),
+      );
+      assert.equal(again.repoPath, bound.repoPath);
+
+      const unbound = await json<{ repoPath: string | null }>(
+        await req("PATCH", `/api/lists/${f.listId}`, { repoPath: null }),
+      );
+      assert.equal(unbound.repoPath, null, "null unbinds");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
 // ── Quick add & the default list ────────────────────────────
 
 test("tasks: quick add without a list lands in 收件箱, created on demand", async () => {

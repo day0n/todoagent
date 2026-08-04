@@ -692,6 +692,28 @@
     color: var(--white);
   }
   /* Inline rename, sized to the row so the sidebar does not reflow while typing. */
+  /* The repo-binding editor: same row, but the engine's rejection message needs a
+     second line, so the fixed row height gives way. */
+  .srow.bind {
+    height: auto;
+    padding: 4px 8px;
+    align-items: flex-start;
+    cursor: default;
+  }
+  .srow.bind .swatch {
+    margin-top: 6px;
+  }
+  .srow.bind .bindbox {
+    flex: 1;
+    min-width: 0;
+  }
+  .srow.bind .err {
+    margin: 4px 2px 2px;
+    color: var(--color-bad);
+    font-size: 11.5px;
+    line-height: 1.45;
+  }
+
   .srow .rename {
     min-width: 0;
     flex: 1;

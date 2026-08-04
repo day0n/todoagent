@@ -203,15 +203,35 @@ async function main(): Promise<void> {
       bound = { name: list.name, repoPath: project.repoPath };
     }
 
+    // Re-read: the inbox may already carry a projectId from a prior UI bind /
+    // `pnpm seed <repo>`, and printing "不能派发" against that state is a lie.
+    const inboxNow = store.getChannel(inbox.id) ?? inbox;
+    const inboxRepo =
+      inboxNow.projectId === null
+        ? null
+        : (store.getProject(inboxNow.projectId)?.repoPath ?? null);
+
     console.log(`\n清单：`);
-    console.log(`  ${inbox.name.padEnd(16)} 纯待办，不能派发`);
-    if (bound !== null) {
+    if (inboxRepo !== null) {
+      console.log(`  ${inboxNow.name.padEnd(16)} → ${inboxRepo}`);
+    } else {
+      console.log(`  ${inboxNow.name.padEnd(16)} 纯待办，不能派发`);
+    }
+    if (bound !== null && (inboxRepo === null || resolve(inboxRepo) !== resolve(bound.repoPath))) {
       console.log(`  ${bound.name.padEnd(16)} → ${bound.repoPath}`);
+    }
+
+    const anyDispatchable =
+      inboxRepo !== null || bound !== null ||
+      store.listChannels().some(
+        (ch) => ch.kind === "channel" && ch.archivedAt === null && ch.projectId !== null,
+      );
+    if (anyDispatchable) {
       console.log(`\n清单已就绪。启动 pnpm dev 和 pnpm dev:web，去界面添加任务。`);
     } else {
       console.log(`\nagent 已就绪，但还没有能派发的清单。`);
       console.log(`要执行任务，重跑一次带仓库路径：pnpm seed <仓库路径>`);
-      console.log(`（也可以在界面上「新建清单」时填仓库路径。）`);
+      console.log(`（也可以在界面上「新建清单」时填仓库路径，或侧栏清单菜单 → 绑定仓库。）`);
     }
   } finally {
     store.close();

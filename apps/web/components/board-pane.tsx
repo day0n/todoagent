@@ -545,10 +545,28 @@ function CardAction({
   onStartAnswer: (task: Task) => void;
 }) {
   if (task.status === "todo") {
-    // No repository on the list means no working directory. Omitted rather than
-    // shown disabled: the reason lives on the list, and a dead button here could
-    // not explain itself.
-    if (!canDispatch) return null;
+    /*
+     * No repository on the list means no working directory. The button used to be
+     * omitted entirely on the grounds that a dead control cannot explain itself —
+     * and the first dogfooding session hit exactly the failure mode that reasoning
+     * produces: every card silently undispatchable, and nothing anywhere saying
+     * why. Now that a repo can be bound in place (清单菜单 → 绑定仓库), the button
+     * can stay and point at the fix.
+     */
+    if (!canDispatch) {
+      return (
+        <button
+          type="button"
+          className="act ghost"
+          title="清单未绑定仓库，不能派发"
+          onClick={() =>
+            window.alert("这个清单没有绑定仓库，任务无处执行。\n侧栏里打开清单菜单（⋯）→「绑定仓库…」，填一个 git 仓库路径后就能派发了。")
+          }
+        >
+          派发
+        </button>
+      );
+    }
     return (
       <button type="button" className="act" onClick={() => onDispatch(task)}>
         派发
@@ -581,7 +599,23 @@ function CardAction({
    * the wrong word for work that never started. Dispatching is what unsticks it.
    */
   if (task.runId === null) {
-    if (task.status !== "needs_you" || !canDispatch) return null;
+    if (task.status !== "needs_you") return null;
+    // Same story as the todo branch: a parked card on an unbound list still
+    // deserves a button that says what would unstick it.
+    if (!canDispatch) {
+      return (
+        <button
+          type="button"
+          className="act ghost"
+          title="清单未绑定仓库，不能派发"
+          onClick={() =>
+            window.alert("这个清单没有绑定仓库，任务无处执行。\n侧栏里打开清单菜单（⋯）→「绑定仓库…」，填一个 git 仓库路径后就能派发了。")
+          }
+        >
+          派发
+        </button>
+      );
+    }
     return (
       <button type="button" className="act" onClick={() => onDispatch(task)}>
         派发

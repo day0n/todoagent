@@ -155,10 +155,16 @@ export const api = {
   createList: (body: { name: string; color?: string | null; repoPath?: string | null }) =>
     req<TodoList>("/api/lists", { method: "POST", body: JSON.stringify(body) }),
 
-  /** Renames, recolours, or archives a list. Archiving keeps its tasks. */
+  /**
+   * Renames, recolours, archives, or (un)binds the repository of a list.
+   *
+   * `repoPath` gets the same engine-side validation as creation — a path that is
+   * not a git repository comes back as a 400 with a sentence to show. Null unbinds,
+   * which turns the list back into a pure to-do list whose tasks cannot dispatch.
+   */
   patchList: (
     id: string,
-    patch: { name?: string; color?: string | null; archived?: boolean },
+    patch: { name?: string; color?: string | null; archived?: boolean; repoPath?: string | null },
   ) => req<TodoList>(`/api/lists/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
 
   // ── Tasks ───────────────────────────────────────────────────
