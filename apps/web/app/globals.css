@@ -1985,11 +1985,13 @@
     color: var(--ink-3);
   }
 
-  /* ══ Chat pane ══════════════════════════════════════════════ */
+  /* ══ Secretary panel ════════════════════════════════════════
+     The right column, always present. Structure from opt-h2: a 54px header, the
+     needs-you context card, the message stream, a composer. */
 
   .chat {
     /*
-     * No fixed width: the shell's grid track owns it now (336px).
+     * No fixed width: the shell's grid track owns it (336px).
      *
      * It was `width: 360px` for the old flex body, which as a grid item in a 336px
      * track would overflow its own column and push the board.
@@ -1997,69 +1999,186 @@
     min-width: 0;
     display: flex;
     flex-direction: column;
-    border-left: 1px solid rgba(0, 0, 0, 0.055);
-    background: rgba(255, 255, 255, 0.78);
-    backdrop-filter: blur(28px) saturate(1.35);
-    -webkit-backdrop-filter: blur(28px) saturate(1.35);
-    box-shadow: inset 0.5px 0 0 rgba(255, 255, 255, 0.7);
+    background: var(--white);
+    box-shadow: -1px 0 0 var(--line);
   }
+
+  /*
+   * The header, now a single 54px row.
+   *
+   * It was a 100px-tall centred column with a 46px avatar, which is why the three
+   * top bars did not line up — the whole point of `--head-h` is that this one
+   * matches the sidebar's and the board's to the pixel.
+   */
   .chead {
-    padding: 25px 20px 17px;
+    height: var(--head-h);
+    flex-shrink: 0;
+    padding: 0 14px;
     display: flex;
-    flex-direction: column;
     align-items: center;
-    gap: 6px;
-    border-bottom: 0.5px solid var(--line);
+    gap: 10px;
+    box-shadow: 0 1px 0 var(--line);
   }
-  .chead .face {
-    width: 46px;
-    height: 46px;
+  /* A drawn mark rather than an image: no asset to load, crisp at any density, and
+     it matches the sidebar's brand square so the two read as one product. */
+  .chat-mark {
+    width: 26px;
+    height: 26px;
+    flex-shrink: 0;
     position: relative;
-    display: grid;
-    place-items: center;
-    border-radius: 50%;
-    border: 0.5px solid rgba(0, 0, 0, 0.07);
-    background: rgba(255, 255, 255, 0.86);
+    border-radius: var(--r-xs);
+    background: linear-gradient(160deg, #3a3a3e, var(--ink));
     box-shadow:
-      inset 0 0.5px 0 rgba(255, 255, 255, 0.95),
-      0 1px 3px rgba(0, 0, 0, 0.07),
-      0 9px 24px rgba(0, 0, 0, 0.07);
+      inset 0 0.5px 0 rgba(255, 255, 255, 0.28),
+      0 1px 2px rgba(0, 0, 0, 0.14);
   }
-  .chead .face::before {
+  /* A speech mark, in two rules. */
+  .chat-mark::before {
     content: "";
-    width: 20px;
-    height: 20px;
-    background: var(--accent);
-    clip-path: polygon(50% 0%, 61% 37%, 100% 50%, 61% 63%, 50% 100%, 39% 63%, 0% 50%, 39% 37%);
-  }
-  .chead .face::after {
-    content: "";
-    width: 7px;
-    height: 7px;
     position: absolute;
-    top: 9px;
-    right: 8px;
-    background: #8e8e93;
-    clip-path: polygon(50% 0%, 61% 37%, 100% 50%, 61% 63%, 50% 100%, 39% 63%, 0% 50%, 39% 37%);
+    left: 6px;
+    top: 8px;
+    width: 14px;
+    height: 8px;
+    border-radius: 2px 2px 2px 0;
+    background: rgba(255, 255, 255, 0.9);
   }
-  .chead .t {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    font-weight: 600;
+  .chat-mark::after {
+    content: "";
+    position: absolute;
+    left: 6px;
+    top: 16px;
+    width: 4px;
+    height: 4px;
+    background: rgba(255, 255, 255, 0.9);
+    clip-path: polygon(0 0, 100% 0, 0 100%);
   }
-  .chead .t i {
-    width: 7px;
-    height: 7px;
-    border-radius: 50%;
-    background: #636366;
+  .chead-id {
+    min-width: 0;
+    flex: 1;
   }
-  .chead .s {
+  .chead-id .name {
+    color: var(--ink);
+    font-size: 13.5px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+  .chead-id .sub {
+    overflow: hidden;
     color: var(--ink-3);
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
+  /*
+   * Online state as a dot.
+   *
+   * Green is the one place a third hue is justified: this is a liveness indicator,
+   * not product state, and `--color-ok` already exists for exactly that meaning.
+   * Grey when unconfigured — the reason is spelled out in the banner below, so
+   * repeating it here would push the model name out of the header.
+   */
+  .dot-live {
+    width: 8px;
+    height: 8px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--ink-4);
+    box-shadow: 0 0 0 3px var(--fill);
+  }
+  .dot-live.on {
+    background: var(--color-ok);
+    box-shadow: 0 0 0 3px var(--color-ok-soft);
+  }
+
+  /* ── Context card ───────────────────────────────────────────
+     What is waiting on you, pinned above the conversation. Not part of the stream:
+     it is the state of the board, and it stays put while you scroll history. */
+  .ctx {
+    margin-bottom: 14px;
+    padding: 11px 12px;
+    border-radius: var(--r-lg);
+    background: var(--color-warn-soft);
+    box-shadow:
+      0 0 0 1px rgba(154, 91, 0, 0.28),
+      0 1px 3px rgba(154, 91, 0, 0.08);
+  }
+  .ctx .k {
+    margin-bottom: 4px;
+    color: var(--color-warn);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+  }
+  .ctx .t {
+    color: var(--ink);
+    font-size: 13.5px;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+    line-height: 1.35;
+    overflow-wrap: anywhere;
+  }
+  .ctx .q {
+    margin: 5px 0 0;
+    color: var(--ink-2);
+    font-size: 12.5px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+  .ctx .acts {
+    margin-top: 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .ctx button {
+    height: 28px;
+    padding: 0 11px;
+    flex-shrink: 0;
+    border: 0;
+    border-radius: var(--r-sm);
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    font-weight: 600;
+    transition:
+      background 0.14s ease,
+      transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .ctx button:active {
+    transform: scale(0.97);
+  }
+  /* Ink, not the accent: the accent is spent on live state elsewhere, and white on
+     `--accent` measures 4.02:1, which fails AA at this size. */
+  .ctx .yes {
+    background: var(--ink);
+    color: var(--white);
+    box-shadow: 0 1px 2px rgba(20, 22, 26, 0.22);
+  }
+  .ctx .yes:hover {
+    background: #000;
+  }
+  .ctx .no {
+    background: var(--white);
+    color: var(--ink);
+    box-shadow: 0 0 0 1px var(--line-strong);
+  }
+  .ctx .no:hover {
+    background: var(--side-bg);
+  }
+  /* The overflow counter, quietest of the three. */
+  .ctx .more {
+    margin-left: auto;
+    padding: 0 4px;
+    background: transparent;
+    color: var(--color-warn);
+    font-size: 11.5px;
+  }
+  .ctx .more:hover {
+    text-decoration: underline;
+  }
+
   .cbody {
     flex: 1;
     overflow-y: auto;
@@ -2068,7 +2187,7 @@
     flex-direction: column;
     gap: 5px;
   }
-  .stamp {
+  .day-sep {
     margin: 6px 0 10px;
     color: var(--ink-3);
     font-size: 10.5px;
@@ -2198,12 +2317,6 @@
     line-height: 1.55;
     overflow-wrap: anywhere;
   }
-  .chead .t i.on {
-    background: #34c759;
-  }
-  .cinput.busy {
-    opacity: 0.65;
-  }
   /* Waiting for the main agent (M4). Centred rather than a bubble, so it reads as
      the pane's state and not as something an agent said. */
   .cempty {
@@ -2214,40 +2327,54 @@
     line-height: 1.6;
     text-align: center;
   }
-  .cinput-wrap {
-    padding: 11px 16px 20px;
+  /* ── Composer ───────────────────────────────────────────────
+     A textarea rather than an input: Shift+Enter has to insert a line, which an
+     `<input>` cannot do at all. */
+  .composer {
+    flex-shrink: 0;
+    padding: 10px 12px 12px;
+    box-shadow: 0 -1px 0 var(--line);
   }
-  .cinput {
-    height: 44px;
-    padding: 0 6px 0 16px;
+  .composer-box {
+    padding: 7px 7px 7px 11px;
     display: flex;
-    align-items: center;
+    align-items: flex-end;
     gap: 8px;
-    border: 1px solid rgba(0, 0, 0, 0.11);
-    border-radius: 999px;
-    background: var(--card);
+    border-radius: var(--r-lg);
+    background: var(--fill);
     transition:
-      border-color 0.12s ease,
+      background 0.12s ease,
       box-shadow 0.12s ease;
   }
-  .cinput:focus-within {
-    border-color: var(--accent);
-    box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.1);
+  .composer-box:focus-within {
+    background: var(--white);
+    box-shadow: 0 0 0 1.5px var(--accent);
   }
-  .cinput input {
+  .composer-box.busy {
+    opacity: 0.6;
+  }
+  .composer-box textarea {
     flex: 1;
     min-width: 0;
+    /* Grows to four lines, then scrolls. A composer that grows without limit pushes
+       the conversation off screen while you type. */
+    min-height: 20px;
+    max-height: 76px;
     border: 0;
     outline: 0;
     background: transparent;
-    font-size: 13.5px;
+    color: var(--ink);
+    font: inherit;
+    font-size: 13px;
+    line-height: 1.45;
+    resize: none;
   }
-  .cinput input::placeholder {
+  .composer-box textarea::placeholder {
     color: var(--ink-3);
   }
-  .cinput .send {
-    width: 32px;
-    height: 32px;
+  .composer-box .send {
+    width: 28px;
+    height: 28px;
     flex-shrink: 0;
     display: grid;
     place-items: center;
@@ -2256,31 +2383,61 @@
     background: var(--accent);
     cursor: pointer;
     transition:
-      transform 0.18s cubic-bezier(0.2, 0.8, 0.2, 1),
-      opacity 0.18s ease;
+      background 0.14s ease,
+      opacity 0.14s ease,
+      transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
   }
-  .cinput .send:active {
-    transform: scale(0.92);
-    opacity: 0.78;
-  }
-  .cinput .send:hover {
+  .composer-box .send:hover:not(:disabled) {
     background: var(--accent-pressed);
   }
-  .cinput .send svg {
+  .composer-box .send:active:not(:disabled) {
+    transform: scale(0.92);
+  }
+  .composer-box .send:disabled {
+    background: var(--ink-4);
+    cursor: not-allowed;
+  }
+  .composer-box .send svg {
     width: 13px;
     height: 13px;
     fill: none;
     stroke: var(--white);
     stroke-width: 2.4;
   }
-  /* Disabled until M4 wires the main agent. Stated plainly rather than hidden:
-     the pane is the product's promise, and an empty space would not say so. */
-  .cinput.off {
-    opacity: 0.6;
+  .composer-hint {
+    margin-top: 6px;
+    color: var(--ink-3);
+    font-size: 10.5px;
+    text-align: center;
   }
-  .cinput.off .send {
-    background: #c7c7cc;
-    cursor: not-allowed;
+
+  /* ── Quick commands ─────────────────────────────────────────
+     Three sentences the secretary's existing tools can already act on. Shortcuts
+     for typing, not a second command surface. */
+  .quick-chip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .quick-chip button {
+    padding: 5px 10px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--white);
+    color: var(--ink-2);
+    cursor: pointer;
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 600;
+    box-shadow: 0 0 0 1px var(--line);
+    transition:
+      background 0.14s ease,
+      color 0.14s ease;
+  }
+  .quick-chip button:hover {
+    background: var(--accent-tint);
+    color: var(--accent-text);
+    box-shadow: 0 0 0 1px var(--accent-line);
   }
 
   /* ══ Result drawer ══════════════════════════════════════════

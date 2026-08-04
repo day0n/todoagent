@@ -127,6 +127,15 @@ export default function Page() {
    * seconds and leaves the false sentence sitting there.
    */
   const [loadError, setLoadError] = useState<string | null>(null);
+  /*
+   * Tasks parked in 需要你, for the secretary panel's context card.
+   *
+   * Fetched separately from the view, because a task waiting on you is waiting
+   * whichever view is open — and the board is only loaded for 我的一天. Without this
+   * the card would vanish the moment you clicked into a list, which is precisely
+   * when a reminder is most useful.
+   */
+  const [needsTasks, setNeedsTasks] = useState<Task[]>([]);
 
   // Loaded once: none of these change while the app is open. Runtimes are what
   // the machine has installed; experts are configured on /team.
@@ -259,23 +268,93 @@ export default function Page() {
     setChat(await api.chatHistory());
   }, []);
 
+  /*
+   * Four independent requests, deliberately NOT bundled in one `Promise.all`.
+   *
+   * They were, and the cost was measured: `/api/runtimes` takes 15 seconds because it
+   * spawns every installed CLI to read its version, while `/api/chat/status` answers
+   * in 39ms. Bundled, the fast three waited for the slow one — so for the first ~15
+   * seconds after every load the secretary header showed "未检测到 CLI" with a grey
+   * offline dot on a machine with six CLIs installed and the model live.
+   *
+   * That is not a slow render, it is a false statement with a tooltip on it. Split,
+   * each lands when it lands: the panel is correct immediately and the agent count
+   * fills in when the probe finishes.
+   *
+   * Each also gets its own failure handling now, which the shared `.catch` could not
+   * do — it reset the chat history whenever the runtime probe failed, for reasons
+   * that had nothing to do with the conversation.
+   */
   useEffect(() => {
-    void Promise.all([api.runtimes(), api.experts(), api.chatHistory(), api.chatStatus()])
-      .then(([rt, ex, history, status]) => {
+    // Slow: spawns each CLI. Only feeds the agent count and the fallback subtitle.
+    void api
+      .runtimes()
+      .then((rt) => {
         setRuntimeNames(rt.detected.map((d) => d.kind));
         setRuntimeCount(rt.detected.length);
-        setExperts(ex);
-        setChat(history);
-        setChatStatus(status);
       })
-      // A missing runtime list degrades the subtitle and the chat header; it is
-      // not worth a toast over, and the task list works regardless.
+      .catch(() => undefined);
+
+    // Needed by `executorFor` to name who is running a task.
+    void api
+      .experts()
+      .then(setExperts)
+      .catch(() => undefined);
+
+    /*
+     * The empty fallback matters here specifically: the panel distinguishes "no
+     * messages yet" from "still loading" by whether this is null, so a failed fetch
+     * has to resolve to an empty history or the stream never renders its prompt.
+     */
+    void api
+      .chatHistory()
+      .then(setChat)
       .catch(() => setChat({ messages: [], tasks: {} }));
+
+    // Left null on failure, which the panel reads as "still asking" — better than
+    // asserting the secretary is offline because one request did not arrive.
+    void api
+      .chatStatus()
+      .then(setChatStatus)
+      .catch(() => undefined);
 
     // Its own request, and its own failure: an empty archived section is the
     // normal case, so a failure here must not disturb the task list.
     void loadArchived().catch(() => undefined);
   }, [loadArchived]);
+
+  /*
+   * Re-reads the parked tasks when how many there are changes.
+   *
+   * Keyed on `counts.needs` rather than folded into `refresh`: the count arrives with
+   * every poll anyway, and fetching the full rows on each tick would be a second
+   * request every few seconds to render a card that is usually absent. At zero it
+   * skips the request entirely.
+   *
+   * KNOWN GAP: if the count stays equal while membership changes — one task answered
+   * and another parked between two polls — the card shows the old pair until the next
+   * time the count moves. Accepted rather than papered over with a poll-rate refetch,
+   * because the window is seconds and the failure is a stale title, not a wrong action:
+   * every button on the card addresses the task by id.
+   */
+  useEffect(() => {
+    if (counts.needs === 0) {
+      setNeedsTasks([]);
+      return;
+    }
+    let alive = true;
+    void api
+      .tasks("needs")
+      .then((res) => {
+        if (alive) setNeedsTasks(res.groups.needs_you);
+      })
+      // A failed fetch leaves the card absent, which is the honest degradation: the
+      // sidebar's dot still says something is waiting.
+      .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, [counts.needs]);
 
   /*
    * The invalidation stream: "something changed, re-read it".
@@ -778,6 +857,21 @@ export default function Page() {
 
   const rowOps = { onMove: moveTask, onToggleMyDay: toggleMyDay, onSetDue: setDue };
 
+  /**
+   * Answering from the secretary panel.
+   *
+   * Switches to 我的一天 first, and that is not a convenience: the answer bar lives
+   * inside the task's own card, and a parked task always sits in the board's today
+   * column (live status outranks its deadline in `boardColumn`). From a list view the
+   * card may not be rendered at all, so opening the bar without switching would focus
+   * nothing and look broken.
+   */
+  const answerFromPanel = (task: Task): void => {
+    setView("today");
+    setDrawerTaskId(null);
+    setAnsweringId(task.id);
+  };
+
   const answerControls = {
     activeId: answeringId,
     onStart: (t: Task) => {
@@ -879,6 +973,8 @@ export default function Page() {
             await loadChat().catch(() => undefined);
           }
         }}
+        needsTasks={needsTasks}
+        onAnswer={answerFromPanel}
         onOpenTask={(t) => setView(`list:${t.channelId}`)}
       />
       </div>
