@@ -320,16 +320,43 @@ CREATE INDEX IF NOT EXISTS idx_task_channel ON task (channel_id, status);
 
 -- ── Main-agent conversation ─────────────────────────────────
 --
--- A single timeline, not per-channel: the main agent is one assistant for the
--- whole workspace. Same AUTOINCREMENT reasoning as `message`.
+-- Many independent threads with the same assistant, not one global timeline —
+-- a `chat_session` row per thread, the way multiple ChatGPT conversations sit
+-- side by side. Same AUTOINCREMENT reasoning as `message` for the row order.
+
+CREATE TABLE IF NOT EXISTS chat_session (
+  id              TEXT PRIMARY KEY,
+  title           TEXT NOT NULL DEFAULT '',
+  -- The pi SDK's own JSONL session file backing this thread's model context.
+  -- NULL until the first turn actually runs and pi assigns one.
+  pi_session_path TEXT,
+  created_at      TEXT NOT NULL,
+  -- Bumped on every message so the sidebar can sort by "most recently active"
+  -- rather than by creation order.
+  updated_at      TEXT NOT NULL,
+  -- Archived threads keep their messages but leave the switcher's default list.
+  archived_at     TEXT
+);
 
 CREATE TABLE IF NOT EXISTS agent_chat (
-  seq        INTEGER PRIMARY KEY AUTOINCREMENT,
-  id         TEXT NOT NULL UNIQUE,
+  seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+  id           TEXT NOT NULL UNIQUE,
+  session_id   TEXT,
   -- 'user' | 'agent'
-  role       TEXT NOT NULL,
-  body       TEXT NOT NULL,
+  role         TEXT NOT NULL,
+  body         TEXT NOT NULL,
   -- JSON array of task ids this message created or referenced, for inline cards.
-  task_refs  TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL
+  task_refs    TEXT NOT NULL DEFAULT '[]',
+  -- JSON array of {id, mediaType, url, width?, height?} — images sent with the
+  -- message. Stored on the row rather than a side table because a chat message
+  -- never has more than a handful and nothing needs to query attachments
+  -- independently of the message they arrived on.
+  attachments  TEXT NOT NULL DEFAULT '[]',
+  created_at   TEXT NOT NULL
 );
+
+-- Not `CREATE INDEX IF NOT EXISTS` here: on a database that predates
+-- `session_id`, this would run before `migrate()`'s ALTER TABLE adds the
+-- column and fail with "no such column". `Store.migrate()` creates it once
+-- the column is guaranteed to exist, covering both the fresh-database and
+-- upgraded-database cases.

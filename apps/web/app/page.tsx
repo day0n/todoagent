@@ -7,6 +7,7 @@ import type {
   BoardColumn,
   BoardResponse,
   ChatHistory,
+  ChatSession,
   ChatStatus,
   Expert,
   Task,
@@ -67,6 +68,9 @@ const POLL_BACKSTOP_MS = 60_000;
 const POLL_FAST_MS = 4_000;
 /** No stream, nothing running. */
 const POLL_IDLE_MS = 15_000;
+
+/** Remembers the open conversation across a reload — a browser tab, not a login. */
+const CHAT_SESSION_STORAGE_KEY = "todoagent.chat.sessionId";
 
 export default function Page() {
   const [view, setView] = useState<ViewKey>("today");
@@ -139,12 +143,44 @@ export default function Page() {
 
   // Loaded once: none of these change while the app is open. Runtimes are what
   // the machine has installed; experts are configured on /team.
-  const [runtimeNames, setRuntimeNames] = useState<string[]>([]);
   const [runtimeCount, setRuntimeCount] = useState<number | null>(null);
   const [experts, setExperts] = useState<Expert[]>([]);
   const [chat, setChat] = useState<ChatHistory | null>(null);
   const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
-  const [thinking, setThinking] = useState(false);
+  /*
+   * Every open (unarchived) conversation with the secretary, and which one is
+   * showing.
+   *
+   * `activeSessionId` starts from localStorage rather than null, so a reload
+   * lands back on the thread that was open — the same reasoning `view` would
+   * get if it persisted, applied to the one piece of chat state that a person
+   * actually expects to survive a refresh.
+   */
+  const [sessions, setSessions] = useState<ChatSession[]>([]);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(() =>
+    typeof window === "undefined" ? null : window.localStorage.getItem(CHAT_SESSION_STORAGE_KEY),
+  );
+  /** Threads with a turn in flight, this tab's active one included. Drives the switcher's dots. */
+  const [busySessionIds, setBusySessionIds] = useState<Set<string>>(new Set());
+  /*
+   * The active session's in-flight reply, or null when nothing is streaming
+   * IN THIS THREAD right now.
+   *
+   * `text: null` is the three-dot state (thinking, no delta yet); once set it
+   * only ever grows. Deliberately NOT kept per-session — switching away from a
+   * streaming thread drops it, per the panel's contract of never rendering a
+   * background thread's tokens, only a dot in the switcher (`busySessionIds`).
+   * Cleared exclusively once the turn's `chat:message` has been folded into
+   * `chat`, never by the `chat:thinking off` frame that follows it — that frame
+   * can arrive before the history refetch resolves, and clearing on it would
+   * flash the three dots back on over what is already the final bubble.
+   */
+  const [pendingReply, setPendingReply] = useState<{ sessionId: string; text: string } | null>(null);
+  /** Read inside the SSE handler, which must not resubscribe on every session switch. */
+  const activeSessionIdRef = useRef<string | null>(activeSessionId);
+  useEffect(() => {
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   /*
    * Counts local changes, so a poll that went out before one can be recognised as
@@ -263,10 +299,35 @@ export default function Page() {
     };
   }, [refresh, showError]);
 
-  /** Re-reads the conversation; the SSE `chat:message` signal calls this. */
-  const loadChat = useCallback(async (): Promise<void> => {
-    setChat(await api.chatHistory());
+  /** Re-reads one thread's conversation; the SSE `chat:message` signal calls this. */
+  const loadChat = useCallback(async (sessionId: string): Promise<void> => {
+    setChat(await api.chatHistory(sessionId));
   }, []);
+
+  /** Remembers the open thread across reloads. */
+  useEffect(() => {
+    if (activeSessionId === null) return;
+    window.localStorage.setItem(CHAT_SESSION_STORAGE_KEY, activeSessionId);
+  }, [activeSessionId]);
+
+  /*
+   * Load the active thread whenever it changes.
+   *
+   * Switching drops any in-flight preview for the thread just left — background
+   * streaming keeps only a busy dot in the switcher, never another thread's
+   * tokens in the stream (see `pendingReply` above).
+   */
+  useEffect(() => {
+    if (activeSessionId === null) return;
+    let alive = true;
+    setPendingReply(null);
+    void loadChat(activeSessionId).catch(() => {
+      if (alive) setChat({ sessionId: activeSessionId, messages: [], tasks: {} });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [activeSessionId, loadChat]);
 
   /*
    * Four independent requests, deliberately NOT bundled in one `Promise.all`.
@@ -290,7 +351,6 @@ export default function Page() {
     void api
       .runtimes()
       .then((rt) => {
-        setRuntimeNames(rt.detected.map((d) => d.kind));
         setRuntimeCount(rt.detected.length);
       })
       .catch(() => undefined);
@@ -302,14 +362,31 @@ export default function Page() {
       .catch(() => undefined);
 
     /*
-     * The empty fallback matters here specifically: the panel distinguishes "no
-     * messages yet" from "still loading" by whether this is null, so a failed fetch
-     * has to resolve to an empty history or the stream never renders its prompt.
+     * Sessions first, then pick a thread. History loading is owned by the
+     * `activeSessionId` effect above — this only decides WHICH id that effect
+     * should be watching, including minting the lazy default when the store is
+     * empty and rejecting a remembered id that has since been archived.
      */
-    void api
-      .chatHistory()
-      .then(setChat)
-      .catch(() => setChat({ messages: [], tasks: {} }));
+    void (async () => {
+      try {
+        let list = await api.chatSessions();
+        if (list.length === 0) {
+          list = [await api.createChatSession("默认会话")];
+        }
+        setSessions(list);
+        const remembered = activeSessionIdRef.current;
+        const pick =
+          remembered !== null && list.some((s) => s.id === remembered)
+            ? remembered
+            : list[0]!.id;
+        setActiveSessionId(pick);
+      } catch {
+        // Same contract as the old single-thread fallback: null means "still
+        // loading", so a failed probe must resolve to an empty history or the
+        // stream never renders its prompt.
+        setChat({ sessionId: "", messages: [], tasks: {} });
+      }
+    })();
 
     // Left null on failure, which the panel reads as "still asking" — better than
     // asserting the secretary is offline because one request did not arrive.
@@ -380,8 +457,39 @@ export default function Page() {
         },
         (ok) => setStreamOk(ok),
         (ev) => {
-          if (ev.type === "chat:message") void loadChat().catch(() => undefined);
-          else setThinking(ev.on);
+          if (ev.type === "chat:thinking") {
+            setBusySessionIds((cur) => {
+              const next = new Set(cur);
+              if (ev.on) next.add(ev.sessionId);
+              else next.delete(ev.sessionId);
+              return next;
+            });
+            return;
+          }
+          if (ev.type === "chat:delta") {
+            // Only the active thread renders tokens; a background turn keeps
+            // its busy dot and nothing else.
+            if (ev.sessionId !== activeSessionIdRef.current) return;
+            setPendingReply((cur) => {
+              if (cur === null || cur.sessionId !== ev.sessionId) {
+                return { sessionId: ev.sessionId, text: ev.text };
+              }
+              return { sessionId: ev.sessionId, text: cur.text + ev.text };
+            });
+            return;
+          }
+          // chat:message — fold the persisted turn in, THEN drop the preview.
+          // Clearing on thinking-off would flash the three dots back on while
+          // the history refetch is still in flight.
+          if (ev.sessionId === activeSessionIdRef.current) {
+            void loadChat(ev.sessionId)
+              .then(() => {
+                setPendingReply((cur) => (cur?.sessionId === ev.sessionId ? null : cur));
+              })
+              .catch(() => undefined);
+          }
+          // updatedAt (and maybe an auto-title) moved; keep the switcher honest.
+          void api.chatSessions().then(setSessions).catch(() => undefined);
         },
       );
     };
@@ -823,6 +931,16 @@ export default function Page() {
             ? "已完成"
             : (activeList?.name ?? "清单");
 
+  /** Three-dot state for the open thread; a background turn only lights its switcher dot. */
+  const thinking = activeSessionId !== null && busySessionIds.has(activeSessionId);
+  /** Growing bubble for the open thread, or null until the first delta arrives. */
+  const live =
+    pendingReply !== null &&
+    pendingReply.sessionId === activeSessionId &&
+    pendingReply.text.length > 0
+      ? pendingReply.text
+      : null;
+
   /** Who is executing a task, by name. Null when nothing can be resolved. */
   const executorFor = (task: Task): string | null => {
     if (task.assigneeKind !== "expert" || task.assigneeId === null) return null;
@@ -869,21 +987,19 @@ export default function Page() {
 
   const rowOps = { onMove: moveTask, onToggleMyDay: toggleMyDay, onSetDue: setDue };
 
-  /**
-   * Answering from the secretary panel.
+  /*
+   * Answering, from wherever the question was seen.
    *
-   * Switches to 我的一天 first, and that is not a convenience: the answer bar lives
-   * inside the task's own card, and a parked task always sits in the board's today
-   * column (live status outranks its deadline in `boardColumn`). From a list view the
-   * card may not be rendered at all, so opening the bar without switching would focus
-   * nothing and look broken.
+   * There used to be a `answerFromPanel` here that switched to 我的一天 before
+   * opening the bar — it had to, because the only answer field lived inside the
+   * task's own card, and from a list view that card might not be rendered at all.
+   * A button whose job is "teleport you elsewhere, then reveal an input" was the
+   * symptom of the field belonging to the wrong thing.
+   *
+   * Now the secretary's composer is the answer field (bound via `activeId`), and the
+   * card's own bar only exists below 1050px where that panel is hidden. One piece of
+   * state drives both, so they can never both be open.
    */
-  const answerFromPanel = (task: Task): void => {
-    setView("today");
-    setDrawerTaskId(null);
-    setAnsweringId(task.id);
-  };
-
   const answerControls = {
     activeId: answeringId,
     onStart: (t: Task) => {
@@ -974,21 +1090,71 @@ export default function Page() {
         history={chat}
         status={chatStatus}
         thinking={thinking}
-        runtimeNames={runtimeNames}
-        onSend={async (body) => {
+        live={live}
+        sessions={sessions}
+        activeSessionId={activeSessionId}
+        busySessionIds={busySessionIds}
+        onSend={async (body, images) => {
+          if (activeSessionId === null) return;
           try {
-            await api.chatSend(body);
+            await api.chatSend(activeSessionId, body, images);
           } catch (err) {
             showError(err);
           } finally {
             // The stream usually beat us to it; this covers a dropped stream and
             // the error path, where the engine records the failure as a message.
-            await loadChat().catch(() => undefined);
+            await loadChat(activeSessionId).catch(() => undefined);
+            setPendingReply((cur) => (cur?.sessionId === activeSessionId ? null : cur));
+            void api.chatSessions().then(setSessions).catch(() => undefined);
           }
         }}
         needsTasks={needsTasks}
-        onAnswer={answerFromPanel}
+        answer={answerControls}
         onOpenTask={(t) => setView(`list:${t.channelId}`)}
+        onSelectSession={(id) => setActiveSessionId(id)}
+        onCreateSession={() => {
+          void api
+            .createChatSession()
+            .then((s) => {
+              setSessions((cur) => [s, ...cur]);
+              setActiveSessionId(s.id);
+            })
+            .catch(showError);
+        }}
+        onRenameSession={(id, nextTitle) => {
+          void api
+            .patchChatSession(id, { title: nextTitle })
+            .then((s) => {
+              setSessions((cur) => cur.map((row) => (row.id === id ? s : row)));
+            })
+            .catch(showError);
+        }}
+        onArchiveSession={(id) => {
+          void api
+            .patchChatSession(id, { archived: true })
+            .then(() => {
+              setSessions((cur) => {
+                const next = cur.filter((row) => row.id !== id);
+                if (activeSessionIdRef.current === id) {
+                  // Always leave the user on SOME thread. An empty switcher would
+                  // make the composer a dead end; mint a fresh one if needed.
+                  if (next.length === 0) {
+                    void api
+                      .createChatSession("默认会话")
+                      .then((s) => {
+                        setSessions([s]);
+                        setActiveSessionId(s.id);
+                      })
+                      .catch(showError);
+                  } else {
+                    setActiveSessionId(next[0]!.id);
+                  }
+                }
+                return next;
+              });
+            })
+            .catch(showError);
+        }}
       />
       </div>
 

@@ -150,16 +150,22 @@ const RULES = [
   },
   {
     /*
-     * The needs-you dot survives, repositioned. It is the one signal that still
-     * has to be visible once there is no label for it to sit beside.
+     * The parked-work dots survive, repositioned. They are the one signal that still
+     * has to be visible once there is no label for them to sit beside.
      *
-     * Anchored on the selector alone: the minifier reorders this rule's properties
-     * (`margin:0;position:absolute;top:5px;right:12px`), so a needle carrying any
-     * declaration would match by luck rather than by contract.
+     * The GROUP is what gets anchored, and that is the contract: there are two dots
+     * now (asking / broken), and absolutely positioning each one would stack them at
+     * identical coordinates so that only the last would be visible. Pinning
+     * `.dot-badge` here — as this needle did while 需要你 was a single aggregate row —
+     * would pass on exactly that bug.
+     *
+     * Selector only, no declaration: the minifier reorders this rule's properties
+     * (`margin:0;position:absolute;top:5px;right:10px`), so a needle carrying one
+     * would match by luck rather than by contract.
      */
-    decl: ".srow .dot-badge{",
+    decl: ".srow .pdots{",
     inside: "@media (max-width:720px)",
-    what: "needs-you dot repositioned, not dropped",
+    what: "parked dots repositioned, not dropped",
   },
   {
     // The calendar and the new-list form have no icon to fall back on: a month

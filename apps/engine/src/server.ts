@@ -1,5 +1,6 @@
-import { tmpdir } from "node:os";
-import { resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono, type Context, type Next } from "hono";
 import { cors } from "hono/cors";
@@ -12,6 +13,7 @@ import {
   deliverMessage,
   detectAll,
   isGitRepo,
+  newId,
   recordEvent,
   resolveEscalationAndContinue,
   runDirect,
@@ -22,6 +24,7 @@ import {
   EXPERT_ROLES,
   RUNTIME_KINDS,
   TASK_STATUSES,
+  type AgentChatAttachment,
   type Channel,
   type Expert,
   type Run,
@@ -45,6 +48,57 @@ installProxyDispatcher();
 const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());
 const app = new Hono();
+
+// ── Chat image uploads ───────────────────────────────────────
+//
+// Stored on disk rather than in SQLite: chat images can run into the
+// megabytes, and `agent_chat` already holds the full conversation history in
+// one table — inlining binary blobs there would make every unrelated read of
+// that table (history, backfill, migration) drag them along.
+
+function defaultUploadsDir(): string {
+  const home = process.env["HOME"] ?? homedir();
+  return process.env["TODOAGENT_UPLOADS_DIR"] ?? join(home, ".todoagent", "uploads");
+}
+const uploadsDir = defaultUploadsDir();
+mkdirSync(uploadsDir, { recursive: true });
+
+const UPLOAD_MEDIA_EXT: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+  "image/gif": "gif",
+};
+const UPLOAD_EXT_CONTENT_TYPE: Record<string, string> = {
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+  gif: "image/gif",
+};
+// The id IS the filename, so the id in the URL must not be able to walk the
+// filesystem — a fixed alphabet plus a known extension makes that structural
+// rather than something a sanitizer has to get right on every call.
+const UPLOAD_ID_RE = /^[a-zA-Z0-9-]+\.(png|jpg|jpeg|webp|gif)$/;
+
+/** Writes one incoming image to disk and returns its chat-message attachment record. */
+function saveUploadedImage(img: {
+  mediaType: string;
+  data: string;
+  width?: number;
+  height?: number;
+}): AgentChatAttachment {
+  const ext = UPLOAD_MEDIA_EXT[img.mediaType] ?? "png";
+  const id = `${newId()}.${ext}`;
+  writeFileSync(join(uploadsDir, id), Buffer.from(img.data, "base64"));
+  return {
+    id,
+    mediaType: img.mediaType,
+    url: `/api/uploads/${id}`,
+    ...(img.width !== undefined ? { width: img.width } : {}),
+    ...(img.height !== undefined ? { height: img.height } : {}),
+  };
+}
 
 /**
  * Localhost only, and deliberately unauthenticated.
@@ -1472,6 +1526,26 @@ app.get("/api/lists", (c) => {
   for (const t of tasks) {
     if (t.status !== "done") open.set(t.channelId, (open.get(t.channelId) ?? 0) + 1);
   }
+  /*
+   * Parked tasks, per list, split by what it would COST you to deal with them.
+   *
+   * Two buckets rather than one, because the sidebar draws a different dot for
+   * each and the distinction is the whole point: answering a question is a
+   * sentence and a few seconds, while a dead run wants you to go fix something.
+   * One number summing both is what the old aggregate 需要你 badge did, and it
+   * could not be used to decide whether to look now.
+   *
+   * A `needs_you` row with no `needs_kind` violates an invariant, but if one
+   * exists it counts as BROKEN: the answer endpoint refuses anything that is not
+   * a question, so repair is the only action actually available on it.
+   */
+  const asking = new Map<string, number>();
+  const broken = new Map<string, number>();
+  for (const t of tasks) {
+    if (t.status !== "needs_you") continue;
+    const bucket = t.needsKind === "question" ? asking : broken;
+    bucket.set(t.channelId, (bucket.get(t.channelId) ?? 0) + 1);
+  }
   const now = new Date();
   const lists = store
     .listChannels()
@@ -1481,6 +1555,8 @@ app.get("/api/lists", (c) => {
     .map((ch) => ({
       ...ch,
       openCount: open.get(ch.id) ?? 0,
+      askingCount: asking.get(ch.id) ?? 0,
+      brokenCount: broken.get(ch.id) ?? 0,
       repoPath: ch.projectId === null ? null : (store.getProject(ch.projectId)?.repoPath ?? null),
     }));
   const counts = {
@@ -1843,6 +1919,71 @@ app.get("/api/chat/status", async (c) => {
   return c.json(init.ready ? { ready: true, model: init.secretary.model } : { ready: false, reason: init.reason });
 });
 
+// ── Chat sessions ─────────────────────────────────────────────
+//
+// Many independent conversations with the secretary, switcher-selected —
+// `chat_session` rows in `packages/core`. A person can hold several at once;
+// this is what makes that possible instead of one global chat timeline.
+
+app.get("/api/chat/sessions", (c) => {
+  const archived = c.req.query("archived") === "1";
+  return c.json(store.listChatSessions({ archived }));
+});
+
+const ChatSessionBody = z.object({ title: z.string().max(200).default("") });
+
+app.post("/api/chat/sessions", async (c) => {
+  const parsed = ChatSessionBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  return c.json(store.createChatSession({ title: parsed.data.title }), 201);
+});
+
+const ChatSessionPatchBody = z.object({
+  title: z.string().max(200).optional(),
+  archived: z.boolean().optional(),
+});
+
+app.patch("/api/chat/sessions/:id", async (c) => {
+  const id = c.req.param("id");
+  if (!store.getChatSession(id)) return c.json({ error: "not found" }, 404);
+  const parsed = ChatSessionPatchBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+
+  store.patchChatSession(id, {
+    ...(parsed.data.title !== undefined ? { title: parsed.data.title } : {}),
+    ...(parsed.data.archived !== undefined
+      ? { archivedAt: parsed.data.archived ? new Date().toISOString() : null }
+      : {}),
+  });
+
+  // An archived thread leaves the switcher's default list, so there is no
+  // point keeping its AgentSession warm — closing it here rather than
+  // waiting for the LRU to get around to it.
+  if (parsed.data.archived === true) {
+    void getSecretary().then((init) => {
+      if (init.ready) init.secretary.closeSession(id);
+    });
+  }
+
+  return c.json(store.getChatSession(id));
+});
+
+app.get("/api/uploads/:id", (c) => {
+  const id = c.req.param("id");
+  if (!UPLOAD_ID_RE.test(id)) return c.json({ error: "bad id" }, 400);
+  const path = join(uploadsDir, id);
+  if (!existsSync(path)) return c.json({ error: "not found" }, 404);
+  const ext = id.slice(id.lastIndexOf(".") + 1);
+  return new Response(readFileSync(path), {
+    headers: {
+      "Content-Type": UPLOAD_EXT_CONTENT_TYPE[ext] ?? "application/octet-stream",
+      // Attachment ids are content-addressed by random id, never reused for
+      // different bytes, so a cached copy is never stale.
+      "Cache-Control": "public, max-age=31536000, immutable",
+    },
+  });
+});
+
 /**
  * The conversation timeline, plus a resolution map for the task cards
  * embedded in it. Resolved here because a `taskRefs` id is useless to the
@@ -1850,7 +1991,8 @@ app.get("/api/chat/status", async (c) => {
  * task at all.
  */
 app.get("/api/chat/history", (c) => {
-  const messages = store.listAgentChat();
+  const sessionId = c.req.query("sessionId") ?? store.defaultChatSession().id;
+  const messages = store.listAgentChat(sessionId);
   const tasks: Record<string, { id: string; title: string; status: string; channelId: string }> = {};
   for (const m of messages) {
     for (const id of m.taskRefs) {
@@ -1859,49 +2001,82 @@ app.get("/api/chat/history", (c) => {
       if (t) tasks[id] = { id: t.id, title: t.title, status: t.status, channelId: t.channelId };
     }
   }
-  return c.json({ messages, tasks });
+  return c.json({ sessionId, messages, tasks });
 });
 
-const ChatBody = z.object({ body: z.string().min(1).max(4000) });
+const ChatImage = z.object({
+  mediaType: z.enum(["image/png", "image/jpeg", "image/webp", "image/gif"]),
+  // Base64, no `data:` prefix. Capped generously above the client's own
+  // ~1600px-long-edge resize target, as a backstop rather than the real limit.
+  data: z.string().min(1).max(15_000_000),
+  width: z.number().int().positive().optional(),
+  height: z.number().int().positive().optional(),
+});
+
+const ChatBody = z
+  .object({
+    sessionId: z.string().min(1),
+    body: z.string().max(4000).default(""),
+    images: z.array(ChatImage).max(4).default([]),
+  })
+  // A message needs SOME content — but that content can be entirely a
+  // picture, e.g. "what does this mean" is implicit in the image itself.
+  .refine((v) => v.body.trim() !== "" || v.images.length > 0, {
+    message: "body 或 images 至少要有一个",
+  });
 
 app.post("/api/chat", async (c) => {
   const parsed = ChatBody.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const { sessionId } = parsed.data;
+  if (!store.getChatSession(sessionId)) return c.json({ error: "unknown sessionId" }, 404);
 
   const init = await getSecretary();
   if (!init.ready) return c.json({ error: init.reason }, 503);
   const secretary = init.secretary;
 
-  // One turn at a time. steer/followUp queueing exists in the SDK, but silently
-  // splicing a second request into a running turn muddles taskRefs attribution;
-  // an honest 409 is better until a real need shows up.
-  if (secretary.isBusy()) return c.json({ error: "上一轮还没结束，稍等几秒再发。" }, 409);
+  /*
+   * One turn at a time PER SESSION. steer/followUp queueing exists in the
+   * SDK, but silently splicing a second request into a running turn muddles
+   * taskRefs attribution; an honest 409 is better until a real need shows up.
+   *
+   * Scoped to this session only — a reply streaming in session A must never
+   * block a person from sending in session B, which is the entire point of
+   * letting several conversations be live at once.
+   */
+  if (secretary.isBusy(sessionId)) return c.json({ error: "上一轮还没结束，稍等几秒再发。" }, 409);
 
-  const userRow = store.appendAgentChat({ role: "user", body: parsed.data.body });
-  bus.publishChat({ type: "chat:message" });
-  bus.publishChat({ type: "chat:thinking", on: true });
+  const attachments = parsed.data.images.map(saveUploadedImage);
+  const userRow = store.appendAgentChat({ sessionId, role: "user", body: parsed.data.body, attachments });
+  bus.publishChat({ type: "chat:message", sessionId });
+  bus.publishChat({ type: "chat:thinking", on: true, sessionId });
 
   try {
-    const turn = await secretary.turn(parsed.data.body);
+    const turn = await secretary.turn(sessionId, parsed.data.body, {
+      images: parsed.data.images.map((img) => ({ mediaType: img.mediaType, data: img.data })),
+      onDelta: (text) => bus.publishChat({ type: "chat:delta", sessionId, text }),
+    });
     const agentRow = store.appendAgentChat({
+      sessionId,
       role: "agent",
       body: turn.reply,
       taskRefs: turn.taskRefs,
     });
-    bus.publishChat({ type: "chat:message" });
+    bus.publishChat({ type: "chat:message", sessionId });
     return c.json({ user: userRow, agent: agentRow }, 201);
   } catch (err) {
     // The failure is recorded IN the conversation: a chat where the agent
     // silently says nothing looks like the app ate the message.
     const message = err instanceof Error ? err.message : String(err);
     const agentRow = store.appendAgentChat({
+      sessionId,
       role: "agent",
       body: `这轮出错了：${message}`,
     });
-    bus.publishChat({ type: "chat:message" });
+    bus.publishChat({ type: "chat:message", sessionId });
     return c.json({ user: userRow, agent: agentRow, error: message }, 500);
   } finally {
-    bus.publishChat({ type: "chat:thinking", on: false });
+    bus.publishChat({ type: "chat:thinking", on: false, sessionId });
   }
 });
 

@@ -7,9 +7,11 @@ import { fileURLToPath } from "node:url";
 import type {
   ActorKind,
   Adjudication,
+  AgentChatAttachment,
   AgentChatMessage,
   Attempt,
   Channel,
+  ChatSession,
   DiscussionMessage,
   Expert,
   ExpertRole,
@@ -84,6 +86,24 @@ function jsonArray(v: unknown): string[] {
   }
 }
 
+function jsonAttachments(v: unknown): AgentChatAttachment[] {
+  if (typeof v !== "string") return [];
+  try {
+    const parsed: unknown = JSON.parse(v);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (x): x is AgentChatAttachment =>
+        typeof x === "object" &&
+        x !== null &&
+        typeof (x as Record<string, unknown>)["id"] === "string" &&
+        typeof (x as Record<string, unknown>)["mediaType"] === "string" &&
+        typeof (x as Record<string, unknown>)["url"] === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
 export class Store {
   private readonly db: DatabaseSync;
 
@@ -93,6 +113,7 @@ export class Store {
     const schema = readFileSync(join(HERE, "schema.sql"), "utf8");
     this.db.exec(schema);
     this.migrate();
+    this.backfillDefaultChatSession();
   }
 
   /**
@@ -125,6 +146,8 @@ export class Store {
       { table: "run", column: "diff", definition: "TEXT" },
       { table: "run", column: "outcome_kind", definition: "TEXT" },
       { table: "run", column: "outcome_text", definition: "TEXT" },
+      { table: "agent_chat", column: "session_id", definition: "TEXT" },
+      { table: "agent_chat", column: "attachments", definition: "TEXT NOT NULL DEFAULT '[]'" },
     ];
 
     for (const { table, column, definition } of expected) {
@@ -134,6 +157,33 @@ export class Store {
       if (info.some((c) => str(c["name"]) === column)) continue;
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
+
+    // Deferred from schema.sql: it indexes a column that may have just been
+    // added above, so creating it earlier would fail on a pre-existing table.
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_chat_session ON agent_chat (session_id, seq)`);
+  }
+
+  /**
+   * Ensures a default chat session exists and every pre-multi-session
+   * `agent_chat` row points at it.
+   *
+   * Runs on every open, not just once, because it is cheap (two small queries
+   * when there is nothing to do) and idempotent — the alternative, a one-time
+   * migration flag, adds a place for the backfill to silently not happen on a
+   * database that predates this flag's own introduction.
+   */
+  private backfillDefaultChatSession(): void {
+    const orphans = this.db
+      .prepare(`SELECT COUNT(*) AS n FROM agent_chat WHERE session_id IS NULL`)
+      .get() as Row;
+    if (num(orphans["n"]) === 0) return;
+    const existing = this.db
+      .prepare(`SELECT id FROM chat_session ORDER BY created_at LIMIT 1`)
+      .get() as Row | undefined;
+    const sessionId = existing ? str(existing["id"]) : this.createChatSession({ title: "默认会话" }).id;
+    this.db
+      .prepare(`UPDATE agent_chat SET session_id=? WHERE session_id IS NULL`)
+      .run(sessionId);
   }
 
   close(): void {
@@ -1354,34 +1404,141 @@ export class Store {
     return res.changes > 0;
   }
 
+  // ── Chat sessions ─────────────────────────────────────────
+
+  createChatSession(s: { title?: string; id?: string } = {}): ChatSession {
+    const at = nowIso();
+    const row: ChatSession = {
+      id: s.id ?? newId(),
+      title: s.title ?? "",
+      piSessionPath: null,
+      createdAt: at,
+      updatedAt: at,
+      archivedAt: null,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO chat_session (id,title,pi_session_path,created_at,updated_at,archived_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(row.id, row.title, row.piSessionPath, row.createdAt, row.updatedAt, row.archivedAt);
+    return row;
+  }
+
+  private toChatSession(r: Row): ChatSession {
+    return {
+      id: str(r["id"]),
+      title: str(r["title"]),
+      piSessionPath: strOrNull(r["pi_session_path"]),
+      createdAt: str(r["created_at"]),
+      updatedAt: str(r["updated_at"]),
+      archivedAt: strOrNull(r["archived_at"]),
+    };
+  }
+
+  listChatSessions(opts: { archived?: boolean } = {}): ChatSession[] {
+    const archived = opts.archived ?? false;
+    const sql = archived
+      ? `SELECT * FROM chat_session WHERE archived_at IS NOT NULL ORDER BY updated_at DESC`
+      : `SELECT * FROM chat_session WHERE archived_at IS NULL ORDER BY updated_at DESC`;
+    return this.db
+      .prepare(sql)
+      .all()
+      .map((r) => this.toChatSession(r as Row));
+  }
+
+  getChatSession(id: string): ChatSession | null {
+    const r = this.db.prepare(`SELECT * FROM chat_session WHERE id=?`).get(id);
+    return r ? this.toChatSession(r as Row) : null;
+  }
+
+  /**
+   * The oldest non-archived session, creating one if none exists yet.
+   *
+   * The fallback target for requests that omit a session id — a single global
+   * chat is the degenerate case of "many sessions", not a separate code path.
+   */
+  defaultChatSession(): ChatSession {
+    const existing = this.listChatSessions()[0];
+    if (existing) return existing;
+    return this.createChatSession({ title: "默认会话" });
+  }
+
+  patchChatSession(
+    id: string,
+    patch: Partial<Pick<ChatSession, "title" | "piSessionPath" | "archivedAt">>,
+  ): void {
+    const cols: Record<keyof typeof patch, string> = {
+      title: "title",
+      piSessionPath: "pi_session_path",
+      archivedAt: "archived_at",
+    };
+    const sets: string[] = [];
+    const vals: Array<string | null> = [];
+    for (const [k, col] of Object.entries(cols) as Array<[keyof typeof patch, string]>) {
+      const v = patch[k];
+      if (v === undefined) continue;
+      sets.push(`${col}=?`);
+      vals.push(v);
+    }
+    if (sets.length === 0) return;
+    sets.push("updated_at=?");
+    vals.push(nowIso());
+    vals.push(id);
+    this.db.prepare(`UPDATE chat_session SET ${sets.join(",")} WHERE id=?`).run(...vals);
+  }
+
+  /** Bumps `updated_at` so the switcher can sort by recent activity. */
+  touchChatSession(id: string): void {
+    this.db.prepare(`UPDATE chat_session SET updated_at=? WHERE id=?`).run(nowIso(), id);
+  }
+
   // ── Main-agent chat ───────────────────────────────────────
 
   appendAgentChat(m: {
+    sessionId: string;
     role: AgentChatMessage["role"];
     body: string;
     taskRefs?: string[];
+    attachments?: AgentChatAttachment[];
   }): AgentChatMessage {
     const id = newId();
     const createdAt = nowIso();
     const taskRefs = m.taskRefs ?? [];
+    const attachments = m.attachments ?? [];
     this.db
-      .prepare(`INSERT INTO agent_chat (id,role,body,task_refs,created_at) VALUES (?,?,?,?,?)`)
-      .run(id, m.role, m.body, JSON.stringify(taskRefs), createdAt);
+      .prepare(
+        `INSERT INTO agent_chat (id,session_id,role,body,task_refs,attachments,created_at)
+         VALUES (?,?,?,?,?,?,?)`,
+      )
+      .run(id, m.sessionId, m.role, m.body, JSON.stringify(taskRefs), JSON.stringify(attachments), createdAt);
     const seq = this.db.prepare(`SELECT seq FROM agent_chat WHERE id=?`).get(id) as Row;
-    return { seq: Number(seq["seq"]), id, role: m.role, body: m.body, taskRefs, createdAt };
+    this.touchChatSession(m.sessionId);
+    return {
+      seq: Number(seq["seq"]),
+      id,
+      sessionId: m.sessionId,
+      role: m.role,
+      body: m.body,
+      taskRefs,
+      attachments,
+      createdAt,
+    };
   }
 
-  /** The newest `limit` entries, returned oldest-first for straight rendering. */
-  listAgentChat(limit = 200): AgentChatMessage[] {
+  /** One session's newest `limit` entries, returned oldest-first for straight rendering. */
+  listAgentChat(sessionId: string, limit = 200): AgentChatMessage[] {
     const rows = this.db
-      .prepare(`SELECT * FROM agent_chat ORDER BY seq DESC LIMIT ?`)
-      .all(limit) as Row[];
+      .prepare(`SELECT * FROM agent_chat WHERE session_id=? ORDER BY seq DESC LIMIT ?`)
+      .all(sessionId, limit) as Row[];
     return rows.reverse().map((r) => ({
       seq: Number(r["seq"]),
       id: str(r["id"]),
+      sessionId: strOrNull(r["session_id"]) ?? sessionId,
       role: str(r["role"]) === "agent" ? "agent" : "user",
       body: str(r["body"]),
       taskRefs: jsonArray(r["task_refs"]),
+      attachments: jsonAttachments(r["attachments"]),
       createdAt: str(r["created_at"]),
     }));
   }

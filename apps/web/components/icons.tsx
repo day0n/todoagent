@@ -117,3 +117,33 @@ export function IconBack() {
     </Svg>
   );
 }
+
+/** Copy a message's text. Two overlapping sheets, the universal clipboard glyph. */
+export function IconCopy() {
+  return (
+    <Svg>
+      <rect x="8.5" y="8.5" width="11" height="11" rx="2" />
+      <path d="M15.5 8.5V6.5a2 2 0 0 0-2-2h-7a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h2" />
+    </Svg>
+  );
+}
+
+/** Jump to the newest message, once scrolling up has left it off-screen. */
+export function IconArrowDown() {
+  return (
+    <Svg>
+      <path d="M12 5v14M6 13l6 6 6-6" strokeLinecap="round" strokeLinejoin="round" />
+    </Svg>
+  );
+}
+
+/** Attach an image to the composer. A picture frame with a mountain corner. */
+export function IconImage() {
+  return (
+    <Svg>
+      <rect x="3.5" y="4.5" width="17" height="15" rx="2.4" />
+      <circle cx="8.5" cy="9.5" r="1.6" />
+      <path d="M4.5 16.5l4.5-4.5 3 3 3.5-4.5 5 6" strokeLinejoin="round" />
+    </Svg>
+  );
+}

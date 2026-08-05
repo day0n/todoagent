@@ -125,6 +125,22 @@ async function legacyDb(): Promise<{ path: string; dispose: () => Promise<void> 
     `INSERT INTO attempt (id,run_id,subtask_id,expert_id,runtime_kind,kind,status,input_tokens,output_tokens,started_at)
      VALUES (?,?,?,?,?,?,?,?,?,?)`,
   ).run("a1", "r1", "s1", "e1", "claude", "draft", "completed", 100, 50, "2026-01-01T00:00:00.000Z");
+
+  /*
+   * `agent_chat` as it shipped before multi-session support: no `session_id`,
+   * no `attachments`. This is what the default-session backfill exists for.
+   */
+  db.exec(`CREATE TABLE agent_chat (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    id TEXT NOT NULL UNIQUE,
+    role TEXT NOT NULL,
+    body TEXT NOT NULL,
+    task_refs TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL
+  )`);
+  db.prepare(
+    `INSERT INTO agent_chat (id,role,body,created_at) VALUES (?,?,?,?)`,
+  ).run("m1", "user", "老消息", "2026-01-01T00:00:00.000Z");
   db.close();
 
   return { path, dispose: () => rm(dir, { recursive: true, force: true }) };
@@ -307,6 +323,32 @@ test("migrate: an old database gains run.outcome_*, and unclassified stays disti
       assert.equal(store.getRunOutcome("r1").kind, null, "an unknown kind reads as unclassified");
 
       assert.deepEqual(store.getRunOutcome("no-such-run"), { kind: null, text: null });
+    } finally {
+      store.close();
+    }
+  } finally {
+    await legacy.dispose();
+  }
+});
+
+test("migrate: an old agent_chat table gains session_id/attachments and backfills a default session", async () => {
+  const legacy = await legacyDb();
+  try {
+    const store = new Store(legacy.path);
+    try {
+      // The pre-existing row must survive under some session rather than
+      // vanishing from every session-scoped query.
+      const sessions = store.listChatSessions();
+      assert.equal(sessions.length, 1, "exactly one default session is created");
+      const rows = store.listAgentChat(sessions[0]?.id ?? "");
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0]?.body, "老消息");
+      assert.deepEqual(rows[0]?.attachments, [], "a legacy row has no attachments");
+
+      // The write path is what used to throw `no such column: session_id`.
+      assert.doesNotThrow(() =>
+        store.appendAgentChat({ sessionId: sessions[0]?.id ?? "", role: "agent", body: "新消息" }),
+      );
     } finally {
       store.close();
     }

@@ -37,9 +37,17 @@ export interface BoardEvent {
  */
 const BOARD_CHANNEL = "board:changed";
 
+/**
+ * Chat events, all scoped to one `chat_session` now that several can be live
+ * at once. `chat:delta` is the streaming case: one per token/chunk while an
+ * `AgentSession` is generating, ephemeral like `chat:thinking` — a dropped
+ * delta costs a few missing characters until `chat:message` triggers a
+ * history refetch, never a correctness problem.
+ */
 export type ChatBusEvent =
-  | { type: "chat:message" }
-  | { type: "chat:thinking"; on: boolean };
+  | { type: "chat:message"; sessionId: string }
+  | { type: "chat:thinking"; on: boolean; sessionId: string }
+  | { type: "chat:delta"; sessionId: string; text: string };
 
 const CHAT_CHANNEL = "chat:event";
 

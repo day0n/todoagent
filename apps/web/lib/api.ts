@@ -3,6 +3,7 @@ import type {
   BoardResponse,
   ChatHistory,
   ChatMessage,
+  ChatSession,
   ChatStatus,
   DetectedRuntime,
   Expert,
@@ -268,21 +269,44 @@ export const api = {
    */
   runResult: (runId: string) => req<RunResult>(`/api/runs/${runId}/result`),
 
-  /** The main-agent conversation, plus title resolution for its inline cards. */
-  chatHistory: () => req<ChatHistory>("/api/chat/history"),
+  // ── Chat sessions ───────────────────────────────────────────
+  //
+  // Several independent conversations with the secretary can exist at once —
+  // these back the header's switcher.
+
+  /** `archived: true` returns the archived threads INSTEAD of the live ones. */
+  chatSessions: (opts: { archived?: boolean } = {}) =>
+    req<ChatSession[]>(`/api/chat/sessions${opts.archived === true ? "?archived=1" : ""}`),
+
+  createChatSession: (title = "") =>
+    req<ChatSession>("/api/chat/sessions", { method: "POST", body: JSON.stringify({ title }) }),
+
+  patchChatSession: (id: string, patch: { title?: string; archived?: boolean }) =>
+    req<ChatSession>(`/api/chat/sessions/${id}`, { method: "PATCH", body: JSON.stringify(patch) }),
+
+  /** One thread's conversation, plus title resolution for its inline cards. */
+  chatHistory: (sessionId: string) =>
+    req<ChatHistory>(`/api/chat/history?sessionId=${encodeURIComponent(sessionId)}`),
 
   /** Whether the main agent can run right now, with the banner text when not. */
   chatStatus: () => req<ChatStatus>("/api/chat/status"),
 
   /**
-   * One chat turn. Resolves when the agent has answered — tool calls included —
-   * so the caller should show the thinking state from the stream, not a spinner
-   * on this promise alone.
+   * One chat turn, in one thread. Resolves when the agent has answered — tool
+   * calls included — so the caller should show the thinking/streaming state from
+   * the SSE stream, not a spinner on this promise alone.
+   *
+   * `images` travel as base64 with no `data:` prefix — exactly what a canvas'
+   * `toDataURL()` produces once its own prefix is stripped.
    */
-  chatSend: (body: string) =>
+  chatSend: (
+    sessionId: string,
+    body: string,
+    images: Array<{ mediaType: string; data: string; width?: number; height?: number }> = [],
+  ) =>
     req<{ user: ChatMessage; agent: ChatMessage }>("/api/chat", {
       method: "POST",
-      body: JSON.stringify({ body }),
+      body: JSON.stringify({ sessionId, body, images }),
     }),
 };
 
@@ -335,10 +359,16 @@ export function subscribeRun(
  * on its own with its own backoff, so a dropped connection needs no handling here
  * beyond telling the caller to poll faster until it returns.
  */
+/** One frame off the chat channel of `/api/stream`, always scoped to a thread. */
+export type ChatStreamEvent =
+  | { type: "chat:message"; sessionId: string }
+  | { type: "chat:thinking"; on: boolean; sessionId: string }
+  | { type: "chat:delta"; sessionId: string; text: string };
+
 export function subscribeBoard(
   onChange: () => void,
   onHealth?: (open: boolean) => void,
-  onChat?: (ev: { type: "chat:message" } | { type: "chat:thinking"; on: boolean }) => void,
+  onChat?: (ev: ChatStreamEvent) => void,
 ): () => void {
   const source = new EventSource(`${ENGINE}/api/stream`);
 
@@ -375,10 +405,15 @@ export function subscribeBoard(
     // leave the caller polling at the fallback rate over a working stream.
     markHealthy();
     try {
-      const ev = JSON.parse(e.data) as { type?: string; on?: boolean };
+      const ev = JSON.parse(e.data) as { type?: string; on?: boolean; sessionId?: string; text?: string };
       if (ev.type === "board:changed") onChange();
-      else if (ev.type === "chat:message") onChat?.({ type: "chat:message" });
-      else if (ev.type === "chat:thinking") onChat?.({ type: "chat:thinking", on: ev.on === true });
+      else if (ev.type === "chat:message" && ev.sessionId !== undefined) {
+        onChat?.({ type: "chat:message", sessionId: ev.sessionId });
+      } else if (ev.type === "chat:thinking" && ev.sessionId !== undefined) {
+        onChat?.({ type: "chat:thinking", on: ev.on === true, sessionId: ev.sessionId });
+      } else if (ev.type === "chat:delta" && ev.sessionId !== undefined) {
+        onChat?.({ type: "chat:delta", sessionId: ev.sessionId, text: ev.text ?? "" });
+      }
       // `stream:ready` needs no action beyond the health signal above: its only job
       // is to start the response body so the browser fires `onopen`.
     } catch {

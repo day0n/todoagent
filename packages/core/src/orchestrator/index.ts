@@ -5,7 +5,7 @@
  * `import ... from "@todoagent/core/orchestrator"` failed to resolve. Nothing
  * imported it yet, which is exactly why it went unnoticed.
  */
-export { bus, type BusEvent } from "./bus.ts";
+export { bus, type BusEvent, type BoardEvent, type ChatBusEvent } from "./bus.ts";
 export {
   BudgetExceededError,
   recordEvent,

@@ -135,25 +135,14 @@ export function Sidebar({
         {/*
           The status views.
 
-          需要你 gets a dot rather than a number, and only when there is something:
-          it is the one state that is about attention rather than volume, and a
-          grey "0" beside it would demand a reading every time you glance at it.
-          The amber follows the mockup's semantics — needs-you and running have to
-          be told apart at a glance, which one shared accent colour cannot do — but
-          uses this app's existing warn token rather than the mockup's own orange.
-        */}
-        <button
-          type="button"
-          className={`srow${view === "needs" ? " on" : ""}`}
-          aria-current={view === "needs"}
-          onClick={() => onSelect("needs")}
-        >
-          <span className="label">需要你</span>
-          {counts.needs > 0 ? (
-            <span className="dot-badge" aria-label={`${counts.needs} 项需要你`} />
-          ) : null}
-        </button>
+          需要你 used to be here and is deliberately gone: a parked task is already
+          visible wherever its list is, now marked by the dots on that list's row,
+          and the conversation is where it gets dealt with. One aggregate entry
+          listing the same cards a third time only made the count meaningless —
+          「等你回答」and「凭据过期」are not the same errand.
 
+          A cross-list inbox that can RANK parked work is deferred, not rejected.
+        */}
         <button
           type="button"
           className={`srow${view === "running" ? " on" : ""}`}
@@ -435,6 +424,42 @@ function ListRow({
         </span>
         <span className="label">{list.name}</span>
       </button>
+
+      {/*
+        What is parked on this list, one dot per KIND — never a sum.
+
+        This is what replaced the aggregate 需要你 view. That view was a second copy
+        of cards already on screen (a parked task outranks its date in `boardColumn`,
+        so it always sits in the board's 今天 column), and its single badge added
+        「回一句话」to「凭据过期了」— a number you could not act on.
+
+        Attention before volume: these sit left of `openCount`, which counts
+        everything open and answers a different question.
+      */}
+      {list.askingCount > 0 || list.brokenCount > 0 ? (
+        <span className="pdots">
+          {/* Blue, not red. An agent that asks instead of guessing did the right
+              thing; colouring it like a failure would say the opposite. */}
+          {list.askingCount > 0 ? (
+            <span
+              className="dot-badge ask"
+              role="img"
+              aria-label={`${list.askingCount} 项等你回答`}
+              title={`${list.askingCount} 项等你回答`}
+            />
+          ) : null}
+          {/* Warm: the run is dead and something needs fixing. `blocked` and
+              `failed` share it — both cost you a detour, not a sentence. */}
+          {list.brokenCount > 0 ? (
+            <span
+              className="dot-badge"
+              role="img"
+              aria-label={`${list.brokenCount} 项需要修复`}
+              title={`${list.brokenCount} 项需要修复`}
+            />
+          ) : null}
+        </span>
+      ) : null}
 
       {list.openCount > 0 ? <span className="count">{list.openCount}</span> : null}
 

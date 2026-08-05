@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store } from "@todoagent/core";
-import type { Task, TaskStatus } from "@todoagent/core/types";
+import type { NeedsKind, Task, TaskStatus } from "@todoagent/core/types";
 
 /**
  * The todoagent surface: lists, the derived views (today / needs / done), quick
@@ -46,6 +46,55 @@ async function fixture(): Promise<Fixture> {
     listId: list.id,
     dispose: () => rm(root, { recursive: true, force: true }),
   };
+}
+
+/** A second list, so a per-list count has somewhere to be wrong. */
+function seedList(dbPath: string, name: string): string {
+  const store = new Store(dbPath);
+  try {
+    return store.createChannel({
+      name,
+      purpose: "",
+      kind: "channel",
+      projectId: null,
+      dmExpertId: null,
+      color: null,
+    }).id;
+  } finally {
+    store.close();
+  }
+}
+
+/**
+ * Parks a task the way a finished run would.
+ *
+ * Written straight through the Store because PATCH refuses `needs_you` — that
+ * status is a run outcome and never something a caller can set, which is the
+ * invariant the `views:` test below pins.
+ */
+function park(
+  dbPath: string,
+  listId: string,
+  over: { title: string; needsKind: NeedsKind; needsText: string },
+): string {
+  const store = new Store(dbPath);
+  try {
+    return store.createTask({
+      channelId: listId,
+      title: over.title,
+      status: "needs_you",
+      needsKind: over.needsKind,
+      needsText: over.needsText,
+      assigneeKind: null,
+      assigneeId: null,
+      creatorKind: "human",
+      creatorId: null,
+      sourceMessageId: null,
+      runId: null,
+    }).id;
+  } finally {
+    store.close();
+  }
 }
 
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
@@ -286,6 +335,46 @@ test("tasks: quick add without a list lands in 收件箱, created on demand", as
       await req("POST", "/api/tasks", { title: "回消息" });
       const again = await json<{ lists: Array<{ name: string }> }>(await req("GET", "/api/lists"));
       assert.equal(again.lists.filter((l) => l.name === "收件箱").length, 1);
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("lists: parked tasks split into asking and broken, counted per list", async () => {
+  const f = await fixture();
+  try {
+    const study = seedList(f.dbPath, "学习");
+    park(f.dbPath, f.listId, {
+      title: "接数据库",
+      needsKind: "question",
+      needsText: "postgres 还是 sqlite？",
+    });
+    park(f.dbPath, study, { title: "改配置", needsKind: "blocked", needsText: "没有凭据" });
+    park(f.dbPath, study, { title: "跑测试", needsKind: "failed", needsText: "超时" });
+
+    await withEngine(f.dbPath, async () => {
+      const res = await json<{
+        lists: Array<{ id: string; askingCount: number; brokenCount: number }>;
+        counts: { needs: number };
+      }>(await req("GET", "/api/lists"));
+
+      const work = res.lists.find((l) => l.id === f.listId);
+      const other = res.lists.find((l) => l.id === study);
+
+      /*
+       * The two buckets are never summed, which is the whole point of the split:
+       * answering is a sentence, and a dead run is a repair. The sidebar draws a
+       * different dot for each, and the removed aggregate badge — one number over
+       * all three kinds — was unusable for deciding whether to look now.
+       */
+      assert.equal(work?.askingCount, 1);
+      assert.equal(work?.brokenCount, 0);
+      assert.equal(other?.askingCount, 0);
+      assert.equal(other?.brokenCount, 2, "blocked and failed share the repair bucket");
+
+      // The aggregate stays: the chat panel still gates its needs fetch on it.
+      assert.equal(res.counts.needs, 3);
     });
   } finally {
     await f.dispose();

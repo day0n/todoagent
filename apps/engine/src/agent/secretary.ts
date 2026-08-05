@@ -30,6 +30,14 @@ import type { Store, Task } from "@todoagent/core";
  * The pi session (JSONL, with compaction) is the truth for LLM context. The
  * `agent_chat` table is only the UI timeline projection — the engine writes it
  * for rendering, never feeds it back to the model.
+ *
+ * Multiple `chat_session` rows can be live at once — this is the whole point
+ * of letting a person hold several independent conversations. Each gets its
+ * OWN `AgentSession` (own pi JSONL file, own in-flight turn), tracked in a
+ * small LRU so the process does not accumulate one live agent per conversation
+ * ever created. Model/tool wiring (`modelRuntime`, `resourceLoader`,
+ * `settingsManager`) is resolved once and shared; only the per-conversation
+ * `AgentSession` and its tool closures (`pendingRefs`) are per-session.
  */
 
 export interface SecretaryDeps {
@@ -47,10 +55,25 @@ export interface SecretaryTurn {
   taskRefs: string[];
 }
 
+/** An image attachment ready to hand to the model. Matches pi's `ImageContent` shape. */
+export interface SecretaryImage {
+  mediaType: string;
+  /** Base64-encoded bytes, no `data:` prefix. */
+  data: string;
+}
+
+export interface SecretaryTurnOptions {
+  images?: SecretaryImage[];
+  /** Called once per streamed text chunk, in order, before the turn resolves. */
+  onDelta?: (text: string) => void;
+}
+
 export interface Secretary {
   model: string;
-  isBusy(): boolean;
-  turn(userText: string): Promise<SecretaryTurn>;
+  isBusy(chatSessionId: string): boolean;
+  turn(chatSessionId: string, userText: string, options?: SecretaryTurnOptions): Promise<SecretaryTurn>;
+  /** Drops one conversation's live agent (e.g. after it is archived). Safe to call on an unopened session. */
+  closeSession(chatSessionId: string): void;
   dispose(): void;
 }
 
@@ -60,6 +83,18 @@ export type SecretaryInit =
 
 /** Wall clock for one whole turn, tool loops included. */
 const TURN_TIMEOUT_MS = 120_000;
+
+/**
+ * How many conversations may hold a live `AgentSession` at once.
+ *
+ * Each one is a real in-memory agent loop plus its loaded context, so this is
+ * a memory/fan-out cap, not a UI limit — a person can have far more chat
+ * sessions than this; the rest just reload from their pi JSONL file (a few
+ * hundred ms) the next time they're opened. Never counts against a session
+ * that is mid-turn: eviction skips those, so a slow reply is never cut off by
+ * someone opening a sixth conversation.
+ */
+const MAX_LIVE_SESSIONS = 6;
 
 const SYSTEM_PROMPT = `你是 TodoAgent 的任务秘书。你管理的是任务卡片，不写代码。
 
@@ -361,14 +396,14 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
     };
   }
 
-  const pendingRefs: string[] = [];
-  const customTools = buildTools(deps, pendingRefs);
-
   const settingsManager = SettingsManager.inMemory({
     retry: { enabled: true, maxRetries: 2 },
   });
 
   // Discovery is fully off: the user's personal pi setup must not leak in.
+  // Shared across every conversation's AgentSession — it carries no
+  // per-conversation state, only the (fixed) system prompt and disabled
+  // discovery channels.
   const loader = new DefaultResourceLoader({
     cwd,
     agentDir,
@@ -382,8 +417,63 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
   });
   await loader.reload();
 
-  let session: AgentSession;
-  try {
+  const sessionsDir = join(agentDir, "sessions");
+
+  interface LiveSession {
+    session: AgentSession;
+    /** Task ids the CURRENT turn's tool calls touched. Reset at the start of every turn. */
+    pendingRefs: string[];
+  }
+
+  /**
+   * Live agents, oldest-touched first.
+   *
+   * A `Map` rather than a dedicated LRU structure because "move to the end on
+   * access" is exactly `delete` + `set` on a `Map` — insertion order IS
+   * recency order, and iterating from the front finds the eviction candidate
+   * for free.
+   */
+  const live = new Map<string, LiveSession>();
+
+  function touch(chatSessionId: string, entry: LiveSession): void {
+    live.delete(chatSessionId);
+    live.set(chatSessionId, entry);
+  }
+
+  /** Drops the oldest non-streaming session once the cap is exceeded. */
+  function evictIfNeeded(): void {
+    while (live.size > MAX_LIVE_SESSIONS) {
+      let victimId: string | undefined;
+      for (const [id, entry] of live) {
+        if (!entry.session.isStreaming) {
+          victimId = id;
+          break;
+        }
+      }
+      // Everyone left is mid-turn: over the cap, but nothing safe to drop.
+      // The map shrinks back down as those turns finish and later evictions run.
+      if (victimId === undefined) return;
+      const victim = live.get(victimId);
+      live.delete(victimId);
+      victim?.session.dispose();
+    }
+  }
+
+  async function getOrCreate(chatSessionId: string): Promise<LiveSession> {
+    const existing = live.get(chatSessionId);
+    if (existing) {
+      touch(chatSessionId, existing);
+      return existing;
+    }
+
+    const chatSession = deps.store.getChatSession(chatSessionId);
+    const pendingRefs: string[] = [];
+    const customTools = buildTools(deps, pendingRefs);
+    const sessionManager =
+      chatSession?.piSessionPath !== null && chatSession?.piSessionPath !== undefined
+        ? SessionManager.open(chatSession.piSessionPath, sessionsDir, cwd)
+        : SessionManager.create(cwd, sessionsDir);
+
     const created = await createAgentSession({
       cwd,
       agentDir,
@@ -393,26 +483,45 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
       tools: ["read", "grep", "find", "ls", ...customTools.map((t) => t.name)],
       customTools,
       resourceLoader: loader,
-      sessionManager: SessionManager.continueRecent(cwd, join(agentDir, "sessions")),
+      sessionManager,
       settingsManager,
     });
-    session = created.session;
-  } catch (err) {
-    return {
-      ready: false,
-      reason: `主 agent 初始化失败：${err instanceof Error ? err.message : String(err)}`,
-    };
+
+    const entry: LiveSession = { session: created.session, pendingRefs };
+    touch(chatSessionId, entry);
+
+    // pi assigns the file path synchronously on creation, so this is safe to
+    // read back immediately rather than waiting for the first turn to finish.
+    const path = created.session.sessionFile;
+    if (path !== undefined && path !== chatSession?.piSessionPath) {
+      deps.store.patchChatSession(chatSessionId, { piSessionPath: path });
+    }
+
+    evictIfNeeded();
+    return entry;
   }
 
   const secretary: Secretary = {
     model: `${model.provider}/${model.id}`,
-    isBusy: () => session.isStreaming,
+    isBusy: (chatSessionId: string) => live.get(chatSessionId)?.session.isStreaming ?? false,
 
-    async turn(userText: string): Promise<SecretaryTurn> {
+    async turn(
+      chatSessionId: string,
+      userText: string,
+      options: SecretaryTurnOptions = {},
+    ): Promise<SecretaryTurn> {
+      const { session, pendingRefs } = await getOrCreate(chatSessionId);
       pendingRefs.length = 0;
       const replyParts: string[] = [];
 
       const unsubscribe = session.subscribe((event) => {
+        if (
+          event.type === "message_update" &&
+          event.assistantMessageEvent.type === "text_delta" &&
+          event.assistantMessageEvent.delta !== ""
+        ) {
+          options.onDelta?.(event.assistantMessageEvent.delta);
+        }
         if (event.type === "agent_end") {
           for (const message of event.messages) {
             if (message.role !== "assistant") continue;
@@ -435,11 +544,10 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
         /*
          * Today's date is stamped on every turn, not baked into the system prompt.
          *
-         * The session is created once when the engine starts and lives as long as the
-         * process — a local tool people leave running for days. A date in the system
-         * prompt would be correct until midnight and then quietly wrong, and "明天"
-         * resolving to yesterday is the kind of error nobody notices until a deadline
-         * is already missed.
+         * A conversation's AgentSession can live for days — this is a local tool
+         * people leave running — so a date in the system prompt would be correct
+         * until midnight and then quietly wrong, and "明天" resolving to yesterday
+         * is the kind of error nobody notices until a deadline is already missed.
          *
          * Stamped on the text sent to the MODEL only. The `agent_chat` row the UI
          * renders is written by the caller from the original message, so the user
@@ -447,7 +555,12 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
          */
         const now = new Date();
         const stamp = `[今天是 ${todayIso()} 星期${WEEKDAYS[now.getDay()]}]`;
-        await session.prompt(`${stamp}\n\n${userText}`);
+        const images = options.images?.map((img) => ({
+          type: "image" as const,
+          data: img.data,
+          mimeType: img.mediaType,
+        }));
+        await session.prompt(`${stamp}\n\n${userText}`, images && images.length > 0 ? { images } : undefined);
       } finally {
         clearTimeout(timeout);
         unsubscribe();
@@ -460,7 +573,17 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
       };
     },
 
-    dispose: () => session.dispose(),
+    closeSession(chatSessionId: string): void {
+      const entry = live.get(chatSessionId);
+      if (!entry) return;
+      live.delete(chatSessionId);
+      entry.session.dispose();
+    },
+
+    dispose: () => {
+      for (const entry of live.values()) entry.session.dispose();
+      live.clear();
+    },
   };
 
   return { ready: true, secretary };

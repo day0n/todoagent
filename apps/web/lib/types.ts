@@ -265,6 +265,17 @@ export interface TodoList {
   archivedAt: string | null;
   /** Tasks not yet done. Drives the sidebar count. */
   openCount: number;
+  /**
+   * Parked tasks on this list that are waiting on a SENTENCE from you.
+   *
+   * Drives the blue dot. Split from `brokenCount` because the two cost wildly
+   * different amounts of your attention — answering is seconds, and one number
+   * summing both is exactly what the removed 需要你 badge did: unusable for
+   * deciding whether to look now.
+   */
+  askingCount: number;
+  /** Parked tasks whose run is dead (`blocked` / `failed`). Drives the warm dot. */
+  brokenCount: number;
   repoPath: string | null;
   createdAt: string;
 }
@@ -432,13 +443,44 @@ export interface RunResult {
   executor: string | null;
 }
 
+/**
+ * One independent conversation thread with the secretary.
+ *
+ * Several of these can exist side by side — a person picks one from the
+ * header's switcher rather than the app holding a single global chat.
+ */
+export interface ChatSession {
+  id: string;
+  /** Empty until renamed; the switcher falls back to a relative-time label. */
+  title: string;
+  createdAt: string;
+  /** Bumped on every message, so the switcher can sort by recent activity. */
+  updatedAt: string;
+  /** Archived threads keep their messages but leave the switcher's default list. */
+  archivedAt: string | null;
+}
+
+/** An image sent alongside a chat message. */
+export interface ChatAttachment {
+  id: string;
+  /** e.g. "image/png". Only images are supported today. */
+  mediaType: string;
+  /** Where the engine serves the stored file, e.g. "/api/uploads/:id". */
+  url: string;
+  width?: number;
+  height?: number;
+}
+
 /** One turn of the main-agent conversation. Posting into it arrives with M4. */
 export interface ChatMessage {
   id: string;
+  sessionId: string;
   role: "user" | "agent";
   body: string;
   /** Ids of tasks this message created or referenced. */
   taskRefs: string[];
+  /** Images sent with this message, if any. */
+  attachments: ChatAttachment[];
   createdAt: string;
 }
 
@@ -451,6 +493,7 @@ export interface ChatTaskCard {
 }
 
 export interface ChatHistory {
+  sessionId: string;
   messages: ChatMessage[];
   tasks: Record<string, ChatTaskCard>;
 }

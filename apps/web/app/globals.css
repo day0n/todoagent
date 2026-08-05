@@ -598,20 +598,42 @@
     font-weight: 600;
   }
   /*
-   * 需要你 gets a dot, not a number.
+   * Parked work gets dots, not a number.
    *
-   * It is the one state about attention rather than volume, and amber separates it
-   * from the accent blue that means "running" two rows below — one colour for both
-   * would make the sidebar's two live signals indistinguishable at a glance.
+   * Attention rather than volume: a count would have to be read, and these only
+   * have to be noticed. `margin-left: auto` lives on the group so the two dots stay
+   * adjacent instead of one of them claiming all the slack.
    */
+  .srow .pdots {
+    margin-left: auto;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    /* 5px, not less: each dot carries a 3px halo, and touching halos would read as
+       one wide smudge rather than two separate signals. */
+    gap: 5px;
+  }
   .srow .dot-badge {
     width: 6px;
     height: 6px;
-    margin-left: auto;
     flex-shrink: 0;
     border-radius: 50%;
     background: var(--color-warn);
     box-shadow: 0 0 0 3px var(--color-warn-soft);
+  }
+  /*
+   * Blue for a question, warm for a dead run.
+   *
+   * The two are told apart by cost, not by severity: answering is a sentence, and
+   * `blocked`/`failed` want you to go fix something. Red was considered and
+   * rejected — an agent that asks instead of guessing did the right thing, and
+   * marking that like a failure argues for guessing.
+   *
+   * `--color-accent` is the fill token, safe here because a dot is non-text (3:1).
+   */
+  .srow .dot-badge.ask {
+    background: var(--color-accent);
+    box-shadow: 0 0 0 3px var(--color-accent-soft);
   }
   /* The name half of a list row: everything except the overflow menu. */
   .srow .pick {
@@ -1479,7 +1501,17 @@
      dialog: the question is one line and the answer is usually one sentence, so a
      modal would be more furniture than the exchange deserves — and the row above
      stays readable while typing, which is where the question is. */
+  /*
+   * The card's own answer field — the NARROW path only.
+   *
+   * Hidden here because the composer is bound instead, and the two are driven by one
+   * `activeId`: rendering both would put two textareas with two drafts on screen for
+   * the same question. Restored below 1050px, where `.chat` is display:none and the
+   * composer does not exist — without that, answering would be unreachable at those
+   * widths rather than merely relocated.
+   */
   .abar {
+    display: none;
     padding: 2px 17px 15px;
     /* Indented to the row's TEXT column (17px padding + 20px ring + 13px gap), so
        the exchange reads as belonging to the title above rather than to the card. */
@@ -2126,6 +2158,223 @@
     box-shadow: 0 0 0 3px var(--color-ok-soft);
   }
 
+  /* ── Session switcher ───────────────────────────────────────
+     Click "秘书" to see every open conversation. A dropdown rather than a
+     permanent rail: a person holds far fewer live threads than tasks, so a
+     column costing space on every screen would be furniture for something
+     checked once in a while. */
+  .chat-switcher {
+    position: relative;
+    min-width: 0;
+    flex: 1;
+  }
+  .chat-switcher-trigger {
+    width: 100%;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: pointer;
+    text-align: left;
+  }
+  .chead-id-text {
+    min-width: 0;
+  }
+  .chat-switcher-trigger .name {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+  }
+  .chat-switcher-caret {
+    width: 9px;
+    height: 9px;
+    flex-shrink: 0;
+    stroke-width: 2.4;
+    opacity: 0.55;
+    transform: rotate(90deg);
+  }
+  .chat-switcher-panel {
+    position: absolute;
+    top: calc(var(--head-h) - 8px);
+    left: -2px;
+    z-index: 30;
+    width: 268px;
+    max-height: 360px;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    border-radius: var(--r-md);
+    background: var(--white);
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 1px 3px rgba(0, 0, 0, 0.07),
+      0 12px 32px rgba(0, 0, 0, 0.14);
+    animation: rise 140ms ease-out;
+  }
+  .chat-switcher-new {
+    height: 32px;
+    flex-shrink: 0;
+    margin-bottom: 4px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border: 0;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--accent-text);
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    text-align: left;
+  }
+  .chat-switcher-new:hover {
+    background: var(--accent-tint);
+  }
+  .chat-switcher-new svg {
+    width: 13px;
+    height: 13px;
+    stroke-width: 2.2;
+  }
+  .chat-switcher-list {
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+  .chat-switcher-row {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+  .chat-switcher-row .pick {
+    min-width: 0;
+    flex: 1;
+    height: 36px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border: 0;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--ink-2);
+    cursor: pointer;
+    font: inherit;
+    text-align: left;
+    transition: background 0.14s ease;
+  }
+  .chat-switcher-row:hover .pick {
+    background: var(--fill);
+  }
+  .chat-switcher-row.on .pick {
+    background: var(--accent-tint);
+    color: var(--accent-text);
+    font-weight: 600;
+  }
+  .chat-switcher-row .label {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    color: inherit;
+    font-size: 12.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chat-switcher-row .when {
+    flex-shrink: 0;
+    color: var(--ink-3);
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+  }
+  /* A live turn streaming in a thread that is not the open one. */
+  .busy-dot {
+    width: 6px;
+    height: 6px;
+    flex-shrink: 0;
+    border-radius: 50%;
+    background: var(--color-ok);
+    box-shadow: 0 0 0 3px var(--color-ok-soft);
+  }
+  .chat-switcher-row .more {
+    width: 24px;
+    height: 24px;
+    margin-left: 2px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    opacity: 0;
+    transition:
+      opacity 0.14s ease,
+      background 0.14s ease;
+  }
+  .chat-switcher-row .more svg {
+    width: 13px;
+    height: 13px;
+    stroke-width: 2;
+  }
+  .chat-switcher-row:hover .more,
+  .chat-switcher-row .more:focus-visible,
+  .chat-switcher-row .more[data-open="true"] {
+    opacity: 1;
+  }
+  .chat-switcher-row .more:hover {
+    background: var(--fill-hover);
+  }
+  .chat-switcher-rowmenu {
+    position: absolute;
+    top: 32px;
+    right: 4px;
+    z-index: 31;
+    min-width: 108px;
+    padding: 5px;
+    display: flex;
+    flex-direction: column;
+    border-radius: var(--r-md);
+    background: var(--white);
+    box-shadow:
+      0 0 0 1px var(--line),
+      0 1px 3px rgba(0, 0, 0, 0.07),
+      0 12px 32px rgba(0, 0, 0, 0.14);
+    animation: rise 140ms ease-out;
+  }
+  .chat-switcher-rowmenu button {
+    height: 30px;
+    padding: 0 9px;
+    display: flex;
+    align-items: center;
+    border: 0;
+    border-radius: var(--r-xs);
+    background: transparent;
+    color: var(--ink);
+    cursor: pointer;
+    font-size: 13px;
+    text-align: left;
+  }
+  .chat-switcher-rowmenu button:hover {
+    background: var(--accent);
+    color: var(--white);
+  }
+  .chat-switcher-rename {
+    flex: 1;
+    height: 30px;
+    margin: 1px 0;
+    padding: 0 8px;
+    border: 1px solid var(--accent);
+    border-radius: var(--r-xs);
+    outline: 0;
+    background: var(--white);
+    color: var(--ink);
+    font-size: 12.5px;
+    box-shadow: 0 0 0 3px var(--accent-ring);
+  }
+
   /* ── Context card ───────────────────────────────────────────
      What is waiting on you, pinned above the conversation. Not part of the stream:
      it is the state of the board, and it stays put while you scroll history. */
@@ -2138,12 +2387,30 @@
       0 0 0 1px rgba(154, 91, 0, 0.28),
       0 1px 3px rgba(154, 91, 0, 0.08);
   }
+  /*
+   * A question, in blue — the same split the sidebar dots draw.
+   *
+   * Warm is reserved for a dead run, which is the one that wants you to go fix
+   * something. An agent that asks instead of guessing did the right thing, so
+   * dressing it in the failure colour would argue for guessing.
+   */
+  .ctx.ask {
+    background: var(--accent-tint);
+    box-shadow:
+      0 0 0 1px var(--accent-line),
+      0 1px 3px var(--accent-ring);
+  }
   .ctx .k {
     margin-bottom: 4px;
     color: var(--color-warn);
     font-size: 10px;
     font-weight: 700;
     letter-spacing: 0.05em;
+  }
+  /* `--accent-text`, not `--accent`: this is 10px text, and the fill token measures
+     4.02:1 against this tint where the text token clears AA at 5.02:1. */
+  .ctx.ask .k {
+    color: var(--accent-text);
   }
   .ctx .t {
     color: var(--ink);
@@ -2201,13 +2468,75 @@
   .ctx .no:hover {
     background: var(--side-bg);
   }
-  /* The overflow counter, quietest of the three. */
-  .ctx .more {
-    margin-left: auto;
-    padding: 0 4px;
-    background: transparent;
+  /*
+   * The composer's binding pill: which question the next Enter answers.
+   *
+   * Needed because the field's BEHAVIOUR changes under it — the text goes to a
+   * waiting run rather than to the secretary — and a placeholder alone disappears
+   * the moment someone starts typing.
+   */
+  .abind {
+    margin-bottom: 7px;
+    padding: 5px 6px 5px 10px;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    border-radius: var(--r-sm);
+    background: var(--accent-tint);
+    box-shadow: 0 0 0 1px var(--accent-line);
+  }
+  .abind .k {
+    flex-shrink: 0;
+    color: var(--accent-text);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+  }
+  .abind .t {
+    min-width: 0;
+    flex: 1;
+    overflow: hidden;
+    color: var(--ink);
+    font-size: 12px;
+    font-weight: 550;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  /*
+   * The task can no longer be resolved — answered in another window, or moved by a
+   * poll. Warm rather than blue, because the pending send is now refused: the
+   * answer must not silently become a chat message to the secretary.
+   */
+  .abind.stale {
+    background: var(--color-warn-soft);
+    box-shadow: 0 0 0 1px rgba(154, 91, 0, 0.28);
+  }
+  .abind.stale .k {
     color: var(--color-warn);
-    font-size: 11.5px;
+  }
+  .abind.stale .t {
+    color: var(--color-warn);
+  }
+  .abind .x {
+    width: 22px;
+    height: 22px;
+    flex-shrink: 0;
+    display: grid;
+    padding: 0;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    place-items: center;
+  }
+  .abind .x:hover {
+    background: var(--fill-hover);
+    color: var(--ink);
+  }
+  .abind .x svg {
+    width: 12px;
+    height: 12px;
   }
   .ctx .more:hover {
     text-decoration: underline;
@@ -2240,6 +2569,7 @@
     text-align: center;
   }
   .m {
+    position: relative;
     max-width: 86%;
     margin-bottom: 10px;
     padding: 9px 14px;
@@ -2259,6 +2589,107 @@
     border-radius: 18px 18px 18px 5px;
     background: #e9e9eb;
     color: var(--ink);
+  }
+
+  /* ── Corner copy action ─────────────────────────────────────
+     A badge outside the bubble's own corner rather than inside its padding: it
+     never covers the first or last word of a short reply, and it needs no
+     layout reserved for it — the bubble's box is exactly what it was before
+     this existed, right up until a pointer arrives to reveal the badge. */
+  .mcopy {
+    position: absolute;
+    top: -7px;
+    width: 22px;
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: var(--white);
+    box-shadow:
+      0 1px 3px rgba(20, 22, 26, 0.18),
+      0 0 0 1px var(--line-strong);
+    color: var(--ink-2);
+    cursor: pointer;
+    opacity: 0;
+    transform: scale(0.85);
+    transition:
+      opacity 0.14s ease,
+      transform 0.16s cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+  .m.a .mcopy {
+    right: -7px;
+  }
+  .m.u .mcopy {
+    left: -7px;
+  }
+  .mrow:hover .mcopy,
+  .mcopy:focus-visible,
+  .mcopy.show {
+    opacity: 1;
+    transform: scale(1);
+  }
+  .mcopy.show {
+    color: var(--color-ok);
+  }
+  .mcopy svg {
+    width: 11px;
+    height: 11px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.8;
+  }
+
+  /* ── Markdown-lite, secretary replies only ──────────────────
+     A restrained subset (see markdown-lite.tsx) rendered inside the same bubble
+     box `.m.a` already defines — no code block ever needs its own background
+     distinct from the bubble, this app has exactly one surface per message. */
+  .md p {
+    margin: 0 0 8px;
+  }
+  .md p:last-child {
+    margin-bottom: 0;
+  }
+  .md ul,
+  .md ol {
+    margin: 0 0 8px;
+    padding-left: 20px;
+  }
+  .md ul:last-child,
+  .md ol:last-child {
+    margin-bottom: 0;
+  }
+  .md li {
+    margin-bottom: 2px;
+  }
+  .md code {
+    padding: 1.5px 5px;
+    border-radius: 5px;
+    background: rgba(0, 0, 0, 0.07);
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .md pre {
+    margin: 0 0 8px;
+    padding: 9px 11px;
+    border-radius: 10px;
+    background: rgba(0, 0, 0, 0.07);
+    overflow-x: auto;
+  }
+  .md pre:last-child {
+    margin-bottom: 0;
+  }
+  .md pre code {
+    padding: 0;
+    background: none;
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre;
+  }
+  .md a {
+    color: var(--accent-text);
+    text-decoration: underline;
+    text-decoration-color: var(--accent-line);
   }
   /* One message plus its inline task cards; alignment lives here so the cards
      hang under the bubble on the same side. */
@@ -2351,6 +2782,54 @@
       transform: translateY(-2px);
     }
   }
+  /* The growing reply, mid-stream — same bubble class as a persisted `.m.a`
+     plus a trailing caret so a pause between tokens still reads as "still
+     writing" rather than "finished on an incomplete sentence". */
+  .m.live {
+    position: relative;
+  }
+  .live-caret {
+    display: inline-block;
+    width: 2px;
+    height: 13px;
+    margin-left: 1px;
+    vertical-align: -2px;
+    background: var(--ink-3);
+    animation: caret-blink 1s step-end infinite;
+  }
+  @keyframes caret-blink {
+    50% {
+      opacity: 0;
+    }
+  }
+  /* ── Image attachments, in a message bubble's row ───────────
+     Full images rather than cropped squares: a picture asked about loses
+     exactly the detail the question is about if a thumbnail crops it. */
+  .attach-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+  .attach-strip.u {
+    justify-content: flex-end;
+  }
+  .attach-thumb {
+    display: block;
+    max-width: 220px;
+    max-height: 220px;
+    overflow: hidden;
+    border-radius: 14px;
+    box-shadow: 0 0 0 1px var(--line);
+  }
+  .attach-thumb img {
+    display: block;
+    max-width: 220px;
+    max-height: 220px;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+  }
   /* "Chat cannot run yet, and this is why." Informational, not an error. */
   .cbanner {
     margin: 12px 16px 0;
@@ -2381,6 +2860,68 @@
     padding: 10px 12px 12px;
     box-shadow: 0 -1px 0 var(--line);
   }
+  /* ── Pending attachments ──────────────────────────────────
+     Thumbnails of images picked but not yet sent, above the input box — the
+     same row a picture will occupy once it becomes a message, so attaching one
+     previews roughly what the bubble is about to look like. */
+  .composer-attachments {
+    margin-bottom: 8px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .composer-thumb {
+    position: relative;
+    width: 52px;
+    height: 52px;
+    flex-shrink: 0;
+    overflow: hidden;
+    border-radius: var(--r-sm);
+    background: var(--fill);
+    box-shadow: 0 0 0 1px var(--line);
+  }
+  .composer-thumb img {
+    width: 100%;
+    height: 100%;
+    display: block;
+    object-fit: cover;
+  }
+  /* A file still being decoded/resized — a soft pulse rather than a blank box,
+     so a slow picture does not read as the drop having failed. */
+  .composer-thumb.loading {
+    animation: think 1.2s ease-in-out infinite;
+  }
+  .composer-thumb-remove {
+    position: absolute;
+    top: 2px;
+    right: 2px;
+    width: 16px;
+    height: 16px;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(20, 22, 26, 0.55);
+    color: var(--white);
+    cursor: pointer;
+  }
+  .composer-thumb-remove svg {
+    width: 8px;
+    height: 8px;
+    stroke-width: 2.4;
+  }
+  .composer-attach-error {
+    margin: 0 0 6px;
+    color: var(--color-bad);
+    font-size: 11.5px;
+  }
+  .composer-file-input {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    opacity: 0;
+    pointer-events: none;
+  }
   .composer-box {
     padding: 7px 7px 7px 11px;
     display: flex;
@@ -2391,6 +2932,36 @@
     transition:
       background 0.12s ease,
       box-shadow 0.12s ease;
+  }
+  .composer-attach {
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    display: grid;
+    place-items: center;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: var(--ink-3);
+    cursor: pointer;
+    transition:
+      background 0.14s ease,
+      color 0.14s ease;
+  }
+  .composer-attach:hover:not(:disabled) {
+    background: var(--fill-hover);
+    color: var(--ink-2);
+  }
+  .composer-attach:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+  .composer-attach svg {
+    width: 16px;
+    height: 16px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
   }
   .composer-box:focus-within {
     background: var(--white);
@@ -2484,6 +3055,44 @@
     background: var(--accent-tint);
     color: var(--accent-text);
     box-shadow: 0 0 0 1px var(--accent-line);
+  }
+
+  /* ── Jump-to-latest pill ─────────────────────────────────────
+     `position: sticky` on the scrolling column's last child pins it to the
+     bottom of the VISIBLE area with no width or offset math against the
+     composer below — the one thing sticky is for. Only ever rendered while
+     there is something to report (see the `unseen > 0` guard at the call
+     site), so it never sits over an empty thread or a reader already at
+     the bottom. */
+  .jump {
+    position: sticky;
+    bottom: 8px;
+    align-self: center;
+    margin-top: 4px;
+    padding: 6px 13px 6px 10px;
+    display: flex;
+    align-items: center;
+    gap: 5px;
+    border: 0;
+    border-radius: 999px;
+    background: var(--ink);
+    color: var(--white);
+    box-shadow: 0 3px 10px rgba(20, 22, 26, 0.22);
+    cursor: pointer;
+    font: inherit;
+    font-size: 11.5px;
+    font-weight: 600;
+    animation: rise 160ms ease-out;
+  }
+  .jump:hover {
+    background: #000;
+  }
+  .jump svg {
+    width: 11px;
+    height: 11px;
+    fill: none;
+    stroke: var(--white);
+    stroke-width: 2.2;
   }
 
   /* ══ Result drawer ══════════════════════════════════════════
@@ -3069,6 +3678,8 @@
 
 /*
  * The secretary panel is the first thing to go: the board is the working surface.
+ * Its composer carries the answer field on wide screens, so `.abar` comes back
+ * inside that breakpoint — see the rule near `.abar` above.
  *
  * The COLUMN TRACK is what collapses, not the panel's own width. `.chat` no longer
  * carries a width — the grid owns it — so hiding the element without dropping its
@@ -3080,6 +3691,15 @@
   }
   .chat {
     display: none;
+  }
+  /*
+   * The card's answer field comes back, because the composer that replaced it went
+   * away with the panel above. Answering has to survive this breakpoint: it is the
+   * only way to unstick a parked question, so losing it here would be a feature
+   * disappearing at a window width rather than a layout degrading.
+   */
+  .abar {
+    display: block;
   }
 }
 
@@ -3125,17 +3745,20 @@
     gap: 0;
   }
   /*
-   * The needs-you dot survives, anchored to the row rather than pushed by
-   * `margin-left: auto` — there is no label left for it to be pushed away from.
-   * It is the one signal that must stay visible when there is no room for a count.
+   * The parked dots survive, anchored to the row rather than pushed by
+   * `margin-left: auto` — there is no label left for them to be pushed away from.
+   * They are the one signal that must stay visible when there is no room for a count.
+   *
+   * The GROUP is positioned, not each dot: absolutely positioning both would stack
+   * them at the same coordinates and one would hide the other.
    */
   .srow {
     position: relative;
   }
-  .srow .dot-badge {
+  .srow .pdots {
     position: absolute;
     top: 5px;
-    right: 12px;
+    right: 10px;
     margin: 0;
   }
   /* Two things with no icon to fall back on: a calendar at 68px is unreadable, and

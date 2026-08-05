@@ -462,14 +462,52 @@ export interface Task {
   updatedAt: string;
 }
 
-/** One entry in the main-agent conversation timeline. */
+/**
+ * One independent conversation thread with the main agent.
+ *
+ * Many of these can exist side by side, the way multiple ChatGPT
+ * conversations do — a person picks one from a switcher rather than the
+ * workspace holding a single global chat.
+ */
+export interface ChatSession {
+  id: string;
+  /** Empty until renamed; the UI falls back to a relative-time label. */
+  title: string;
+  /**
+   * Path to the pi SDK's own JSONL session file backing this thread's model
+   * context. Null until the first turn actually runs and pi assigns one —
+   * a session can exist (and hold history rows) before an agent ever replies.
+   */
+  piSessionPath: string | null;
+  createdAt: string;
+  /** Bumped on every message, so the switcher can sort by recent activity. */
+  updatedAt: string;
+  /** Archived threads keep their messages but leave the switcher's default list. */
+  archivedAt: string | null;
+}
+
+/** An image sent alongside a chat message. */
+export interface AgentChatAttachment {
+  id: string;
+  /** e.g. "image/png". Only images are supported today. */
+  mediaType: string;
+  /** Where the engine serves the stored file, e.g. "/api/uploads/:id". */
+  url: string;
+  width?: number;
+  height?: number;
+}
+
+/** One entry in a chat session's conversation timeline. */
 export interface AgentChatMessage {
   seq: number;
   id: string;
+  sessionId: string;
   role: "user" | "agent";
   body: string;
   /** Tasks this message created or referenced, for inline cards in the chat. */
   taskRefs: string[];
+  /** Images sent with this message, if any. */
+  attachments: AgentChatAttachment[];
   createdAt: string;
 }
 

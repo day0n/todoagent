@@ -417,3 +417,70 @@ test("run: soloMode round-trips as a boolean", () => {
   assert.equal(store.getRun(team.id)?.soloMode, false);
   store.close();
 });
+
+// ── Chat sessions ───────────────────────────────────────────
+
+test("chat session: create/list/get/patch round-trip", () => {
+  const store = new Store(":memory:");
+  const s = store.createChatSession({ title: "第一个" });
+  assert.equal(store.getChatSession(s.id)?.title, "第一个");
+  assert.equal(store.listChatSessions().length, 1);
+
+  store.patchChatSession(s.id, { title: "改名了" });
+  assert.equal(store.getChatSession(s.id)?.title, "改名了");
+
+  store.patchChatSession(s.id, { archivedAt: new Date().toISOString() });
+  assert.equal(store.listChatSessions().length, 0, "archived leaves the default list");
+  assert.equal(store.listChatSessions({ archived: true }).length, 1);
+  store.close();
+});
+
+test("chat session: defaultChatSession creates one lazily and is stable across calls", () => {
+  const store = new Store(":memory:");
+  const first = store.defaultChatSession();
+  const second = store.defaultChatSession();
+  assert.equal(first.id, second.id);
+  assert.equal(store.listChatSessions().length, 1);
+  store.close();
+});
+
+test("chat: messages are scoped to their session", () => {
+  const store = new Store(":memory:");
+  const a = store.createChatSession({ title: "a" });
+  const b = store.createChatSession({ title: "b" });
+  store.appendAgentChat({ sessionId: a.id, role: "user", body: "in a" });
+  store.appendAgentChat({ sessionId: b.id, role: "user", body: "in b" });
+
+  assert.deepEqual(store.listAgentChat(a.id).map((m) => m.body), ["in a"]);
+  assert.deepEqual(store.listAgentChat(b.id).map((m) => m.body), ["in b"]);
+  store.close();
+});
+
+test("chat: attachments round-trip as JSON and default to empty", () => {
+  const store = new Store(":memory:");
+  const s = store.createChatSession();
+  const withImage = store.appendAgentChat({
+    sessionId: s.id,
+    role: "user",
+    body: "look",
+    attachments: [{ id: "att1", mediaType: "image/png", url: "/api/uploads/att1" }],
+  });
+  const withoutImage = store.appendAgentChat({ sessionId: s.id, role: "agent", body: "ok" });
+
+  const rows = store.listAgentChat(s.id);
+  assert.deepEqual(rows[0]?.attachments, withImage.attachments);
+  assert.deepEqual(rows[1]?.attachments, withoutImage.attachments);
+  assert.deepEqual(rows[1]?.attachments, []);
+  store.close();
+});
+
+test("chat: appending a message touches its session's updatedAt", () => {
+  const store = new Store(":memory:");
+  const s = store.createChatSession();
+  const before = store.getChatSession(s.id)?.updatedAt;
+  store.appendAgentChat({ sessionId: s.id, role: "user", body: "hi" });
+  const after = store.getChatSession(s.id)?.updatedAt;
+  assert.ok(before !== undefined && after !== undefined);
+  assert.ok(after !== undefined);
+  store.close();
+});
