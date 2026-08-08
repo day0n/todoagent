@@ -3,7 +3,11 @@ import SwiftUI
 struct ContentView: View {
     @State private var state: AppState
 
-    init(repository: any AppRepository = DemoRepository()) {
+    init(state: AppState) {
+        _state = State(initialValue: state)
+    }
+
+    init(repository: any AppRepository) {
         _state = State(initialValue: AppState(repository: repository))
     }
 
@@ -188,12 +192,21 @@ private struct TaskDestinationSheet: View {
 }
 
 private actor EmptyPreviewRepository: AppRepository {
-    private let snapshot = AppSnapshot(lists: [], tasks: [], messages: [])
+    private let snapshot = AppSnapshot(revision: 0, lists: [], tasks: [], runtimes: [], sessions: [], messages: [])
 
     func load() async throws -> AppSnapshot { snapshot }
-    func createTask(title: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot { snapshot }
-    func setStatus(taskID: UUID, status: TaskStatus) async throws -> AppSnapshot { snapshot }
-    func answer(taskID: UUID, text: String) async throws -> AppSnapshot { snapshot }
-    func cancel(taskID: UUID) async throws -> AppSnapshot { snapshot }
-    func sendChat(_ text: String) async throws -> AppSnapshot { snapshot }
+    func sync() async throws -> AppSnapshot { snapshot }
+    func events() async -> AsyncStream<EngineEvent> { AsyncStream { $0.finish() } }
+    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot { snapshot }
+    func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot { snapshot }
+    func detectRuntimes() async throws -> AppSnapshot { snapshot }
+    func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot { snapshot }
+    func session(taskID: UUID) async throws -> SessionBundle? { nil }
+    func createSession(taskID: UUID, runtime: RuntimeKind, workspace: String) async throws -> SessionBundle { throw AppRepositoryError.sessionNotFound }
+    func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle { throw AppRepositoryError.sessionNotFound }
+    func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle { throw AppRepositoryError.sessionNotFound }
+    func markRead(sessionID: String, through sequence: Int64) async throws {}
+    func cancelTurn(sessionID: String) async throws {}
+    func injectGeminiKey(_ key: String) async throws {}
+    func shutdown() async {}
 }

@@ -1,4 +1,4 @@
-{"event":"engine.ready","data":{"protocolVersion":1,"engineVersion":"0.1.0","capabilities":["snapshot","list.create","task.create","task.set_status","runtime.detect","runtime.verify","engine.shutdown"]}}
-{"id":"snapshot-1","method":"app.snapshot","params":{}}
-{"id":"snapshot-1","result":{"lists":[],"tasks":[]}}
+{"event":"engine.ready","data":{"protocolVersion":2,"engineVersion":"0.1.0","capabilities":["app.bootstrap","session.send"],"runtimes":["codex","claude","cursor","kiro"]}}
+{"id":"bootstrap-1","method":"app.bootstrap","params":{}}
+{"id":"bootstrap-1","result":{"revision":0,"lists":[],"tasks":[],"runtimes":[],"sessions":[]}}
 {"id":"missing-1","error":{"code":"not_found","message":"requested record does not exist"}}

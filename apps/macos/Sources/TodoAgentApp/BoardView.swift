@@ -146,7 +146,7 @@ private struct TimelineColumn: View {
 
     var body: some View {
         let completedCount = tasks.reduce(into: 0) { count, task in
-            if task.status == .done { count += 1 }
+            if task.status == .completed { count += 1 }
         }
 
         VStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
@@ -277,21 +277,44 @@ private struct TaskCard: View {
     let state: AppState
 
     var body: some View {
+        HStack(alignment: .top, spacing: TodoAgentUI.standardSpacing) {
+            completionButton
+            sessionButton
+        }
+        .padding(TodoAgentUI.cardPadding)
+        .background(Color(nsColor: .windowBackgroundColor), in: .rect(cornerRadius: TodoAgentUI.cardRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
+                .stroke(borderColor, lineWidth: state.hasUnreadAgentMessage(for: task) ? 1.5 : 1)
+        }
+        .shadow(color: .black.opacity(0.055), radius: 4, y: 2)
+        .accessibilityLabel("\(task.title)，\(state.session(for: task) == nil ? "尚未创建 Session" : "进入 Session")")
+        .accessibilityIdentifier("task.\(task.id.uuidString).card")
+    }
+
+    private var completionButton: some View {
         Button {
-            state.openTask(task)
+            Task { _ = await state.setCompleted(task, completed: task.status == .open) }
         } label: {
+            Image(systemName: task.status == .completed ? "checkmark.circle.fill" : "circle")
+                .font(.title3)
+                .foregroundStyle(task.status == .completed ? Color.green : Color.secondary)
+        }
+        .labelStyle(.iconOnly)
+        .buttonStyle(.plain)
+        .accessibilityLabel(task.status == .completed ? "重新打开" : "标记完成")
+        .help(task.status == .completed ? "重新打开任务" : "标记任务为已完成")
+    }
+
+    private var sessionButton: some View {
+        Button { state.openTask(task) } label: {
             VStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
                 HStack(alignment: .top, spacing: TodoAgentUI.standardSpacing) {
-                    Image(systemName: task.status == .done ? "checkmark.circle.fill" : "circle")
-                        .font(.title3)
-                        .foregroundStyle(task.status == .done ? .green : .secondary)
-                        .accessibilityHidden(true)
-
                     VStack(alignment: .leading, spacing: 3) {
                         Text(task.title)
                             .font(.body)
                             .bold()
-                            .strikethrough(task.status == .done)
+                            .strikethrough(task.status == .completed)
                         if !task.note.isEmpty {
                             Text(task.note)
                                 .font(.callout)
@@ -317,8 +340,8 @@ private struct TaskCard: View {
 
                 HStack(spacing: TodoAgentUI.standardSpacing) {
                     if let session = state.session(for: task) {
-                        Label(session.runtime, systemImage: "terminal")
-                        Label(session.workspace, systemImage: "folder")
+                        Label(session.runtimeKind.title, systemImage: "terminal")
+                        Label(session.workingDirectory, systemImage: "folder")
                             .lineLimit(1)
                     } else {
                         Label("进入后选择 Runtime 和执行目录", systemImage: "arrow.right.circle")
@@ -331,34 +354,16 @@ private struct TaskCard: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             }
-            .padding(TodoAgentUI.cardPadding)
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .background(Color(nsColor: .windowBackgroundColor), in: .rect(cornerRadius: TodoAgentUI.cardRadius))
-        .overlay {
-            RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
-                .stroke(
-                    task.status == .needsYou
-                        ? Color.orange.opacity(0.62)
-                        : Color(nsColor: .separatorColor).opacity(0.38),
-                    lineWidth: task.status == .needsYou ? 1.5 : 1
-                )
-        }
-        .shadow(color: .black.opacity(0.055), radius: 4, y: 2)
-        .accessibilityLabel(
-            "\(task.title)，\(state.session(for: task) == nil ? "尚未创建 Session" : "进入 Session")"
-        )
-        .accessibilityIdentifier("task.\(task.id.uuidString).card")
     }
 
     private var statusColor: Color {
-        switch task.status {
-        case .todo: .secondary
-        case .running: .blue
-        case .needsYou: .orange
-        case .review: .green
-        case .done: .secondary
-        }
+        task.status == .completed ? .green : .secondary
+    }
+
+    private var borderColor: Color {
+        state.hasUnreadAgentMessage(for: task) ? .red.opacity(0.58) : Color(nsColor: .separatorColor).opacity(0.38)
     }
 }

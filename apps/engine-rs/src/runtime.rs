@@ -2,93 +2,229 @@ use std::collections::HashSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use chrono::Utc;
-use wait_timeout::ChildExt;
+use serde_json::{Value, json};
+use tokio::process::Command;
+use tokio::time::timeout;
 
 use crate::models::{Runtime, RuntimeKind};
-use crate::store::Store;
 
-pub fn detect(store: &Store) -> rusqlite::Result<Vec<Runtime>> {
-    for kind in [RuntimeKind::Codex, RuntimeKind::Claude] {
-        let existing = store.runtime(kind)?;
-        let executable = discover(kind);
-        let runtime = Runtime {
-            kind,
-            executable: executable.as_ref().map(|path| path.display().to_string()),
-            version: existing.as_ref().and_then(|value| value.version.clone()),
-            status: if executable.is_some() {
-                "detected"
-            } else {
-                "missing"
+pub fn detect_all() -> Vec<Runtime> {
+    RuntimeKind::ALL
+        .into_iter()
+        .map(|kind| {
+            let launch = discover(kind);
+            Runtime {
+                kind,
+                launch_path: launch.as_ref().map(|path| path.display().to_string()),
+                resolved_path: launch
+                    .as_ref()
+                    .and_then(|path| fs::canonicalize(path).ok())
+                    .map(|path| path.display().to_string()),
+                version: None,
+                status: if launch.is_some() {
+                    "detected"
+                } else {
+                    "missing"
+                }
+                .to_owned(),
+                auth_status: "unknown".to_owned(),
+                capabilities: capabilities(kind),
+                provider_engine: (kind == RuntimeKind::Kiro).then(|| "v2".to_owned()),
+                detected_at: Some(Utc::now().to_rfc3339()),
+                verified_at: None,
+                verify_error: None,
             }
-            .to_owned(),
-            detected_at: Some(Utc::now().to_rfc3339()),
-            verified_at: existing.and_then(|value| value.verified_at),
-            verify_error: None,
-        };
-        store.save_runtime(&runtime)?;
-    }
-    store.runtimes()
+        })
+        .collect()
 }
 
-pub fn verify(
-    store: &Store,
-    kind: RuntimeKind,
-    explicit: Option<&str>,
-) -> rusqlite::Result<Runtime> {
-    let executable = explicit
-        .map(PathBuf::from)
-        .or_else(|| {
-            store
-                .runtime(kind)
-                .ok()
-                .flatten()
-                .and_then(|value| value.executable.map(PathBuf::from))
-        })
-        .or_else(|| discover(kind));
-    let now = Utc::now().to_rfc3339();
-    let Some(executable) = executable else {
-        let runtime = Runtime {
+pub async fn verify(kind: RuntimeKind, explicit: Option<&str>) -> Runtime {
+    let timestamp = Utc::now().to_rfc3339();
+    let launch = explicit.map(PathBuf::from).or_else(|| discover(kind));
+    let Some(launch) = launch else {
+        return Runtime {
             kind,
-            executable: None,
+            launch_path: None,
+            resolved_path: None,
             version: None,
             status: "missing".to_owned(),
-            detected_at: Some(now.clone()),
-            verified_at: Some(now),
+            auth_status: "unknown".to_owned(),
+            capabilities: capabilities(kind),
+            provider_engine: provider_engine(kind),
+            detected_at: Some(timestamp.clone()),
+            verified_at: Some(timestamp),
             verify_error: Some("executable not found".to_owned()),
         };
-        store.save_runtime(&runtime)?;
-        return Ok(runtime);
     };
-    let absolute = fs::canonicalize(&executable).unwrap_or(executable);
-    let validation = validate_executable(&absolute);
-    let (status, version, verify_error) = match validation {
-        Ok(version) => ("ready".to_owned(), Some(version), None),
-        Err(error) => ("error".to_owned(), None, Some(error)),
+    let resolved = fs::canonicalize(&launch).unwrap_or_else(|_| launch.clone());
+    if !resolved.is_absolute() || !is_executable(&resolved) {
+        return failed(
+            kind,
+            launch,
+            resolved,
+            timestamp,
+            "path is not an executable file".to_owned(),
+        );
+    }
+    let version = match command_output(&resolved, &["--version"], Duration::from_secs(8)).await {
+        Ok(output) => first_line(&output).unwrap_or_else(|| "unknown".to_owned()),
+        Err(error) => return failed(kind, launch, resolved, timestamp, error),
     };
-    let runtime = Runtime {
+    let (auth_status, verify_error) = verify_auth(kind, &resolved).await;
+    let status = match auth_status.as_str() {
+        "authenticated" => "ready",
+        "required" => "auth_required",
+        _ => "error",
+    };
+    Runtime {
         kind,
-        executable: Some(absolute.display().to_string()),
-        version,
-        status,
-        detected_at: Some(now.clone()),
-        verified_at: Some(now),
+        launch_path: Some(launch.display().to_string()),
+        resolved_path: Some(resolved.display().to_string()),
+        version: Some(version),
+        status: status.to_owned(),
+        auth_status,
+        capabilities: capabilities(kind),
+        provider_engine: provider_engine(kind),
+        detected_at: Some(timestamp.clone()),
+        verified_at: Some(timestamp),
         verify_error,
-    };
-    store.save_runtime(&runtime)?;
-    Ok(runtime)
+    }
 }
 
-fn discover(kind: RuntimeKind) -> Option<PathBuf> {
-    let name = kind.as_str();
+pub fn discover(kind: RuntimeKind) -> Option<PathBuf> {
+    let name = kind.executable_name();
     search_directories()
         .into_iter()
         .map(|directory| directory.join(name))
         .find(|candidate| is_executable(candidate))
-        .and_then(|candidate| fs::canonicalize(&candidate).ok().or(Some(candidate)))
+}
+
+pub fn merged_path() -> String {
+    std::env::join_paths(search_directories())
+        .ok()
+        .and_then(|value| value.into_string().ok())
+        .unwrap_or_default()
+}
+
+pub fn capabilities(kind: RuntimeKind) -> Value {
+    match kind {
+        RuntimeKind::Kiro => json!({
+            "nativeResume": true, "transport": "acp", "text": true,
+            "attachments": false, "providerEngine": "v2"
+        }),
+        RuntimeKind::Codex => {
+            json!({"nativeResume": true, "transport": "jsonl", "text": true, "attachments": false})
+        }
+        RuntimeKind::Claude | RuntimeKind::Cursor => {
+            json!({"nativeResume": true, "transport": "stream_json", "text": true, "attachments": false})
+        }
+    }
+}
+
+async fn verify_auth(kind: RuntimeKind, executable: &Path) -> (String, Option<String>) {
+    let args: &[&str] = match kind {
+        RuntimeKind::Codex => &["login", "status"],
+        RuntimeKind::Claude => &["auth", "status", "--json"],
+        RuntimeKind::Cursor => &["status", "--format", "json"],
+        RuntimeKind::Kiro => &["whoami", "--format", "json"],
+    };
+    match command_output(executable, args, Duration::from_secs(10)).await {
+        Ok(output) => {
+            let lowered = output.to_lowercase();
+            let unauthenticated = lowered.contains("not logged in")
+                || lowered.contains("not authenticated")
+                || lowered.contains("\"account\":null")
+                || lowered.contains("\"loggedin\":false")
+                || lowered.contains("\"authenticated\":false");
+            if unauthenticated {
+                (
+                    "required".to_owned(),
+                    Some("runtime is not authenticated".to_owned()),
+                )
+            } else {
+                ("authenticated".to_owned(), None)
+            }
+        }
+        Err(error) => {
+            let lowered = error.to_lowercase();
+            if lowered.contains("not logged in")
+                || lowered.contains("not authenticated")
+                || lowered.contains("login")
+            {
+                ("required".to_owned(), Some(error))
+            } else {
+                ("error".to_owned(), Some(error))
+            }
+        }
+    }
+}
+
+async fn command_output(path: &Path, args: &[&str], budget: Duration) -> Result<String, String> {
+    let mut command = Command::new(path);
+    command
+        .args(args)
+        .env("PATH", merged_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let output = timeout(budget, command.output())
+        .await
+        .map_err(|_| format!("{} timed out", args.join(" ")))?
+        .map_err(|error| error.to_string())?;
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.success() {
+        Ok(combined.trim().to_owned())
+    } else {
+        Err(format!(
+            "{} exited {}: {}",
+            args.join(" "),
+            output.status,
+            combined.trim()
+        ))
+    }
+}
+
+fn failed(
+    kind: RuntimeKind,
+    launch: PathBuf,
+    resolved: PathBuf,
+    timestamp: String,
+    error: String,
+) -> Runtime {
+    Runtime {
+        kind,
+        launch_path: Some(launch.display().to_string()),
+        resolved_path: Some(resolved.display().to_string()),
+        version: None,
+        status: "error".to_owned(),
+        auth_status: "error".to_owned(),
+        capabilities: capabilities(kind),
+        provider_engine: provider_engine(kind),
+        detected_at: Some(timestamp.clone()),
+        verified_at: Some(timestamp),
+        verify_error: Some(error),
+    }
+}
+
+fn provider_engine(kind: RuntimeKind) -> Option<String> {
+    (kind == RuntimeKind::Kiro).then(|| "v2".to_owned())
+}
+
+fn first_line(value: &str) -> Option<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
 }
 
 fn search_directories() -> Vec<PathBuf> {
@@ -96,10 +232,13 @@ fn search_directories() -> Vec<PathBuf> {
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/opt/homebrew/sbin"),
         PathBuf::from("/usr/local/bin"),
+        PathBuf::from("/usr/bin"),
+        PathBuf::from("/bin"),
     ];
     if let Some(home) = dirs::home_dir() {
         directories.push(home.join(".local/bin"));
         directories.push(home.join(".bun/bin"));
+        directories.push(home.join(".cargo/bin"));
     }
     if let Some(path) = std::env::var_os("PATH") {
         directories.extend(std::env::split_paths(&path));
@@ -115,52 +254,18 @@ fn is_executable(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn validate_executable(path: &Path) -> Result<String, String> {
-    if !path.is_absolute() || !is_executable(path) {
-        return Err("path is not an executable file".to_owned());
-    }
-    let mut child = Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| error.to_string())?;
-    match child
-        .wait_timeout(Duration::from_secs(5))
-        .map_err(|error| error.to_string())?
-    {
-        Some(status) if status.success() => {
-            let output = child
-                .wait_with_output()
-                .map_err(|error| error.to_string())?;
-            let version = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-            if version.is_empty() {
-                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                if stderr.is_empty() {
-                    Ok("unknown".to_owned())
-                } else {
-                    Ok(stderr)
-                }
-            } else {
-                Ok(version)
-            }
-        }
-        Some(status) => Err(format!("version command exited with {status}")),
-        None => {
-            let _ = child.kill();
-            let _ = child.wait();
-            Err("version command timed out".to_owned())
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn rejects_a_non_executable_path() {
-        assert!(validate_executable(Path::new("/definitely/missing/codex")).is_err());
+    fn all_four_runtimes_have_distinct_executables() {
+        let names: HashSet<_> = RuntimeKind::ALL
+            .into_iter()
+            .map(RuntimeKind::executable_name)
+            .collect();
+        assert_eq!(names.len(), 4);
+        assert_eq!(RuntimeKind::Cursor.executable_name(), "cursor-agent");
+        assert_eq!(RuntimeKind::Kiro.executable_name(), "kiro-cli");
     }
 }

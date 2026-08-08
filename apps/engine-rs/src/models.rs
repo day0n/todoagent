@@ -13,33 +13,24 @@ pub struct List {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "lowercase")]
 pub enum TaskStatus {
-    Todo,
-    Running,
-    NeedsYou,
-    Review,
-    Done,
+    Open,
+    Completed,
 }
 
 impl TaskStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Todo => "todo",
-            Self::Running => "running",
-            Self::NeedsYou => "needs_you",
-            Self::Review => "review",
-            Self::Done => "done",
+            Self::Open => "open",
+            Self::Completed => "completed",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "todo" => Some(Self::Todo),
-            "running" => Some(Self::Running),
-            "needs_you" => Some(Self::NeedsYou),
-            "review" => Some(Self::Review),
-            "done" => Some(Self::Done),
+            "open" => Some(Self::Open),
+            "completed" => Some(Self::Completed),
             _ => None,
         }
     }
@@ -54,34 +45,38 @@ pub struct Task {
     pub note: String,
     pub status: TaskStatus,
     pub due_date: Option<String>,
-    pub needs_kind: Option<String>,
-    pub needs_text: Option<String>,
-    pub runtime_kind: Option<String>,
-    pub working_directory: Option<String>,
-    pub active_run_id: Option<String>,
+    pub completed_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Snapshot {
-    pub lists: Vec<List>,
-    pub tasks: Vec<Task>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum RuntimeKind {
     Codex,
     Claude,
+    Cursor,
+    Kiro,
 }
 
 impl RuntimeKind {
+    pub const ALL: [Self; 4] = [Self::Codex, Self::Claude, Self::Cursor, Self::Kiro];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Cursor => "cursor",
+            Self::Kiro => "kiro",
+        }
+    }
+
+    pub fn executable_name(self) -> &'static str {
+        match self {
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+            Self::Cursor => "cursor-agent",
+            Self::Kiro => "kiro-cli",
         }
     }
 
@@ -89,6 +84,8 @@ impl RuntimeKind {
         match value {
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
+            "cursor" => Some(Self::Cursor),
+            "kiro" => Some(Self::Kiro),
             _ => None,
         }
     }
@@ -98,10 +95,193 @@ impl RuntimeKind {
 #[serde(rename_all = "camelCase")]
 pub struct Runtime {
     pub kind: RuntimeKind,
-    pub executable: Option<String>,
+    pub launch_path: Option<String>,
+    pub resolved_path: Option<String>,
     pub version: Option<String>,
     pub status: String,
+    pub auth_status: String,
+    pub capabilities: serde_json::Value,
+    pub provider_engine: Option<String>,
     pub detected_at: Option<String>,
     pub verified_at: Option<String>,
     pub verify_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionState {
+    Idle,
+    Queued,
+    Running,
+    Failed,
+    Closed,
+}
+
+impl SessionState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Failed => "failed",
+            Self::Closed => "closed",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "idle" => Some(Self::Idle),
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "failed" => Some(Self::Failed),
+            "closed" => Some(Self::Closed),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl TurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum MessageRole {
+    User,
+    Agent,
+    System,
+    Tool,
+}
+
+impl MessageRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Agent => "agent",
+            Self::System => "system",
+            Self::Tool => "tool",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "user" => Some(Self::User),
+            "agent" => Some(Self::Agent),
+            "system" => Some(Self::System),
+            "tool" => Some(Self::Tool),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskSession {
+    pub id: String,
+    pub task_id: String,
+    pub runtime_kind: RuntimeKind,
+    pub working_directory: String,
+    pub provider_session_id: Option<String>,
+    pub provider_engine: Option<String>,
+    pub state: SessionState,
+    pub last_agent_sequence: i64,
+    pub last_read_sequence: i64,
+    pub last_error_code: Option<String>,
+    pub last_error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTurn {
+    pub id: String,
+    pub session_id: String,
+    pub ordinal: i64,
+    pub user_message_id: String,
+    pub provider_session_id_before: Option<String>,
+    pub provider_session_id_after: Option<String>,
+    pub status: TurnStatus,
+    pub exit_code: Option<i32>,
+    pub final_output: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub provider_usage_json: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMessage {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub sequence: i64,
+    pub client_message_id: Option<String>,
+    pub role: MessageRole,
+    pub kind: String,
+    pub body: String,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Bootstrap {
+    pub revision: i64,
+    pub lists: Vec<List>,
+    pub tasks: Vec<Task>,
+    pub runtimes: Vec<Runtime>,
+    pub sessions: Vec<TaskSession>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBundle {
+    pub session: TaskSession,
+    pub messages: Vec<SessionMessage>,
+    pub active_turn: Option<SessionTurn>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedTurn {
+    pub session: TaskSession,
+    pub turn: SessionTurn,
+    pub prompt: String,
+    pub is_new: bool,
 }

@@ -130,10 +130,12 @@ private struct RuntimeSettingsPane: View {
         settingsForm {
             Section("支持的 CLI") {
                 runtimeRow(name: "Codex", symbol: "c.square.fill")
-                runtimeRow(name: "Claude", symbol: "sparkle")
+                runtimeRow(name: "Claude Code", symbol: "sparkle")
+                runtimeRow(name: "Cursor Agent", symbol: "cursorarrow.rays")
+                runtimeRow(name: "Kiro CLI", symbol: "terminal")
             }
             Section {
-                Text("预览版不会启动真实 CLI。Rust Engine 接入后，这里会分别显示“已发现”和“已验证”。")
+                Text("可用性由 Rust Engine 启动时真实检测；未安装或未登录的 Runtime 不会影响其他 Runtime。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -142,7 +144,7 @@ private struct RuntimeSettingsPane: View {
 
     private func runtimeRow(name: String, symbol: String) -> some View {
         LabeledContent {
-            Label("预览", systemImage: "circle.fill")
+            Label("启动时检测", systemImage: "arrow.clockwise.circle")
                 .foregroundStyle(.secondary)
         } label: {
             Label(name, systemImage: symbol)
@@ -153,21 +155,45 @@ private struct RuntimeSettingsPane: View {
 private struct ModelSettingsPane: View {
     @AppStorage("geminiModel") private var model = "gemini-3.6-flash"
     @State private var apiKey = ""
+    @State private var status = ""
 
     var body: some View {
         settingsForm {
             Section("Gemini") {
                 TextField("模型", text: $model)
                 SecureField("API Key", text: $apiKey)
-                Text("正式版只会把 Key 保存到 macOS Keychain。预览版不会保存或发送这里的内容。")
+                Text("API Key 只会保存到 macOS Keychain，不写入数据库、环境变量或日志。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
             Section {
-                Button("验证连接") {}
-                    .disabled(true)
+                HStack {
+                    Button("保存到钥匙串") { save() }
+                        .disabled(apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Button("移除", role: .destructive) { remove() }
+                    if !status.isEmpty { Text(status).font(.caption).foregroundStyle(.secondary) }
+                }
             }
         }
+        .task {
+            status = ((try? KeychainStore.loadGeminiKey()) ?? nil) == nil ? "尚未配置" : "已保存"
+        }
+    }
+
+    private func save() {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try KeychainStore.saveGeminiKey(key)
+            Task {
+                do { try await AppContainer.shared.state.injectGeminiKey(key); status = "已保存并注入 Engine"; apiKey = "" }
+                catch { status = error.localizedDescription }
+            }
+        } catch { status = error.localizedDescription }
+    }
+
+    private func remove() {
+        do { try KeychainStore.deleteGeminiKey(); status = "已移除"; apiKey = "" }
+        catch { status = error.localizedDescription }
     }
 }
 
@@ -191,7 +217,7 @@ private struct AboutSettingsPane: View {
             }
             Section("架构") {
                 LabeledContent("界面", value: "SwiftUI + AppKit")
-                LabeledContent("Engine", value: "Rust sidecar（下一阶段接入）")
+                LabeledContent("Engine", value: "Rust sidecar · IPC v2")
                 LabeledContent("系统", value: "macOS 26+")
             }
         }

@@ -1,162 +1,99 @@
 import Foundation
 
 protocol AppRepository: Sendable {
+    var requiresExecutionConsent: Bool { get }
     func load() async throws -> AppSnapshot
-    func createTask(title: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot
-    func setStatus(taskID: UUID, status: TaskStatus) async throws -> AppSnapshot
-    func answer(taskID: UUID, text: String) async throws -> AppSnapshot
-    func cancel(taskID: UUID) async throws -> AppSnapshot
-    func sendChat(_ text: String) async throws -> AppSnapshot
+    func sync() async throws -> AppSnapshot
+    func events() async -> AsyncStream<EngineEvent>
+    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot
+    func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot
+    func detectRuntimes() async throws -> AppSnapshot
+    func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot
+    func session(taskID: UUID) async throws -> SessionBundle?
+    func createSession(taskID: UUID, runtime: RuntimeKind, workspace: String) async throws -> SessionBundle
+    func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle
+    func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle
+    func markRead(sessionID: String, through sequence: Int64) async throws
+    func cancelTurn(sessionID: String) async throws
+    func injectGeminiKey(_ key: String) async throws
+    func shutdown() async
 }
+
+extension AppRepository { var requiresExecutionConsent: Bool { false } }
 
 enum AppRepositoryError: LocalizedError, Equatable, Sendable {
-    case taskNotFound
-
+    case taskNotFound, sessionNotFound, runtimeUnavailable
     var errorDescription: String? {
         switch self {
-        case .taskNotFound: "找不到这个任务，它可能已经被删除。"
+        case .taskNotFound: "找不到这个任务。"
+        case .sessionNotFound: "这个任务还没有本地 Session。"
+        case .runtimeUnavailable: "所选 Runtime 尚未安装、登录或验证。"
         }
     }
-}
-
-private enum DemoID {
-    static let productList = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
-    static let ideasList = UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
-    static let runningTask = UUID(uuidString: "00000000-0000-4000-8000-000000000101")!
-    static let questionTask = UUID(uuidString: "00000000-0000-4000-8000-000000000102")!
-    static let reviewTask = UUID(uuidString: "00000000-0000-4000-8000-000000000103")!
-    static let todoTask = UUID(uuidString: "00000000-0000-4000-8000-000000000104")!
-    static let doneTask = UUID(uuidString: "00000000-0000-4000-8000-000000000105")!
-    static let greetingMessage = UUID(uuidString: "00000000-0000-4000-8000-000000000201")!
-    static let requestMessage = UUID(uuidString: "00000000-0000-4000-8000-000000000202")!
-    static let responseMessage = UUID(uuidString: "00000000-0000-4000-8000-000000000203")!
 }
 
 actor DemoRepository: AppRepository {
     private var snapshot: AppSnapshot
+    private var bundles: [UUID: SessionBundle] = [:]
 
     init(now: Date = .now) {
-        let calendar = Calendar.current
-        let today = calendar.startOfDay(for: now)
-        let tomorrow = calendar.date(byAdding: .day, value: 1, to: today)
-        let dayAfter = calendar.date(byAdding: .day, value: 2, to: today)
-
-        let product = TodoList(id: DemoID.productList, name: "TodoAgent", colorName: "blue", repositoryPath: "~/Desktop/todoagent")
-        let ideas = TodoList(id: DemoID.ideasList, name: "灵光一现", colorName: "orange", repositoryPath: nil)
-
-        let running = TaskItem(
-            id: DemoID.runningTask, listID: product.id, title: "实现原生 macOS 预览版",
-            note: "Codex 正在搭建 SwiftUI 三栏界面", status: .running,
-            dueDate: today, needsKind: nil, needsText: nil, runtime: "Codex",
-            elapsed: "3 分钟", resultText: nil, diffPreview: nil, createdAt: now
-        )
-        let question = TaskItem(
-            id: DemoID.questionTask, listID: product.id, title: "确定 DMG 首次发布范围",
-            note: "Agent 需要一个产品决策", status: .needsYou,
-            dueDate: today, needsKind: .question, needsText: "第一版是否只支持 Apple Silicon？",
-            runtime: "Claude", elapsed: "1 分钟", resultText: nil, diffPreview: nil, createdAt: now
-        )
-        let review = TaskItem(
-            id: DemoID.reviewTask, listID: product.id, title: "修复运行时 PATH 检测",
-            note: "已修改 4 个文件，等待人工确认", status: .review,
-            dueDate: tomorrow, needsKind: nil, needsText: nil, runtime: "Codex",
-            elapsed: "6 分钟",
-            resultText: "已补齐 Finder 启动时的 PATH，并验证 Codex 与 Claude 均可发现。",
-            diffPreview: "+ resolve Homebrew and ~/.local/bin\n+ preserve executable snapshots\n+ add runtime verification tests",
-            createdAt: now
-        )
-        let todo = TaskItem(
-            id: DemoID.todoTask, listID: ideas.id, title: "设计首次启动引导",
-            note: "说明 CLI、仓库权限与人工确认", status: .todo,
-            dueDate: dayAfter, needsKind: nil, needsText: nil, runtime: nil,
-            elapsed: nil, resultText: nil, diffPreview: nil, createdAt: now
-        )
-        let done = TaskItem(
-            id: DemoID.doneTask, listID: product.id, title: "确认原生重构技术路线",
-            note: "SwiftUI + Rust Engine sidecar", status: .done,
-            dueDate: today, needsKind: nil, needsText: nil, runtime: nil,
-            elapsed: nil, resultText: "技术路线已确认。", diffPreview: nil, createdAt: now
-        )
-
+        let listID = UUID(uuidString: "00000000-0000-4000-8000-000000000001")!
+        let taskID = UUID(uuidString: "00000000-0000-4000-8000-000000000101")!
         snapshot = AppSnapshot(
-            lists: [product, ideas],
-            tasks: [running, question, review, todo, done],
-            messages: [
-                ChatMessage(
-                    id: DemoID.greetingMessage, role: .todoAgent,
-                    body: "下午好。我会帮你整理任务、调用本机 CLI，并把结果留给你确认。",
-                    createdAt: now.addingTimeInterval(-240), taskReference: nil
-                ),
-                ChatMessage(
-                    id: DemoID.requestMessage, role: .user,
-                    body: "把原生 Mac 版的工作整理一下。",
-                    createdAt: now.addingTimeInterval(-180), taskReference: nil
-                ),
-                ChatMessage(
-                    id: DemoID.responseMessage, role: .todoAgent,
-                    body: "已经整理成任务，并将 SwiftUI 预览版放在今天。",
-                    createdAt: now.addingTimeInterval(-150), taskReference: running.id
-                ),
-            ]
+            revision: 1,
+            lists: [TodoList(id: listID, name: "TodoAgent", colorName: "blue", repositoryPath: "~/Desktop/todoagent")],
+            tasks: [TaskItem(id: taskID, listID: listID, title: "接通真实本地 Agent", note: "选择 Runtime 与目录后进入完整 Session", status: .open, dueDate: Calendar.current.startOfDay(for: now), completedAt: nil, createdAt: now, updatedAt: ISO8601DateFormatter().string(from: now))],
+            runtimes: RuntimeKind.allCases.map { RuntimeInfo(kind: $0, launchPath: nil, resolvedPath: nil, version: "preview", status: .ready, authStatus: "ready", capabilities: [:], providerEngine: $0 == .kiro ? "v2" : nil, detectedAt: nil, verifiedAt: nil, verifyError: nil) },
+            sessions: [],
+            messages: []
         )
     }
 
     func load() async throws -> AppSnapshot { snapshot }
+    func sync() async throws -> AppSnapshot { snapshot }
+    func events() async -> AsyncStream<EngineEvent> { AsyncStream { $0.finish() } }
 
-    func createTask(title: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot {
-        snapshot.tasks.insert(
-            TaskItem(
-                id: UUID(), listID: listID, title: title, note: "", status: .todo,
-                dueDate: dueDate, needsKind: nil, needsText: nil, runtime: nil,
-                elapsed: nil, resultText: nil, diffPreview: nil, createdAt: .now
-            ),
-            at: 0
-        )
+    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot {
+        snapshot.tasks.insert(TaskItem(id: UUID(), listID: listID, title: title, note: note, status: .open, dueDate: dueDate, completedAt: nil, createdAt: .now, updatedAt: ISO8601DateFormatter().string(from: .now)), at: 0)
+        snapshot.revision += 1
         return snapshot
     }
 
-    func setStatus(taskID: UUID, status: TaskStatus) async throws -> AppSnapshot {
-        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else {
-            throw AppRepositoryError.taskNotFound
-        }
-        try TaskStateMachine.validate(from: snapshot.tasks[index].status, to: status)
-        snapshot.tasks[index].status = status
-        if status != .needsYou {
-            snapshot.tasks[index].needsKind = nil
-            snapshot.tasks[index].needsText = nil
-        }
-        if status == .running {
-            snapshot.tasks[index].runtime = snapshot.tasks[index].runtime ?? "Codex"
-            snapshot.tasks[index].elapsed = "刚刚"
-        }
+    func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot {
+        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else { throw AppRepositoryError.taskNotFound }
+        snapshot.tasks[index].status = completed ? .completed : .open
+        snapshot.revision += 1
         return snapshot
     }
 
-    func answer(taskID: UUID, text: String) async throws -> AppSnapshot {
-        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else {
-            throw AppRepositoryError.taskNotFound
-        }
-        try TaskStateMachine.validate(from: snapshot.tasks[index].status, to: .running)
-        snapshot.tasks[index].status = .running
-        snapshot.tasks[index].needsKind = nil
-        snapshot.tasks[index].needsText = nil
-        snapshot.tasks[index].note = "已回答：\(text)"
-        return snapshot
+    func detectRuntimes() async throws -> AppSnapshot { snapshot }
+    func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot { snapshot }
+    func session(taskID: UUID) async throws -> SessionBundle? { bundles[taskID] }
+
+    func createSession(taskID: UUID, runtime: RuntimeKind, workspace: String) async throws -> SessionBundle {
+        let id = UUID().uuidString
+        let session = TaskSessionDescriptor(id: id, taskID: taskID, runtimeKind: runtime, workingDirectory: workspace, providerSessionID: nil, providerEngine: runtime == .kiro ? "v2" : nil, state: .idle, lastAgentSequence: 0, lastReadSequence: 0, lastErrorCode: nil, lastErrorMessage: nil, createdAt: "", updatedAt: "")
+        let bundle = SessionBundle(session: session, messages: [], activeTurn: nil)
+        bundles[taskID] = bundle
+        snapshot.sessions.append(session)
+        return bundle
     }
 
-    func cancel(taskID: UUID) async throws -> AppSnapshot {
-        try await setStatus(taskID: taskID, status: .todo)
+    func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle {
+        guard let taskID = bundles.first(where: { $0.value.session.id == sessionID })?.key, var bundle = bundles[taskID] else { throw AppRepositoryError.sessionNotFound }
+        let sequence = Int64(bundle.messages.count + 1)
+        let message = SessionMessage(id: UUID().uuidString, sessionID: sessionID, turnID: nil, sequence: sequence, clientMessageID: clientMessageID.uuidString, role: .user, kind: "text", body: text, payloadJSON: nil, createdAt: "", updatedAt: "")
+        bundle = SessionBundle(session: bundle.session, messages: bundle.messages + [message], activeTurn: nil)
+        bundles[taskID] = bundle
+        return bundle
     }
 
-    func sendChat(_ text: String) async throws -> AppSnapshot {
-        snapshot.messages.append(ChatMessage(id: UUID(), role: .user, body: text, createdAt: .now, taskReference: nil))
-        snapshot.messages.append(
-            ChatMessage(
-                id: UUID(), role: .todoAgent,
-                body: "收到。预览模式不会启动真实 CLI；我已把这条消息保留在本次演示会话中。",
-                createdAt: .now, taskReference: nil
-            )
-        )
-        return snapshot
+    func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle {
+        guard let bundle = bundles.values.first(where: { $0.session.id == sessionID }) else { throw AppRepositoryError.sessionNotFound }
+        return SessionBundle(session: bundle.session, messages: bundle.messages.filter { $0.sequence > sequence }, activeTurn: bundle.activeTurn)
     }
+    func markRead(sessionID: String, through sequence: Int64) async throws {}
+    func cancelTurn(sessionID: String) async throws {}
+    func injectGeminiKey(_ key: String) async throws {}
+    func shutdown() async {}
 }

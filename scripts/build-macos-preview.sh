@@ -10,7 +10,8 @@ APP_DIR="$STAGING_DIR/TodoAgent.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 DMG_ROOT="$STAGING_DIR/dmg-root"
 FINAL_APP_DIR="$DIST_DIR/TodoAgent.app"
-DMG_PATH="$DIST_DIR/TodoAgent-0.1.0-preview-arm64.dmg"
+DMG_PATH="$DIST_DIR/TodoAgent-0.1.0-arm64.dmg"
+TEMP_DMG_PATH="$STAGING_DIR/TodoAgent-0.1.0-arm64.dmg"
 XCODE_DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 trap 'rm -rf "$STAGING_DIR"' EXIT
@@ -26,7 +27,7 @@ export SWIFTPM_MODULECACHE_OVERRIDE="${TMPDIR:-/tmp}/todoagent-swift-cache"
 
 swift build -c release --arch arm64 --package-path "$PACKAGE_DIR"
 BIN_DIR="$(swift build -c release --arch arm64 --package-path "$PACKAGE_DIR" --show-bin-path)"
-cargo build --release --manifest-path "$ENGINE_DIR/Cargo.toml"
+cargo build --release --locked --manifest-path "$ENGINE_DIR/Cargo.toml"
 ENGINE_BIN="$ENGINE_DIR/target/release/todoagent-engine"
 
 if [[ "$(uname -m)" != "arm64" ]]; then
@@ -52,13 +53,16 @@ ditto "$APP_DIR" "$DMG_ROOT/TodoAgent.app"
 ln -s /Applications "$DMG_ROOT/Applications"
 xattr -cr "$DMG_ROOT/TodoAgent.app"
 codesign --verify --deep --strict "$DMG_ROOT/TodoAgent.app"
-rm -f "$DMG_PATH"
-hdiutil create -volname "TodoAgent Preview" -srcfolder "$DMG_ROOT" -ov -format UDZO "$DMG_PATH"
+rm -f "$DMG_PATH" "$TEMP_DMG_PATH"
+hdiutil create -volname "TodoAgent" -srcfolder "$DMG_ROOT" -ov -format UDZO "$TEMP_DMG_PATH"
+ditto "$TEMP_DMG_PATH" "$DMG_PATH"
 
 # Keep a convenient unpacked copy for local inspection. The DMG above was
 # created from /tmp so Desktop file-provider metadata cannot contaminate it.
 ditto "$APP_DIR" "$FINAL_APP_DIR"
 xattr -cr "$FINAL_APP_DIR"
+codesign --force --deep --sign - "$FINAL_APP_DIR"
+codesign --verify --deep --strict "$FINAL_APP_DIR"
 
 echo "$FINAL_APP_DIR"
 echo "$DMG_PATH"

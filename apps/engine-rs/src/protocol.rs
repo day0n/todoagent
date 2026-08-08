@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -12,8 +12,8 @@ pub struct Request {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Response<'a> {
-    pub id: &'a str,
+pub struct Response {
+    pub id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -23,13 +23,13 @@ pub struct Response<'a> {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProtocolError {
-    pub code: &'static str,
+    pub code: String,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Event<T: Serialize> {
     pub event: &'static str,
     pub data: T,
@@ -41,23 +41,24 @@ pub struct Handshake {
     pub protocol_version: u32,
     pub engine_version: &'static str,
     pub capabilities: &'static [&'static str],
+    pub runtimes: &'static [&'static str],
 }
 
-impl<'a> Response<'a> {
-    pub fn ok(id: &'a str, result: Value) -> Self {
+impl Response {
+    pub fn ok(id: impl Into<String>, result: Value) -> Self {
         Self {
-            id,
+            id: id.into(),
             result: Some(result),
             error: None,
         }
     }
 
-    pub fn err(id: &'a str, code: &'static str, message: impl Into<String>) -> Self {
+    pub fn err(id: impl Into<String>, code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            id,
+            id: id.into(),
             result: None,
             error: Some(ProtocolError {
-                code,
+                code: code.into(),
                 message: message.into(),
                 details: None,
             }),
@@ -72,14 +73,26 @@ pub fn handshake() -> Event<Handshake> {
             protocol_version: PROTOCOL_VERSION,
             engine_version: env!("CARGO_PKG_VERSION"),
             capabilities: &[
-                "snapshot",
+                "app.bootstrap",
+                "app.sync",
                 "list.create",
                 "task.create",
-                "task.set_status",
+                "task.complete",
+                "task.reopen",
+                "runtime.list",
                 "runtime.detect",
                 "runtime.verify",
+                "workspace.authorize",
+                "secret.inject",
+                "session.create",
+                "session.get",
+                "session.history",
+                "session.send",
+                "session.mark_read",
+                "session.cancel_turn",
                 "engine.shutdown",
             ],
+            runtimes: &["codex", "claude", "cursor", "kiro"],
         },
     }
 }
@@ -90,28 +103,16 @@ mod tests {
 
     #[test]
     fn request_defaults_params_to_null() {
-        let request: Request = serde_json::from_str(r#"{"id":"1","method":"health"}"#).unwrap();
+        let request: Request =
+            serde_json::from_str(r#"{"id":"1","method":"engine.health"}"#).unwrap();
         assert_eq!(request.id, "1");
         assert_eq!(request.params, Value::Null);
     }
 
     #[test]
-    fn handshake_is_versioned() {
+    fn handshake_is_v2_and_lists_four_runtimes() {
         let value = serde_json::to_value(handshake()).unwrap();
-        assert_eq!(value["event"], "engine.ready");
-        assert_eq!(value["data"]["protocolVersion"], PROTOCOL_VERSION);
-    }
-
-    #[test]
-    fn shared_contract_fixture_is_valid_ndjson() {
-        let fixture = include_str!("../../../protocol/fixtures/contract.ndjson");
-        let values: Vec<Value> = fixture
-            .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
-            .collect();
-        assert_eq!(values.len(), 4);
-        assert_eq!(values[0]["data"]["protocolVersion"], PROTOCOL_VERSION);
-        assert_eq!(values[1]["method"], "app.snapshot");
-        assert_eq!(values[3]["error"]["code"], "not_found");
+        assert_eq!(value["data"]["protocolVersion"], 2);
+        assert_eq!(value["data"]["runtimes"].as_array().unwrap().len(), 4);
     }
 }

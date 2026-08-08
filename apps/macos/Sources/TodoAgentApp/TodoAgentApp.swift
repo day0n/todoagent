@@ -9,9 +9,11 @@ extension Notification.Name {
 
 @main
 struct TodoAgentApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            ContentView(state: AppContainer.shared.state)
                 .frame(minWidth: 980, minHeight: 680)
         }
         .defaultSize(width: 1380, height: 860)

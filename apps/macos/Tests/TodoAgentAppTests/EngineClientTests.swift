@@ -23,22 +23,22 @@ struct EngineClientTests {
         let handshake = try #require(
             JSONSerialization.jsonObject(with: ready.data) as? [String: Any]
         )
-        #expect(handshake["protocolVersion"] as? Int == 1)
+        #expect(handshake["protocolVersion"] as? Int == 2)
         #expect(handshake["engineVersion"] as? String == "0.1.0")
 
         guard case let .request(id, method, params) = messages[1] else {
             Issue.record("The second contract line must be a request.")
             return
         }
-        #expect(id == "snapshot-1")
-        #expect(method == "app.snapshot")
+        #expect(id == "bootstrap-1")
+        #expect(method == "app.bootstrap")
         #expect(try JSONSerialization.jsonObject(with: params) as? [String: String] == [:])
 
         guard case let .response(responseID, result) = messages[2] else {
             Issue.record("The third contract line must be a response.")
             return
         }
-        #expect(responseID == "snapshot-1")
+        #expect(responseID == "bootstrap-1")
         let snapshot = try #require(
             JSONSerialization.jsonObject(with: result) as? [String: Any]
         )
@@ -124,7 +124,7 @@ struct EngineClientTests {
             try await client.start()
             Issue.record("The first handshake should have been rejected.")
         } catch let error as EngineClientError {
-            #expect(error == .protocolMismatch(expected: 1, received: 999))
+            #expect(error == .protocolMismatch(expected: 2, received: 999))
         }
 
         do {
@@ -217,7 +217,7 @@ struct EngineClientTests {
 
         var script = #"""
         #!/bin/zsh
-        protocol_version=1
+        protocol_version=2
         __FIRST_LAUNCH_BLOCK__
         printf '{"event":"engine.ready","data":{"protocolVersion":%s,"engineVersion":"fake-1.0.0","capabilities":["engine.shutdown"]}}\n' "$protocol_version"
 

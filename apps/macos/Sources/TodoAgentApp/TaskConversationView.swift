@@ -47,14 +47,22 @@ struct TaskConversationSheet: View {
                     .font(.title2)
                     .bold()
                     .lineLimit(1)
-                Text("\(session.runtime) 本地会话")
+                Text("\(session.runtime.title) 本地会话")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
 
             Spacer()
 
-            TaskConversationStatus(status: task.status)
+            Text(session.state == .running ? "运行中" : session.state == .queued ? "排队中" : session.state == .failed ? "失败" : "可继续")
+                .font(.caption.bold())
+                .foregroundStyle(session.state.isBusy ? Color.blue : Color.secondary)
+
+            if session.state.isBusy {
+                Button("停止本轮", role: .destructive) {
+                    Task { await state.cancelTurn(for: task) }
+                }
+            }
 
             Button("关闭", systemImage: "xmark", action: dismiss.callAsFunction)
                 .labelStyle(.iconOnly)
@@ -67,7 +75,7 @@ struct TaskConversationSheet: View {
 
     private func sessionMetadata(_ session: TaskConversationSnapshot) -> some View {
         HStack(spacing: 20) {
-            Label(session.runtime, systemImage: "cpu")
+            Label(session.runtime.title, systemImage: "cpu")
             Label(session.workspace, systemImage: "folder")
             Label(session.sessionID, systemImage: "number")
                 .fontDesign(.monospaced)
@@ -82,7 +90,7 @@ struct TaskConversationSheet: View {
         .background(.bar)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(
-            "\(session.runtime) 本地会话，工作目录 \(session.workspace)，Session \(session.sessionID)"
+            "\(session.runtime.title) 本地会话，工作目录 \(session.workspace)，Session \(session.sessionID)"
         )
     }
 
@@ -111,16 +119,14 @@ struct TaskConversationSheet: View {
     private func composer(_ session: TaskConversationSnapshot) -> some View {
         VStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
             Label(
-                task.status == .needsYou
-                    ? "\(session.runtime) 有一条新消息"
-                    : "随时向这个本地 Session 继续发送消息",
-                systemImage: task.status == .needsYou ? "circle.fill" : "arrow.triangle.2.circlepath"
+                session.state.isBusy ? "Agent 正在处理本轮消息" : "随时向这个本地 Session 继续发送消息",
+                systemImage: session.state.isBusy ? "hourglass" : "arrow.triangle.2.circlepath"
             )
             .font(.callout)
-            .foregroundStyle(task.status == .needsYou ? Color.red : Color.secondary)
+            .foregroundStyle(session.state.isBusy ? Color.blue : Color.secondary)
 
             HStack(alignment: .bottom, spacing: TodoAgentUI.standardSpacing) {
-                TextField("发送消息给 \(session.runtime)…", text: $draft, axis: .vertical)
+                TextField("发送消息给 \(session.runtime.title)…", text: $draft, axis: .vertical)
                     .lineLimit(2...6)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit(submit)
@@ -130,13 +136,15 @@ struct TaskConversationSheet: View {
                     .buttonStyle(.borderedProminent)
                     .disabled(
                         draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            || isSubmitting
+                            || isSubmitting || session.state.isBusy
                     )
                     .accessibilityIdentifier("task.session.send")
             }
         }
         .padding(16)
         .background(.ultraThinMaterial)
+        .task { await state.markReadIfCurrent(task) }
+        .onChange(of: session.latestSequence) { Task { await state.markReadIfCurrent(task) } }
     }
 
     private func submit() {
@@ -158,7 +166,7 @@ private struct TaskSessionSetupView: View {
     let state: AppState
 
     @Environment(\.dismiss) private var dismiss
-    @State private var runtime = "Codex"
+    @State private var runtime = RuntimeKind.codex
     @State private var workspace = ""
     @State private var isStarting = false
 
@@ -189,8 +197,12 @@ private struct TaskSessionSetupView: View {
                         Text("Runtime")
                             .foregroundStyle(.secondary)
                         Picker("Runtime", selection: $runtime) {
-                            Text("Codex").tag("Codex")
-                            Text("Claude Code").tag("Claude Code")
+                            ForEach(RuntimeKind.allCases) { kind in
+                                let info = state.runtime(kind)
+                                Text(runtimeTitle(kind, info: info))
+                                    .tag(kind)
+                                    .disabled(info?.isSelectable != true)
+                            }
                         }
                         .labelsHidden()
                         .frame(width: 260)
@@ -204,6 +216,7 @@ private struct TaskSessionSetupView: View {
                             HStack {
                                 TextField("选择一个文件夹", text: $workspace)
                                     .textFieldStyle(.roundedBorder)
+                                    .disabled(true)
                                     .accessibilityIdentifier("task.session.workspace")
                                 Button("选择…", action: chooseDirectory)
                                     .accessibilityIdentifier("task.session.choose-workspace")
@@ -234,9 +247,6 @@ private struct TaskSessionSetupView: View {
             .padding(32)
             .frame(maxWidth: 760, maxHeight: .infinity)
         }
-        .onAppear {
-            if workspace.isEmpty { workspace = state.suggestedWorkspace(for: task) }
-        }
     }
 
     private func chooseDirectory() {
@@ -247,6 +257,7 @@ private struct TaskSessionSetupView: View {
         panel.canCreateDirectories = true
         panel.title = "选择 Agent 执行目录"
         if panel.runModal() == .OK, let url = panel.url {
+            try? WorkspaceAuthorizationStore.save(url)
             workspace = url.path(percentEncoded: false)
         }
     }
@@ -259,27 +270,14 @@ private struct TaskSessionSetupView: View {
             isStarting = false
         }
     }
-}
-
-private struct TaskConversationStatus: View {
-    let status: TaskStatus
-
-    var body: some View {
-        Text(status.title)
-            .font(.caption)
-            .bold()
-            .foregroundStyle(color)
-            .padding(.horizontal, 9)
-            .padding(.vertical, 5)
-            .background(color.opacity(0.1), in: .capsule)
-    }
-
-    private var color: Color {
-        switch status {
-        case .todo, .done: .secondary
-        case .running: .blue
-        case .needsYou: .orange
-        case .review: .green
+    private func runtimeTitle(_ kind: RuntimeKind, info: RuntimeInfo?) -> String {
+        guard let info else { return "\(kind.title)（检测中）" }
+        switch info.status {
+        case .ready: return "\(kind.title) · \(info.version ?? "已验证")"
+        case .authRequired: return "\(kind.title)（需要登录）"
+        case .missing: return "\(kind.title)（未安装）"
+        case .detected: return "\(kind.title)（待验证）"
+        case .error: return "\(kind.title)（不可用）"
         }
     }
 }
