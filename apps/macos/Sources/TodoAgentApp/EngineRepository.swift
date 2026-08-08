@@ -43,7 +43,13 @@ private struct MarkReadRequest: Encodable, Sendable { let sessionID: String; let
 private struct SessionIDRequest: Encodable, Sendable { let sessionID: String }
 private struct WorkspaceRequest: Encodable, Sendable { let path: String }
 private struct WorkspaceResult: Decodable, Sendable { let path: String }
-private struct SecretRequest: Encodable, Sendable { let geminiAPIKey: String }
+struct SecretRequest: Encodable, Sendable {
+    let geminiAPIKey: String
+
+    enum CodingKeys: String, CodingKey {
+        case geminiAPIKey = "geminiApiKey"
+    }
+}
 private struct EmptyRepositoryParams: Encodable, Sendable {}
 private struct EmptyResult: Decodable, Sendable { let ok: Bool }
 

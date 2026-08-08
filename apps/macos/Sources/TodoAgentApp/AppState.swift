@@ -29,7 +29,8 @@ final class AppState {
         loadState = .loading
         do {
             apply(try await repository.load())
-            if let key = try? KeychainStore.loadGeminiKey(), !key.isEmpty {
+            if repository.requiresExecutionConsent,
+               let key = try? KeychainStore.loadGeminiKey(), !key.isEmpty {
                 try await repository.injectGeminiKey(key)
             }
             loadState = .loaded

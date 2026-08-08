@@ -9,7 +9,6 @@ STAGING_DIR="$(mktemp -d /tmp/todoagent-build.XXXXXX)"
 APP_DIR="$STAGING_DIR/TodoAgent.app"
 CONTENTS_DIR="$APP_DIR/Contents"
 DMG_ROOT="$STAGING_DIR/dmg-root"
-FINAL_APP_DIR="$DIST_DIR/TodoAgent.app"
 DMG_PATH="$DIST_DIR/TodoAgent-0.1.0-arm64.dmg"
 TEMP_DMG_PATH="$STAGING_DIR/TodoAgent-0.1.0-arm64.dmg"
 XCODE_DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
@@ -35,7 +34,7 @@ if [[ "$(uname -m)" != "arm64" ]]; then
   exit 1
 fi
 
-rm -rf "$APP_DIR" "$DMG_ROOT" "$FINAL_APP_DIR"
+rm -rf "$APP_DIR" "$DMG_ROOT"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources" "$DMG_ROOT"
 cp "$BIN_DIR/TodoAgent" "$CONTENTS_DIR/MacOS/TodoAgent"
 cp "$ENGINE_BIN" "$CONTENTS_DIR/Resources/todoagent-engine"
@@ -57,12 +56,4 @@ rm -f "$DMG_PATH" "$TEMP_DMG_PATH"
 hdiutil create -volname "TodoAgent" -srcfolder "$DMG_ROOT" -ov -format UDZO "$TEMP_DMG_PATH"
 ditto "$TEMP_DMG_PATH" "$DMG_PATH"
 
-# Keep a convenient unpacked copy for local inspection. The DMG above was
-# created from /tmp so Desktop file-provider metadata cannot contaminate it.
-ditto "$APP_DIR" "$FINAL_APP_DIR"
-xattr -cr "$FINAL_APP_DIR"
-codesign --force --deep --sign - "$FINAL_APP_DIR"
-codesign --verify --deep --strict "$FINAL_APP_DIR"
-
-echo "$FINAL_APP_DIR"
 echo "$DMG_PATH"
