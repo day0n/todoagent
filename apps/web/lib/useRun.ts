@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, ApiError, subscribeRun } from "./api.ts";
+import { api, ApiError, subscribeRun, type RunStreamConnection } from "./api.ts";
 import type { Phase, RunDetail, StreamEvent } from "./types.ts";
 import {
   applyEvent,
@@ -25,6 +25,7 @@ export type { LiveAttempt, LogRow, VerifyReport };
 export interface RunState extends RunStreamState {
   detail: RunDetail | null;
   connected: boolean;
+  connection: RunStreamConnection;
   error: string | null;
   reload: () => void;
 }
@@ -55,6 +56,7 @@ export function useRun(runId: string): RunState {
    */
   const [stream, setStream] = useState<RunStreamState>(emptyRunStreamState);
   const [connected, setConnected] = useState(false);
+  const [connection, setConnection] = useState<RunStreamConnection>({ state: "connecting", attempt: 0 });
   const [error, setError] = useState<string | null>(null);
 
   // Refetches are coalesced: a stage of five subtasks emits a burst of structural
@@ -111,6 +113,7 @@ export function useRun(runId: string): RunState {
     setDetail(null);
     setStream(emptyRunStreamState());
     setError(null);
+    setConnection({ state: "connecting", attempt: 0 });
     reload();
     return () => {
       if (refetchTimer.current !== null) clearTimeout(refetchTimer.current);
@@ -127,9 +130,10 @@ export function useRun(runId: string): RunState {
         if (needsRefetch(ev)) scheduleReload();
       },
       setConnected,
+      setConnection,
     );
     return unsubscribe;
   }, [runId, scheduleReload]);
 
-  return { ...stream, detail, connected, error, reload };
+  return { ...stream, detail, connected, connection, error, reload };
 }

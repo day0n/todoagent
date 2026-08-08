@@ -48,7 +48,12 @@ async function fixture(): Promise<Fixture> {
 
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
+    env: {
+      ...process.env,
+      TODOAGENT_DB: dbPath,
+      TODOAGENT_PORT: String(PORT),
+      TODOAGENT_DISABLE_RUNTIME_DISCOVERY: "1",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {
@@ -102,8 +107,9 @@ function day(n: number): string {
   return `${d.getFullYear()}-${m}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
-async function board(): Promise<Board> {
-  return json<Board>(await req("GET", "/api/board"));
+async function board(date?: string): Promise<Board> {
+  const query = date === undefined ? "" : `?date=${encodeURIComponent(date)}`;
+  return json<Board>(await req("GET", `/api/board${query}`));
 }
 
 /** Which column holds this task, or null. Proves exactly-one-column too. */
@@ -189,6 +195,38 @@ test("board: four columns, dated from today, with 以后 carrying no date", asyn
         b.columns[2]?.weekday,
         new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2).getDay(),
       );
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("board: a calendar date becomes the first column and keeps three real days", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const anchor = day(7);
+      const due = await json<Task>(
+        await req("POST", "/api/tasks", { title: "下周处理", listId: f.listId, dueDate: anchor }),
+      );
+      const b = await board(anchor);
+      assert.equal(b.today, anchor);
+      assert.equal(b.columns[0]?.date, anchor);
+      assert.equal(b.columns[1]?.date, day(8));
+      assert.equal(b.columns[2]?.date, day(9));
+      assert.equal(columnOf(b, due.id), "today");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("board: rejects a calendar date that only looks like YYYY-MM-DD", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f.dbPath, async () => {
+      const res = await req("GET", "/api/board?date=2026-02-31");
+      assert.equal(res.status, 400);
     });
   } finally {
     await f.dispose();

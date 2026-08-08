@@ -1,5 +1,6 @@
 export * from "./types.ts";
 export * from "./adapters/index.ts";
+export * from "./runtime/index.ts";
 export { Store, defaultDbPath, newId, nowIso } from "./db/index.ts";
 export { bus, type BoardEvent, type BusEvent, type ChatBusEvent } from "./orchestrator/bus.ts";
 export {
@@ -7,6 +8,7 @@ export {
   recordEvent,
   runOne,
   runStructured,
+  legacyExecutionOptions,
   type RunOneOptions,
   type RunOneResult,
 } from "./orchestrator/runner.ts";

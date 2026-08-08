@@ -5,13 +5,17 @@ import type {
   ChatMessage,
   ChatSession,
   ChatStatus,
-  DetectedRuntime,
   Expert,
   ListsResponse,
   Project,
   Run,
   RunDetail,
   RunResult,
+  TaskThread,
+  AssistantWorkspace,
+  RuntimeEnvelope,
+  RuntimeInfo,
+  RuntimeKind,
   SettableTaskStatus,
   StreamEvent,
   Task,
@@ -21,6 +25,7 @@ import type {
   TodoList,
   ViewKey,
 } from "./types.ts";
+import { fetchEventSource } from "@microsoft/fetch-event-source";
 
 export const ENGINE =
   process.env["NEXT_PUBLIC_ENGINE_URL"] ?? "http://127.0.0.1:8787";
@@ -81,8 +86,20 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   health: () => req<{ ok: boolean; db: string; activeRuns: number }>("/api/health"),
 
-  runtimes: () =>
-    req<{ detected: DetectedRuntime[]; known: string[]; missing: string[] }>("/api/runtimes"),
+  /** Opens the local operating system folder chooser. Null means it was cancelled. */
+  pickDirectory: () =>
+    req<{ path: string | null }>("/api/system/pick-directory", { method: "POST" }),
+
+  /** Cheap persisted Runtime Manager state; this never launches a real prompt. */
+  runtimes: () => req<RuntimeEnvelope>("/api/runtimes"),
+
+  /** Re-scan executable paths and versions without consuming provider credits. */
+  refreshRuntimes: () =>
+    req<RuntimeEnvelope>("/api/runtimes/refresh", { method: "POST" }),
+
+  /** Run one minimal real prompt so the engine can distinguish installed from usable. */
+  verifyRuntime: (kind: RuntimeKind) =>
+    req<RuntimeInfo>(`/api/runtimes/${encodeURIComponent(kind)}/verify`, { method: "POST" }),
 
   experts: () => req<Expert[]>("/api/experts"),
 
@@ -187,10 +204,11 @@ export const api = {
    * at all. The precedence (live status → done-today → manual pin → deadline →
    * created today) is documented at `boardColumn` in the engine.
    */
-  board: () => req<BoardResponse>("/api/board"),
+  board: (date?: string) =>
+    req<BoardResponse>(`/api/board${date === undefined ? "" : `?date=${encodeURIComponent(date)}`}`),
 
-  /** Quick add. Absent `listId` lands the task in the default 收件箱 list. */
-  createTask: (body: { title: string; note?: string; listId?: string | null }) =>
+  /** Null/absent listId creates an unlisted task in the aggregate Tasks view. */
+  createTask: (body: { title: string; note?: string; listId?: string | null; dueDate?: string | null }) =>
     req<Task>("/api/tasks", { method: "POST", body: JSON.stringify(body) }),
 
   /**
@@ -224,17 +242,43 @@ export const api = {
     req<{ ok: true }>(`/api/tasks/${taskId}`, { method: "DELETE" }),
 
   /**
-   * Dispatches a task to one agent, directly.
+   * Dispatches a task to one explicitly selected local CLI, directly.
    *
    * Never optimistic: this spawns a real CLI process and spends real tokens, and
    * the engine can refuse it (no repository on the list, another run already
-   * holding the repository lock, this task already running, no agent installed).
+   * holding the repository lock, this task already running, CLI unavailable).
    * The caller has to await the answer and show the refusal.
    */
-  runTask: (taskId: string, opts: { budgetTokens?: number } = {}) =>
+  runTask: (taskId: string, opts: { runtimeKind: RuntimeKind; budgetTokens?: number }) =>
     req<{ run: Run; task: Task }>(`/api/tasks/${taskId}/run`, {
       method: "POST",
       body: JSON.stringify(opts),
+    }),
+
+  /** Durable task conversation: every user message is one immutable CLI turn. */
+  taskThread: (taskId: string) => req<TaskThread>(`/api/tasks/${taskId}/thread`),
+
+  sendTaskMessage: (
+    taskId: string,
+    body: { message: string; runtimeKind?: RuntimeKind; workingDirectory?: string },
+  ) =>
+    req<{ run: Run; task: Task; resumed: boolean }>(`/api/tasks/${taskId}/messages`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+
+  assistantWorkspace: () => req<AssistantWorkspace>("/api/assistant/workspace"),
+  saveAssistantMemory: (memory: string) =>
+    req<{ ok: true }>("/api/assistant/memory", {
+      method: "PUT",
+      body: JSON.stringify({ content: memory }),
+    }),
+  assistantRef: (name: string) =>
+    req<{ name: string; content: string }>(`/api/assistant/ref/${encodeURIComponent(name)}`),
+  saveAssistantRef: (name: string, content: string) =>
+    req<{ ok: true; name: string }>(`/api/assistant/ref/${encodeURIComponent(name)}`, {
+      method: "PUT",
+      body: JSON.stringify({ content }),
     }),
 
   /** Aborts a task's live run. The task returns to todo. */
@@ -247,7 +291,7 @@ export const api = {
    * Accepted only for a `needs_you` task whose `needsKind` is `question` — a
    * failure or an obstacle has no question to answer and takes 重派 instead. Like
    * `runTask` this spawns a real CLI, so the engine can refuse it (repository busy,
-   * no agent installed) and the caller has to show that refusal.
+   * selected CLI unavailable) and the caller has to show that refusal.
    *
    * `resumed` reports whether the runtime continued its own session or the prompt
    * had to carry the context. Nothing renders it today; it is the one signal that
@@ -313,38 +357,90 @@ export const api = {
 /**
  * Subscribes to a run's event stream.
  *
- * `EventSource` handles reconnection and replays `Last-Event-ID` for us, and the
- * engine persists events before broadcasting them — so a dropped connection
- * catches up from the table rather than losing whatever happened while away.
+ * Reconnects with bounded exponential backoff and carries `Last-Event-ID` across
+ * attempts. The engine persists events before broadcasting them, so a dropped
+ * connection catches up from the table instead of losing work. A small recent-id
+ * set also protects the UI from an overlapping replay/live frame.
  */
+export type RunStreamConnection =
+  | { state: "connecting"; attempt: number }
+  | { state: "connected"; attempt: 0 }
+  | { state: "reconnecting"; attempt: number }
+  | { state: "failed"; attempt: number; error: string };
+
+class RunStreamFatalError extends Error {}
+
+const RUN_STREAM_RECONNECT_DELAYS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000] as const;
+const RUN_STREAM_MAX_RECONNECTS = 10;
+const RUN_STREAM_MAX_SEEN_IDS = 500;
+
 export function subscribeRun(
   runId: string,
   onEvent: (ev: StreamEvent) => void,
   onError?: (open: boolean) => void,
+  onConnection?: (connection: RunStreamConnection) => void,
 ): () => void {
-  const source = new EventSource(`${ENGINE}/api/runs/${runId}/events`);
+  const controller = new AbortController();
+  const seen = new Set<string>();
+  const recent: string[] = [];
+  let reconnectAttempt = 0;
 
-  /*
-   * `onmessage` alone is sufficient, and that is the point.
-   *
-   * This used to also register an allowlist of ~50 named event types, because
-   * EventSource does not route a named event to onmessage. That list silently
-   * drifted: any event the engine started emitting without a matching client
-   * entry was dropped with no error. The engine now sends every event as a
-   * default-type message with its type inside `data`, so nothing can be missed.
-   */
-  source.onmessage = (e: MessageEvent<string>) => {
-    try {
-      onEvent(JSON.parse(e.data) as StreamEvent);
-    } catch {
-      /* a malformed frame must not kill the stream */
-    }
-  };
+  onConnection?.({ state: "connecting", attempt: 0 });
+  void fetchEventSource(`${ENGINE}/api/runs/${runId}/events`, {
+    method: "GET",
+    headers: { accept: "text/event-stream" },
+    signal: controller.signal,
+    openWhenHidden: true,
+    onopen: async (response) => {
+      if (!response.ok) {
+        const body = await response.text().catch(() => "");
+        throw new RunStreamFatalError(body || `HTTP ${response.status}`);
+      }
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!contentType.toLowerCase().includes("text/event-stream")) {
+        throw new RunStreamFatalError(`unexpected content-type: ${contentType}`);
+      }
+      reconnectAttempt = 0;
+      onError?.(true);
+      onConnection?.({ state: "connected", attempt: 0 });
+    },
+    onmessage: (message) => {
+      if (message.id !== "") {
+        if (seen.has(message.id)) return;
+        seen.add(message.id);
+        recent.push(message.id);
+        if (recent.length > RUN_STREAM_MAX_SEEN_IDS) {
+          const dropped = recent.shift();
+          if (dropped !== undefined) seen.delete(dropped);
+        }
+      }
+      try {
+        onEvent(JSON.parse(message.data) as StreamEvent);
+      } catch {
+        /* malformed frames are isolated; the next durable event still arrives */
+      }
+    },
+    onclose: () => {
+      throw new Error("run stream closed unexpectedly");
+    },
+    onerror: (reason) => {
+      if (reason instanceof RunStreamFatalError) throw reason;
+      reconnectAttempt += 1;
+      onError?.(false);
+      if (reconnectAttempt > RUN_STREAM_MAX_RECONNECTS) throw reason;
+      onConnection?.({ state: "reconnecting", attempt: reconnectAttempt });
+      return RUN_STREAM_RECONNECT_DELAYS[
+        Math.min(reconnectAttempt - 1, RUN_STREAM_RECONNECT_DELAYS.length - 1)
+      ];
+    },
+  }).catch((reason: unknown) => {
+    if (controller.signal.aborted) return;
+    const error = reason instanceof Error ? reason.message : String(reason);
+    onError?.(false);
+    onConnection?.({ state: "failed", attempt: reconnectAttempt, error });
+  });
 
-  source.onopen = () => onError?.(true);
-  source.onerror = () => onError?.(false);
-
-  return () => source.close();
+  return () => controller.abort();
 }
 
 /**

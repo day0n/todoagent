@@ -1,11 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { Fragment, useEffect, useRef, useState } from "react";
 import type { Task, TaskGroups, TaskStatus, TodoList, ViewKey } from "../lib/types.ts";
 import { TASK_STATUS_LABEL } from "../lib/types.ts";
 import { visibleGroups } from "../lib/todo-state.ts";
 import { dueLabel, isOverdue, isPinnedToday } from "../lib/api.ts";
 import { IconCaret, IconCheck, IconPlus, IconToday, IconX } from "./icons.tsx";
+import { ConfirmButton, SelectMenu } from "./overlays.tsx";
 
 /**
  * The middle pane: one view's tasks, grouped.
@@ -119,7 +121,7 @@ export function TaskPane({
       // A modifier means the user is reaching for a browser or OS command.
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       // A dialog owns the keyboard while it is open.
-      if (document.querySelector(".drawer") !== null) return;
+      if (document.querySelector('[role="dialog"]') !== null) return;
 
       // Prevented so `/` does not open Firefox's quick-find and `n` does not type
       // itself into the field we are about to focus.
@@ -186,7 +188,7 @@ export function TaskPane({
                   // Every status view names itself; `other` covers 我的一天 and the
                   // list views, whose emptiness is about today rather than a status.
                   // A view missing from this guard silently renders the wrong line.
-                  view === "needs" || view === "running" || view === "done" ? view : "other"
+                  view === "tasks" || view === "needs" || view === "running" || view === "done" ? view : "other"
                 ]
               }
             </p>
@@ -198,8 +200,9 @@ export function TaskPane({
 }
 
 const EMPTY_LINE = {
+  tasks: "还没有任务。",
   needs: "没有等你的事。",
-  running: "现在没有 agent 在跑。",
+  running: "现在没有本机 CLI 在执行。",
   done: "还没有完成的任务。",
   other: "今天很干净。",
 } as const;
@@ -223,7 +226,7 @@ function Subtitle({ runtimeCount }: { runtimeCount: number | null }) {
   return (
     <div className="sub">
       {today ?? " "}
-      {today !== null && runtimeCount !== null ? ` · ${runtimeCount} 个 agent 待命` : null}
+      {today !== null && runtimeCount !== null ? ` · ${runtimeCount} 个 CLI 可用` : null}
     </div>
   );
 }
@@ -571,38 +574,24 @@ function Row({
         type="button"
         className={`act ghost sun${pinned ? " on" : ""}`}
         aria-pressed={pinned}
-        aria-label={pinned ? `从我的一天移出「${task.title}」` : `加入我的一天：「${task.title}」`}
-        title={pinned ? "从我的一天移出" : "加入我的一天"}
+        aria-label={pinned ? `从今天移出「${task.title}」` : `加入今天：「${task.title}」`}
+        title={pinned ? "从今天移出" : "加入今天"}
         onClick={() => rowOps.onToggleMyDay(task)}
       >
         <IconToday />
       </button>
 
-      {/*
-        Move to another list.
-
-        A native `<select>` rather than a custom menu: it is keyboard-accessible for
-        free, needs no outside-click handling or focus trap, and the platform renders
-        it correctly on every viewport. `.move` keeps it hover-revealed like the
-        other row actions.
-      */}
-      {lists.length > 1 ? (
-        <select
+      {lists.length > 0 && (!lists.some((list) => list.id === task.channelId) || lists.length > 1) ? (
+        <SelectMenu
           className="move"
           value={task.channelId}
-          aria-label={`移动「${task.title}」到别的清单`}
-          title="移动到别的清单"
-          onChange={(e) => {
-            const next = e.target.value;
-            if (next !== task.channelId) rowOps.onMove(task, next);
-          }}
-        >
-          {lists.map((l) => (
-            <option key={l.id} value={l.id}>
-              {l.name}
-            </option>
-          ))}
-        </select>
+          ariaLabel={`移动「${task.title}」到别的清单`}
+          options={[
+            ...(!lists.some((list) => list.id === task.channelId) ? [{ value: task.channelId, label: "任务（未加入清单）" }] : []),
+            ...lists.map((list) => ({ value: list.id, label: list.name })),
+          ]}
+          onChange={(next) => { if (next !== task.channelId) rowOps.onMove(task, next); }}
+        />
       ) : null}
 
       <RowAction
@@ -614,17 +603,17 @@ function Row({
         onStartAnswer={answer.onStart}
       />
 
-      <button
-        type="button"
+      <ConfirmButton
         className="act ghost"
-        aria-label={`删除「${task.title}」`}
+        ariaLabel={`删除「${task.title}」`}
         title="删除"
-        onClick={() => {
-          if (window.confirm(`删除「${task.title}」？`)) onDelete(task);
-        }}
+        heading={`删除「${task.title}」？`}
+        description="任务及其对话记录会被永久删除，这个操作无法撤销。"
+        confirmLabel="删除任务"
+        onConfirm={() => onDelete(task)}
       >
         <IconX />
-      </button>
+      </ConfirmButton>
     </div>
   );
 }
@@ -652,7 +641,8 @@ function Subline({ task, executor }: { task: Task; executor: string | null }) {
 }
 
 const NEEDS_FALLBACK: Record<string, string> = {
-  question: "agent 有个问题等你回答。",
+  question: "本机 CLI 有个问题等你回答。",
+  reply: "本轮回复完成，等你继续对话。",
   blocked: "受阻，等你决定。",
   failed: "执行失败，看看日志再决定。",
 };
@@ -688,95 +678,30 @@ function RowAction({
   onStartAnswer: (task: Task) => void;
 }) {
   if (task.status === "todo") {
-    // No repository on the list means no working directory, so there is nothing
-    // to dispatch to. Omitted rather than shown disabled: the reason lives on the
-    // list, not the task, and a dead button here could not explain itself.
-    if (!canDispatch) return null;
-    return (
-      <button type="button" className="act" onClick={() => onDispatch(task)}>
-        派发
-      </button>
-    );
+    return <Link href={`/tasks/${task.id}`} className="act">开始对话</Link>;
   }
 
   if (task.status === "in_progress") {
     return (
-      <button
-        type="button"
-        className="act"
-        onClick={() => {
-          // Confirmed once: this kills a live CLI process, and whatever it had
-          // done so far in the working tree stays there.
-          if (window.confirm(`取消执行「${task.title}」？已经改动的文件会留在工作区。`)) {
-            onCancel(task);
-          }
-        }}
-      >
-        取消
-      </button>
-    );
-  }
-
-  /*
-   * A parked card with no run behind it.
-   *
-   * Reachable when a task is moved into 需要你 by something other than a finished
-   * run — and until M6 it offered NOTHING, which the M3 notes recorded as a known
-   * dead row: visibly waiting on you, with no way to act on it. 查看 cannot be the
-   * answer because there is no result to show; dispatching is what actually
-   * unsticks it, and 重派 would be the wrong word for work that never started.
-   */
-  if (task.runId === null) {
-    if (task.status !== "needs_you" || !canDispatch) return null;
-    return (
-      <button type="button" className="act" onClick={() => onDispatch(task)}>
-        派发
-      </button>
-    );
-  }
-
-  if (task.status === "in_review") {
-    return (
-      <button type="button" className="act" onClick={() => onOpenResult(task)}>
-        看结果
-      </button>
-    );
-  }
-
-  if (task.status === "needs_you") {
-    /*
-     * A question is answerable; an obstacle or a failure is not.
-     *
-     * `question` means the agent asked something and is waiting, so 回答 is the
-     * primary action and the answer goes back to the run that asked. `blocked` and
-     * `failed` share the other shape — nobody asked anything, so the only ways
-     * forward are to run it again or to read what happened.
-     */
-    if (task.needsKind === "question") {
-      return (
-        <>
-          <button type="button" className="act" onClick={() => onStartAnswer(task)}>
-            回答
-          </button>
-          <button type="button" className="act" onClick={() => onOpenResult(task)}>
-            查看
-          </button>
-        </>
-      );
-    }
-    return (
       <>
-        {canDispatch ? (
-          <button type="button" className="act" onClick={() => onDispatch(task)}>
-            重派
-          </button>
-        ) : null}
-        <button type="button" className="act" onClick={() => onOpenResult(task)}>
-          查看
-        </button>
+        <Link href={`/tasks/${task.id}`} className="act">查看对话</Link>
+        <ConfirmButton
+          className="act ghost"
+          heading={`取消执行「${task.title}」？`}
+          description="CLI 会停止，但已经写入工作目录的文件改动会保留。"
+          confirmLabel="停止执行"
+          onConfirm={() => onCancel(task)}
+        >取消</ConfirmButton>
       </>
     );
   }
+  if (task.status === "needs_you" || task.status === "in_review") {
+    return <Link href={`/tasks/${task.id}`} className="act">继续对话</Link>;
+  }
+  void canDispatch;
+  void onDispatch;
+  void onOpenResult;
+  void onStartAnswer;
   return null;
 }
 
@@ -822,7 +747,7 @@ function AnswerBar({
         className="ain"
         value={draft}
         rows={2}
-        placeholder="回答它，agent 会接着做"
+        placeholder="回答后，CLI 会接着做"
         aria-label={`回答「${task.title}」`}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {

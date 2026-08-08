@@ -8,6 +8,7 @@
     "./types": "./src/types.ts",
     "./db": "./src/db/index.ts",
     "./adapters": "./src/adapters/index.ts",
+    "./runtime": "./src/runtime/index.ts",
     "./orchestrator": "./src/orchestrator/index.ts",
     "./review-rules": "./src/review-rules.ts",
     "./mentions": "./src/mentions.ts"

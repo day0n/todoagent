@@ -120,7 +120,10 @@ export function spawnStream(opts: SpawnStreamOptions): {
 
   const child = spawn(resolved, opts.args, {
     cwd: opts.cwd,
-    env: { ...process.env, ...opts.env },
+    // A few CLIs and their child tools consult PWD instead of asking the OS for
+    // cwd. Keeping the two identical prevents repository instructions, relative
+    // config and shell commands from resolving against the Engine's own folder.
+    env: { ...process.env, PWD: opts.cwd, ...opts.env },
     // stdin must be closed, not inherited: codex blocks on "Reading additional
     // input from stdin..." when it stays open, and never reaches its turn.
     stdio: ["ignore", "pipe", "pipe"],

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Store } from "../db/index.ts";
 import { Semaphore } from "../util/concurrency.ts";
-import { BudgetExceededError, runOne } from "./runner.ts";
+import { BudgetExceededError, legacyExecutionOptions, runOne } from "./runner.ts";
 
 /**
  * What happens to a turn while it WAITS for a concurrency slot.
@@ -92,7 +92,7 @@ function start(f: Fixture, slots: Semaphore): Promise<{ ok: boolean; attemptId: 
   return runOne({
     store: f.store,
     runId: f.runId,
-    expert,
+    ...legacyExecutionOptions(expert),
     kind: "draft",
     subTaskId: null,
     prompt: "go",
@@ -237,7 +237,7 @@ test("an abort signal that fires while queued stops the turn", async () => {
     const pending = runOne({
       store: f.store,
       runId: f.runId,
-      expert,
+      ...legacyExecutionOptions(expert),
       kind: "draft",
       subTaskId: null,
       prompt: "go",

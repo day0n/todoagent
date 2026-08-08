@@ -3,10 +3,10 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { z } from "zod";
-import { getAdapter } from "../adapters/index.ts";
+import { defaultExecutableForRuntime, getAdapter } from "../adapters/index.ts";
 import type { AgentEvent, AgentResultStatus } from "../adapters/types.ts";
 import type { Store } from "../db/index.ts";
-import type { Attempt, Expert } from "../types.ts";
+import type { Attempt, ExecutionTarget, Expert } from "../types.ts";
 import type { Semaphore } from "../util/concurrency.ts";
 import { bus } from "./bus.ts";
 import { repairPrompt, tryParse } from "./structured.ts";
@@ -30,7 +30,12 @@ export class BudgetExceededError extends Error {
 export interface RunOneOptions {
   store: Store;
   runId: string;
-  expert: Expert;
+  target: ExecutionTarget;
+  /** Legacy pipeline ownership; direct CLI attempts intentionally leave it null. */
+  expertId?: string | null;
+  /** Legacy-only overrides. Direct dispatch leaves both unset. */
+  model?: string | null;
+  systemPrompt?: string | null;
   kind: Attempt["kind"];
   subTaskId: string | null;
   prompt: string;
@@ -63,6 +68,30 @@ export interface RunOneOptions {
    * every one holding hundreds of megabytes and spawning its own build tools.
    */
   slots?: Semaphore;
+}
+
+/**
+ * Compatibility adapter for the retained multi-expert pipeline.
+ *
+ * New direct dispatch must obtain its absolute-path target from RuntimeManager;
+ * this helper intentionally keeps the old PATH-based behaviour only where the
+ * old pipeline still exists for historical compatibility.
+ */
+export function legacyExecutionOptions(expert: Expert): Pick<
+  RunOneOptions,
+  "target" | "expertId" | "model" | "systemPrompt"
+> {
+  return {
+    target: {
+      runtimeKind: expert.runtimeKind,
+      displayName: expert.name,
+      execPath: defaultExecutableForRuntime(expert.runtimeKind),
+      version: "legacy",
+    },
+    expertId: expert.id,
+    model: expert.model,
+    systemPrompt: expert.systemPrompt,
+  };
 }
 
 export interface RunOneResult {
@@ -168,7 +197,7 @@ function record(
  * afterwards has already let the run overshoot by one full agent turn.
  */
 export async function runOne(opts: RunOneOptions): Promise<RunOneResult> {
-  const { store, runId, expert, prompt, cwd } = opts;
+  const { store, runId, target, prompt, cwd } = opts;
 
   const run = store.getRun(runId);
   if (!run) throw new Error(`run not found: ${runId}`);
@@ -217,24 +246,25 @@ export async function runOne(opts: RunOneOptions): Promise<RunOneResult> {
     const attempt = store.startAttempt({
       runId,
       subTaskId: opts.subTaskId,
-      expertId: expert.id,
-      runtimeKind: expert.runtimeKind,
+      expertId: opts.expertId ?? null,
+      runtimeKind: target.runtimeKind,
       kind: opts.kind,
     });
 
     record(store, runId, attempt.id, "attempt:started", {
-      expertId: expert.id,
-      expertName: expert.name,
-      runtimeKind: expert.runtimeKind,
+      expertId: opts.expertId ?? null,
+      targetName: target.displayName,
+      runtimeKind: target.runtimeKind,
       kind: opts.kind,
       subTaskId: opts.subTaskId,
     });
 
-    const adapter = getAdapter(expert.runtimeKind);
+    const adapter = getAdapter(target.runtimeKind);
     const execution = adapter.execute(prompt, {
       cwd,
-      model: expert.model,
-      systemPrompt: expert.systemPrompt,
+      execPath: target.execPath,
+      model: opts.model,
+      systemPrompt: opts.systemPrompt,
       ...(opts.timeoutMs !== undefined ? { timeoutMs: opts.timeoutMs } : {}),
       ...(opts.idleTimeoutMs !== undefined ? { idleTimeoutMs: opts.idleTimeoutMs } : {}),
       ...(opts.signal ? { signal: opts.signal } : {}),
@@ -326,7 +356,7 @@ export async function runOneWithRetry(opts: RunOneOptions): Promise<RunOneResult
       attempt: retries,
       of: MAX_TRANSIENT_RETRIES,
       kind: opts.kind,
-      expertName: opts.expert.name,
+      targetName: opts.target.displayName,
       reason: res.error,
     });
     await delay(retryDelayMs(retries), opts.signal);
@@ -360,7 +390,7 @@ export async function runStructured<T>(
   // work instead of us reparsing prose.
   let schemaDir: string | null = null;
   let schemaPath: string | null = null;
-  if (opts.schemaJson !== undefined && opts.expert.runtimeKind === "codex") {
+  if (opts.schemaJson !== undefined && opts.target.runtimeKind === "codex") {
     schemaDir = await mkdtemp(join(tmpdir(), "todoagent-schema-"));
     schemaPath = join(schemaDir, "schema.json");
     await writeFile(schemaPath, JSON.stringify(opts.schemaJson), "utf8");

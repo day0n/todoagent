@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import type { ChatSession } from "../lib/types.ts";
 import { fmtRelative } from "../lib/api.ts";
 import { IconCaret, IconMore, IconPlus } from "./icons.tsx";
+import { AnimatedText } from "./animated-text.tsx";
 
 /**
  * The header's session switcher: click "秘书" to see every open conversation.
@@ -71,7 +72,7 @@ export function ChatSessionMenu({
       >
         <div className="chead-id-text">
           <div className="name">
-            {activeTitle}
+            <AnimatedText>{activeTitle}</AnimatedText>
             <IconCaret className="chat-switcher-caret" />
           </div>
           <div className="sub">{sessions.length > 1 ? `${sessions.length} 个会话` : "秘书"}</div>

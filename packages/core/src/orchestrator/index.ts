@@ -11,6 +11,7 @@ export {
   recordEvent,
   runOne,
   runStructured,
+  legacyExecutionOptions,
   type RunOneOptions,
   type RunOneResult,
 } from "./runner.ts";

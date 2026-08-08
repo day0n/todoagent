@@ -1,5 +1,5 @@
 import type { Store } from "../db/index.ts";
-import type { Expert, Run } from "../types.ts";
+import type { ExecutionTarget, Run } from "../types.ts";
 import { captureWorkingDiff } from "../util/git.ts";
 import { BudgetExceededError, recordEvent, runOneWithRetry } from "./runner.ts";
 
@@ -19,7 +19,7 @@ import { BudgetExceededError, recordEvent, runOneWithRetry } from "./runner.ts";
 export interface DirectRunOptions {
   store: Store;
   runId: string;
-  expert: Expert;
+  target: ExecutionTarget;
   signal?: AbortSignal;
   /**
    * Continue the CLI session this id names, rather than starting cold.
@@ -41,16 +41,24 @@ export interface DirectRunResult {
 }
 
 export async function runDirect(opts: DirectRunOptions): Promise<DirectRunResult> {
-  const { store, runId, expert, signal, resumeSessionId } = opts;
+  const { store, runId, target, signal, resumeSessionId } = opts;
 
   const run = store.getRun(runId);
   if (!run) throw new Error(`run not found: ${runId}`);
   const project = store.getProject(run.projectId);
   if (!project) throw new Error(`project not found: ${run.projectId}`);
+  const workingDirectory = run.workingDirectory ?? project.repoPath;
+  const repositoryRoot = run.repositoryRoot ?? project.repoPath;
 
   // `draft` is the closest phase in the closed union: the maker producing work.
   store.updateRun(runId, { status: "running", phase: "draft" });
-  recordEvent(store, runId, null, "run:started", { mode: "direct", expert: expert.name });
+  recordEvent(store, runId, null, "run:started", {
+    mode: "direct",
+    runtimeKind: target.runtimeKind,
+    targetName: target.displayName,
+    execPath: target.execPath,
+    version: target.version,
+  });
 
   /**
    * Settles the run, and for a completed one, snapshots the working tree.
@@ -85,7 +93,7 @@ export async function runDirect(opts: DirectRunOptions): Promise<DirectRunResult
      * statement about a failed run that had in fact edited several.
      */
     if (status === "completed") {
-      store.updateRun(runId, { diff: await captureWorkingDiff(project.repoPath) });
+      store.updateRun(runId, { diff: await captureWorkingDiff(repositoryRoot) });
     }
 
     const eventType =
@@ -104,11 +112,11 @@ export async function runDirect(opts: DirectRunOptions): Promise<DirectRunResult
     const res = await runOneWithRetry({
       store,
       runId,
-      expert,
+      target,
       kind: "draft",
       subTaskId: null,
       prompt: run.goal,
-      cwd: project.repoPath,
+      cwd: workingDirectory,
       signal,
       resumeSessionId,
     });

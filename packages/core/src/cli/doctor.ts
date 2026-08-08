@@ -8,15 +8,9 @@
  * forever if stdin is left open. Only a real round trip tells you the truth,
  * so `--probe` spawns each CLI with a trivial prompt.
  */
-import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { detectAll, getAdapter } from "../adapters/index.ts";
-import { git } from "../util/git.ts";
-import { RUNTIME_KINDS, type RuntimeKind } from "../types.ts";
-
-const PROBE_PROMPT = "Reply with exactly: TODOAGENT_OK";
-const PROBE_TIMEOUT_MS = 180_000;
+import { probeRuntime } from "../runtime/probe.ts";
+import { RUNTIME_DISPLAY_NAMES, RUNTIME_KINDS, type RuntimeKind } from "../types.ts";
 
 interface ProbeResult {
   kind: RuntimeKind;
@@ -40,7 +34,7 @@ interface ProbeResult {
   types: string[];
 }
 
-async function probe(kind: RuntimeKind, cwd: string): Promise<ProbeResult> {
+async function probe(kind: RuntimeKind): Promise<ProbeResult> {
   const adapter = getAdapter(kind);
   const detected = await adapter.detect();
   if (!detected) {
@@ -58,53 +52,24 @@ async function probe(kind: RuntimeKind, cwd: string): Promise<ProbeResult> {
     };
   }
 
-  const started = Date.now();
-  try {
-    const run = adapter.execute(PROBE_PROMPT, {
-      cwd,
-      timeoutMs: PROBE_TIMEOUT_MS,
-      idleTimeoutMs: 90_000,
-    });
-    // The stream must be drained or the adapter's queue grows unbounded.
-    const seen: string[] = [];
-    const types = new Set<string>();
-    let events = 0;
-    const drain = (async () => {
-      for await (const ev of run.events) {
-        events++;
-        types.add(ev.type);
-        if (ev.type === "text") seen.push(ev.content);
-      }
-    })();
-    const result = await run.result;
-    await drain;
-    const text = (result.output || seen.join("")).trim();
-    return {
-      kind,
-      installed: true,
-      version: detected.version,
-      probed: true,
-      ok: result.status === "completed" && text.length > 0,
-      output: text.slice(0, 200),
-      error: result.error,
-      ms: Date.now() - started,
-      events,
-      types: [...types].sort(),
-    };
-  } catch (err) {
-    return {
-      kind,
-      installed: true,
-      version: detected.version,
-      probed: true,
-      ok: false,
-      output: "",
-      error: err instanceof Error ? err.message : String(err),
-      ms: Date.now() - started,
-      events: 0,
-      types: [],
-    };
-  }
+  const result = await probeRuntime({
+    runtimeKind: kind,
+    displayName: RUNTIME_DISPLAY_NAMES[kind],
+    execPath: detected.execPath,
+    version: detected.version,
+  });
+  return {
+    kind,
+    installed: true,
+    version: detected.version,
+    probed: true,
+    ok: result.ok,
+    output: result.output,
+    error: result.error,
+    ms: result.durationMs,
+    events: result.eventCount,
+    types: result.eventTypes,
+  };
 }
 
 function pad(s: string, n: number): string {
@@ -138,21 +103,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  // Probes run in a throwaway git repo: several CLIs refuse to operate outside
-  // one, and a temp dir keeps the probe from touching a real project.
-  const dir = await mkdtemp(join(tmpdir(), "todoagent-doctor-"));
-  await git(["init", "-q", "."], dir);
-  await git(["-c", "user.name=TodoAgent", "-c", "user.email=todoagent@localhost", "commit", "--allow-empty", "-q", "-m", "init"], dir);
-
   const targets = only.length > 0 ? only : detected.map((d) => d.kind);
-  console.log(`\nProbing ${targets.length} runtime(s) in ${dir} ...\n`);
+  console.log(`\nProbing ${targets.length} runtime(s) in disposable repositories ...\n`);
 
   // Sequential on purpose: parallel probes race for the same rate limits and a
   // 429 would look like a broken adapter.
   const results: ProbeResult[] = [];
   for (const kind of targets) {
     process.stdout.write(`  ${pad(kind, 10)} ... `);
-    const r = await probe(kind, dir);
+    const r = await probe(kind);
     results.push(r);
     if (r.ok) {
       // The event count is shown, not just stored: it is the only way to see that
@@ -164,8 +123,6 @@ async function main(): Promise<void> {
       console.log(`FAIL ${(r.ms / 1000).toFixed(1)}s  ${(r.error ?? "no output").slice(0, 160)}`);
     }
   }
-
-  await rm(dir, { recursive: true, force: true });
 
   const ok = results.filter((r) => r.ok);
   console.log(`\n${ok.length}/${results.length} runtime(s) completed a turn.`);

@@ -29,6 +29,66 @@ export interface DetectedRuntime {
   version: string;
 }
 
+/** Stable product-facing names for the supported local CLIs. */
+export const RUNTIME_DISPLAY_NAMES: Readonly<Record<RuntimeKind, string>> = {
+  claude: "Claude Code",
+  codex: "Codex",
+  cursor: "Cursor Agent",
+  gemini: "Gemini CLI",
+  kiro: "Kiro CLI",
+  grok: "Grok CLI",
+};
+
+/**
+ * A runtime's persisted readiness state.
+ *
+ * `unverified` is deliberately distinct from `missing`: finding an executable
+ * proves neither that its credentials work nor that its output protocol is one
+ * TodoAgent can understand. Only a real probe may promote it to `ready`.
+ */
+export type RuntimeStatus =
+  | "missing"
+  | "unverified"
+  | "verifying"
+  | "ready"
+  | "auth_required"
+  | "error";
+
+/** The durable portion of a local runtime record. */
+export interface LocalRuntime {
+  kind: RuntimeKind;
+  execPath: string | null;
+  version: string | null;
+  status: RuntimeStatus;
+  /** Most recent successful binary detection. */
+  detectedAt: string | null;
+  /** Most recent successful real round trip. */
+  verifiedAt: string | null;
+  verifyError: string | null;
+}
+
+/** API/UI view of a runtime, with presentation and live activity added. */
+export interface RuntimeInfo extends LocalRuntime {
+  displayName: string;
+  /** Backward-friendly UI alias; always identical to `displayName`. */
+  label: string;
+  activeRuns: number;
+}
+
+/**
+ * Immutable execution identity selected by the user.
+ *
+ * It intentionally contains no persona, skills, model or system prompt. A
+ * direct task is handed to the chosen CLI as itself, using that CLI's defaults
+ * and the repository's native instruction files.
+ */
+export interface ExecutionTarget {
+  runtimeKind: RuntimeKind;
+  displayName: string;
+  execPath: string;
+  version: string;
+}
+
 /**
  * Pipeline position. Orthogonal to `capabilities` — a team may hold two makers
  * with different specialties, and one expert may serve several roles.
@@ -126,6 +186,14 @@ export type HumanGate = "plan_approval" | "adjudication";
 export interface Run {
   id: string;
   projectId: string;
+  /** Task conversation that owns this turn; null on legacy/direct pipeline runs. */
+  taskId: string | null;
+  parentRunId: string | null;
+  trigger: "dispatch" | "task_chat" | null;
+  /** Human-authored message, before fallback context is stitched into `goal`. */
+  userMessage: string | null;
+  repositoryRoot: string | null;
+  workingDirectory: string | null;
   goal: string;
   acceptance: string | null;
   status: RunStatus;
@@ -141,6 +209,10 @@ export interface Run {
   createdAt: string;
   endedAt: string | null;
   error: string | null;
+  /** Immutable local-CLI snapshot for direct runs; null on legacy pipeline rows. */
+  runtimeKind: RuntimeKind | null;
+  runtimeExecPath: string | null;
+  runtimeVersion: string | null;
 }
 
 export type SubTaskStatus =
@@ -209,7 +281,8 @@ export interface Attempt {
   id: string;
   runId: string;
   subTaskId: string | null;
-  expertId: string;
+  /** Null for direct local-CLI dispatch; populated by the legacy expert pipeline. */
+  expertId: string | null;
   runtimeKind: RuntimeKind;
   /** Why this agent was woken. Mirrors Multica's trigger reasons. */
   kind: "plan" | "draft" | "review" | "rebuttal" | "adjudicate" | "verify" | "discuss" | "repro";
@@ -413,7 +486,7 @@ export const TASK_STATUSES: readonly TaskStatus[] = [
  *   blocked  — the agent cannot proceed (dirty worktree, missing credential…)
  *   failed   — the run errored or timed out; a person decides what happens next
  */
-export type NeedsKind = "question" | "blocked" | "failed";
+export type NeedsKind = "question" | "reply" | "blocked" | "failed";
 
 /**
  * What a completed worker turn actually amounted to.
@@ -458,6 +531,10 @@ export interface Task {
   sourceMessageId: string | null;
   /** The pipeline run doing the work, once started. */
   runId: string | null;
+  /** CLI explicitly selected for the latest dispatch, if any. */
+  runtimeKind: RuntimeKind | null;
+  /** Locked working directory for this task's CLI conversation. */
+  workingDirectory: string | null;
   createdAt: string;
   updatedAt: string;
 }

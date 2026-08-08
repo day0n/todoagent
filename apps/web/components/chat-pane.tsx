@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 import { ENGINE } from "../lib/api.ts";
 import type { ChatAttachment, ChatHistory, ChatSession, ChatStatus, ChatTaskCard, Task } from "../lib/types.ts";
 import { TASK_STATUS_LABEL } from "../lib/types.ts";
@@ -9,6 +10,8 @@ import { ChatSessionMenu } from "./chat-session-menu.tsx";
 import type { AnswerControls } from "./task-pane.tsx";
 import { IconArrowDown, IconCheck, IconCopy, IconImage, IconSend, IconX } from "./icons.tsx";
 import { MarkdownLite } from "./markdown-lite.tsx";
+import { AnimatedText } from "./animated-text.tsx";
+import { EdgeGlow } from "./edge-glow.tsx";
 
 /**
  * The right column: the secretary, always present.
@@ -33,10 +36,25 @@ import { MarkdownLite } from "./markdown-lite.tsx";
  * summary through `list_state`. They are shortcuts for typing, not a second command
  * surface with its own semantics.
  */
-const QUICK_CHIPS = ["派发剩余任务", "把明天的挪到今天", "总结今天的进展"] as const;
+const QUICK_CHIPS = ["创建一个任务", "查看待办任务", "整理本周任务"] as const;
 
 /** How many pictures one turn can carry, matching the engine's own `images.max(4)`. */
 const MAX_IMAGES = 4;
+const CHAT_WIDTH_DEFAULT = 400;
+const CHAT_WIDTH_MIN = 320;
+const CHAT_WIDTH_MAX = 620;
+const CHAT_WIDTH_STORAGE_KEY = "todoagent:secretary-width";
+
+function availableChatWidth(): number {
+  if (typeof window === "undefined") return CHAT_WIDTH_MAX;
+  // Keep enough room for the 216px navigation and a useful task canvas. The
+  // secretary disappears at 1050px, so this only governs the desktop surface.
+  return Math.max(CHAT_WIDTH_MIN, Math.min(CHAT_WIDTH_MAX, window.innerWidth - 216 - 420));
+}
+
+function clampChatWidth(width: number): number {
+  return Math.round(Math.min(Math.max(width, CHAT_WIDTH_MIN), availableChatWidth()));
+}
 
 /** One picture attached to the draft, resized and ready to send. */
 interface PendingImage extends ResizedImage {
@@ -102,6 +120,7 @@ export function ChatPane({
   onRenameSession: (id: string, title: string) => void;
   onArchiveSession: (id: string) => void;
 }) {
+  const panelRef = useRef<HTMLElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -111,6 +130,75 @@ export function ChatPane({
   /** How many files are still being decoded/resized, to hold off sending mid-drop. */
   const [attaching, setAttaching] = useState(0);
   const [attachError, setAttachError] = useState<string | null>(null);
+  const [panelWidth, setPanelWidth] = useState(CHAT_WIDTH_DEFAULT);
+  const resizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
+  const panelWidthRef = useRef(CHAT_WIDTH_DEFAULT);
+  const resizeFrameRef = useRef(0);
+  const pendingWidthRef = useRef<number | null>(null);
+
+  const paintPanelWidth = useCallback((next: number) => {
+    const width = clampChatWidth(next);
+    panelWidthRef.current = width;
+    panelRef.current?.parentElement?.style.setProperty("--chat-pane-width", `${width}px`);
+    return width;
+  }, []);
+
+  const applyPanelWidth = useCallback((next: number, persist = false) => {
+    const width = paintPanelWidth(next);
+    setPanelWidth(width);
+    if (persist) window.localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(width));
+  }, [paintPanelWidth]);
+
+  useEffect(() => {
+    const saved = Number(window.localStorage.getItem(CHAT_WIDTH_STORAGE_KEY));
+    applyPanelWidth(Number.isFinite(saved) && saved > 0 ? saved : CHAT_WIDTH_DEFAULT);
+    const onResize = () => applyPanelWidth(panelWidthRef.current);
+    window.addEventListener("resize", onResize);
+    return () => {
+      cancelAnimationFrame(resizeFrameRef.current);
+      window.removeEventListener("resize", onResize);
+      document.body.classList.remove("resizing-chat-panel");
+    };
+  }, [applyPanelWidth]);
+
+  useEffect(() => {
+    const move = (event: PointerEvent): void => {
+      const resize = resizeRef.current;
+      if (resize === null || resize.pointerId !== event.pointerId) return;
+      pendingWidthRef.current = resize.startWidth + resize.startX - event.clientX;
+      if (resizeFrameRef.current !== 0) return;
+      resizeFrameRef.current = requestAnimationFrame(() => {
+        resizeFrameRef.current = 0;
+        if (pendingWidthRef.current !== null) paintPanelWidth(pendingWidthRef.current);
+      });
+    };
+    const finish = (event: PointerEvent): void => {
+      if (resizeRef.current?.pointerId !== event.pointerId) return;
+      cancelAnimationFrame(resizeFrameRef.current);
+      resizeFrameRef.current = 0;
+      const finalWidth = pendingWidthRef.current ?? panelWidthRef.current;
+      pendingWidthRef.current = null;
+      resizeRef.current = null;
+      document.body.classList.remove("resizing-chat-panel");
+      applyPanelWidth(finalWidth, true);
+    };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", finish);
+    window.addEventListener("pointercancel", finish);
+    return () => {
+      window.removeEventListener("pointermove", move);
+      window.removeEventListener("pointerup", finish);
+      window.removeEventListener("pointercancel", finish);
+    };
+  }, [applyPanelWidth, paintPanelWidth]);
+
+  const startResize = (event: ReactPointerEvent<HTMLButtonElement>): void => {
+    if (event.button !== 0) return;
+    event.currentTarget.setPointerCapture(event.pointerId);
+    pendingWidthRef.current = null;
+    resizeRef.current = { pointerId: event.pointerId, startX: event.clientX, startWidth: panelWidthRef.current };
+    document.body.classList.add("resizing-chat-panel");
+  };
 
   /**
    * Whether the stream is pinned to the newest message.
@@ -173,6 +261,15 @@ export function ChatPane({
   useEffect(() => {
     if ((thinking || live !== null) && stuck) scrollToBottom(true);
   }, [thinking, live, stuck, scrollToBottom]);
+
+  // Grow with the draft up to a useful working height, then let the field scroll.
+  // Resetting to auto first also collapses the composer after a message is sent.
+  useEffect(() => {
+    const input = inputRef.current;
+    if (input === null) return;
+    input.style.height = "auto";
+    input.style.height = `${Math.min(input.scrollHeight, 112)}px`;
+  }, [draft]);
 
 
   const addFiles = useCallback((files: FileList | File[]) => {
@@ -247,9 +344,52 @@ export function ChatPane({
     sessions.find((s) => s.id === activeSessionId)?.title.trim() || "秘书";
 
   return (
-    <aside className="chat">
+    <aside ref={panelRef} className="chat">
+      <button
+        type="button"
+        className="chat-resizer"
+        role="separator"
+        aria-label="调整秘书栏宽度"
+        aria-orientation="vertical"
+        aria-valuemin={CHAT_WIDTH_MIN}
+        aria-valuemax={CHAT_WIDTH_MAX}
+        aria-valuenow={panelWidth}
+        title="左右拖动调整宽度，双击恢复默认"
+        onPointerDown={startResize}
+        onDoubleClick={() => applyPanelWidth(CHAT_WIDTH_DEFAULT, true)}
+        onKeyDown={(event) => {
+          const step = event.shiftKey ? 40 : 16;
+          if (event.key === "ArrowLeft") {
+            event.preventDefault();
+            applyPanelWidth(panelWidthRef.current + step, true);
+          } else if (event.key === "ArrowRight") {
+            event.preventDefault();
+            applyPanelWidth(panelWidthRef.current - step, true);
+          } else if (event.key === "Home") {
+            event.preventDefault();
+            applyPanelWidth(CHAT_WIDTH_MIN, true);
+          } else if (event.key === "End") {
+            event.preventDefault();
+            applyPanelWidth(CHAT_WIDTH_MAX, true);
+          }
+        }}
+      />
       <div className="chead">
-        <span className="chat-mark" aria-hidden="true" />
+        <span className="chat-agent-avatar" aria-hidden="true">
+          <img src="/images/secretary-avatar.png" alt="" />
+        </span>
+        <div className="chat-agent-identity">
+          <span className="chat-agent-kicker">TODOAGENT</span>
+          <strong>秘书工作台</strong>
+        </div>
+        <span
+          className={`chat-agent-status${ready ? " on" : ""}`}
+          role="status"
+          aria-live="polite"
+        >
+          <i />
+          <AnimatedText>{ready ? "在线" : "离线"}</AnimatedText>
+        </span>
         <ChatSessionMenu
           sessions={sessions}
           activeSessionId={activeSessionId}
@@ -266,12 +406,13 @@ export function ChatPane({
           `title` rather than text: the reason is already spelled out in the banner
           below, and repeating it in the header would push the model name out.
         */}
-        <span
-          className={`dot-live${ready ? " on" : ""}`}
-          title={ready ? "在线" : (status?.reason ?? "未配置模型")}
-          aria-label={ready ? "秘书在线" : "秘书未配置"}
-        />
       </div>
+
+      <nav className="chat-subnav" aria-label="秘书工具栏">
+        <span className="active">对话 <b>{messages.length}</b></span>
+        {needsTasks.length > 0 ? <span>需要你 <b>{needsTasks.length}</b></span> : null}
+        <button type="button" onClick={onCreateSession}>＋ 新对话</button>
+      </nav>
 
       {status !== null && !status.ready && (
         <div className="cbanner" role="note">
@@ -339,7 +480,11 @@ export function ChatPane({
         })}
 
         {messages.length === 0 && !thinking && live === null ? (
-          <p className="cempty">和 agent 说件事，它会变成任务</p>
+          <div className="cempty">
+            <span className="cempty-mark" aria-hidden="true" />
+            <strong>从一件事开始</strong>
+            <p>告诉秘书要记录或整理什么，它会把内容变成清晰的任务。</p>
+          </div>
         ) : (
           messages.map((m, i) => (
             <MessageRow
@@ -365,14 +510,16 @@ export function ChatPane({
           bubble on `chat:message` cannot visibly reflow.
         */}
         {thinking && live === null ? (
-          <div className="m a thinking" aria-label="agent 正在处理">
-            <i />
-            <i />
-            <i />
+          <div className="mrow a agent-turn" aria-label="agent 正在处理">
+            <div className="m a thinking">
+              <i />
+              <i />
+              <i />
+            </div>
           </div>
         ) : null}
         {live !== null ? (
-          <div className="mrow a">
+          <div className="mrow a agent-turn">
             <div className="m a live" aria-live="polite" aria-label="agent 正在回复">
               <MarkdownLite text={live} />
               <span className="live-caret" aria-hidden="true" />
@@ -478,6 +625,7 @@ export function ChatPane({
             {attachError}
           </p>
         ) : null}
+        <EdgeGlow active={sending} className="secretary-composer-glow">
         <div className={`composer-box${sending ? " busy" : ""}`}>
           <input
             ref={fileInputRef}
@@ -492,23 +640,12 @@ export function ChatPane({
               e.target.value = "";
             }}
           />
-          <button
-            type="button"
-            className="composer-attach"
-            aria-label="添加图片"
-            // No pictures on an answer: `POST /answer` carries a sentence, so an
-            // attached image would be silently dropped.
-            disabled={sending || pending || images.length >= MAX_IMAGES}
-            onClick={() => fileInputRef.current?.click()}
-          >
-            <IconImage />
-          </button>
           <textarea
             ref={inputRef}
             rows={1}
             placeholder={
               bound !== null
-                ? "回答它，agent 会接着做"
+                ? "回答后，CLI 会接着做"
                 : pending
                   ? "这个任务已经不在等回答了"
                   : ready
@@ -535,27 +672,47 @@ export function ChatPane({
             }}
             disabled={sending}
           />
-          <button
-            type="button"
-            className="send"
-            onClick={() => submit()}
-            disabled={
-              sending ||
-              attaching > 0 ||
-              // Bound: a resolvable task and some text. Never falls back to sending
-              // the answer to the secretary as chat.
-              (pending
-                ? bound === null || draft.trim() === ""
-                : draft.trim() === "" && images.length === 0)
-            }
-            aria-label={bound !== null ? "发送回答" : "发送"}
-          >
-            <IconSend />
-          </button>
+          <div className="composer-footer">
+            <div className="composer-tools">
+              <button
+                type="button"
+                className="composer-attach"
+                aria-label="添加图片"
+                disabled={sending || pending || images.length >= MAX_IMAGES}
+                onClick={() => fileInputRef.current?.click()}
+              >
+                <IconImage />
+              </button>
+              <span
+                className={`composer-model${sending ? " active" : ""}`}
+                role="status"
+                aria-live="polite"
+              >
+                <i />
+                <AnimatedText>{sending ? "正在处理" : "任务管理"}</AnimatedText>
+              </span>
+            </div>
+            <button
+              type="button"
+              className={`send${sending ? " loading" : ""}`}
+              onClick={() => submit()}
+              disabled={
+                sending ||
+                attaching > 0 ||
+                (pending
+                  ? bound === null || draft.trim() === ""
+                  : draft.trim() === "" && images.length === 0)
+              }
+              aria-label={
+                sending ? "正在处理" : bound !== null ? "发送回答" : "发送"
+              }
+            >
+              {sending ? <span className="composer-spinner" aria-hidden="true" /> : <IconSend />}
+            </button>
+          </div>
         </div>
-        <div className="composer-hint">
-          {pending ? "↩ 发送回答 · ⇧↩ 换行 · esc 取消" : "↩ 发送 · ⇧↩ 换行 · 可拖拽/粘贴图片"}
-        </div>
+        </EdgeGlow>
+        <div className="composer-hint">{pending ? "Enter 发送回答 · Esc 取消" : "Enter 发送 · Shift + Enter 换行"}</div>
       </div>
     </aside>
   );
@@ -585,7 +742,7 @@ function MessageRow({
   return (
     <>
       {daySep !== null ? <div className="day-sep">{daySep}</div> : null}
-      <div className={`mrow ${mine ? "u" : "a"}${isLatest ? " rise" : ""}`}>
+      <div className={`mrow ${mine ? "u" : "a agent-turn"}${isLatest ? " rise" : ""}`}>
         {message.attachments.length > 0 ? (
           <AttachmentStrip attachments={message.attachments} align={mine ? "u" : "a"} />
         ) : null}

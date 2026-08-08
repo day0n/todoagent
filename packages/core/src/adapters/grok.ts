@@ -1,7 +1,7 @@
 import { which } from "../util/which.ts";
 import { probeVersion } from "./process.ts";
 import { runAcp } from "./acp.ts";
-import { filterBlockedArgs, type AgentAdapter, type BlockedArgMode, type ExecOptions } from "./types.ts";
+import { execPathForRuntime, filterBlockedArgs, type AgentAdapter, type BlockedArgMode, type ExecOptions } from "./types.ts";
 import type { DetectedRuntime } from "../types.ts";
 
 const BLOCKED: Readonly<Record<string, BlockedArgMode>> = {
@@ -47,6 +47,6 @@ export class GrokAdapter implements AgentAdapter {
     args.push(...kept);
     // Subcommand goes last: `grok agent [OPTIONS] stdio`.
     args.push("stdio");
-    return runAcp(prompt, { ...opts, execPath: "grok", args });
+    return runAcp(prompt, { ...opts, execPath: execPathForRuntime(this.kind, opts), args });
   }
 }

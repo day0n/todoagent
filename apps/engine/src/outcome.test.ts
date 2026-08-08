@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store } from "@todoagent/core";
-import type { Task } from "@todoagent/core/types";
+import type { RuntimeKind, Task } from "@todoagent/core/types";
 
 /**
  * The 需要你 loop, end to end: a worker asks, the card parks, a person answers,
@@ -40,7 +40,7 @@ interface Fixture {
   /** Where the stub appends one JSON line per invocation. */
   argvLog: string;
   listId: string;
-  expertId: string;
+  runtimeKind: RuntimeKind;
   dispose: () => Promise<void>;
 }
 
@@ -83,9 +83,15 @@ say({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 5 } });`
   return `#!/usr/bin/env node
 const fs = require("node:fs");
 const SID = ${JSON.stringify(SESSION_ID)};
-fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify({ argv: process.argv.slice(2) }) + "\\n");
+const args = process.argv.slice(2);
+if (args.includes("--version") || args.includes("-v")) {
+  process.stdout.write("stub 1.0.0\\n");
+  process.exit(0);
+}
+fs.appendFileSync(${JSON.stringify(argvLog)}, JSON.stringify({ argv: args }) + "\\n");
 let script = { text: "done", exit: 0 };
 try { script = JSON.parse(fs.readFileSync(${JSON.stringify(scriptPath)}, "utf8")); } catch {}
+if (args.join(" ").includes("TODOAGENT_OK")) script = { text: "TODOAGENT_OK", exit: 0 };
 if (script.exit !== 0) {
   process.stderr.write(String(script.stderr ?? "stub failure"));
   process.exit(script.exit);
@@ -127,16 +133,9 @@ async function fixture(runtimeKind = "claude"): Promise<Fixture> {
 
   const dbPath = join(root, "o.db");
   const store = new Store(dbPath);
-  const expert = store.createExpert({
-    name: "Solo",
-    description: "",
-    runtimeKind: runtimeKind as "claude",
-    model: null,
-    systemPrompt: "",
-    capabilities: ["general"],
-  });
+  // Projects still carry a compatibility team id, but direct CLI execution
+  // must work with an empty Expert table.
   const team = store.createTeam("t");
-  store.addTeamMember(team.id, expert.id, "maker");
   const project = store.createProject({ name: "p", repoPath: repo, teamId: team.id });
   const list = store.createChannel({
     name: "工作",
@@ -154,7 +153,7 @@ async function fixture(runtimeKind = "claude"): Promise<Fixture> {
     scriptPath,
     argvLog,
     listId: list.id,
-    expertId: expert.id,
+    runtimeKind: runtimeKind as RuntimeKind,
     dispose: () => rm(root, { recursive: true, force: true }),
   };
 }
@@ -184,6 +183,9 @@ async function withEngine<T>(f: Fixture, fn: () => Promise<T>): Promise<T> {
       }
       await new Promise((r) => setTimeout(r, 150));
     }
+    const verified = await post(`/api/runtimes/${f.runtimeKind}/verify`);
+    assert.equal(verified.status, 200);
+    assert.equal((await json<{ status: string }>(verified)).status, "ready");
     return await fn();
   } finally {
     child.kill("SIGKILL");
@@ -197,6 +199,10 @@ function post(path: string, body: unknown = {}): Promise<Response> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+function runCard(f: Fixture, taskId: string): Promise<Response> {
+  return post(`/api/tasks/${taskId}/run`, { runtimeKind: f.runtimeKind });
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -271,7 +277,7 @@ test("outcome: a worker that ends by asking parks the card with its question", a
     await withEngine(f, async () => {
       await say(f, "我看了 config.ts。\n\n数据库用 postgres 还是 sqlite？");
       const id = await newCard(f, "接数据库");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
 
       const task = await settle(f, id);
       /*
@@ -294,7 +300,7 @@ test("outcome: the verdict is persisted on the run, not just applied once", asyn
     await withEngine(f, async () => {
       await say(f, "写好了。\n\n要我把旧文件删掉吗？");
       const id = await newCard(f, "清理");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
       const task = await settle(f, id);
       assert.equal(task.needsKind, "question");
 
@@ -327,7 +333,7 @@ test("outcome: ordinary completion still goes to 待确认", async () => {
       // The M0 behaviour, pinned so classification cannot quietly capture it.
       await say(f, "改完了。app.ts 的返回值换成 new，加了一行注释。");
       const id = await newCard(f, "改返回值");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
 
       const task = await settle(f, id);
       assert.equal(task.status, "in_review");
@@ -344,7 +350,7 @@ test("outcome: a failing run is still 失败, not a question", async () => {
     await withEngine(f, async () => {
       await say(f, "", 3);
       const id = await newCard(f, "会失败的任务");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
 
       const task = await settle(f, id);
       assert.equal(task.status, "needs_you");
@@ -385,7 +391,7 @@ test("answer: a card that is not asking anything is 409", async () => {
       // the distinction the endpoint exists to keep: 重派 handles that one.
       await say(f, "", 3);
       const failed = await newCard(f, "失败的");
-      await post(`/api/tasks/${failed}/run`);
+      await runCard(f, failed);
       const settled = await settle(f, failed);
       assert.equal(settled.needsKind, "failed");
       assert.equal((await post(`/api/tasks/${failed}/answer`, { answer: "再试" })).status, 409);
@@ -401,7 +407,7 @@ test("answer: an empty or oversized answer is rejected", async () => {
     await withEngine(f, async () => {
       await say(f, "好了。\n\n端口用哪个？");
       const id = await newCard(f, "选端口");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
       await settle(f, id);
 
       assert.equal((await post(`/api/tasks/${id}/answer`, { answer: "" })).status, 400);
@@ -427,10 +433,17 @@ test("answer: the card continues, and claude resumes the real session", async ()
     await withEngine(f, async () => {
       await say(f, "看完了。\n\n数据库用 postgres 还是 sqlite？");
       const id = await newCard(f, "接数据库");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
       const parked = await settle(f, id);
       assert.equal(parked.needsKind, "question");
       const firstRunId = parked.runId;
+
+      // Simulate a stale UI edit after the question was asked. Answering must
+      // ignore the task's mutable preference and use the immutable runtime
+      // snapshot on the run that owns SESSION_ID.
+      const external = new Store(f.dbPath);
+      external.updateTask(id, { runtimeKind: "codex" });
+      external.close();
 
       // The answer arrives, and the worker now finishes cleanly.
       await say(f, "好，用 sqlite，已经接完了。");
@@ -444,6 +457,7 @@ test("answer: the card continues, and claude resumes the real session", async ()
       assert.equal(body.task.needsKind, null, "the question is no longer owed");
       assert.equal(body.task.needsText, null);
       assert.equal(body.task.runId, body.run.id);
+      assert.equal(body.task.runtimeKind, "claude", "answering cannot switch the session to codex");
 
       // The loop closes: the follow-up run finishes as ordinary work.
       const done = await settle(f, id);
@@ -486,7 +500,7 @@ test("answer: codex cannot resume, so the prompt carries the whole context", asy
     await withEngine(f, async () => {
       await say(f, "我停在这里了。\n\n要用哪个 API 版本？");
       const id = await newCard(f, "调接口");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
       await settle(f, id);
 
       await say(f, "用 v2，做完了。");
@@ -519,7 +533,7 @@ test("answer: a second question after answering parks the card again", async () 
     await withEngine(f, async () => {
       await say(f, "开始了。\n\n用哪个端口？");
       const id = await newCard(f, "起服务");
-      await post(`/api/tasks/${id}/run`);
+      await runCard(f, id);
       assert.equal((await settle(f, id)).needsKind, "question");
 
       // The worker asks again rather than finishing. The loop is a feature: the

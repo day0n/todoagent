@@ -154,7 +154,12 @@ async function fixture(): Promise<Fixture> {
 
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
+    env: {
+      ...process.env,
+      TODOAGENT_DB: dbPath,
+      TODOAGENT_PORT: String(PORT),
+      TODOAGENT_DISABLE_RUNTIME_DISCOVERY: "1",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {

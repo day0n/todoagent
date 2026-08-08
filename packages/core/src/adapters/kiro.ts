@@ -1,7 +1,7 @@
 import { which } from "../util/which.ts";
 import { probeVersion } from "./process.ts";
 import { runAcp } from "./acp.ts";
-import { filterBlockedArgs, type AgentAdapter, type BlockedArgMode, type ExecOptions } from "./types.ts";
+import { execPathForRuntime, filterBlockedArgs, type AgentAdapter, type BlockedArgMode, type ExecOptions } from "./types.ts";
 import type { DetectedRuntime } from "../types.ts";
 
 const BLOCKED: Readonly<Record<string, BlockedArgMode>> = {
@@ -35,6 +35,6 @@ export class KiroAdapter implements AgentAdapter {
     if (opts.model) args.push("--model", opts.model);
     const { kept } = filterBlockedArgs(opts.extraArgs ?? [], BLOCKED);
     args.push(...kept);
-    return runAcp(prompt, { ...opts, execPath: "kiro-cli", args });
+    return runAcp(prompt, { ...opts, execPath: execPathForRuntime(this.kind, opts), args });
   }
 }

@@ -20,6 +20,7 @@ import {
 import { LiveCard, PhaseRail, StageBoard } from "../../../components/timeline.tsx";
 import { DiscussionThread, EscalationGate, ReviewPanel } from "../../../components/review.tsx";
 import { AttemptHistory } from "../../../components/transcripts.tsx";
+import { runtimeLabel } from "../../../lib/runtime.ts";
 
 type Tab = "work" | "review" | "log";
 
@@ -137,7 +138,13 @@ export default function RunPage({ params }: { params: Promise<{ id: string }> })
 
           <div className="mt-2.5 flex flex-wrap items-center gap-x-2 gap-y-1.5">
             <StatusBadge status={run.status} />
-            {run.soloMode ? <Meta>单专家直通</Meta> : null}
+            {run.soloMode ? (
+              <Meta>
+                {run.runtimeKind === null || run.runtimeKind === undefined
+                  ? "本机 CLI 直通"
+                  : `${runtimeLabel(run.runtimeKind)} 直通`}
+              </Meta>
+            ) : null}
             {detail.project ? (
               <>
                 <Dot />
@@ -598,7 +605,7 @@ function EventLog({ rows }: { rows: LogRow[] }) {
         />
         <Meta>{visible.length} 条</Meta>
       </div>
-      <p className="mb-3 t-meta">逐字输出不在这里 —— 它属于上方每位专家的实时卡片。</p>
+      <p className="mb-3 t-meta">逐字输出不在这里 —— 它属于上方每次执行的实时卡片。</p>
 
       {visible.length === 0 ? (
         <Empty icon="○" title="没有匹配的事件" />

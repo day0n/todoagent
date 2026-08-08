@@ -121,6 +121,7 @@ async function withEngine<T>(h: Harness, fn: () => Promise<T>): Promise<T> {
       ...process.env,
       TODOAGENT_DB: h.dbPath,
       TODOAGENT_PORT: String(PORT),
+      TODOAGENT_DISABLE_RUNTIME_DISCOVERY: "1",
       // Fakes ahead of the real CLIs, so no real agent turn is spent.
       PATH: `${binDir}${delimiter}${process.env["PATH"] ?? ""}`,
     },

@@ -163,6 +163,9 @@ export function applyEvent(state: RunStreamState, ev: StreamEvent): RunStreamSta
       next.currentTool = null;
     } else if (ev.type === "agent:error") {
       next.error = s(p["message"]);
+    } else if (ev.type === "agent:status") {
+      // Retained below for the execution log (session and provider status), but
+      // it does not change the visible transcript card.
     } else {
       // An unrecognised agent:* event is not a structural change either, so it is
       // dropped rather than logged — the log would fill with noise.
@@ -171,6 +174,29 @@ export function applyEvent(state: RunStreamState, ev: StreamEvent): RunStreamSta
 
     const live = new Map(state.live);
     live.set(next.attemptId, next);
+
+    // Text and provider reasoning stay in the live transcript. Tool boundaries
+    // and errors are durable work records a task chat must be able to replay, so
+    // retain those rows as well instead of reducing them to only a counter.
+    if (
+      ev.type === "agent:tool_use" ||
+      ev.type === "agent:tool_result" ||
+      ev.type === "agent:error" ||
+      ev.type === "agent:status"
+    ) {
+      const row: LogRow = {
+        id: ev.id,
+        type: ev.type,
+        payload: ev.payload,
+        createdAt: ev.createdAt,
+        search: `${ev.type} ${JSON.stringify(ev.payload ?? "")}`
+          .slice(0, MAX_SEARCH_CHARS)
+          .toLowerCase(),
+      };
+      const log = state.log.length >= MAX_EVENTS ? state.log.slice(-MAX_EVENTS + 1) : state.log.slice();
+      log.push(row);
+      return { ...state, live, log };
+    }
     return { ...state, live };
   }
 

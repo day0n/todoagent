@@ -173,6 +173,7 @@ async function withEngine<T>(
       ...process.env,
       TODOAGENT_DB: f.dbPath,
       TODOAGENT_PORT: String(PORT),
+      TODOAGENT_DISABLE_RUNTIME_DISCOVERY: "1",
       TODOAGENT_AGENT_DIR: f.agentDir,
       TODOAGENT_AGENT_CWD: f.root,
       // Isolated from a developer's real `~/.todoagent/uploads` — a test image

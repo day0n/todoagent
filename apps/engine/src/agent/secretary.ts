@@ -1,3 +1,4 @@
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -42,9 +43,7 @@ import type { Store, Task } from "@todoagent/core";
 
 export interface SecretaryDeps {
   store: Store;
-  /** The engine's one true dispatch path, guards included. */
-  dispatch: (taskId: string) => Promise<{ ok: boolean; error?: string }>;
-  /** Where a quick-add without a list lands (收件箱 semantics). */
+  /** Internal owner behind the aggregate “任务” smart view. */
   defaultListId: () => string;
   /** Announce board mutations made outside a request (tools write directly). */
   publishBoard: (taskId: string | null) => void;
@@ -98,17 +97,18 @@ const MAX_LIVE_SESSIONS = 6;
 
 const SYSTEM_PROMPT = `你是 TodoAgent 的任务秘书。你管理的是任务卡片，不写代码。
 
-职责：把用户的话变成清晰的任务卡、维护看板、在合适的时候派发任务给本地编码 agent。
+职责：把用户的话变成清晰的任务卡、维护看板和提醒。你不执行代码，也不启动本机 CLI。
 
 规则：
-1. 建卡前先用 find_related 查一遍：发现相关的历史任务就在回复里提一句（如「和上周的 X 同清单」），并把新卡建到同一清单。
+1. 建卡前先用 find_related 查一遍：发现相关的历史任务就在回复里提一句。用户明确指定自定义清单时用 list_lists 找到它；没有指定时放入系统“任务”总览，不要擅自塞进某个自定义清单。
 2. 一句话里有多件事就拆成多张卡；标题短，细节放 note。
-3. 自动派发必须同时满足三个条件：目标清单绑定了仓库、dispatch_task 没有返回占用错误、用户没有表达「先别做 / 待会 / 只是记一下」这类意思。拿不准就只建卡不派发——建错卡删掉就好，派错了会烧钱。
+3. 禁止派发、启动或猜测 CLI。用户要求执行时，只创建或更新任务，并告诉他打开任务后亲自选择工作目录、Runtime 和第一条消息。
 4. 回复惜字如金：一两句确认即可，不要复述任务内容（卡片自己会展示），不要用列表和标题排版。
 5. 永远不要编造任务状态，状态只来自工具返回值。
 6. 用户问现状时用 list_state，照实转述。
 7. 需要看文件内容时可以用 read/grep/find/ls（只读）。
-8. 截止日期：用户明确说了时间才填 dueDate，格式必须是 YYYY-MM-DD。每条用户消息开头会给你今天的日期，
+8. MEMORY.md 是长期记忆；ref/ 是按需查阅的小抄。不要把 ref/ 全部复述或塞进回复，只在当前问题需要时读取。
+9. 截止日期：用户明确说了时间才填 dueDate，格式必须是 YYYY-MM-DD。每条用户消息开头会给你今天的日期，
    相对时间（明天、下周五、月底）都从那个日期算。用户没提时间就不要自己编一个截止日期——
    大多数待办本来就没有截止日期。`;
 
@@ -165,14 +165,13 @@ function buildTools(
   const createTasks = defineTool({
     name: "create_tasks",
     label: "创建任务",
-    description:
-      "批量创建任务卡。listId 省略时进入默认收件箱。返回创建的任务 id 列表。",
+    description: "批量创建任务卡。listId 省略时进入系统“任务”总览；明确指定自定义清单时必须使用现有 listId。",
     parameters: Type.Object({
       tasks: Type.Array(
         Type.Object({
           title: Type.String({ description: "任务标题，一行" }),
           note: Type.Optional(Type.String({ description: "补充说明，可空" })),
-          listId: Type.Optional(Type.String({ description: "目标清单 id" })),
+          listId: Type.Optional(Type.String({ description: "可选的自定义清单 id，必须来自 list_lists 或 find_related" })),
           dueDate: Type.Optional(
             Type.String({
               description: "截止日期，必须是 YYYY-MM-DD。用户没提到时间就不要填。",
@@ -186,8 +185,9 @@ function buildTools(
       const lines: string[] = [];
       for (const t of params.tasks) {
         const listId = t.listId ?? deps.defaultListId();
-        if (t.listId !== undefined && store.getChannel(t.listId) === null) {
-          lines.push(`跳过「${clip(t.title, 60)}」：清单 ${t.listId} 不存在`);
+        const list = store.getChannel(listId);
+        if (list === null || list.kind !== "channel" || list.archivedAt !== null) {
+          lines.push(`跳过「${clip(t.title, 60)}」：清单 ${listId} 不存在或已归档`);
           continue;
         }
         /*
@@ -211,7 +211,10 @@ function buildTools(
           ...(t.dueDate !== undefined ? { dueDate: t.dueDate } : {}),
           assigneeKind: null,
           assigneeId: null,
-          creatorKind: "expert",
+          // The secretary writes on the user's behalf. It is not a configured
+          // coding Expert, and the direct-CLI product path must not create an
+          // Expert identity merely to attribute a card.
+          creatorKind: "human",
           creatorId: null,
           sourceMessageId: null,
           runId: null,
@@ -243,21 +246,6 @@ function buildTools(
       const text =
         hits.length === 0 ? "没有找到相关任务" : hits.map((t) => taskLine(store, t)).join("\n");
       return { content: [{ type: "text", text }], details: {} };
-    },
-  });
-
-  const dispatchTask = defineTool({
-    name: "dispatch_task",
-    label: "派发任务",
-    description:
-      "把一张任务卡派发给本地编码 agent 执行。目标清单必须绑定 git 仓库；同一仓库同时只能跑一个任务。失败时返回原因。",
-    parameters: Type.Object({
-      taskId: Type.String({ description: "要派发的任务 id" }),
-    }),
-    execute: async (_id, params) => {
-      const res = await deps.dispatch(params.taskId);
-      const text = res.ok ? `已派发 ${params.taskId}` : `派发失败：${res.error ?? "未知原因"}`;
-      return { content: [{ type: "text", text }], details: {}, isError: !res.ok };
     },
   });
 
@@ -346,7 +334,39 @@ function buildTools(
     },
   });
 
-  return [createTasks, findRelated, dispatchTask, updateTask, listState];
+  const listLists = defineTool({
+    name: "list_lists",
+    label: "查看清单",
+    description: "读取用户创建的清单名称和 id。仅在用户明确提到自定义清单时用它确定 listId。",
+    parameters: Type.Object({}),
+    execute: async () => {
+      const lists = store.listChannels().filter((list) =>
+        list.kind === "channel" &&
+        list.archivedAt === null &&
+        !list.name.startsWith("__todoagent_") &&
+        list.name !== "收件箱"
+      );
+      const text = lists.length === 0
+        ? "当前没有清单。请用户先创建清单。"
+        : lists.map((list) => `[${list.id}] ${list.name}`).join("\n");
+      return { content: [{ type: "text", text }], details: {} };
+    },
+  });
+
+  return [createTasks, findRelated, updateTask, listState, listLists];
+}
+
+/** Transparent, user-editable long-term memory for the one TodoAgent assistant. */
+export function assistantWorkspaceDir(): string {
+  return process.env["TODOAGENT_ASSISTANT_WORKSPACE"] ?? join(homedir(), ".todoagent", "assistant");
+}
+
+export function ensureAssistantWorkspace(): string {
+  const dir = assistantWorkspaceDir();
+  mkdirSync(join(dir, "ref"), { recursive: true });
+  const memory = join(dir, "MEMORY.md");
+  if (!existsSync(memory)) writeFileSync(memory, "", "utf8");
+  return dir;
 }
 
 /**
@@ -367,7 +387,10 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
   }
 
   const agentDir = process.env["TODOAGENT_AGENT_DIR"] ?? join(homedir(), ".todoagent", "pi");
-  const cwd = process.env["TODOAGENT_AGENT_CWD"] ?? homedir();
+  // The secretary gets a small, persistent home of its own. It can read its
+  // MEMORY.md and ref/ cheat sheets, but it is not launched from the user's home
+  // or from a code repository and has no shell/write tools.
+  const cwd = ensureAssistantWorkspace();
 
   const modelRuntime = await ModelRuntime.create({
     authPath: join(agentDir, "auth.json"),
@@ -413,7 +436,13 @@ export async function createSecretary(deps: SecretaryDeps): Promise<SecretaryIni
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    systemPromptOverride: () => SYSTEM_PROMPT,
+    systemPromptOverride: () => {
+      const memoryPath = join(cwd, "MEMORY.md");
+      const memory = existsSync(memoryPath) ? readFileSync(memoryPath, "utf8").slice(0, 20_000) : "";
+      return memory.trim() === ""
+        ? SYSTEM_PROMPT
+        : `${SYSTEM_PROMPT}\n\n以下是用户可见、可编辑的长期记忆 MEMORY.md：\n\n${memory}`;
+    },
   });
   await loader.reload();
 

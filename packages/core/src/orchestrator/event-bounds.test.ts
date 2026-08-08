@@ -4,7 +4,7 @@ import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { Store } from "../db/index.ts";
-import { MAX_EVENT_STRING, boundPayload, runOne } from "./runner.ts";
+import { MAX_EVENT_STRING, boundPayload, legacyExecutionOptions, runOne } from "./runner.ts";
 
 /**
  * Event payloads are bounded; the durable transcript is not.
@@ -109,7 +109,7 @@ test("a huge text event is trimmed in the log but kept whole in the transcript",
     const res = await runOne({
       store: f.store,
       runId: f.runId,
-      expert,
+      ...legacyExecutionOptions(expert),
       kind: "draft",
       subTaskId: null,
       prompt: "say a lot",
@@ -165,7 +165,7 @@ test("ordinary output is left completely untouched", async () => {
     const res = await runOne({
       store: f.store,
       runId: f.runId,
-      expert,
+      ...legacyExecutionOptions(expert),
       kind: "draft",
       subTaskId: null,
       prompt: "say a normal amount",
@@ -206,7 +206,7 @@ test("a huge string NESTED in a tool payload is bounded too", async () => {
     const res = await runOne({
       store: f.store,
       runId: f.runId,
-      expert,
+      ...legacyExecutionOptions(expert),
       kind: "draft",
       subTaskId: null,
       prompt: "write a big file",

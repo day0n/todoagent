@@ -56,7 +56,7 @@ export function AttemptHistory({
         right={<Meta>{fmtTokens(totalTokens)} tokens</Meta>}
       />
       <p className="mb-3 max-w-[62ch] text-balance t-meta">
-        每次 agent 运行的完整输出都保留着。点开才会加载 —— 一次委托的成绩单加起来有几百 KB，默认全传会让页面变慢。
+        每次 CLI 运行的完整输出都保留着。点开才会加载 —— 一次委托的成绩单加起来有几百 KB，默认全传会让页面变慢。
       </p>
 
       <div className="card divide-line overflow-hidden">

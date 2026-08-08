@@ -9,7 +9,8 @@ import type {
   ChatHistory,
   ChatSession,
   ChatStatus,
-  Expert,
+  RuntimeInfo,
+  RuntimeKind,
   Task,
   TaskGroups,
   TasksResponse,
@@ -38,6 +39,8 @@ import { BoardPane } from "../components/board-pane.tsx";
 import { TaskPane } from "../components/task-pane.tsx";
 import { ChatPane } from "../components/chat-pane.tsx";
 import { ResultDrawer } from "../components/result-drawer.tsx";
+import { RuntimePicker } from "../components/runtime-picker.tsx";
+import { runtimeLabel } from "../lib/runtime.ts";
 
 /**
  * The whole product surface: sidebar, task list, agent conversation.
@@ -84,6 +87,8 @@ export default function Page() {
    * lets one set of handlers serve both renderers.
    */
   const [board, setBoard] = useState<BoardResponse | null>(null);
+  /** The calendar day anchoring the first board column. Clicking 时间线 resets it. */
+  const [boardDate, setBoardDate] = useState(() => localDayIso());
   const [lists, setLists] = useState<TodoList[]>([]);
   /*
    * Archived lists, fetched separately from the live ones.
@@ -92,7 +97,7 @@ export default function Page() {
    * every few seconds and has no use for them.
    */
   const [archived, setArchived] = useState<TodoList[]>([]);
-  const [counts, setCounts] = useState<ViewCounts>({ today: 0, needs: 0, running: 0, done: 0 });
+  const [counts, setCounts] = useState<ViewCounts>({ tasks: 0, today: 0, needs: 0, running: 0, done: 0 });
   const [loading, setLoading] = useState(true);
   const [toast, setToast] = useState<string | null>(null);
   /*
@@ -113,6 +118,11 @@ export default function Page() {
    * the view, which is exactly what should happen if it is no longer a member.
    */
   const [drawerTaskId, setDrawerTaskId] = useState<string | null>(null);
+  /** The one task waiting for an explicit local-CLI choice. */
+  const [dispatchTarget, setDispatchTarget] = useState<Task | null>(null);
+  const [dispatching, setDispatching] = useState(false);
+  /** Same-tick guard: React state does not update until after the event returns. */
+  const dispatchingRef = useRef(false);
   /*
    * Which task's answer bar is open.
    *
@@ -141,10 +151,10 @@ export default function Page() {
    */
   const [needsTasks, setNeedsTasks] = useState<Task[]>([]);
 
-  // Loaded once: none of these change while the app is open. Runtimes are what
-  // the machine has installed; experts are configured on /team.
-  const [runtimeCount, setRuntimeCount] = useState<number | null>(null);
-  const [experts, setExperts] = useState<Expert[]>([]);
+  // Runtime Manager state is cheap to read and refreshes independently of tasks.
+  const [runtimes, setRuntimes] = useState<RuntimeInfo[] | null>(null);
+  const runtimeCount =
+    runtimes === null ? null : runtimes.filter((runtime) => runtime.status === "ready").length;
   const [chat, setChat] = useState<ChatHistory | null>(null);
   const [chatStatus, setChatStatus] = useState<ChatStatus | null>(null);
   /*
@@ -220,7 +230,7 @@ export default function Page() {
          */
         const onBoard = isBoardView(view);
         const [data, sidebar] = await Promise.all([
-          onBoard ? api.board() : api.tasks(view),
+          onBoard ? api.board(boardDate) : api.tasks(view),
           api.lists(),
         ]);
         // The sidebar is never guarded: its counts are derived server-side from
@@ -258,7 +268,7 @@ export default function Page() {
         throw err;
       }
     },
-    [view],
+    [boardDate, view],
   );
 
   /*
@@ -330,37 +340,36 @@ export default function Page() {
   }, [activeSessionId, loadChat]);
 
   /*
-   * Four independent requests, deliberately NOT bundled in one `Promise.all`.
-   *
-   * They were, and the cost was measured: `/api/runtimes` takes 15 seconds because it
-   * spawns every installed CLI to read its version, while `/api/chat/status` answers
-   * in 39ms. Bundled, the fast three waited for the slow one — so for the first ~15
-   * seconds after every load the secretary header showed "未检测到 CLI" with a grey
-   * offline dot on a machine with six CLIs installed and the model live.
-   *
-   * That is not a slow render, it is a false statement with a tooltip on it. Split,
-   * each lands when it lands: the panel is correct immediately and the agent count
-   * fills in when the probe finishes.
+   * Runtime state is its own cadence. The engine re-detects every two minutes;
+   * reading that persisted snapshot here keeps the ready count and picker current
+   * without ever launching a provider prompt.
+   */
+  useEffect(() => {
+    let alive = true;
+    const loadRuntimes = (): void => {
+      void api
+        .runtimes()
+        .then((envelope) => {
+          if (alive) setRuntimes(envelope.runtimes);
+        })
+        .catch(() => undefined);
+    };
+    loadRuntimes();
+    const timer = window.setInterval(loadRuntimes, 120_000);
+    return () => {
+      alive = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  /*
+   * Three independent requests, deliberately NOT bundled in one `Promise.all`.
    *
    * Each also gets its own failure handling now, which the shared `.catch` could not
    * do — it reset the chat history whenever the runtime probe failed, for reasons
    * that had nothing to do with the conversation.
    */
   useEffect(() => {
-    // Slow: spawns each CLI. Only feeds the agent count and the fallback subtitle.
-    void api
-      .runtimes()
-      .then((rt) => {
-        setRuntimeCount(rt.detected.length);
-      })
-      .catch(() => undefined);
-
-    // Needed by `executorFor` to name who is running a task.
-    void api
-      .experts()
-      .then(setExperts)
-      .catch(() => undefined);
-
     /*
      * Sessions first, then pick a thread. History loading is owned by the
      * `activeSessionId` effect above — this only decides WHICH id that effect
@@ -618,6 +627,7 @@ export default function Page() {
   ): Promise<void> => {
     mutations.current += 1;
     try {
+      const listId = view.startsWith("list:") ? view.slice("list:".length) : null;
       /*
        * The server's row is inserted, not a placeholder.
        *
@@ -628,7 +638,7 @@ export default function Page() {
        */
       const created = await api.createTask({
         title,
-        listId: view.startsWith("list:") ? view.slice("list:".length) : null,
+        listId,
         ...(dueDate !== null ? { dueDate } : {}),
       });
       setGroups((current) => insertTask(current, created));
@@ -684,19 +694,40 @@ export default function Page() {
 
   /**
    * Dispatch is never optimistic: it spawns a real CLI process and spends real
-   * tokens, and the engine refuses it for reasons only it knows — the repository
-   * is locked by another run, no agent is installed, this task is already running.
-   * Those refusals are the whole reason the button waits for an answer.
+   * tokens. The first click only opens the shared picker; the API call happens
+   * after the person confirms one ready CLI.
    */
   const dispatch = (task: Task): void => {
+    setDrawerTaskId(null);
+    setDispatchTarget(task);
+  };
+
+  const confirmDispatch = (runtimeKind: RuntimeKind): void => {
+    if (dispatchTarget === null || dispatchingRef.current) return;
+    const task = dispatchTarget;
+    dispatchingRef.current = true;
+    setDispatching(true);
     mutations.current += 1;
     void api
-      .runTask(task.id)
+      .runTask(task.id, { runtimeKind })
       .then(({ task: row }) => {
         confirmRow(row);
+        setDispatchTarget(null);
         void refresh().catch(() => undefined);
       })
-      .catch(showError);
+      .catch((err: unknown) => {
+        showError(err);
+        // A 409 commonly means the persisted runtime state changed since the
+        // picker opened. Refresh the choices but keep it open so another can be used.
+        void api
+          .runtimes()
+          .then((envelope) => setRuntimes(envelope.runtimes))
+          .catch(() => undefined);
+      })
+      .finally(() => {
+        dispatchingRef.current = false;
+        setDispatching(false);
+      });
   };
 
   const cancel = (task: Task): void => {
@@ -922,7 +953,9 @@ export default function Page() {
 
   const title =
     view === "today"
-      ? "我的一天"
+      ? "时间线"
+      : view === "tasks"
+        ? "任务"
       : view === "needs"
         ? "需要你"
         : view === "running"
@@ -941,14 +974,11 @@ export default function Page() {
       ? pendingReply.text
       : null;
 
-  /** Who is executing a task, by name. Null when nothing can be resolved. */
+  /** The explicitly selected local CLI. No Expert lookup or fallback. */
   const executorFor = (task: Task): string | null => {
-    if (task.assigneeKind !== "expert" || task.assigneeId === null) return null;
-    const expert = experts.find((e) => e.id === task.assigneeId);
-    if (expert === undefined) return null;
-    // The runtime kind is the recognisable half — a person knows "codex", not the
-    // expert name they typed on /team six weeks ago.
-    return expert.runtimeKind;
+    return task.runtimeKind === null || task.runtimeKind === undefined
+      ? null
+      : runtimeLabel(task.runtimeKind);
   };
 
   /*
@@ -1028,7 +1058,15 @@ export default function Page() {
         archived={archived}
         counts={counts}
         view={view}
-        onSelect={setView}
+        selectedDate={boardDate}
+        onSelect={(next) => {
+          if (next === "today") setBoardDate(localDayIso());
+          setView(next);
+        }}
+        onSelectDate={(date) => {
+          setBoardDate(date);
+          setView("today");
+        }}
         onCreate={createList}
         onRename={renameList}
         onBindRepo={bindRepo}
@@ -1110,7 +1148,9 @@ export default function Page() {
         }}
         needsTasks={needsTasks}
         answer={answerControls}
-        onOpenTask={(t) => setView(`list:${t.channelId}`)}
+        onOpenTask={(task) =>
+          setView(lists.some((list) => list.id === task.channelId) ? `list:${task.channelId}` : "tasks")
+        }
         onSelectSession={(id) => setActiveSessionId(id)}
         onCreateSession={() => {
           void api
@@ -1174,7 +1214,6 @@ export default function Page() {
           }}
           onRedispatch={(t) => {
             dispatch(t);
-            setDrawerTaskId(null);
           }}
           /*
            * Answering from the drawer hands off to the inline bar rather than
@@ -1186,6 +1225,19 @@ export default function Page() {
             setDrawerTaskId(null);
             setAnsweringId(t.id);
           }}
+        />
+      ) : null}
+
+      {dispatchTarget !== null ? (
+        <RuntimePicker
+          key={dispatchTarget.id}
+          task={dispatchTarget}
+          runtimes={runtimes}
+          submitting={dispatching}
+          onClose={() => {
+            if (!dispatching) setDispatchTarget(null);
+          }}
+          onConfirm={confirmDispatch}
         />
       ) : null}
 

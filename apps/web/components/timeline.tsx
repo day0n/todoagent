@@ -5,6 +5,7 @@ import type { LiveAttempt } from "../lib/useRun.ts";
 import type { Attempt, Phase, Review, RuntimeKind, SubTask } from "../lib/types.ts";
 import { PHASE_LABEL, PHASE_ORDER } from "../lib/types.ts";
 import { Badge, Meta, RuntimeMark, SubTaskBadge } from "./atoms.tsx";
+import { isRuntimeKind, runtimeLabel } from "../lib/runtime.ts";
 
 const KIND_LABEL: Record<string, string> = {
   plan: "拆解",
@@ -141,6 +142,9 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
 
   const running = live.status === "running";
   const tone = live.status === "failed" ? "bad" : running ? "info" : "ok";
+  const executor =
+    live.expertName ||
+    (isRuntimeKind(live.runtimeKind) ? runtimeLabel(live.runtimeKind) : "本机 CLI");
 
   return (
     <div
@@ -174,8 +178,8 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
             {running ? (
               <Badge tone="info" dot>
                 {live.currentTool !== null
-                  ? `${live.expertName || "专家"} 正在执行 ${live.currentTool}`
-                  : `${live.expertName || "专家"} 思考中`}
+                  ? `${executor} 正在执行 ${live.currentTool}`
+                  : `${executor} 思考中`}
               </Badge>
             ) : live.retrying !== null ? (
               /*
@@ -193,11 +197,11 @@ export function LiveCard({ live }: { live: LiveAttempt }) {
                 so red would overstate the outcome.
               */
               <Badge tone="warn">
-                {`${live.expertName || "专家"} 失败，已重试 ${live.retrying.attempt}/${live.retrying.of}`}
+                {`${executor} 失败，已重试 ${live.retrying.attempt}/${live.retrying.of}`}
               </Badge>
             ) : (
               <Badge tone={tone}>
-                {`${live.expertName || "专家"} ${live.status === "done" ? "完成" : "失败"}`}
+                {`${executor} ${live.status === "done" ? "完成" : "失败"}`}
               </Badge>
             )}
           </span>

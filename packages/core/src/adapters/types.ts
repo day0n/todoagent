@@ -46,6 +46,14 @@ export interface AgentResult {
 
 export interface ExecOptions {
   cwd: string;
+  /**
+   * Executable selected and versioned by RuntimeManager.
+   *
+   * Direct dispatch always supplies an absolute path. Optional only for the
+   * legacy expert pipeline and low-level adapter tests; transports still resolve
+   * that fallback before spawning.
+   */
+  execPath?: string;
   model?: string | null;
   /**
    * Carried inline for runtimes that cannot pick it up from disk. Multica
@@ -80,6 +88,25 @@ export interface AgentAdapter {
   /** Returns null when the CLI is absent from PATH. */
   detect(): Promise<DetectedRuntime | null>;
   execute(prompt: string, opts: ExecOptions): AgentRun;
+}
+
+const DEFAULT_EXECUTABLES: Readonly<Record<RuntimeKind, string>> = {
+  claude: "claude",
+  codex: "codex",
+  cursor: "cursor-agent",
+  gemini: "gemini",
+  kiro: "kiro-cli",
+  grok: "grok",
+};
+
+/** Bare-name compatibility path for the retained legacy expert pipeline. */
+export function defaultExecutableForRuntime(kind: RuntimeKind): string {
+  return DEFAULT_EXECUTABLES[kind];
+}
+
+/** RuntimeManager's pinned path wins for every supported adapter. */
+export function execPathForRuntime(kind: RuntimeKind, opts: ExecOptions): string {
+  return opts.execPath ?? defaultExecutableForRuntime(kind);
 }
 
 /**

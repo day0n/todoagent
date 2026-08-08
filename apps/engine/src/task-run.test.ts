@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,6 +30,7 @@ const AGENT_EXECUTABLES = ["claude", "codex", "gemini", "cursor-agent", "grok", 
 
 interface Fixture {
   dbPath: string;
+  repo: string;
   /** PATH with the stubs in front, for the engine child process. */
   stubbedPath: string;
   repoChannelId: string;
@@ -51,6 +52,7 @@ async function fixture(): Promise<Fixture> {
   const binDir = join(root, "bin");
   await mkdir(repo, { recursive: true });
   await mkdir(binDir, { recursive: true });
+  const canonicalRepo = await realpath(repo);
 
   // A real git repository: worktree isolation is not mocked anywhere in this repo.
   await git(["init", "-q", "-b", "main", "."], repo);
@@ -62,7 +64,22 @@ async function fixture(): Promise<Fixture> {
     const path = join(binDir, name);
     await writeFile(
       path,
-      `#!/usr/bin/env node\nprocess.stderr.write(${JSON.stringify(`${name} is stubbed\n`)});\nprocess.exit(3);\n`,
+      `#!/usr/bin/env node
+const args = process.argv.slice(2);
+if (args.includes("--version") || args.includes("-v")) {
+  process.stdout.write(${JSON.stringify(`${name} 1.0.0\n`)});
+  process.exit(0);
+}
+if (args.join(" ").includes("TODOAGENT_OK")) {
+  const say = (o) => process.stdout.write(JSON.stringify(o) + "\\n");
+  say({ type: "system", subtype: "init", session_id: "probe-session" });
+  say({ type: "assistant", message: { content: [{ type: "text", text: "TODOAGENT_OK" }] } });
+  say({ type: "result", subtype: "success", is_error: false, session_id: "probe-session", result: "TODOAGENT_OK", usage: { input_tokens: 1, output_tokens: 1 } });
+  process.exit(0);
+}
+process.stderr.write(${JSON.stringify(`${name} is stubbed\n`)});
+process.exit(3);
+`,
       "utf8",
     );
     await chmod(path, 0o755);
@@ -70,19 +87,10 @@ async function fixture(): Promise<Fixture> {
 
   const dbPath = join(root, "t.db");
   const store = new Store(dbPath);
-  const expert = store.createExpert({
-    name: "Solo",
-    description: "",
-    runtimeKind: "claude",
-    model: null,
-    systemPrompt: "",
-    capabilities: ["general"],
-  });
+  // Direct dispatch must not depend on any Expert row. The empty compatibility
+  // team exists only because Project still carries its historical team_id.
   const team = store.createTeam("t");
-  for (const role of ["orchestrator", "maker", "reviewer", "verifier"] as const) {
-    store.addTeamMember(team.id, expert.id, role);
-  }
-  const project = store.createProject({ name: "p", repoPath: repo, teamId: team.id });
+  const project = store.createProject({ name: "p", repoPath: canonicalRepo, teamId: team.id });
 
   const withRepo = store.createChannel({
     name: "demo",
@@ -104,12 +112,88 @@ async function fixture(): Promise<Fixture> {
 
   return {
     dbPath,
+    repo: canonicalRepo,
     stubbedPath: `${binDir}${delimiter}${process.env["PATH"] ?? ""}`,
     repoChannelId: withRepo.id,
     plainChannelId: plain.id,
     dispose: () => rm(root, { recursive: true, force: true }),
   };
 }
+
+test("task chat: first human message locks the real workspace and preserves a durable turn", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f, async () => {
+      const id = await makeCard(f.plainChannelId, "在指定仓库里对话", false);
+
+      const empty = await json<{
+        turns: unknown[];
+        defaultWorkingDirectory: string | null;
+        knownWorkspaces: Array<{ path: string }>;
+      }>(await fetch(`${BASE}/api/tasks/${id}/thread`));
+      assert.deepEqual(empty.turns, []);
+      assert.equal(empty.defaultWorkingDirectory, null, "an unbound list does not guess a cwd");
+      assert.ok(empty.knownWorkspaces.some((workspace) => workspace.path === f.repo));
+
+      assert.equal(
+        (await post(`/api/tasks/${id}/messages`, { message: "先看一下项目" })).status,
+        400,
+        "the first message cannot silently choose a CLI or cwd",
+      );
+
+      const startedResponse = await post(`/api/tasks/${id}/messages`, {
+        message: "先看一下项目，不要猜需求",
+        runtimeKind: "claude",
+        workingDirectory: f.repo,
+      });
+      assert.equal(startedResponse.status, 201);
+      const started = await json<{
+        run: {
+          id: string;
+          taskId: string | null;
+          trigger: string | null;
+          userMessage: string | null;
+          repositoryRoot: string | null;
+          workingDirectory: string | null;
+          runtimeKind: string | null;
+        };
+        task: { runtimeKind: string | null; workingDirectory: string | null };
+      }>(startedResponse);
+      assert.equal(started.run.taskId, id);
+      assert.equal(started.run.trigger, "task_chat");
+      assert.equal(started.run.userMessage, "先看一下项目，不要猜需求");
+      assert.equal(started.run.repositoryRoot, f.repo);
+      assert.equal(started.run.workingDirectory, f.repo);
+      assert.equal(started.run.runtimeKind, "claude");
+      assert.equal(started.task.runtimeKind, "claude");
+      assert.equal(started.task.workingDirectory, f.repo);
+
+      await waitForRun(started.run.id, (status) => status !== "running");
+      const thread = await json<{
+        turns: Array<{
+          message: string;
+          run: { id: string; workingDirectory: string | null };
+          events: Array<{ type: string }>;
+        }>;
+        activeRunId: string | null;
+      }>(await fetch(`${BASE}/api/tasks/${id}/thread`));
+      assert.equal(thread.turns.length, 1);
+      assert.equal(thread.turns[0]?.message, "先看一下项目，不要猜需求");
+      assert.equal(thread.turns[0]?.run.id, started.run.id);
+      assert.equal(thread.turns[0]?.run.workingDirectory, f.repo);
+      assert.equal(thread.activeRunId, null);
+
+      const changed = await post(`/api/tasks/${id}/messages`, {
+        message: "换一个运行时",
+        runtimeKind: "codex",
+        workingDirectory: f.repo,
+      });
+      assert.equal(changed.status, 409, "a task conversation cannot switch runtime after it starts");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
 
 async function withEngine<T>(f: Fixture, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
@@ -128,6 +212,9 @@ async function withEngine<T>(f: Fixture, fn: () => Promise<T>): Promise<T> {
       }
       await new Promise((r) => setTimeout(r, 150));
     }
+    const verified = await post("/api/runtimes/claude/verify");
+    assert.equal(verified.status, 200);
+    assert.equal((await json<{ status: string }>(verified)).status, "ready");
     return await fn();
   } finally {
     child.kill("SIGKILL");
@@ -141,6 +228,10 @@ function post(path: string, body: unknown = {}): Promise<Response> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+function runCard(taskId: string, runtimeKind = "claude"): Promise<Response> {
+  return post(`/api/tasks/${taskId}/run`, { runtimeKind });
 }
 
 async function json<T>(res: Response): Promise<T> {
@@ -179,7 +270,7 @@ test("run: an unknown card is 404", async () => {
   const f = await fixture();
   try {
     await withEngine(f, async () => {
-      assert.equal((await post("/api/tasks/nope/run")).status, 404);
+      assert.equal((await runCard("nope")).status, 404);
     });
   } finally {
     await f.dispose();
@@ -191,7 +282,7 @@ test("run: a channel with no repository is refused, not attempted", async () => 
   try {
     await withEngine(f, async () => {
       const id = await makeCard(f.plainChannelId, "无仓库的任务", false);
-      const res = await post(`/api/tasks/${id}/run`);
+      const res = await runCard(id);
 
       /*
        * Refused rather than started. The pipeline isolates each subtask in a git
@@ -213,6 +304,36 @@ test("run: a channel with no repository is refused, not attempted", async () => 
   }
 });
 
+test("run: requires an explicit verified CLI before writing task or run state", async () => {
+  const f = await fixture();
+  try {
+    await withEngine(f, async () => {
+      const id = await makeCard(f.repoChannelId, "先选本机 CLI", false);
+
+      assert.equal((await post(`/api/tasks/${id}/run`)).status, 400, "runtimeKind is required");
+      assert.equal(
+        (await post(`/api/tasks/${id}/run`, { runtimeKind: "imaginary" })).status,
+        400,
+        "unknown runtime kinds are schema errors",
+      );
+      assert.equal(
+        (await runCard(id, "codex")).status,
+        409,
+        "installed but unverified is not executable",
+      );
+
+      const list = await json<{ tasks: Array<{ id: string; status: string; runId: string | null }> }>(
+        await fetch(`${BASE}/api/channels/${f.repoChannelId}/tasks`),
+      );
+      const card = list.tasks.find((task) => task.id === id);
+      assert.equal(card?.status, "todo");
+      assert.equal(card?.runId, null, "all readiness refusals happen before database writes");
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
 // ── The link ────────────────────────────────────────────────
 
 test("run: the card records its run and moves to in_progress", async () => {
@@ -220,13 +341,33 @@ test("run: the card records its run and moves to in_progress", async () => {
   try {
     await withEngine(f, async () => {
       const id = await makeCard(f.repoChannelId, "把 README 补一句", false);
-      const res = await post(`/api/tasks/${id}/run`);
+      const res = await runCard(id);
 
       assert.equal(res.status, 201);
-      const body = await json<{ run: { id: string }; task: { runId: string; status: string } }>(res);
+      const body = await json<{
+        run: {
+          id: string;
+          runtimeKind: string | null;
+          runtimeExecPath: string | null;
+          runtimeVersion: string | null;
+        };
+        task: {
+          runId: string;
+          status: string;
+          runtimeKind: string | null;
+          assigneeKind: string | null;
+          assigneeId: string | null;
+        };
+      }>(res);
       // The whole point of the feature: task.run_id was never set before this.
       assert.equal(body.task.runId, body.run.id);
       assert.equal(body.task.status, "in_progress");
+      assert.equal(body.task.runtimeKind, "claude");
+      assert.equal(body.task.assigneeKind, null, "direct CLI dispatch creates no Expert claim");
+      assert.equal(body.task.assigneeId, null);
+      assert.equal(body.run.runtimeKind, "claude");
+      assert.ok(body.run.runtimeExecPath?.endsWith("/claude"));
+      assert.match(body.run.runtimeVersion ?? "", /1\.0\.0/);
     });
   } finally {
     await f.dispose();
@@ -247,7 +388,7 @@ test("run: the goal is the source message, not the truncated card title", async 
       const id = await makeCard(f.repoChannelId, detail, true);
 
       const res = await json<{ run: { id: string; goal: string }; task: { title: string } }>(
-        await post(`/api/tasks/${id}/run`),
+        await runCard(id),
       );
 
       assert.equal(res.task.title, "给首页加空状态", "the card stays a one-liner");
@@ -264,7 +405,7 @@ test("run: a failed run parks the card in needs_you with the reason attached", a
   try {
     await withEngine(f, async () => {
       const id = await makeCard(f.repoChannelId, "会失败的任务", false);
-      const started = await json<{ run: { id: string } }>(await post(`/api/tasks/${id}/run`));
+      const started = await json<{ run: { id: string } }>(await runCard(id));
 
       // Every CLI is a refusing stub, so the agent cannot do the work.
       await waitForRun(started.run.id, (s) => s === "failed" || s === "cancelled");
@@ -302,7 +443,7 @@ test("run: a second run is refused while the first is live", async () => {
       const a = await makeCard(f.repoChannelId, "第一个", false);
       const b = await makeCard(f.repoChannelId, "第二个", false);
 
-      const first = await post(`/api/tasks/${a}/run`);
+      const first = await runCard(a);
       assert.equal(first.status, 201);
 
       /*
@@ -314,7 +455,7 @@ test("run: a second run is refused while the first is live", async () => {
        * in which case 201 is also correct. Both answers are checked rather than
        * asserting on a timing-dependent one.
        */
-      const second = await post(`/api/tasks/${b}/run`);
+      const second = await runCard(b);
       assert.ok(
         second.status === 409 || second.status === 201,
         `expected 409 (locked) or 201 (first already finished), got ${second.status}`,
@@ -444,11 +585,11 @@ test("run: the same card cannot start a second run while its first is live", asy
   try {
     await withEngine(f, async () => {
       const id = await makeCard(f.repoChannelId, "只跑一次", false);
-      const first = await json<{ run: { id: string } }>(await post(`/api/tasks/${id}/run`));
+      const first = await json<{ run: { id: string } }>(await runCard(id));
 
       // Otherwise the first run keeps going with nothing pointing at it, and the
       // card tracks only the second.
-      const again = await post(`/api/tasks/${id}/run`);
+      const again = await runCard(id);
       assert.ok(
         again.status === 409 || again.status === 201,
         `expected 409 or 201 (if the first already failed), got ${again.status}`,

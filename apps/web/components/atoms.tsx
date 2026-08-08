@@ -1,5 +1,6 @@
 import type { RunStatus, RuntimeKind, SubTaskStatus } from "../lib/types.ts";
 import { STATUS_LABEL } from "../lib/types.ts";
+import { runtimeLabel } from "../lib/runtime.ts";
 
 /**
  * Semantic tones.
@@ -148,7 +149,7 @@ export function RuntimeMark({
   showKind?: boolean;
 }) {
   const t = TONE[RUNTIME_TONE[kind] ?? "mute"] ?? TONE.mute;
-  const label = name ?? kind;
+  const label = runtimeLabel(kind, name);
   return (
     <span className="inline-flex min-w-0 items-center gap-1.5" title={`runtime: ${kind}`}>
       <span

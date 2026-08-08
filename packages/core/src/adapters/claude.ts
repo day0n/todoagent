@@ -8,7 +8,7 @@ import {
   spawnStream,
   type LineContext,
 } from "./process.ts";
-import { filterBlockedArgs, type AgentAdapter, type AgentEvent, type AgentResult, type BlockedArgMode, type ExecOptions } from "./types.ts";
+import { execPathForRuntime, filterBlockedArgs, type AgentAdapter, type AgentEvent, type AgentResult, type BlockedArgMode, type ExecOptions } from "./types.ts";
 import type { DetectedRuntime } from "../types.ts";
 
 /**
@@ -178,7 +178,7 @@ export class ClaudeAdapter implements AgentAdapter {
     const spawnOpts = {
       // Resolved to an absolute path by the transport, which searches the same
       // install directories as detect() — spawn's own PATH lookup does not.
-      execPath: "claude",
+      execPath: execPathForRuntime(this.kind, opts),
       args: buildArgs(prompt, opts),
       cwd: opts.cwd,
       onLine: parseClaudeLine,

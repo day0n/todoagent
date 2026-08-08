@@ -3,7 +3,8 @@
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 import type { TodoList, ViewCounts, ViewKey } from "../lib/types.ts";
-import { IconCaret, IconGear, IconMore, IconPlus, IconToday } from "./icons.tsx";
+import { IconCaret, IconCheck, IconDone, IconGear, IconMore, IconNeeds, IconPlus, IconToday } from "./icons.tsx";
+import { ConfirmButton } from "./overlays.tsx";
 
 /**
  * The six colours offered when creating a list.
@@ -26,7 +27,9 @@ export function Sidebar({
   archived,
   counts,
   view,
+  selectedDate,
   onSelect,
+  onSelectDate,
   onCreate,
   onRename,
   onBindRepo,
@@ -38,7 +41,9 @@ export function Sidebar({
   archived: TodoList[];
   counts: ViewCounts;
   view: ViewKey;
+  selectedDate: string;
   onSelect: (view: ViewKey) => void;
+  onSelectDate: (date: string) => void;
   /** Rejects with the engine's message when the repo path is not a git repo. */
   onCreate: (input: { name: string; color: string | null; repoPath: string | null }) => Promise<void>;
   onRename: (id: string, name: string) => void;
@@ -62,7 +67,7 @@ export function Sidebar({
       </div>
 
       <div className="side-scroll">
-        <MiniCalendar />
+        <MiniCalendar selectedDate={selectedDate} onSelectDate={onSelectDate} />
 
         <button
           type="button"
@@ -71,8 +76,19 @@ export function Sidebar({
           onClick={() => onSelect("today")}
         >
           <IconToday />
-          <span className="label">我的一天</span>
+          <span className="label">时间线</span>
           {counts.today > 0 ? <span className="count">{counts.today}</span> : null}
+        </button>
+
+        <button
+          type="button"
+          className={`npill${view === "tasks" ? " on" : ""}`}
+          aria-current={view === "tasks"}
+          onClick={() => onSelect("tasks")}
+        >
+          <IconCheck />
+          <span className="label">任务</span>
+          {counts.tasks > 0 ? <span className="count">{counts.tasks}</span> : null}
         </button>
 
         <div className="side-label">清单</div>
@@ -149,6 +165,9 @@ export function Sidebar({
           aria-current={view === "running"}
           onClick={() => onSelect("running")}
         >
+          <span className="status-glyph" aria-hidden="true">
+            <IconNeeds />
+          </span>
           <span className="label">进行中</span>
           {counts.running > 0 ? <span className="count run">{counts.running}</span> : null}
         </button>
@@ -159,13 +178,16 @@ export function Sidebar({
           aria-current={view === "done"}
           onClick={() => onSelect("done")}
         >
+          <span className="status-glyph" aria-hidden="true">
+            <IconDone />
+          </span>
           <span className="label">已完成</span>
           {counts.done > 0 ? <span className="count">{counts.done}</span> : null}
         </button>
       </div>
 
       <div className="side-foot">
-        <Link href="/team" className="foot-link" title="Agent 管理">
+        <Link href="/settings" className="foot-link" title="本机 CLI 设置">
           <IconGear />
           设置
         </Link>
@@ -177,16 +199,22 @@ export function Sidebar({
 /**
  * The current month, with today marked.
  *
- * Display-only by design (V1 takes no date navigation), but not decoration: the
- * three tinted days ARE the board's three dated columns, so the calendar answers
- * "which days am I looking at" rather than merely showing that a month exists.
+ * Clicking a date anchors the board to that day; the next two tinted dates are the
+ * following board columns. The actual current day keeps a quiet outline when the
+ * person is planning somewhere else in the month.
  *
  * Rendered only after mount, following `Subtitle`'s precedent: the date comes from
  * the browser's clock and time zone, and emitting it during SSR would produce a
  * different grid on a server elsewhere — a hydration mismatch React resolves by
  * blanking the node.
  */
-function MiniCalendar() {
+function MiniCalendar({
+  selectedDate,
+  onSelectDate,
+}: {
+  selectedDate: string;
+  onSelectDate: (date: string) => void;
+}) {
   const [now, setNow] = useState<Date | null>(null);
   /** Months away from the current one. Zero is this month. */
   const [offset, setOffset] = useState(0);
@@ -194,6 +222,14 @@ function MiniCalendar() {
   useEffect(() => {
     setNow(new Date());
   }, []);
+
+  useEffect(() => {
+    if (now === null) return;
+    const selected = new Date(`${selectedDate}T12:00:00`);
+    setOffset(
+      (selected.getFullYear() - now.getFullYear()) * 12 + selected.getMonth() - now.getMonth(),
+    );
+  }, [now, selectedDate]);
 
   if (now === null) {
     // A fixed-height placeholder, so the nav below it does not jump on hydration.
@@ -212,11 +248,12 @@ function MiniCalendar() {
   const iso = (d: Date): string =>
     `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
   const todayIso = iso(now);
+  const selected = new Date(`${selectedDate}T12:00:00`);
   // The board's other two columns. Constructed from calendar parts so month
   // rollover is the platform's problem rather than millisecond arithmetic.
   const boardDays = new Set([
-    iso(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1)),
-    iso(new Date(now.getFullYear(), now.getMonth(), now.getDate() + 2)),
+    iso(new Date(selected.getFullYear(), selected.getMonth(), selected.getDate() + 1)),
+    iso(new Date(selected.getFullYear(), selected.getMonth(), selected.getDate() + 2)),
   ]);
 
   const cells: Array<{ key: string; day: number; iso: string | null }> = [];
@@ -264,15 +301,26 @@ function MiniCalendar() {
         ))}
         {cells.map((c) => {
           const isToday = c.iso === todayIso;
+          const isSelected = c.iso === selectedDate;
           const onBoard = c.iso !== null && boardDays.has(c.iso);
+          if (c.iso === null) {
+            return (
+              <span key={c.key} className="day muted" aria-hidden="true">
+                {c.day}
+              </span>
+            );
+          }
           return (
-            <span
+            <button
+              type="button"
               key={c.key}
-              className={`day${c.iso === null ? " muted" : ""}${isToday ? " today" : ""}${onBoard ? " range" : ""}`}
-              aria-current={isToday ? "date" : undefined}
+              className={`day${isToday ? " today" : ""}${isSelected ? " selected" : ""}${onBoard ? " range" : ""}`}
+              aria-current={isSelected ? "date" : undefined}
+              aria-label={`${year}年${month + 1}月${c.day}日${isToday ? "，今天" : ""}`}
+              onClick={() => onSelectDate(c.iso as string)}
             >
               {c.day}
-            </span>
+            </button>
           );
         })}
       </div>
@@ -499,20 +547,12 @@ function ListRow({
           >
             {list.repoPath === null ? "绑定仓库…" : "改绑仓库…"}
           </button>
-          <button
-            type="button"
-            role="menuitem"
-            onClick={() => {
-              setMenu(false);
-              // Confirmed once: archiving hides a list and every task on it. The
-              // tasks survive, but nothing in this UI can bring the list back.
-              if (window.confirm(`归档「${list.name}」？任务会保留，清单从侧栏移除。`)) {
-                onArchive();
-              }
-            }}
-          >
-            归档
-          </button>
+          <ConfirmButton
+            heading={`归档「${list.name}」？`}
+            description="清单会从侧栏移除，其中的任务和历史记录会保留。"
+            confirmLabel="归档清单"
+            onConfirm={() => { setMenu(false); onArchive(); }}
+          >归档</ConfirmButton>
         </div>
       ) : null}
     </div>

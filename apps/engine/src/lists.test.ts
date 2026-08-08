@@ -99,7 +99,12 @@ function park(
 
 async function withEngine<T>(dbPath: string, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
+    env: {
+      ...process.env,
+      TODOAGENT_DB: dbPath,
+      TODOAGENT_PORT: String(PORT),
+      TODOAGENT_DISABLE_RUNTIME_DISCOVERY: "1",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
   try {
@@ -316,25 +321,70 @@ test("lists: an existing list can gain a repository, and lose it again", async (
   }
 });
 
-// ── Quick add & the default list ────────────────────────────
+// ── Quick add needs a real list ─────────────────────────────
 
-test("tasks: quick add without a list lands in 收件箱, created on demand", async () => {
+test("tasks: quick add lands in the hidden Tasks owner, never a visible inbox", async () => {
   const f = await fixture();
   try {
     await withEngine(f.dbPath, async () => {
-      const task = await json<Task>(await req("POST", "/api/tasks", { title: "买猫粮" }));
+      const unlisted = await json<Task>(await req("POST", "/api/tasks", { title: "买猫粮" }));
+      assert.notEqual(unlisted.channelId, f.listId, "it is not silently put into a custom list");
+
       const lists = await json<{ lists: Array<{ id: string; name: string; openCount: number }> }>(
         await req("GET", "/api/lists"),
       );
-      const inbox = lists.lists.find((l) => l.name === "收件箱");
-      assert.ok(inbox, "收件箱 exists after first quick add");
-      assert.equal(task.channelId, inbox?.id);
-      assert.equal(inbox?.openCount, 1);
+      assert.ok(!lists.lists.some((list) => list.name === "收件箱"));
+      assert.ok(!lists.lists.some((list) => list.name.startsWith("__todoagent_")));
 
-      // A second quick add reuses it rather than multiplying inboxes.
-      await req("POST", "/api/tasks", { title: "回消息" });
-      const again = await json<{ lists: Array<{ name: string }> }>(await req("GET", "/api/lists"));
-      assert.equal(again.lists.filter((l) => l.name === "收件箱").length, 1);
+      const overview = await json<{ groups: Record<string, Task[]> }>(
+        await req("GET", "/api/tasks?view=tasks"),
+      );
+      assert.ok(overview.groups["todo"]?.some((task) => task.id === unlisted.id));
+
+      const task = await json<Task>(
+        await req("POST", "/api/tasks", { title: "回消息", listId: f.listId }),
+      );
+      assert.equal(task.channelId, f.listId);
+    });
+  } finally {
+    await f.dispose();
+  }
+});
+
+test("upgrade: the old system inbox disappears but all of its tasks remain in Tasks", async () => {
+  const f = await fixture();
+  try {
+    const store = new Store(f.dbPath);
+    const inbox = store.createChannel({
+      name: "收件箱",
+      purpose: "",
+      kind: "channel",
+      projectId: null,
+      dmExpertId: null,
+    });
+    const legacyTask = store.createTask({
+      channelId: inbox.id,
+      title: "旧收件箱任务",
+      status: "todo",
+      assigneeKind: null,
+      assigneeId: null,
+      creatorKind: "human",
+      creatorId: null,
+      sourceMessageId: null,
+      runId: null,
+    });
+    store.close();
+
+    await withEngine(f.dbPath, async () => {
+      const lists = await json<{ lists: Array<{ name: string }> }>(await req("GET", "/api/lists"));
+      assert.ok(!lists.lists.some((list) => list.name === "收件箱"));
+
+      const overview = await json<{ groups: Record<string, Task[]> }>(
+        await req("GET", "/api/tasks?view=tasks"),
+      );
+      const migrated = overview.groups["todo"]?.find((task) => task.id === legacyTask.id);
+      assert.ok(migrated, "the task remains in the aggregate Tasks view");
+      assert.notEqual(migrated.channelId, inbox.id, "it no longer belongs to the retired inbox");
     });
   } finally {
     await f.dispose();

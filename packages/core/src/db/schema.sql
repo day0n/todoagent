@@ -44,11 +44,39 @@ CREATE TABLE IF NOT EXISTS project (
   created_at TEXT NOT NULL
 );
 
+-- The six supported local CLIs. Detection and real verification are separate:
+-- an executable on PATH is not proof that its credentials or protocol work.
+CREATE TABLE IF NOT EXISTS local_runtime (
+  kind          TEXT PRIMARY KEY,
+  exec_path     TEXT,
+  version       TEXT,
+  status        TEXT NOT NULL,
+  detected_at   TEXT,
+  verified_at   TEXT,
+  verify_error  TEXT
+);
+
 -- ── Execution layer ─────────────────────────────────────────
 
 CREATE TABLE IF NOT EXISTS run (
   id            TEXT PRIMARY KEY,
   project_id    TEXT NOT NULL,
+  -- Task conversation ownership. NULL on legacy/deep-pipeline runs started
+  -- outside the task UI.
+  task_id       TEXT,
+  -- Previous turn in the same task conversation. The task thread remains
+  -- readable even though each user message creates a fresh immutable Run.
+  parent_run_id TEXT,
+  -- 'dispatch' for the legacy one-shot path, 'task_chat' for a user-authored
+  -- message in the task conversation, NULL on historical runs.
+  trigger       TEXT,
+  -- The person's message before any resume fallback/context stitching. `goal`
+  -- remains the exact prompt handed to the CLI.
+  user_message  TEXT,
+  -- Immutable execution-location snapshots. `project.repo_path` can be rebound
+  -- later; a historical conversation must still say where it actually ran.
+  repository_root TEXT,
+  working_directory TEXT,
   goal          TEXT NOT NULL,
   acceptance    TEXT,
   status        TEXT NOT NULL,
@@ -61,6 +89,11 @@ CREATE TABLE IF NOT EXISTS run (
   created_at    TEXT NOT NULL,
   ended_at      TEXT,
   error         TEXT,
+  -- Immutable snapshot of the CLI selected for this run. Historical pipeline
+  -- runs predate it and legitimately keep all three fields NULL.
+  runtime_kind      TEXT,
+  runtime_exec_path TEXT,
+  runtime_version   TEXT,
   -- Snapshot of the working tree taken the instant a direct run completed.
   --
   -- Captured then, not on demand, because a direct run's agent edits the user's
@@ -90,7 +123,6 @@ CREATE TABLE IF NOT EXISTS run (
 );
 
 CREATE INDEX IF NOT EXISTS idx_run_created ON run (created_at DESC);
-
 CREATE TABLE IF NOT EXISTS subtask (
   id                 TEXT PRIMARY KEY,
   run_id             TEXT NOT NULL,
@@ -120,7 +152,8 @@ CREATE TABLE IF NOT EXISTS attempt (
   id            TEXT PRIMARY KEY,
   run_id        TEXT NOT NULL,
   subtask_id    TEXT,
-  expert_id     TEXT NOT NULL,
+  -- NULL for direct CLI dispatch; legacy expert-pipeline attempts keep the id.
+  expert_id     TEXT,
   runtime_kind  TEXT NOT NULL,
   kind          TEXT NOT NULL,
   session_id    TEXT,
@@ -312,6 +345,13 @@ CREATE TABLE IF NOT EXISTS task (
   source_message_id TEXT,
   -- The pipeline run doing the work, once started. NULL until then.
   run_id        TEXT,
+  -- CLI explicitly selected when the task was dispatched. NULL before dispatch
+  -- and on historical tasks for which no runtime can be inferred.
+  runtime_kind  TEXT,
+  -- Chosen once, before the first task-chat message. It may be a subdirectory
+  -- inside the git root; changing it after a conversation starts requires a new
+  -- task/session so repository instructions and native CLI context cannot mix.
+  working_directory TEXT,
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
 );

@@ -16,6 +16,7 @@ import type {
   Expert,
   ExpertRole,
   HumanGate,
+  LocalRuntime,
   Message,
   MessageWithThread,
   Phase,
@@ -25,6 +26,7 @@ import type {
   Run,
   RunOutcomeKind,
   RunStatus,
+  RuntimeKind,
   SubTask,
   SubTaskStatus,
   Task,
@@ -33,6 +35,7 @@ import type {
   TeamMember,
 } from "../types.ts";
 import { TASK_STATUSES, TERMINAL_SUBTASK_STATUS } from "../types.ts";
+import { RUNTIME_KINDS } from "../types.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -74,6 +77,12 @@ function bool(v: unknown): boolean {
  */
 function actorKind(v: unknown): ActorKind {
   return v === "expert" ? "expert" : "human";
+}
+
+function runtimeKindOrNull(v: unknown): RuntimeKind | null {
+  return typeof v === "string" && (RUNTIME_KINDS as readonly string[]).includes(v)
+    ? (v as RuntimeKind)
+    : null;
 }
 
 function jsonArray(v: unknown): string[] {
@@ -129,8 +138,9 @@ export class Store {
    * Only additive, nullable-or-defaulted columns belong here. SQLite's ADD COLUMN
    * cannot introduce PRIMARY KEY, UNIQUE, or NOT NULL-without-default, and it is
    * a metadata-only operation, so this costs one PRAGMA read per table at open.
-   * Indexes are exempt: `CREATE INDEX IF NOT EXISTS` does create a missing index
-   * on an existing table, so schema.sql handles those on its own.
+   * Indexes over newly migrated columns must be created after the ADD COLUMN
+   * pass. Putting one in schema.sql makes opening an old database fail before
+   * migration gets a chance to add that column.
    */
   private migrate(): void {
     const expected: Array<{ table: string; column: string; definition: string }> = [
@@ -143,9 +153,20 @@ export class Store {
       { table: "task", column: "due_date", definition: "TEXT" },
       { table: "task", column: "needs_kind", definition: "TEXT" },
       { table: "task", column: "needs_text", definition: "TEXT" },
+      { table: "task", column: "runtime_kind", definition: "TEXT" },
+      { table: "task", column: "working_directory", definition: "TEXT" },
       { table: "run", column: "diff", definition: "TEXT" },
       { table: "run", column: "outcome_kind", definition: "TEXT" },
       { table: "run", column: "outcome_text", definition: "TEXT" },
+      { table: "run", column: "runtime_kind", definition: "TEXT" },
+      { table: "run", column: "runtime_exec_path", definition: "TEXT" },
+      { table: "run", column: "runtime_version", definition: "TEXT" },
+      { table: "run", column: "task_id", definition: "TEXT" },
+      { table: "run", column: "parent_run_id", definition: "TEXT" },
+      { table: "run", column: "trigger", definition: "TEXT" },
+      { table: "run", column: "user_message", definition: "TEXT" },
+      { table: "run", column: "repository_root", definition: "TEXT" },
+      { table: "run", column: "working_directory", definition: "TEXT" },
       { table: "agent_chat", column: "session_id", definition: "TEXT" },
       { table: "agent_chat", column: "attachments", definition: "TEXT NOT NULL DEFAULT '[]'" },
     ];
@@ -158,9 +179,89 @@ export class Store {
       this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
     }
 
+    this.migrateAttemptExpertNullable();
+
+    // Preserve the most reliable historical signal before falling back to the
+    // old assignee. These statements are intentionally idempotent: only NULL
+    // targets are touched, so reopening cannot overwrite a later explicit CLI.
+    this.db.exec(`
+      UPDATE run
+         SET runtime_kind = (
+           SELECT a.runtime_kind
+             FROM attempt a
+            WHERE a.run_id = run.id
+            ORDER BY CASE WHEN a.subtask_id IS NULL THEN 0 ELSE 1 END,
+                     a.started_at DESC
+            LIMIT 1
+         )
+       WHERE runtime_kind IS NULL
+         AND EXISTS (SELECT 1 FROM attempt a WHERE a.run_id = run.id);
+
+      UPDATE task
+         SET runtime_kind = COALESCE(
+           (SELECT r.runtime_kind FROM run r WHERE r.id = task.run_id),
+           (SELECT e.runtime_kind
+              FROM expert e
+             WHERE task.assignee_kind = 'expert' AND e.id = task.assignee_id)
+         )
+       WHERE runtime_kind IS NULL;
+
+      UPDATE run
+         SET task_id = (
+           SELECT t.id FROM task t WHERE t.run_id = run.id LIMIT 1
+         )
+       WHERE task_id IS NULL
+         AND EXISTS (SELECT 1 FROM task t WHERE t.run_id = run.id);
+    `);
+
     // Deferred from schema.sql: it indexes a column that may have just been
     // added above, so creating it earlier would fail on a pre-existing table.
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_agent_chat_session ON agent_chat (session_id, seq)`);
+    this.db.exec(`CREATE INDEX IF NOT EXISTS idx_run_task ON run (task_id, created_at)`);
+  }
+
+  /**
+   * SQLite cannot drop a NOT NULL constraint in place, so old `attempt` tables
+   * are rebuilt once. The full row is copied, including transcripts and usage;
+   * the index is recreated only after the legacy table (and its old index) is
+   * gone. A transaction makes an interrupted upgrade all-or-nothing.
+   */
+  private migrateAttemptExpertNullable(): void {
+    const info = this.db.prepare(`PRAGMA table_info(attempt)`).all() as Row[];
+    const expert = info.find((column) => str(column["name"]) === "expert_id");
+    if (!expert || num(expert["notnull"]) === 0) return;
+
+    this.db.exec(`
+      BEGIN;
+      ALTER TABLE attempt RENAME TO attempt_legacy_expert_required;
+      CREATE TABLE attempt (
+        id            TEXT PRIMARY KEY,
+        run_id        TEXT NOT NULL,
+        subtask_id    TEXT,
+        expert_id     TEXT,
+        runtime_kind  TEXT NOT NULL,
+        kind          TEXT NOT NULL,
+        session_id    TEXT,
+        status        TEXT NOT NULL,
+        output        TEXT,
+        error         TEXT,
+        input_tokens  INTEGER NOT NULL DEFAULT 0,
+        output_tokens INTEGER NOT NULL DEFAULT 0,
+        cost_usd      REAL NOT NULL DEFAULT 0,
+        started_at    TEXT NOT NULL,
+        ended_at      TEXT
+      );
+      INSERT INTO attempt
+        (id,run_id,subtask_id,expert_id,runtime_kind,kind,session_id,status,
+         output,error,input_tokens,output_tokens,cost_usd,started_at,ended_at)
+      SELECT
+        id,run_id,subtask_id,expert_id,runtime_kind,kind,session_id,status,
+        output,error,input_tokens,output_tokens,cost_usd,started_at,ended_at
+        FROM attempt_legacy_expert_required;
+      DROP TABLE attempt_legacy_expert_required;
+      CREATE INDEX IF NOT EXISTS idx_attempt_run ON attempt (run_id, started_at);
+      COMMIT;
+    `);
   }
 
   /**
@@ -355,19 +456,102 @@ export class Store {
       .map((r) => this.toProject(r as Row));
   }
 
+  // ── Local runtimes ────────────────────────────────────────
+
+  private toLocalRuntime(r: Row): LocalRuntime {
+    const kind = runtimeKindOrNull(r["kind"]);
+    if (kind === null) throw new Error(`invalid local runtime kind: ${str(r["kind"])}`);
+    const rawStatus = str(r["status"]);
+    const status: LocalRuntime["status"] =
+      rawStatus === "missing" ||
+      rawStatus === "unverified" ||
+      rawStatus === "verifying" ||
+      rawStatus === "ready" ||
+      rawStatus === "auth_required" ||
+      rawStatus === "error"
+        ? rawStatus
+        : "error";
+    return {
+      kind,
+      execPath: strOrNull(r["exec_path"]),
+      version: strOrNull(r["version"]),
+      status,
+      detectedAt: strOrNull(r["detected_at"]),
+      verifiedAt: strOrNull(r["verified_at"]),
+      verifyError: strOrNull(r["verify_error"]),
+    };
+  }
+
+  upsertLocalRuntime(runtime: LocalRuntime): LocalRuntime {
+    this.db
+      .prepare(
+        `INSERT INTO local_runtime
+           (kind,exec_path,version,status,detected_at,verified_at,verify_error)
+         VALUES (?,?,?,?,?,?,?)
+         ON CONFLICT(kind) DO UPDATE SET
+           exec_path=excluded.exec_path,
+           version=excluded.version,
+           status=excluded.status,
+           detected_at=excluded.detected_at,
+           verified_at=excluded.verified_at,
+           verify_error=excluded.verify_error`,
+      )
+      .run(
+        runtime.kind,
+        runtime.execPath,
+        runtime.version,
+        runtime.status,
+        runtime.detectedAt,
+        runtime.verifiedAt,
+        runtime.verifyError,
+      );
+    return runtime;
+  }
+
+  getLocalRuntime(kind: RuntimeKind): LocalRuntime | null {
+    const row = this.db.prepare(`SELECT * FROM local_runtime WHERE kind=?`).get(kind);
+    return row ? this.toLocalRuntime(row as Row) : null;
+  }
+
+  listLocalRuntimes(): LocalRuntime[] {
+    const rows = this.db.prepare(`SELECT * FROM local_runtime`).all() as Row[];
+    const byKind = new Map(rows.map((row) => [str(row["kind"]), row]));
+    // Product order is stable and includes missing rows once the manager has
+    // initialized them; unknown/corrupt kinds are deliberately ignored.
+    return RUNTIME_KINDS.flatMap((kind) => {
+      const row = byKind.get(kind);
+      return row ? [this.toLocalRuntime(row)] : [];
+    });
+  }
+
   // ── Runs ──────────────────────────────────────────────────
 
   createRun(r: {
     projectId: string;
+    taskId?: string | null;
+    parentRunId?: string | null;
+    trigger?: Run["trigger"];
+    userMessage?: string | null;
+    repositoryRoot?: string | null;
+    workingDirectory?: string | null;
     goal: string;
     acceptance?: string | null;
     budgetTokens?: number;
     soloMode?: boolean;
+    runtimeKind?: RuntimeKind | null;
+    runtimeExecPath?: string | null;
+    runtimeVersion?: string | null;
     id?: string;
   }): Run {
     const row: Run = {
       id: r.id ?? newId(),
       projectId: r.projectId,
+      taskId: r.taskId ?? null,
+      parentRunId: r.parentRunId ?? null,
+      trigger: r.trigger ?? null,
+      userMessage: r.userMessage ?? null,
+      repositoryRoot: r.repositoryRoot ?? null,
+      workingDirectory: r.workingDirectory ?? null,
       goal: r.goal,
       acceptance: r.acceptance ?? null,
       status: "running",
@@ -380,15 +564,24 @@ export class Store {
       createdAt: nowIso(),
       endedAt: null,
       error: null,
+      runtimeKind: r.runtimeKind ?? null,
+      runtimeExecPath: r.runtimeExecPath ?? null,
+      runtimeVersion: r.runtimeVersion ?? null,
     };
     this.db
       .prepare(
-        `INSERT INTO run (id,project_id,goal,acceptance,status,phase,gate,budget_tokens,spent_tokens,solo_mode,round,created_at,ended_at,error)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO run (id,project_id,task_id,parent_run_id,trigger,user_message,repository_root,working_directory,goal,acceptance,status,phase,gate,budget_tokens,spent_tokens,solo_mode,round,created_at,ended_at,error,runtime_kind,runtime_exec_path,runtime_version)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         row.id,
         row.projectId,
+        row.taskId,
+        row.parentRunId,
+        row.trigger,
+        row.userMessage,
+        row.repositoryRoot,
+        row.workingDirectory,
         row.goal,
         row.acceptance,
         row.status,
@@ -401,6 +594,9 @@ export class Store {
         row.createdAt,
         row.endedAt,
         row.error,
+        row.runtimeKind,
+        row.runtimeExecPath,
+        row.runtimeVersion,
       );
     return row;
   }
@@ -409,6 +605,15 @@ export class Store {
     return {
       id: str(r["id"]),
       projectId: str(r["project_id"]),
+      taskId: strOrNull(r["task_id"]),
+      parentRunId: strOrNull(r["parent_run_id"]),
+      trigger:
+        r["trigger"] === "dispatch" || r["trigger"] === "task_chat"
+          ? (r["trigger"] as Run["trigger"])
+          : null,
+      userMessage: strOrNull(r["user_message"]),
+      repositoryRoot: strOrNull(r["repository_root"]),
+      workingDirectory: strOrNull(r["working_directory"]),
       goal: str(r["goal"]),
       acceptance: strOrNull(r["acceptance"]),
       status: str(r["status"]) as RunStatus,
@@ -421,6 +626,9 @@ export class Store {
       createdAt: str(r["created_at"]),
       endedAt: strOrNull(r["ended_at"]),
       error: strOrNull(r["error"]),
+      runtimeKind: runtimeKindOrNull(r["runtime_kind"]),
+      runtimeExecPath: strOrNull(r["runtime_exec_path"]),
+      runtimeVersion: strOrNull(r["runtime_version"]),
     };
   }
 
@@ -473,6 +681,14 @@ export class Store {
     return this.db
       .prepare(`SELECT * FROM run ORDER BY created_at DESC LIMIT ?`)
       .all(limit)
+      .map((r) => this.toRun(r as Row));
+  }
+
+  /** Immutable turns in one task conversation, oldest first. */
+  listRunsForTask(taskId: string): Run[] {
+    return this.db
+      .prepare(`SELECT * FROM run WHERE task_id=? ORDER BY created_at, id`)
+      .all(taskId)
       .map((r) => this.toRun(r as Row));
   }
 
@@ -674,7 +890,7 @@ export class Store {
   startAttempt(a: {
     runId: string;
     subTaskId: string | null;
-    expertId: string;
+    expertId?: string | null;
     runtimeKind: Attempt["runtimeKind"];
     kind: Attempt["kind"];
     id?: string;
@@ -683,7 +899,7 @@ export class Store {
       id: a.id ?? newId(),
       runId: a.runId,
       subTaskId: a.subTaskId,
-      expertId: a.expertId,
+      expertId: a.expertId ?? null,
       runtimeKind: a.runtimeKind,
       kind: a.kind,
       sessionId: null,
@@ -765,7 +981,7 @@ export class Store {
       id: str(r["id"]),
       runId: str(r["run_id"]),
       subTaskId: strOrNull(r["subtask_id"]),
-      expertId: str(r["expert_id"]),
+      expertId: strOrNull(r["expert_id"]),
       runtimeKind: str(r["runtime_kind"]) as Attempt["runtimeKind"],
       kind: str(r["kind"]) as Attempt["kind"],
       sessionId: strOrNull(r["session_id"]),
@@ -790,7 +1006,7 @@ export class Store {
           id: str(r["id"]),
           runId: str(r["run_id"]),
           subTaskId: strOrNull(r["subtask_id"]),
-          expertId: str(r["expert_id"]),
+          expertId: strOrNull(r["expert_id"]),
           runtimeKind: str(r["runtime_kind"]) as Attempt["runtimeKind"],
           kind: str(r["kind"]) as Attempt["kind"],
           sessionId: strOrNull(r["session_id"]),
@@ -1217,6 +1433,8 @@ export class Store {
       | "dueDate"
       | "needsKind"
       | "needsText"
+      | "runtimeKind"
+      | "workingDirectory"
     > & {
       id?: string;
       note?: string;
@@ -1224,6 +1442,8 @@ export class Store {
       dueDate?: string | null;
       needsKind?: Task["needsKind"];
       needsText?: string | null;
+      runtimeKind?: RuntimeKind | null;
+      workingDirectory?: string | null;
     },
   ): Task {
     const at = nowIso();
@@ -1235,6 +1455,8 @@ export class Store {
       dueDate: t.dueDate ?? null,
       needsKind: t.needsKind ?? null,
       needsText: t.needsText ?? null,
+      runtimeKind: t.runtimeKind ?? null,
+      workingDirectory: t.workingDirectory ?? null,
       createdAt: at,
       updatedAt: at,
     };
@@ -1243,8 +1465,8 @@ export class Store {
         `INSERT INTO task
            (id,channel_id,title,status,note,my_day,due_date,needs_kind,needs_text,
             assignee_kind,assignee_id,creator_kind,creator_id,
-            source_message_id,run_id,created_at,updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            source_message_id,run_id,runtime_kind,working_directory,created_at,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(
         row.id,
@@ -1262,6 +1484,8 @@ export class Store {
         row.creatorId,
         row.sourceMessageId,
         row.runId,
+        row.runtimeKind,
+        row.workingDirectory,
         row.createdAt,
         row.updatedAt,
       );
@@ -1335,6 +1559,8 @@ export class Store {
         | "assigneeKind"
         | "assigneeId"
         | "runId"
+        | "runtimeKind"
+        | "workingDirectory"
         | "channelId"
       >
     >,
@@ -1350,6 +1576,8 @@ export class Store {
       assigneeKind: "assignee_kind",
       assigneeId: "assignee_id",
       runId: "run_id",
+      runtimeKind: "runtime_kind",
+      workingDirectory: "working_directory",
       channelId: "channel_id",
     };
     const sets: string[] = [];
@@ -1384,7 +1612,7 @@ export class Store {
       myDay: strOrNull(r["my_day"]),
       dueDate: strOrNull(r["due_date"]),
       needsKind:
-        needsKind === "question" || needsKind === "blocked" || needsKind === "failed"
+        needsKind === "question" || needsKind === "reply" || needsKind === "blocked" || needsKind === "failed"
           ? needsKind
           : null,
       needsText: strOrNull(r["needs_text"]),
@@ -1394,6 +1622,8 @@ export class Store {
       creatorId: strOrNull(r["creator_id"]),
       sourceMessageId: strOrNull(r["source_message_id"]),
       runId: strOrNull(r["run_id"]),
+      runtimeKind: runtimeKindOrNull(r["runtime_kind"]),
+      workingDirectory: strOrNull(r["working_directory"]),
       createdAt: str(r["created_at"]),
       updatedAt: str(r["updated_at"]),
     };

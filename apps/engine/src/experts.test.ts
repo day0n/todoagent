@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Store } from "@todoagent/core";
 
@@ -15,10 +15,8 @@ import { Store } from "@todoagent/core";
  * turn assigned to it fails — at run time, far from the cause, after its
  * stage-mates have already spent real tokens.
  *
- * The "not installed" case is produced by booting the engine with a minimal PATH
- * and a throwaway HOME, since `which` also searches ~/.local/bin and
- * /opt/homebrew/bin. Which runtimes that hides depends on the machine, so the test
- * asks the API which ones are missing rather than hardcoding a guess.
+ * Every runtime is shadowed below so these compatibility checks never invoke a
+ * developer's real CLI.
  */
 
 const SERVER = join(fileURLToPath(new URL(".", import.meta.url)), "server.ts");
@@ -27,33 +25,46 @@ const PORT = 8809; // distinct from the other engine suites
 interface Fixture {
   dbPath: string;
   fakeHome: string;
+  stubbedPath: string;
   dispose: () => Promise<void>;
 }
 
 async function fixture(): Promise<Fixture> {
   const root = await mkdtemp(join(tmpdir(), "todoagent-experts-"));
   const fakeHome = join(root, "home");
+  const binDir = join(root, "bin");
   await mkdir(fakeHome, { recursive: true });
+  await mkdir(binDir, { recursive: true });
+
+  // Every detection candidate is shadowed, so this suite never executes a
+  // developer's real coding CLI merely to learn its version.
+  for (const name of ["claude", "codex", "gemini", "cursor-agent", "grok", "kiro-cli"]) {
+    const path = join(binDir, name);
+    await writeFile(path, "#!/bin/sh\nprintf 'stub 1.0.0\\n'\n", "utf8");
+    await chmod(path, 0o755);
+  }
 
   const dbPath = join(root, "e.db");
   // Touch the database so the engine opens an already-migrated file.
   new Store(dbPath).close();
 
-  return { dbPath, fakeHome, dispose: () => rm(root, { recursive: true, force: true }) };
+  return {
+    dbPath,
+    fakeHome,
+    stubbedPath: `${binDir}${delimiter}/usr/bin:/bin`,
+    dispose: () => rm(root, { recursive: true, force: true }),
+  };
 }
 
-/** Boots the engine, optionally with a restricted PATH/HOME. */
-async function withEngine<T>(
-  f: Fixture,
-  fn: () => Promise<T>,
-  restrict?: { path: string; home: string },
-): Promise<T> {
+/** Boots the engine against only the fixture CLIs. */
+async function withEngine<T>(f: Fixture, fn: () => Promise<T>): Promise<T> {
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
     env: {
       ...process.env,
       TODOAGENT_DB: f.dbPath,
       TODOAGENT_PORT: String(PORT),
-      ...(restrict ? { PATH: restrict.path, HOME: restrict.home } : {}),
+      PATH: f.stubbedPath,
+      HOME: f.fakeHome,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -97,37 +108,56 @@ async function runtimes(): Promise<{ detected: Array<{ kind: string }>; missing:
   };
 }
 
-test("an expert on an uninstalled runtime is refused", async () => {
+test("runtime API exposes all CLIs, compatibility fields, refresh and verification state", async () => {
   const f = await fixture();
   try {
-    await withEngine(
-      f,
-      async () => {
-        const rt = await runtimes();
-        // With a stripped PATH and HOME, several CLIs become invisible. Derived
-        // from the API so the test does not depend on this machine's installs.
-        const absent = rt.missing[0];
-        assert.ok(
-          absent !== undefined,
-          "the restricted environment should hide at least one runtime",
-        );
+    await withEngine(f, async () => {
+      const first = (await (
+        await fetch(`http://127.0.0.1:${PORT}/api/runtimes`)
+      ).json()) as {
+        runtimes: Array<{
+          kind: string;
+          label: string;
+          displayName: string;
+          status: string;
+          execPath: string | null;
+          activeRuns: number;
+        }>;
+        detected: Array<{ kind: string }>;
+        known: string[];
+        missing: string[];
+      };
+      assert.equal(first.runtimes.length, 6);
+      assert.equal(first.known.length, 6);
+      assert.equal(first.detected.length, 6);
+      assert.deepEqual(first.missing, []);
+      assert.ok(first.runtimes.every((runtime) => runtime.status === "unverified"));
+      assert.ok(first.runtimes.every((runtime) => runtime.label === runtime.displayName));
+      assert.ok(first.runtimes.every((runtime) => runtime.execPath?.startsWith(f.stubbedPath.split(delimiter)[0] ?? "")));
+      assert.ok(first.runtimes.every((runtime) => runtime.activeRuns === 0));
 
-        const res = await createExpert({ name: "Ghost", runtimeKind: absent });
+      const refreshed = await fetch(`http://127.0.0.1:${PORT}/api/runtimes/refresh`, {
+        method: "POST",
+      });
+      assert.equal(refreshed.status, 200);
+      assert.equal(((await refreshed.json()) as { runtimes: unknown[] }).runtimes.length, 6);
 
-        assert.equal(res.status, 400);
-        const body = (await res.json()) as { error: string };
-        assert.match(body.error, /not installed/);
-        // The message must say what IS available, so the user can pick instead of
-        // guessing, and point at the probe rather than claiming the others work.
-        assert.match(body.error, /Available:/);
-        assert.match(body.error, /doctor --probe/);
+      const unknown = await fetch(`http://127.0.0.1:${PORT}/api/runtimes/not-real/verify`, {
+        method: "POST",
+      });
+      assert.equal(unknown.status, 400);
 
-        // Nothing stored, so the failure cannot resurface at run time.
-        const list = (await (await fetch(`http://127.0.0.1:${PORT}/api/experts`)).json()) as unknown[];
-        assert.equal(list.length, 0);
-      },
-      { path: "/usr/bin:/bin", home: f.fakeHome },
-    );
+      // The stub only reports a version; it does not speak Claude's stream
+      // protocol. Verification therefore completes as an explicit state rather
+      // than turning a valid HTTP request into a 5xx.
+      const verified = await fetch(`http://127.0.0.1:${PORT}/api/runtimes/claude/verify`, {
+        method: "POST",
+      });
+      assert.equal(verified.status, 200);
+      const state = (await verified.json()) as { status: string; verifyError: string | null };
+      assert.notEqual(state.status, "ready");
+      assert.ok((state.verifyError ?? "").length > 0);
+    });
   } finally {
     await f.dispose();
   }

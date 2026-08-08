@@ -107,14 +107,15 @@ async function legacyDb(): Promise<{ path: string; dispose: () => Promise<void> 
     `INSERT INTO subtask (id,run_id,stage,title,brief,status,created_at) VALUES (?,?,?,?,?,?,?)`,
   ).run("s1", "r1", 0, "legacy subtask", "brief", "done", "2026-01-01T00:00:00.000Z");
   db.prepare(
-    `INSERT INTO task (id,channel_id,title,status,creator_kind,created_at,updated_at)
-     VALUES (?,?,?,?,?,?,?)`,
+    `INSERT INTO task (id,channel_id,title,status,creator_kind,run_id,created_at,updated_at)
+     VALUES (?,?,?,?,?,?,?,?)`,
   ).run(
     "t1",
     "ch1",
     "legacy task",
     "todo",
     "human",
+    "r1",
     "2026-01-01T00:00:00.000Z",
     "2026-01-01T00:00:00.000Z",
   );
@@ -192,6 +193,66 @@ test("migrate: an old database gains cost_usd on attempt", async () => {
   }
 });
 
+test("migrate: direct attempts allow a null expert without losing legacy attempts", async () => {
+  const legacy = await legacyDb();
+  try {
+    const store = new Store(legacy.path);
+    try {
+      const old = store.getAttempt("a1");
+      assert.equal(old?.expertId, "e1", "the legacy expert reference survives the table rebuild");
+      assert.equal(old?.runtimeKind, "claude");
+
+      const direct = store.startAttempt({
+        id: "a-direct",
+        runId: "r1",
+        subTaskId: null,
+        expertId: null,
+        runtimeKind: "claude",
+        kind: "draft",
+      });
+      assert.equal(direct.expertId, null);
+      assert.equal(store.getAttempt(direct.id)?.expertId, null, "NULL round-trips from SQLite");
+    } finally {
+      store.close();
+    }
+
+    // The second open must see the nullable schema and skip the destructive
+    // rebuild while preserving both kinds of row.
+    const reopened = new Store(legacy.path);
+    try {
+      assert.deepEqual(
+        reopened.listAttempts("r1").map((attempt) => [attempt.id, attempt.expertId]),
+        [
+          ["a1", "e1"],
+          ["a-direct", null],
+        ],
+      );
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    await legacy.dispose();
+  }
+});
+
+test("migrate: runtime choice backfills run then task without inventing a path or version", async () => {
+  const legacy = await legacyDb();
+  try {
+    const store = new Store(legacy.path);
+    try {
+      const run = store.getRun("r1");
+      assert.equal(run?.runtimeKind, "claude", "attempt runtime is the historical source of truth");
+      assert.equal(run?.runtimeExecPath, null, "an old executable path cannot be reconstructed safely");
+      assert.equal(run?.runtimeVersion, null, "an old CLI version cannot be reconstructed safely");
+      assert.equal(store.getTask("t1")?.runtimeKind, "claude", "the linked run backfills its task");
+    } finally {
+      store.close();
+    }
+  } finally {
+    await legacy.dispose();
+  }
+});
+
 test("migrate: an old database gains run.diff, and null stays distinct from empty", async () => {
   const legacy = await legacyDb();
   try {
@@ -246,6 +307,7 @@ test("migrate: an old task table gains every column added since M1", async () =>
       assert.equal(task.dueDate, null, "no deadline is the honest default for old rows");
       assert.equal(task.needsKind, null);
       assert.equal(task.needsText, null);
+      assert.equal(task.workingDirectory, null);
 
       // The write path is the half that used to throw.
       assert.doesNotThrow(() =>

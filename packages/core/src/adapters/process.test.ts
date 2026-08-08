@@ -204,7 +204,14 @@ test("the idle watchdog kills a process that goes silent", async () => {
     assert.match(result.error ?? "", /idle watchdog/);
     // Partial output is still surrendered rather than discarded.
     assert.equal(result.output, "then silence");
-    assert.ok(elapsed < 15_000, `killed in ${elapsed}ms, not after the script's own sleep`);
+    // The window itself is calibrated from current process-start latency above,
+    // so its assertion must use that same scale. Under the full parallel suite a
+    // 3.5s startup sample legitimately produces a ~14s idle window; a fixed 15s
+    // ceiling then races the timer even though the watchdog did exactly its job.
+    assert.ok(
+      elapsed < window + 10_000,
+      `killed in ${elapsed}ms for a ${window}ms idle window`,
+    );
   } finally {
     await f.dispose();
   }

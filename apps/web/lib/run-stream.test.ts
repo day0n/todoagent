@@ -390,6 +390,11 @@ test("a realistic sequence ends in the state the page renders", () => {
   assert.deepEqual(state.live.get("r1")?.retrying, { attempt: 1, of: 2 });
   assert.equal(state.live.get("r2")?.status, "done");
 
-  // No agent:* chatter in the log.
-  assert.ok(!state.log.some((r) => r.type.startsWith("agent:")));
+  // Streaming prose stays out of the log, while tool boundaries remain as the
+  // durable execution record shown in a task conversation.
+  assert.ok(!state.log.some((r) => r.type === "agent:text"));
+  assert.deepEqual(
+    state.log.filter((r) => r.type.startsWith("agent:")).map((r) => r.type),
+    ["agent:tool_use", "agent:tool_result"],
+  );
 });

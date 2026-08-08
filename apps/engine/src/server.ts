@@ -1,17 +1,28 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { execFile } from "node:child_process";
+import { homedir, platform, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { serve } from "@hono/node-server";
 import { Hono, type Context, type Next } from "hono";
 import { cors } from "hono/cors";
 import { z } from "zod";
 import {
+  RuntimeManager,
   Store,
   approvePlanAndContinue,
   bus,
   defaultDbPath,
   deliverMessage,
   detectAll,
+  git,
   isGitRepo,
   newId,
   recordEvent,
@@ -22,17 +33,24 @@ import {
 } from "@todoagent/core";
 import {
   EXPERT_ROLES,
+  RUNTIME_DISPLAY_NAMES,
   RUNTIME_KINDS,
   TASK_STATUSES,
   type AgentChatAttachment,
-  type Channel,
-  type Expert,
+  type ExecutionTarget,
+  type RuntimeInfo,
+  type RuntimeKind,
   type Run,
   type Task,
   type TaskStatus,
 } from "@todoagent/core/types";
 import { classifyOutcome } from "./agent/classifier.ts";
-import { createSecretary, type SecretaryInit } from "./agent/secretary.ts";
+import {
+  assistantWorkspaceDir,
+  createSecretary,
+  ensureAssistantWorkspace,
+  type SecretaryInit,
+} from "./agent/secretary.ts";
 import { isAllowedOrigin } from "./origin.ts";
 import { installProxyDispatcher } from "./proxy.ts";
 
@@ -47,7 +65,74 @@ installProxyDispatcher();
 
 const PORT = Number(process.env["TODOAGENT_PORT"] ?? 8787);
 const store = new Store(defaultDbPath());
+
+/**
+ * Internal owner for tasks that are not in a user-created list.
+ *
+ * It is never returned by /api/lists. The visible “任务” entry is a smart view
+ * over every task, including tasks owned by custom lists; this row only satisfies
+ * the historical NOT NULL task.channel_id column.
+ */
+const SYSTEM_TASK_LIST_NAME = "__todoagent_tasks__";
+const LEGACY_INBOX_NAME = "收件箱";
+function systemTaskList() {
+  return store.listChannels().find((list) => list.kind === "channel" && list.name === SYSTEM_TASK_LIST_NAME) ??
+    store.createChannel({
+      name: SYSTEM_TASK_LIST_NAME,
+      purpose: "TodoAgent system task owner",
+      kind: "channel",
+      projectId: null,
+      dmExpertId: null,
+      color: null,
+    });
+}
+const systemTasks = systemTaskList();
+
+// “收件箱” was created automatically by older builds. Move its tasks into the
+// system owner and archive the shell so an upgrade immediately matches the new
+// Tasks + user-created Lists model without losing any task history.
+for (const legacy of store.listChannels().filter(
+  (list) => list.kind === "channel" && list.name === LEGACY_INBOX_NAME && list.archivedAt === null,
+)) {
+  for (const task of store.listAllTasks().filter((candidate) => candidate.channelId === legacy.id)) {
+    store.updateTask(task.id, { channelId: systemTasks.id });
+  }
+  store.updateChannel(legacy.id, { archivedAt: new Date().toISOString() });
+}
+const runtimeManager = new RuntimeManager(store);
 const app = new Hono();
+
+/** Opens the operating system's trusted folder chooser without accepting shell input. */
+function chooseDirectory(): Promise<string | null> {
+  const currentPlatform = platform();
+  const command = currentPlatform === "darwin" ? "/usr/bin/osascript" : "zenity";
+  const args = currentPlatform === "darwin"
+    ? ["-e", "set chosenFolder to choose folder with prompt \"选择 TodoAgent 工作目录\"", "-e", "POSIX path of chosenFolder"]
+    : ["--file-selection", "--directory", "--title=选择 TodoAgent 工作目录"];
+  if (currentPlatform !== "darwin" && currentPlatform !== "linux") {
+    return Promise.reject(new Error("当前系统暂不支持目录选择器，请直接粘贴目录路径。"));
+  }
+  return new Promise((resolveChoice, rejectChoice) => {
+    execFile(command, args, { timeout: 120_000, maxBuffer: 64 * 1024 }, (error, stdout) => {
+      if (error) {
+        // AppleScript -128 and zenity exit 1 both mean the person pressed Cancel.
+        const code = "code" in error ? error.code : null;
+        if (code === 1 || String(error.message).includes("-128")) return resolveChoice(null);
+        rejectChoice(error);
+        return;
+      }
+      const raw = stdout.trim();
+      if (raw === "") return resolveChoice(null);
+      try {
+        const path = realpathSync(raw);
+        if (!statSync(path).isDirectory()) throw new Error("选择的路径不是目录");
+        resolveChoice(path);
+      } catch (reason) {
+        rejectChoice(reason);
+      }
+    });
+  });
+}
 
 // ── Chat image uploads ───────────────────────────────────────
 //
@@ -274,15 +359,74 @@ function reconcileOrphanedRuns(): void {
 
 app.get("/api/health", (c) => c.json({ ok: true, db: defaultDbPath(), activeRuns: active.size }));
 
-app.get("/api/runtimes", async (c) => {
-  const detected = await detectAll();
-  return c.json({
-    detected,
-    // Detection proves the binary exists, nothing more — a CLI with expired
-    // credentials looks identical here. The UI must say so.
+app.post("/api/system/pick-directory", async (c) => {
+  try {
+    return c.json({ path: await chooseDirectory() });
+  } catch (reason) {
+    const message = reason instanceof Error ? reason.message : String(reason);
+    return c.json({ error: `无法打开目录选择器：${message}` }, 500);
+  }
+});
+
+function runtimeKind(value: string): RuntimeKind | null {
+  return (RUNTIME_KINDS as readonly string[]).includes(value) ? (value as RuntimeKind) : null;
+}
+
+/** Counts live direct runs by the immutable runtime snapshot on their Run row. */
+function activeRuntimeCounts(): Partial<Record<RuntimeKind, number>> {
+  const counts: Partial<Record<RuntimeKind, number>> = {};
+  for (const runId of active.keys()) {
+    const kind = store.getRun(runId)?.runtimeKind ?? null;
+    if (kind !== null) counts[kind] = (counts[kind] ?? 0) + 1;
+  }
+  return counts;
+}
+
+type RuntimeHttpInfo = RuntimeInfo & { label: string };
+
+/**
+ * New runtime records plus the old detection envelope during the UI migration.
+ *
+ * `detected` deliberately contains only path/version facts. A caller must read
+ * `runtimes[].status === "ready"` before offering execution: installed is not the
+ * same thing as authenticated.
+ */
+function runtimeEnvelope(): {
+  runtimes: RuntimeHttpInfo[];
+  detected: Array<{ kind: RuntimeKind; execPath: string; version: string }>;
+  known: readonly RuntimeKind[];
+  missing: RuntimeKind[];
+} {
+  const infos = runtimeManager.list(activeRuntimeCounts());
+  const runtimes = infos.map((info) => ({ ...info, label: info.displayName }));
+  return {
+    runtimes,
+    detected: infos.flatMap((info) =>
+      info.execPath === null || info.version === null
+        ? []
+        : [{ kind: info.kind, execPath: info.execPath, version: info.version }],
+    ),
     known: RUNTIME_KINDS,
-    missing: RUNTIME_KINDS.filter((k) => !detected.some((d) => d.kind === k)),
-  });
+    missing: infos.filter((info) => info.status === "missing").map((info) => info.kind),
+  };
+}
+
+app.get("/api/runtimes", (c) => c.json(runtimeEnvelope()));
+
+app.post("/api/runtimes/refresh", async (c) => {
+  await runtimeManager.refresh();
+  return c.json(runtimeEnvelope());
+});
+
+app.post("/api/runtimes/:kind/verify", async (c) => {
+  const kind = runtimeKind(c.req.param("kind"));
+  if (kind === null) return c.json({ error: "unknown runtime kind" }, 400);
+
+  // A failed authentication/protocol probe is a STATE, not an HTTP failure.
+  // Returning it lets the settings screen render the actionable error without
+  // treating a correctly completed verification request as a broken network call.
+  const info = await runtimeManager.verify(kind);
+  return c.json({ ...info, label: info.displayName });
 });
 
 // ── Experts, teams, projects ────────────────────────────────
@@ -468,7 +612,7 @@ app.get("/api/runs/:id", (c) => {
      */
     attempts: store.listAttempts(id).map(({ output, ...a }) => ({
       ...a,
-      expertName: nameOf(a.expertId),
+      expertName: nameOf(a.expertId) || RUNTIME_DISPLAY_NAMES[a.runtimeKind],
       // Size only, so the UI can indicate a transcript exists without shipping it.
       outputChars: output?.length ?? 0,
     })),
@@ -497,8 +641,15 @@ app.get("/api/runs/:id/attempts/:attemptId", (c) => {
   // Guards against reading another run's transcript by guessing an id.
   if (attempt.runId !== id) return c.json({ error: "not found" }, 404);
 
-  const expert = store.getExpert(attempt.expertId);
-  return c.json({ ...attempt, expertName: expert?.name ?? attempt.expertId.slice(0, 8) });
+  const expert = attempt.expertId === null ? null : store.getExpert(attempt.expertId);
+  return c.json({
+    ...attempt,
+    expertName:
+      expert?.name ??
+      (attempt.expertId === null
+        ? RUNTIME_DISPLAY_NAMES[attempt.runtimeKind]
+        : attempt.expertId.slice(0, 8)),
+  });
 });
 
 /**
@@ -1011,7 +1162,9 @@ app.get("/api/stream", (c) => {
 // message is durable conversation, and a task is a board card that MAY later
 // point at a pipeline run. Nothing here starts agents on its own.
 
-app.get("/api/channels", (c) => c.json(store.listChannels()));
+app.get("/api/channels", (c) =>
+  c.json(store.listChannels().filter((channel) => channel.name !== SYSTEM_TASK_LIST_NAME)),
+);
 
 const ChannelBody = z.object({
   name: z.string().min(1).max(120),
@@ -1393,23 +1546,6 @@ app.patch("/api/tasks/:id", async (c) => {
 // vocabulary changed — and the aggregated views (today / needs / done) are
 // derived at read time rather than stored, per the 2026-08-02 decision.
 
-const DEFAULT_LIST_NAME = "收件箱";
-
-/** The list quick-added tasks land in when none is chosen. Created on demand. */
-function defaultList(): Channel {
-  const existing = store
-    .listChannels()
-    .find((ch) => ch.kind === "channel" && ch.archivedAt === null && ch.name === DEFAULT_LIST_NAME);
-  if (existing) return existing;
-  return store.createChannel({
-    name: DEFAULT_LIST_NAME,
-    purpose: "",
-    kind: "channel",
-    projectId: null,
-    dmExpertId: null,
-  });
-}
-
 function sameLocalDay(iso: string, now: Date): boolean {
   const d = new Date(iso);
   return (
@@ -1507,6 +1643,49 @@ function boardColumn(t: Task, now: Date): BoardKey | null {
   return "later";
 }
 
+/**
+ * Calendar navigation uses the same four-column shape with a different anchor day.
+ *
+ * The real-today endpoint keeps its overdue rollover rules above. A future or past
+ * anchor is a planning view instead: only a deadline ON the selected day belongs to
+ * its first column, otherwise looking at next Friday would make every task due before
+ * Friday appear overdue there. Live work remains visible because hiding an agent that
+ * is currently running just because the calendar moved would be a dangerous lie.
+ */
+function boardColumnFrom(t: Task, anchor: Date, isCurrentDay: boolean): BoardKey | null {
+  if (isCurrentDay) return boardColumn(t, anchor);
+
+  const anchorIso = localDayIso(anchor);
+  if (t.status === "needs_you" || t.status === "in_progress" || t.status === "in_review") {
+    return "today";
+  }
+  if (t.status === "done") return sameLocalDay(t.updatedAt, anchor) ? "today" : null;
+  if (t.myDay === anchorIso) return "today";
+  if (t.dueDate === anchorIso) return "today";
+  if (t.dueDate === dayOffset(anchor, 1)) return "tomorrow";
+  if (t.dueDate === dayOffset(anchor, 2)) return "dayAfter";
+  if (t.dueDate !== null) return "later";
+  return sameLocalDay(t.createdAt, anchor) ? "today" : "later";
+}
+
+/** Strict local-date parsing for `?date=YYYY-MM-DD`; rejects rollover like Feb 31. */
+function parseLocalDay(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (match === null) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const parsed = new Date(year, month - 1, day);
+  if (
+    parsed.getFullYear() !== year ||
+    parsed.getMonth() !== month - 1 ||
+    parsed.getDate() !== day
+  ) {
+    return null;
+  }
+  return parsed;
+}
+
 app.get("/api/lists", (c) => {
   /*
    * `?archived=1` returns the archived lists INSTEAD of the live ones.
@@ -1550,7 +1729,11 @@ app.get("/api/lists", (c) => {
   const lists = store
     .listChannels()
     .filter(
-      (ch) => ch.kind === "channel" && (wantArchived ? ch.archivedAt !== null : ch.archivedAt === null),
+      (ch) =>
+        ch.kind === "channel" &&
+        ch.name !== SYSTEM_TASK_LIST_NAME &&
+        ch.name !== LEGACY_INBOX_NAME &&
+        (wantArchived ? ch.archivedAt !== null : ch.archivedAt === null),
     )
     .map((ch) => ({
       ...ch,
@@ -1560,6 +1743,7 @@ app.get("/api/lists", (c) => {
       repoPath: ch.projectId === null ? null : (store.getProject(ch.projectId)?.repoPath ?? null),
     }));
   const counts = {
+    tasks: tasks.filter((task) => task.status !== "done").length,
     today: tasks.filter((t) => t.status !== "done" && inToday(t, now)).length,
     needs: tasks.filter((t) => t.status === "needs_you").length,
     /*
@@ -1586,6 +1770,9 @@ app.post("/api/lists", async (c) => {
   const parsed = ListBody.safeParse(await c.req.json().catch(() => null));
   if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
   const { name, color, repoPath } = parsed.data;
+  if (name.trim() === "任务" || name.trim() === SYSTEM_TASK_LIST_NAME || name.trim() === LEGACY_INBOX_NAME) {
+    return c.json({ error: "这个名称由系统保留，请换一个清单名称。" }, 400);
+  }
 
   let projectId: string | null = null;
   if (repoPath !== null) {
@@ -1689,6 +1876,7 @@ app.get("/api/tasks", (c) => {
 
   let picked: Task[];
   if (view === "today") picked = all.filter((t) => inToday(t, now));
+  else if (view === "tasks") picked = all;
   else if (view === "needs") picked = all.filter((t) => t.status === "needs_you");
   // Everything with a live run, for the sidebar's 进行中 entry. A count with nothing
   // to click would be the one number on screen that goes nowhere.
@@ -1734,6 +1922,11 @@ app.get("/api/tasks", (c) => {
  */
 app.get("/api/board", (c) => {
   const now = new Date();
+  const requestedDate = c.req.query("date");
+  const anchor = requestedDate === undefined ? now : parseLocalDay(requestedDate);
+  if (anchor === null) return c.json({ error: "date must be a real YYYY-MM-DD calendar day" }, 400);
+  const anchorIso = localDayIso(anchor);
+  const isCurrentDay = anchorIso === localDayIso(now);
   const all = store.listAllTasks();
 
   const columns = BOARD_KEYS.map((key, i) => ({
@@ -1748,15 +1941,18 @@ app.get("/api/board", (c) => {
      *
      * `later` carries no date: it is a bucket, not a day.
      */
-    date: key === "later" ? null : dayOffset(now, i),
+    date: key === "later" ? null : dayOffset(anchor, i),
     /** `Date.getDay()`, so the client renders 周二 without parsing the string. */
-    weekday: key === "later" ? null : new Date(now.getFullYear(), now.getMonth(), now.getDate() + i).getDay(),
+    weekday:
+      key === "later"
+        ? null
+        : new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate() + i).getDay(),
     tasks: [] as Task[],
   }));
   const byKey = new Map(columns.map((col) => [col.key, col]));
 
   for (const t of all) {
-    const key = boardColumn(t, now);
+    const key = boardColumnFrom(t, anchor, isCurrentDay);
     if (key === null) continue;
     byKey.get(key)?.tasks.push(t);
   }
@@ -1780,7 +1976,7 @@ app.get("/api/board", (c) => {
   }
 
   return c.json({
-    today: localDayIso(now),
+    today: anchorIso,
     columns: columns.map((col) => ({
       ...col,
       /*
@@ -1802,7 +1998,7 @@ app.get("/api/board", (c) => {
 const QuickTaskBody = z.object({
   title: z.string().min(1).max(500),
   note: z.string().max(2000).default(""),
-  /** Absent means the 收件箱 default list. */
+  /** Null/absent means the smart Tasks overview, not a visible default list. */
   listId: z.string().min(1).nullable().default(null),
   /** Optional deadline, `YYYY-MM-DD`. Absent means no deadline. */
   dueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).nullable().default(null),
@@ -1813,7 +2009,7 @@ app.post("/api/tasks", async (c) => {
   if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
   const body = parsed.data;
 
-  const list = body.listId === null ? defaultList() : store.getChannel(body.listId);
+  const list = body.listId === null ? systemTasks : store.getChannel(body.listId);
   if (!list) return c.json({ error: "unknown list" }, 404);
 
   const task = store.createTask({
@@ -1891,6 +2087,7 @@ function secretaryConfigKey(): string {
     process.env["TODOAGENT_MODEL"] ?? "",
     process.env["TODOAGENT_API_KEY"] ?? "",
     process.env["TODOAGENT_AGENT_DIR"] ?? "",
+    process.env["TODOAGENT_ASSISTANT_WORKSPACE"] ?? "",
   ].join("\u0000");
 }
 
@@ -1901,11 +2098,7 @@ function getSecretary(): Promise<SecretaryInit> {
       key,
       promise: createSecretary({
         store,
-        dispatch: async (taskId) => {
-          const res = dispatchCard(taskId, 2_000_000);
-          return res.ok ? { ok: true } : { ok: false, error: res.error };
-        },
-        defaultListId: () => defaultList().id,
+        defaultListId: () => systemTasks.id,
         publishBoard: (taskId) => bus.publishBoard(taskId),
       }),
     };
@@ -1917,6 +2110,51 @@ function getSecretary(): Promise<SecretaryInit> {
 app.get("/api/chat/status", async (c) => {
   const init = await getSecretary();
   return c.json(init.ready ? { ready: true, model: init.secretary.model } : { ready: false, reason: init.reason });
+});
+
+const AssistantFileBody = z.object({ content: z.string().max(200_000) });
+const SAFE_REF_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,119}\.md$/;
+
+/** The assistant's deliberately tiny, transparent memory workspace. */
+app.get("/api/assistant/workspace", (c) => {
+  const dir = ensureAssistantWorkspace();
+  const refDir = join(dir, "ref");
+  return c.json({
+    path: assistantWorkspaceDir(),
+    memory: readFileSync(join(dir, "MEMORY.md"), "utf8"),
+    refs: readdirSync(refDir, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && SAFE_REF_NAME.test(entry.name))
+      .map((entry) => entry.name)
+      .sort(),
+  });
+});
+
+app.put("/api/assistant/memory", async (c) => {
+  const parsed = AssistantFileBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const dir = ensureAssistantWorkspace();
+  writeFileSync(join(dir, "MEMORY.md"), parsed.data.content, "utf8");
+  // Existing live secretary sessions retain their own compacted context. A fresh
+  // conversation (or Engine restart) loads the edited memory, avoiding a silent
+  // mid-conversation identity change.
+  return c.json({ ok: true, content: parsed.data.content });
+});
+
+app.get("/api/assistant/ref/:name", (c) => {
+  const name = c.req.param("name");
+  if (!SAFE_REF_NAME.test(name)) return c.json({ error: "invalid ref name" }, 400);
+  const path = join(ensureAssistantWorkspace(), "ref", name);
+  if (!existsSync(path)) return c.json({ error: "not found" }, 404);
+  return c.json({ name, content: readFileSync(path, "utf8") });
+});
+
+app.put("/api/assistant/ref/:name", async (c) => {
+  const name = c.req.param("name");
+  if (!SAFE_REF_NAME.test(name)) return c.json({ error: "引用文件名必须以 .md 结尾，只能包含字母、数字、点、横线和下划线。" }, 400);
+  const parsed = AssistantFileBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  writeFileSync(join(ensureAssistantWorkspace(), "ref", name), parsed.data.content, "utf8");
+  return c.json({ ok: true, name, content: parsed.data.content });
 });
 
 // ── Chat sessions ─────────────────────────────────────────────
@@ -2080,7 +2318,62 @@ app.post("/api/chat", async (c) => {
   }
 });
 
+interface ResolvedWorkspace {
+  projectId: string;
+  repositoryRoot: string;
+  workingDirectory: string;
+}
+
+/**
+ * Resolves a user-visible directory into the two paths a task conversation needs:
+ * the git root for locking/diffs, and the (possibly nested) cwd for the CLI.
+ * Both are canonical real paths so a symlink cannot bypass the repository lock.
+ */
+async function resolveTaskWorkspace(input: string, name: string): Promise<ResolvedWorkspace | string> {
+  const absolute = resolve(input.trim());
+  if (!existsSync(absolute)) return `工作目录不存在：${absolute}`;
+  try {
+    if (!statSync(absolute).isDirectory()) return `工作目录不是文件夹：${absolute}`;
+  } catch {
+    return `无法读取工作目录：${absolute}`;
+  }
+  if (!(await isGitRepo(absolute))) return `${absolute} 不是 git 仓库中的目录。`;
+
+  const rootResult = await git(["rev-parse", "--show-toplevel"], absolute);
+  if (rootResult.code !== 0 || rootResult.stdout.trim() === "") {
+    return `无法确定 ${absolute} 的 git 仓库根目录。`;
+  }
+
+  let workingDirectory: string;
+  let repositoryRoot: string;
+  try {
+    workingDirectory = realpathSync(absolute);
+    repositoryRoot = realpathSync(rootResult.stdout.trim());
+  } catch {
+    return `无法解析工作目录的真实路径：${absolute}`;
+  }
+
+  const home = realpathSync(homedir());
+  if (repositoryRoot === "/" || repositoryRoot === home) {
+    return "不能把系统根目录或整个用户目录作为任务仓库。请选择具体项目。";
+  }
+
+  let project = store.listProjects().find((candidate) => {
+    try {
+      return realpathSync(candidate.repoPath) === repositoryRoot;
+    } catch {
+      return resolve(candidate.repoPath) === repositoryRoot;
+    }
+  });
+  if (!project) {
+    const team = store.listTeams()[0] ?? store.createTeam("todoagent-internal");
+    project = store.createProject({ name, repoPath: repositoryRoot, teamId: team.id });
+  }
+  return { projectId: project.id, repositoryRoot, workingDirectory };
+}
+
 const TaskRunBody = z.object({
+  runtimeKind: z.enum(["claude", "codex", "cursor", "gemini", "kiro", "grok"]),
   budgetTokens: z.number().int().min(0).max(200_000_000).default(2_000_000),
 });
 
@@ -2089,15 +2382,20 @@ type DispatchResult =
   | { ok: false; code: 400 | 404 | 409; error: string; busyRunId?: string };
 
 /**
- * Dispatches a board card to one agent, directly — the ONE dispatch path.
+ * Dispatches a board card to one explicitly selected local CLI — the ONE
+ * dispatch path.
  *
  * Shared by the HTTP route and the secretary's `dispatch_task` tool, so every
- * guard (repository lock, expert resolution, needs_you consumption) holds no
+ * guard (runtime readiness, repository lock, needs_you consumption) holds no
  * matter who asks. The todoagent default path: no decomposition, no
  * cross-review, no verification. The six-phase pipeline still exists behind
  * `POST /api/runs` for a future deep mode.
  */
-function dispatchCard(taskId: string, budgetTokens: number): DispatchResult {
+function dispatchCard(
+  taskId: string,
+  budgetTokens: number,
+  selectedRuntime: RuntimeKind,
+): DispatchResult {
   const task = store.getTask(taskId);
   if (!task) return { ok: false, code: 404, error: "unknown task" };
 
@@ -2148,17 +2446,30 @@ function dispatchCard(taskId: string, budgetTokens: number): DispatchResult {
   const goal = source !== null && source.body.trim() !== "" ? source.body : task.title;
 
   /*
-   * Who executes: the card's assignee when it is an expert, otherwise the
-   * first expert on file. Resolved BEFORE the run row exists, so a board with
-   * no experts refuses cleanly instead of creating a run that can only fail.
+   * The caller chooses the CLI. There is intentionally no assignee or
+   * "first expert" fallback: silently picking a different paid local runtime is
+   * both surprising and capable of sending the task to the wrong credentials.
+   *
+   * `getReadyTarget` also rechecks the persisted absolute executable path. This
+   * happens before the transaction below, so a stale install can never create a
+   * Run row or move the card.
    */
-  const assigned =
-    task.assigneeKind === "expert" && task.assigneeId !== null
-      ? store.getExpert(task.assigneeId)
-      : null;
-  const expert = assigned ?? store.listExperts()[0] ?? null;
-  if (expert === null) {
-    return { ok: false, code: 400, error: "没有可用的 agent。先运行 pnpm seed 或在团队页创建一个专家。" };
+  const target = runtimeManager.getReadyTarget(selectedRuntime);
+  if (target === null) {
+    const info = runtimeManager.list().find((item) => item.kind === selectedRuntime);
+    const detail =
+      info?.status === "missing"
+        ? "尚未安装"
+        : info?.status === "auth_required"
+          ? "需要重新登录"
+          : info?.status === "verifying"
+            ? "正在验证"
+            : "尚未验证可用";
+    return {
+      ok: false,
+      code: 409,
+      error: `${info?.displayName ?? selectedRuntime} ${detail}，请先到设置页验证连接。`,
+    };
   }
 
   // One transaction: a run whose card was never updated would execute with
@@ -2166,25 +2477,35 @@ function dispatchCard(taskId: string, budgetTokens: number): DispatchResult {
   const run = store.tx(() => {
     const created = store.createRun({
       projectId: channel.projectId as string,
+      taskId: task.id,
+      trigger: "dispatch",
+      userMessage: goal,
+      repositoryRoot: project.repoPath,
+      workingDirectory: project.repoPath,
       goal,
       acceptance: null,
       budgetTokens,
       soloMode: true,
+      runtimeKind: target.runtimeKind,
+      runtimeExecPath: target.execPath,
+      runtimeVersion: target.version,
     });
     store.updateTask(task.id, {
       runId: created.id,
+      runtimeKind: target.runtimeKind,
+      workingDirectory: project.repoPath,
       status: "in_progress",
       // Re-dispatch is how a needs_you card gets unstuck, so the parked
       // question is consumed here rather than lingering next to a live run.
       needsKind: null,
       needsText: null,
-      assigneeKind: "expert",
-      assigneeId: expert.id,
+      assigneeKind: null,
+      assigneeId: null,
     });
     return created;
   });
 
-  launchDirect(run.id, expert);
+  launchDirect(run.id, target);
   const after = store.getTask(task.id);
   return { ok: true, run, task: after ?? task };
 }
@@ -2289,13 +2610,44 @@ app.post("/api/tasks/:id/answer", async (c) => {
     );
   }
 
-  const expert =
-    (task.assigneeKind === "expert" && task.assigneeId !== null
-      ? store.getExpert(task.assigneeId)
-      : null) ?? store.listExperts()[0] ?? null;
-  if (expert === null) {
-    return c.json({ error: "没有可用的 agent。先运行 pnpm seed 或在团队页创建一个专家。" }, 400);
+  /*
+   * A reply belongs to the CLI that asked the question. The task's current
+   * selection is intentionally ignored: it can be changed by a later UI edit,
+   * while the session id below is meaningful only to the runtime snapshot on
+   * the previous Run.
+   */
+  if (
+    previous.runtimeKind === null ||
+    previous.runtimeExecPath === null ||
+    previous.runtimeVersion === null
+  ) {
+    return c.json(
+      { error: "这条历史执行没有保存本机 CLI 快照，无法安全续跑；请重新派发任务。" },
+      409,
+    );
   }
+  const currentTarget = runtimeManager.getReadyTarget(previous.runtimeKind);
+  if (currentTarget === null) {
+    return c.json(
+      { error: "提出问题的本机 CLI 当前不可用，请先到设置页重新验证连接。" },
+      409,
+    );
+  }
+  if (
+    currentTarget.execPath !== previous.runtimeExecPath ||
+    currentTarget.version !== previous.runtimeVersion
+  ) {
+    return c.json(
+      { error: "提出问题后本机 CLI 的路径或版本发生了变化，不能跨运行时恢复会话；请重新派发任务。" },
+      409,
+    );
+  }
+  const target: ExecutionTarget = {
+    runtimeKind: previous.runtimeKind,
+    displayName: currentTarget.displayName,
+    execPath: previous.runtimeExecPath,
+    version: previous.runtimeVersion,
+  };
 
   const { output, sessionId } = finalOutputOf(task.runId);
   const previousOutput = output ?? "";
@@ -2310,7 +2662,7 @@ app.post("/api/tasks/:id/answer", async (c) => {
    * context, which looks like it worked and quietly drops the whole conversation.
    */
   const canResume =
-    sessionId !== null && sessionId !== "" && RESUMABLE_RUNTIMES.has(expert.runtimeKind);
+    sessionId !== null && sessionId !== "" && RESUMABLE_RUNTIMES.has(target.runtimeKind);
   const question = task.needsText;
   const goal = answerPrompt({
     resumed: canResume,
@@ -2325,19 +2677,30 @@ app.post("/api/tasks/:id/answer", async (c) => {
   const run = store.tx(() => {
     const created = store.createRun({
       projectId: previous.projectId,
+      taskId: task.id,
+      parentRunId: previous.id,
+      trigger: "dispatch",
+      userMessage: answer,
+      repositoryRoot: previous.repositoryRoot ?? store.getProject(previous.projectId)?.repoPath ?? null,
+      workingDirectory: previous.workingDirectory ?? store.getProject(previous.projectId)?.repoPath ?? null,
       goal,
       acceptance: null,
       budgetTokens: previous.budgetTokens,
       soloMode: true,
+      runtimeKind: target.runtimeKind,
+      runtimeExecPath: target.execPath,
+      runtimeVersion: target.version,
     });
     store.updateTask(task.id, {
       runId: created.id,
+      runtimeKind: target.runtimeKind,
+      workingDirectory: previous.workingDirectory ?? store.getProject(previous.projectId)?.repoPath ?? null,
       status: "in_progress",
       // The question has been answered, so it stops being something you owe.
       needsKind: null,
       needsText: null,
-      assigneeKind: "expert",
-      assigneeId: expert.id,
+      assigneeKind: null,
+      assigneeId: null,
     });
     return created;
   });
@@ -2356,7 +2719,7 @@ app.post("/api/tasks/:id/answer", async (c) => {
     previousRunId: previous.id,
   });
 
-  launchDirect(run.id, expert, canResume ? sessionId : null, {
+  launchDirect(run.id, target, canResume ? sessionId : null, {
     // Prepared even when resuming succeeds, and used only if the CLI rejects the
     // session id — see `launchDirect`.
     fallbackPrompt: canResume
@@ -2372,7 +2735,7 @@ app.post("/api/tasks/:id/run", async (c) => {
   const parsed = TaskRunBody.safeParse(await c.req.json().catch(() => ({})));
   if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
 
-  const res = dispatchCard(c.req.param("id"), parsed.data.budgetTokens);
+  const res = dispatchCard(c.req.param("id"), parsed.data.budgetTokens, parsed.data.runtimeKind);
   if (!res.ok) {
     return c.json(
       res.busyRunId === undefined ? { error: res.error } : { error: res.error, busyRunId: res.busyRunId },
@@ -2380,6 +2743,204 @@ app.post("/api/tasks/:id/run", async (c) => {
     );
   }
   return c.json({ run: res.run, task: res.task }, 201);
+});
+
+/** One task's durable, human-driven CLI conversation. */
+app.get("/api/tasks/:id/thread", (c) => {
+  const task = store.getTask(c.req.param("id"));
+  if (!task) return c.json({ error: "unknown task" }, 404);
+  const list = store.getChannel(task.channelId);
+  const defaultProject = list?.projectId === null || list?.projectId === undefined
+    ? null
+    : store.getProject(list.projectId);
+  const runs = store.listRunsForTask(task.id);
+  const turns = runs.map((run) => {
+    const { output, executor } = finalOutputOf(run.id);
+    return {
+      run,
+      message: run.userMessage ?? run.goal,
+      output,
+      executor,
+      attempts: store.listAttempts(run.id).map(({ output: _output, ...attempt }) => ({
+        ...attempt,
+        expertName: RUNTIME_DISPLAY_NAMES[attempt.runtimeKind],
+        outputChars: _output?.length ?? 0,
+      })),
+      events: store.eventsAfter(run.id, 0, 2_000).filter((event) =>
+        event.type === "agent:tool_use" ||
+        event.type === "agent:tool_result" ||
+        event.type === "agent:error" ||
+        event.type === "agent:status" ||
+        event.type === "attempt:started" ||
+        event.type === "attempt:completed" ||
+        event.type === "attempt:failed"
+      ),
+    };
+  });
+
+  const knownWorkspaces = [...new Map(
+    store
+      .listChannels()
+      .flatMap((channel) => {
+        if (channel.projectId === null) return [];
+        const project = store.getProject(channel.projectId);
+        return project ? [[project.repoPath, { name: channel.name, path: project.repoPath }] as const] : [];
+      }),
+  ).values()];
+
+  return c.json({
+    task,
+    list: list === null
+      ? null
+      : { id: list.id, name: list.name === SYSTEM_TASK_LIST_NAME ? "任务" : list.name },
+    defaultWorkingDirectory: defaultProject?.repoPath ?? null,
+    knownWorkspaces,
+    turns,
+    activeRunId: task.runId !== null && active.has(task.runId) ? task.runId : null,
+    replyCount: turns.reduce((count, turn) => count + 1 + (turn.output === null ? 0 : 1), 0),
+  });
+});
+
+const TaskMessageBody = z.object({
+  message: z.string().min(1).max(100_000),
+  runtimeKind: z.enum(["claude", "codex", "cursor", "gemini", "kiro", "grok"]).optional(),
+  workingDirectory: z.string().min(1).max(4096).optional(),
+});
+
+function taskConversationPrompt(task: Task, previousRuns: Run[], message: string): string {
+  const history = previousRuns.slice(-6).flatMap((run) => {
+    const output = finalOutputOf(run.id).output;
+    return [
+      `用户：${(run.userMessage ?? run.goal).slice(-4_000)}`,
+      output === null ? "" : `CLI：${output.slice(-6_000)}`,
+    ].filter(Boolean);
+  });
+  return [
+    `你正在继续任务「${task.title}」的对话。`,
+    task.note.trim() === "" ? "" : `任务备注：${task.note}`,
+    history.length === 0 ? "" : `此前对话摘要（最近轮次）：\n${history.join("\n\n")}`,
+    `用户的新消息：${message}`,
+    "继续在当前工作目录完成用户要求，并清楚汇报实际操作和结果。",
+  ].filter(Boolean).join("\n\n");
+}
+
+/**
+ * Sends one human-authored message to a task's real local CLI.
+ *
+ * The first message locks Runtime + cwd. Later messages create new immutable Run
+ * rows and resume the vendor session only when every identity snapshot still
+ * matches; otherwise the durable task thread is stitched into a cold turn.
+ */
+app.post("/api/tasks/:id/messages", async (c) => {
+  const parsed = TaskMessageBody.safeParse(await c.req.json().catch(() => ({})));
+  if (!parsed.success) return c.json({ error: parsed.error.issues }, 400);
+  const task = store.getTask(c.req.param("id"));
+  if (!task) return c.json({ error: "unknown task" }, 404);
+  if (task.status === "done") return c.json({ error: "任务已完成；先重新打开任务再继续对话。" }, 409);
+
+  if (task.runId !== null) {
+    const current = store.getRun(task.runId);
+    if (current && (current.status === "running" || current.status === "blocked_on_human")) {
+      return c.json({ error: "上一轮还在执行，请等它结束或先取消。" }, 409);
+    }
+  }
+
+  const previousRuns = store.listRunsForTask(task.id);
+  // Databases from before task conversations may remember an old CLI choice but
+  // not a working directory. That is not an established session: the human must
+  // still be free to choose both values for the first real conversation turn.
+  const sessionEstablished =
+    task.runtimeKind !== null &&
+    task.workingDirectory !== null &&
+    task.workingDirectory !== undefined;
+  const runtimeKind = sessionEstablished
+    ? task.runtimeKind
+    : (parsed.data.runtimeKind ?? task.runtimeKind);
+  if (runtimeKind === undefined || runtimeKind === null) {
+    return c.json({ error: "第一次发送消息前请选择本机 CLI。" }, 400);
+  }
+  if (sessionEstablished && parsed.data.runtimeKind !== undefined && parsed.data.runtimeKind !== task.runtimeKind) {
+    return c.json({ error: "这个任务已经建立了 CLI 会话；切换 Runtime 请新建任务。" }, 409);
+  }
+
+  const requestedDirectory = sessionEstablished
+    ? task.workingDirectory
+    : (parsed.data.workingDirectory ?? task.workingDirectory);
+  if (requestedDirectory === undefined || requestedDirectory === null) {
+    return c.json({ error: "第一次发送消息前请选择工作目录。" }, 400);
+  }
+  const workspace = await resolveTaskWorkspace(requestedDirectory, task.title);
+  if (typeof workspace === "string") return c.json({ error: workspace }, 400);
+  if (
+    sessionEstablished &&
+    task.workingDirectory !== null &&
+    task.workingDirectory !== undefined &&
+    realpathSync(task.workingDirectory) !== workspace.workingDirectory
+  ) {
+    return c.json({ error: "这个任务已经锁定了工作目录；换目录请新建任务。" }, 409);
+  }
+
+  const busy = projectBusyWith(workspace.projectId);
+  if (busy !== null) {
+    return c.json({ error: `这个仓库正在执行另一个任务（run ${busy}）。`, busyRunId: busy }, 409);
+  }
+  const target = runtimeManager.getReadyTarget(runtimeKind);
+  if (target === null) {
+    return c.json({ error: `${RUNTIME_DISPLAY_NAMES[runtimeKind]} 尚未验证可用，请先到设置页验证连接。` }, 409);
+  }
+
+  const previous = previousRuns.at(-1) ?? null;
+  const previousResult = previous === null ? null : finalOutputOf(previous.id);
+  const canResume =
+    previous !== null &&
+    previousResult?.sessionId !== null &&
+    previousResult?.sessionId !== undefined &&
+    previous.runtimeKind === target.runtimeKind &&
+    previous.runtimeExecPath === target.execPath &&
+    previous.runtimeVersion === target.version &&
+    previous.workingDirectory === workspace.workingDirectory &&
+    RESUMABLE_RUNTIMES.has(target.runtimeKind);
+  const coldPrompt = taskConversationPrompt(task, previousRuns, parsed.data.message.trim());
+  const goal = canResume ? parsed.data.message.trim() : coldPrompt;
+
+  const run = store.tx(() => {
+    const created = store.createRun({
+      projectId: workspace.projectId,
+      taskId: task.id,
+      parentRunId: previous?.id ?? null,
+      trigger: "task_chat",
+      userMessage: parsed.data.message.trim(),
+      repositoryRoot: workspace.repositoryRoot,
+      workingDirectory: workspace.workingDirectory,
+      goal,
+      acceptance: null,
+      budgetTokens: 2_000_000,
+      soloMode: true,
+      runtimeKind: target.runtimeKind,
+      runtimeExecPath: target.execPath,
+      runtimeVersion: target.version,
+    });
+    store.updateTask(task.id, {
+      runId: created.id,
+      runtimeKind: target.runtimeKind,
+      workingDirectory: workspace.workingDirectory,
+      status: "in_progress",
+      needsKind: null,
+      needsText: null,
+    });
+    return created;
+  });
+  recordEvent(store, run.id, null, "run:message", {
+    message: parsed.data.message.trim(),
+    workingDirectory: workspace.workingDirectory,
+    resumed: canResume,
+    previousRunId: previous?.id ?? null,
+  });
+  launchDirect(run.id, target, canResume ? previousResult?.sessionId : null, {
+    fallbackPrompt: canResume ? coldPrompt : null,
+  });
+  bus.publishBoard(task.id);
+  return c.json({ run, task: store.getTask(task.id), resumed: canResume }, 201);
 });
 
 // ── Launch ──────────────────────────────────────────────────
@@ -2402,6 +2963,37 @@ function syncTaskFromRun(runId: string): void {
   if (!task) return;
   const run = store.getRun(runId);
   if (!run) return;
+
+  /*
+   * A task chat completes one CLI TURN, not the person's todo. After a successful
+   * answer the card waits for the next human message (or an explicit Done click).
+   * Treating every turn as finished work moved conversational tasks to 待确认 and
+   * made the second message look like a redispatch instead of a reply.
+   */
+  if (run.trigger === "task_chat") {
+    if (run.status === "running" || run.status === "blocked_on_human") return;
+    if (run.status === "completed") {
+      store.updateTask(task.id, {
+        status: "needs_you",
+        needsKind: "reply",
+        needsText: "本轮回复完成，可以继续对话或标记任务完成。",
+      });
+    } else if (run.status === "cancelled") {
+      store.updateTask(task.id, {
+        status: "needs_you",
+        needsKind: "reply",
+        needsText: "本轮已取消，已产生的文件改动仍保留在工作目录中。",
+      });
+    } else {
+      store.updateTask(task.id, {
+        status: "needs_you",
+        needsKind: "failed",
+        needsText: (run.error ?? "本轮执行失败，请查看记录后重试。 ").slice(0, 500),
+      });
+    }
+    bus.publishBoard(task.id);
+    return;
+  }
 
   /*
    * A completed run is not necessarily finished work.
@@ -2488,7 +3080,7 @@ function isSessionError(error: string | null): boolean {
 
 function launchDirect(
   runId: string,
-  expert: Expert,
+  target: ExecutionTarget,
   resumeSessionId?: string | null,
   opts: { fallbackPrompt?: string | null } = {},
 ): void {
@@ -2498,7 +3090,7 @@ function launchDirect(
     let res = await runDirect({
       store,
       runId,
-      expert,
+      target,
       signal: controller.signal,
       ...(resumeSessionId ? { resumeSessionId } : {}),
     });
@@ -2533,9 +3125,14 @@ function launchDirect(
       console.log(`[run ${runId}] resume rejected, retrying without a session`);
       recordEvent(store, runId, null, "run:resume_degraded", { error: res.error });
       store.updateRun(runId, { goal: fallbackPrompt, error: null, endedAt: null });
-      res = await runDirect({ store, runId, expert, signal: controller.signal });
+      res = await runDirect({ store, runId, target, signal: controller.signal });
       console.log(`[run ${runId}] retry ${res.status}${res.error ? `: ${res.error}` : ""}`);
     }
+
+    // Ordinary task/build failures leave a verified CLI ready. Only failures
+    // classified by RuntimeManager as executable, protocol or authentication
+    // problems invalidate it for subsequent dispatches.
+    if (res.status === "failed") runtimeManager.recordExecutionFailure(target, res.error);
 
     /*
      * Deregistered BEFORE classification, not in the `finally` alone.
@@ -2548,6 +3145,11 @@ function launchDirect(
      */
     active.delete(runId);
     if (res.status !== "completed") return;
+
+    // Task-chat turns are deliberately human-driven. The CLI exiting cleanly
+    // means "this reply ended", not "the todo is done", so no outcome classifier
+    // is allowed to auto-promote the card.
+    if (store.getRun(runId)?.trigger === "task_chat") return;
 
     /*
      * Classify before the card moves.
@@ -2614,6 +3216,19 @@ function launch(runId: string, autoApprovePlan: boolean): void {
 // so no client can observe a run that nothing is driving.
 reconcileOrphanedRuns();
 
+// Detection is cheap (`--version` only) and never spends model quota. Do it
+// before the socket opens so the first settings-page read is complete, then keep
+// it fresh for CLIs installed or upgraded while TodoAgent stays open.
+if (process.env["TODOAGENT_DISABLE_RUNTIME_DISCOVERY"] !== "1") {
+  try {
+    await runtimeManager.start();
+  } catch (err) {
+    // Individual detector failures are represented as `missing`; this guard is
+    // only for an unexpected manager/storage failure. The rest of TodoAgent is
+    // still useful, and dispatch will refuse because no target can be `ready`.
+    console.error("Initial runtime detection failed:", err);
+  }
+}
 serve({ fetch: app.fetch, port: PORT, hostname: "127.0.0.1" }, (info) => {
   console.log(`TodoAgent engine on http://127.0.0.1:${info.port}`);
   console.log(`Database: ${defaultDbPath()}`);
@@ -2623,6 +3238,7 @@ serve({ fetch: app.fetch, port: PORT, hostname: "127.0.0.1" }, (info) => {
 // Cancel in-flight work rather than orphaning agent subprocesses on exit.
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
+    runtimeManager.stop();
     for (const [, controller] of active) controller.abort();
     // Chat deliveries too: they hold live CLI processes that would otherwise keep
     // writing replies into a database whose owner has already exited.

@@ -41,7 +41,13 @@ import {
   verifyPrompt,
   type ReworkContext,
 } from "./prompts.ts";
-import { BudgetExceededError, recordEvent, runOneWithRetry, runStructured } from "./runner.ts";
+import {
+  BudgetExceededError,
+  legacyExecutionOptions,
+  recordEvent,
+  runOneWithRetry,
+  runStructured,
+} from "./runner.ts";
 
 /** Hard caps. There is deliberately no "until they agree" condition anywhere. */
 export const MAX_ROUNDS = 2;
@@ -376,7 +382,7 @@ async function runSolo(ctx: Ctx): Promise<void> {
   const res = await runOneWithRetry({
     store: ctx.store,
     runId: ctx.run.id,
-    expert,
+    ...legacyExecutionOptions(expert),
     kind: "draft",
     subTaskId: null,
     prompt: soloPrompt({ run: ctx.run, expert, repoPath: ctx.repoPath }),
@@ -409,7 +415,7 @@ async function runSolo(ctx: Ctx): Promise<void> {
   const check = await runOneWithRetry({
     store: ctx.store,
     runId: ctx.run.id,
-    expert: verifier,
+    ...legacyExecutionOptions(verifier),
     kind: "verify",
     subTaskId: null,
     prompt: verifyPrompt({
@@ -440,7 +446,7 @@ async function phasePlan(ctx: Ctx, autoApprove: boolean): Promise<boolean> {
   const { value: plan, error } = await runStructured({
     store: ctx.store,
     runId: ctx.run.id,
-    expert: orchestrator,
+    ...legacyExecutionOptions(orchestrator),
     kind: "plan",
     subTaskId: null,
     prompt: planPrompt({ run: ctx.run, roster: ctx.roster, repoPath: ctx.repoPath }),
@@ -762,7 +768,7 @@ async function runSubTask(
       const draft = await runOneWithRetry({
         store: ctx.store,
         runId: ctx.run.id,
-        expert: author,
+        ...legacyExecutionOptions(author),
         kind: "draft",
         subTaskId: subTask.id,
         prompt: draftPrompt({
@@ -1024,7 +1030,7 @@ async function collectReviews(
     runStructured({
       store: ctx.store,
       runId: ctx.run.id,
-      expert: reviewer,
+      ...legacyExecutionOptions(reviewer),
       kind: "review",
       subTaskId: subTask.id,
       prompt: reviewPrompt({ run: ctx.run, subTask, diff, authorName: author.name, reviewer }),
@@ -1124,7 +1130,7 @@ async function settleVerifiableClaims(
       const { value } = await runStructured({
         store: ctx.store,
         runId: ctx.run.id,
-        expert: verifier,
+        ...legacyExecutionOptions(verifier),
         kind: "repro",
         subTaskId: subTask.id,
         prompt: reproPrompt({ subTask, review, worktreePath }),
@@ -1175,7 +1181,7 @@ async function collectRebuttals(
   const { value } = await runStructured({
     store: ctx.store,
     runId: ctx.run.id,
-    expert: author,
+    ...legacyExecutionOptions(author),
     kind: "rebuttal",
     subTaskId: subTask.id,
     prompt: rebuttalPrompt({ subTask, reviews: blocking, author }),
@@ -1219,7 +1225,7 @@ async function adjudicate(
   const { value } = await runStructured({
     store: ctx.store,
     runId: ctx.run.id,
-    expert: orchestrator,
+    ...legacyExecutionOptions(orchestrator),
     kind: "adjudicate",
     subTaskId: subTask.id,
     prompt: adjudicatePrompt({
@@ -1303,7 +1309,7 @@ export async function runDiscussion(
         res = await runOneWithRetry({
           store: ctx.store,
           runId: ctx.run.id,
-          expert: speaker,
+          ...legacyExecutionOptions(speaker),
           kind: "discuss",
           subTaskId: subTask.id,
           prompt: discussPrompt({
@@ -1423,7 +1429,7 @@ async function phaseVerify(ctx: Ctx, ledger: MergeLedger): Promise<void> {
   const res = await runOneWithRetry({
     store: ctx.store,
     runId: ctx.run.id,
-    expert: verifier,
+    ...legacyExecutionOptions(verifier),
     kind: "verify",
     subTaskId: null,
     prompt: verifyPrompt({ run: ctx.run, repoPath: ctx.repoPath, mergedSummary: summary }),

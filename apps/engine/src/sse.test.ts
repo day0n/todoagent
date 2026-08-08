@@ -69,7 +69,12 @@ async function boot(): Promise<Harness> {
   store.close();
 
   const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-    env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
+    env: {
+      ...process.env,
+      TODOAGENT_DB: dbPath,
+      TODOAGENT_PORT: String(PORT),
+      TODOAGENT_DISABLE_RUNTIME_DISCOVERY: "1",
+    },
     stdio: ["ignore", "pipe", "pipe"],
   });
 
@@ -261,7 +266,12 @@ test("SSE: a long history replays in full, not just the first page", async () =>
     store.close();
 
     const child = spawn(process.execPath, ["--experimental-strip-types", SERVER], {
-      env: { ...process.env, TODOAGENT_DB: dbPath, TODOAGENT_PORT: String(PORT) },
+      env: {
+        ...process.env,
+        TODOAGENT_DB: dbPath,
+        TODOAGENT_PORT: String(PORT),
+        TODOAGENT_DISABLE_RUNTIME_DISCOVERY: "1",
+      },
       stdio: ["ignore", "pipe", "pipe"],
     });
     try {

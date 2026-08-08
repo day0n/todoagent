@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../lib/api.ts";
 import type { RunResult, Task } from "../lib/types.ts";
 import { IconCaret, IconCheck, IconX } from "./icons.tsx";
+import { isRuntimeKind, runtimeLabel } from "../lib/runtime.ts";
 
 /**
  * What a finished run left behind, without leaving the task list.
@@ -178,6 +179,12 @@ export function ResultDrawer({
 
   const inReview = task.status === "in_review";
   const failed = task.status === "needs_you";
+  const executor =
+    result?.executor === null || result?.executor === undefined
+      ? null
+      : isRuntimeKind(result.executor)
+        ? runtimeLabel(result.executor)
+        : result.executor;
 
   return (
     <>
@@ -199,9 +206,7 @@ export function ResultDrawer({
             <div className="dtitle">{task.title}</div>
             <div className="dsub">
               {inReview ? "等你确认" : failed ? "需要你" : "已结束"}
-              {result?.executor !== null && result?.executor !== undefined
-                ? ` · ${result.executor}`
-                : null}
+              {executor === null ? null : ` · ${executor}`}
             </div>
           </div>
           <button type="button" className="act ghost" aria-label="关闭" onClick={onClose}>
@@ -216,7 +221,7 @@ export function ResultDrawer({
               reactions and the text alone does not always say which it is. */}
           {task.needsText !== null && task.needsText !== "" ? (
             <div className="dnote">
-              {task.needsKind === "question" ? <span className="dnl">agent 的问题</span> : null}
+              {task.needsKind === "question" ? <span className="dnl">本机 CLI 的问题</span> : null}
               {task.needsText}
             </div>
           ) : null}
@@ -268,7 +273,7 @@ export function ResultDrawer({
                 onClick={() => setShowOutput((v) => !v)}
               >
                 <IconCaret className="caret" />
-                agent 输出
+                CLI 输出
               </button>
               <pre className="outbody">
                 {showOutput || result.output.length <= OUTPUT_PREVIEW

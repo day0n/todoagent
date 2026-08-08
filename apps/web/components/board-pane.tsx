@@ -1,9 +1,14 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import { AnimatePresence, LayoutGroup, motion } from "motion/react";
 import type { BoardColumn, BoardResponse, Task, TodoList } from "../lib/types.ts";
-import { fmtDuration, isOverdue, isPinnedToday } from "../lib/api.ts";
+import { fmtDuration, isOverdue, isPinnedToday, localDayIso } from "../lib/api.ts";
 import { IconCheck, IconPlus, IconToday, IconX } from "./icons.tsx";
+import { ConfirmButton } from "./overlays.tsx";
+import { AnimatedText } from "./animated-text.tsx";
+import { GlowingEffect } from "./glowing-effect.tsx";
 import type { AnswerControls, RowOps } from "./task-pane.tsx";
 
 /**
@@ -77,6 +82,15 @@ export function BoardPane({
 }) {
   const repoByList = new Map(lists.map((l) => [l.id, l.repoPath]));
   const nameByList = new Map(lists.map((l) => [l.id, l.name]));
+  const boardTasks = board?.columns.flatMap((column) => column.tasks) ?? [];
+  const boardStats = {
+    needs: boardTasks.filter((task) => task.status === "needs_you").length,
+    running: boardTasks.filter((task) => task.status === "in_progress").length,
+    review: boardTasks.filter((task) => task.status === "in_review").length,
+    done: boardTasks.filter((task) => task.status === "done").length,
+    total: boardTasks.length,
+  };
+  const isTodayBoard = board !== null && board.today === localDayIso();
 
   /** Which column's inline add is open. Only one at a time. */
   const [adding, setAdding] = useState<BoardColumn["key"] | null>(null);
@@ -97,7 +111,7 @@ export function BoardPane({
       if (el instanceof HTMLElement && el.isContentEditable) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
       // A dialog owns the keyboard while it is open.
-      if (document.querySelector(".drawer") !== null) return;
+      if (document.querySelector('[role="dialog"]') !== null) return;
 
       // Prevented so `/` does not open Firefox's quick-find and `n` does not type
       // itself into the field about to be focused.
@@ -113,8 +127,10 @@ export function BoardPane({
   return (
     <main className="board">
       <div className="board-top">
-        <div className="crumb">今天</div>
-        <Subtitle runtimeCount={runtimeCount} />
+        <div className="board-head-copy">
+          <div className="crumb">时间线</div>
+          <Subtitle date={board?.today ?? null} runtimeCount={runtimeCount} />
+        </div>
         <button
           type="button"
           className="add-btn"
@@ -127,6 +143,8 @@ export function BoardPane({
           新建任务
         </button>
       </div>
+
+      <BoardOverview stats={boardStats} runtimeCount={runtimeCount} />
 
       {/*
         Three states with three different truths, and saying the wrong one is worse
@@ -149,32 +167,105 @@ export function BoardPane({
           ) : null}
         </p>
       ) : (
-        <div className="cols">
-          {(board?.columns ?? []).map((col) => (
-            <Column
-              key={col.key}
-              col={col}
-              repoByList={repoByList}
-              nameByList={nameByList}
-              executorFor={executorFor}
-              adding={adding === col.key}
-              addRef={adding === col.key ? addRef : undefined}
-              onOpenAdd={() => setAdding(col.key)}
-              onCloseAdd={() => setAdding(null)}
-              onAdd={onAdd}
-              onToggleDone={onToggleDone}
-              onRenameTask={onRenameTask}
-              onDispatch={onDispatch}
-              onCancel={onCancel}
-              onDelete={onDelete}
-              onOpenResult={onOpenResult}
-              answer={answer}
-              rowOps={rowOps}
-            />
-          ))}
-        </div>
+        <LayoutGroup id={`timeline-${board?.today ?? "loading"}`}>
+          <div className="cols">
+            {(board?.columns ?? []).map((col) => (
+              <Column
+                key={col.key}
+                col={col}
+                isTodayBoard={isTodayBoard}
+                repoByList={repoByList}
+                nameByList={nameByList}
+                executorFor={executorFor}
+                adding={adding === col.key}
+                addRef={adding === col.key ? addRef : undefined}
+                onOpenAdd={() => setAdding(col.key)}
+                onCloseAdd={() => setAdding(null)}
+                onAdd={onAdd}
+                onToggleDone={onToggleDone}
+                onRenameTask={onRenameTask}
+                onDispatch={onDispatch}
+                onCancel={onCancel}
+                onDelete={onDelete}
+                onOpenResult={onOpenResult}
+                answer={answer}
+                rowOps={rowOps}
+              />
+            ))}
+          </div>
+        </LayoutGroup>
       )}
     </main>
+  );
+}
+
+function BoardOverview({
+  stats,
+  runtimeCount,
+}: {
+  stats: { needs: number; running: number; review: number; done: number; total: number };
+  runtimeCount: number | null;
+}) {
+  const headline =
+    stats.needs > 0
+      ? `${stats.needs} 件任务正在等你决定`
+      : stats.review > 0
+        ? `${stats.review} 项成果等待你的确认`
+        : stats.running > 0
+          ? `${stats.running} 个本机 CLI 正在推进任务`
+          : stats.total > 0
+            ? "选一件事，选择本机 CLI 开始推进"
+            : "今天从一件值得完成的事开始";
+
+  return (
+    <section className="board-overview" aria-label="今日工作概览">
+      <div className="overview-lead">
+        <div className="overview-kicker">
+          <span className="pulse-dot" aria-hidden="true" />
+          本机 CLI 工作台
+        </div>
+        <h1>
+          <AnimatedText>{headline}</AnimatedText>
+        </h1>
+        <p>
+          {stats.running > 0
+            ? "任务会持续推进，只有需要判断时才会回来找你。"
+            : "派发后可以离开这里，TodoAgent 会在关键节点通知你。"}
+        </p>
+      </div>
+
+      <div className="overview-stats" aria-label="任务状态">
+        <OverviewStat tone="warn" label="需要你" value={stats.needs} />
+        <OverviewStat tone="live" label="执行中" value={stats.running} />
+        <OverviewStat tone="ok" label="待确认" value={stats.review} />
+      </div>
+
+      <div className="runtime-ready">
+        <span className="ready-dot" aria-hidden="true" />
+        {runtimeCount === null ? "正在检查本机 CLI" : `${runtimeCount} 个 CLI 已验证可用`}
+      </div>
+    </section>
+  );
+}
+
+function OverviewStat({
+  tone,
+  label,
+  value,
+}: {
+  tone: "warn" | "live" | "ok";
+  label: string;
+  value: number;
+}) {
+  return (
+    <div className={`overview-stat ${tone}`}>
+      <span>{label}</span>
+      <strong>
+        <AnimatedText variant="number" animation="snappy">
+          {value}
+        </AnimatedText>
+      </strong>
+    </div>
   );
 }
 
@@ -185,24 +276,24 @@ export function BoardPane({
  * and emitting it during SSR would produce a different string on a server elsewhere —
  * a hydration mismatch React resolves by blanking the node.
  */
-function Subtitle({ runtimeCount }: { runtimeCount: number | null }) {
-  const [today, setToday] = useState<string | null>(null);
-
-  useEffect(() => {
-    const d = new Date();
-    setToday(`${d.getMonth() + 1}月${d.getDate()}日 星期${WEEKDAYS[d.getDay()]}`);
-  }, []);
+function Subtitle({ date, runtimeCount }: { date: string | null; runtimeCount: number | null }) {
+  const selected = date === null ? null : new Date(`${date}T12:00:00`);
+  const label =
+    selected === null
+      ? " "
+      : `${selected.getMonth() + 1}月${selected.getDate()}日 星期${WEEKDAYS[selected.getDay()]}`;
 
   return (
     <div className="crumb-sub">
-      {today ?? " "}
-      {today !== null && runtimeCount !== null ? ` · ${runtimeCount} 个 agent 待命` : null}
+      {label}
+      {selected !== null && runtimeCount !== null ? ` · ${runtimeCount} 个 CLI 可用` : null}
     </div>
   );
 }
 
 function Column({
   col,
+  isTodayBoard,
   repoByList,
   nameByList,
   executorFor,
@@ -221,6 +312,7 @@ function Column({
   rowOps,
 }: {
   col: BoardColumn;
+  isTodayBoard: boolean;
   repoByList: Map<string, string | null>;
   nameByList: Map<string, string>;
   executorFor: (task: Task) => string | null;
@@ -264,7 +356,9 @@ function Column({
         <span className="day">
           {heading}
         </span>
-        {col.key === "today" ? <span className="links">{COLUMN_LABEL.today}</span> : null}
+        {col.key === "today" ? (
+          <span className="links">{isTodayBoard ? COLUMN_LABEL.today : "所选"}</span>
+        ) : null}
       </div>
       <div className="col-date">
         {dated ? formatColDate(col.date) : "没有截止日期，或更远"}
@@ -277,7 +371,7 @@ function Column({
           aria-valuenow={col.done}
           aria-valuemin={0}
           aria-valuemax={col.total}
-          aria-label={`今天完成 ${col.done} / ${col.total}`}
+          aria-label={`${isTodayBoard ? "今天" : "所选日期"}完成 ${col.done} / ${col.total}`}
         >
           <i style={{ width: `${pct}%` }} />
         </div>
@@ -287,23 +381,35 @@ function Column({
         <div className="col-bar-spacer" aria-hidden="true" />
       )}
 
-      {col.tasks.map((task) => (
-        <TaskCard
-          key={task.id}
-          task={task}
-          repoPath={repoByList.get(task.channelId) ?? null}
-          listName={nameByList.get(task.channelId) ?? null}
-          executor={executorFor(task)}
-          onToggleDone={onToggleDone}
-          onRenameTask={onRenameTask}
-          onDispatch={onDispatch}
-          onCancel={onCancel}
-          onDelete={onDelete}
-          onOpenResult={onOpenResult}
-          answer={answer}
-          rowOps={rowOps}
-        />
-      ))}
+      <AnimatePresence initial={false} mode="popLayout">
+        {col.tasks.map((task) => (
+          <motion.div
+            key={task.id}
+            layout="position"
+            layoutId={`timeline-task-${task.id}`}
+            className="tcard-motion"
+            initial={{ opacity: 0, y: 6, scale: 0.985 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -4, scale: 0.985 }}
+            transition={{ duration: 0.22, ease: [0.2, 0.8, 0.2, 1] }}
+          >
+            <TaskCard
+              task={task}
+              repoPath={repoByList.get(task.channelId) ?? null}
+              listName={nameByList.get(task.channelId) ?? null}
+              executor={executorFor(task)}
+              onToggleDone={onToggleDone}
+              onRenameTask={onRenameTask}
+              onDispatch={onDispatch}
+              onCancel={onCancel}
+              onDelete={onDelete}
+              onOpenResult={onOpenResult}
+              answer={answer}
+              rowOps={rowOps}
+            />
+          </motion.div>
+        ))}
+      </AnimatePresence>
 
       {adding ? (
         <InlineAdd
@@ -375,8 +481,9 @@ function TaskCard({
 
   return (
     <article
-      className={`tcard${needs ? " needs" : ""}${running ? " run" : ""}${done ? " done" : ""}`}
+      className={`tcard${needs ? " needs" : ""}${running ? " run" : ""}${review ? " review" : ""}${done ? " done" : ""}`}
     >
+      <GlowingEffect active={running || needs || review} />
       <div className="tcard-top">
         <button
           type="button"
@@ -425,6 +532,8 @@ function TaskCard({
         )}
       </div>
 
+      <TaskStatusLine task={task} executor={executor} />
+
       {/*
         The badge row: what this card IS, in one glance.
 
@@ -433,32 +542,13 @@ function TaskCard({
         you watch, and one shared accent would make them indistinguishable.
       */}
       <div className="badges">
-        {needs ? <span className="badge needs">需要你</span> : null}
-        {running ? <span className="badge run">运行中</span> : null}
-        {review ? <span className="badge review">待确认</span> : null}
-
-        {/* The agent, when one is involved — the mockup pairs it with 需要你. */}
-        {(needs || running) && executor !== null ? (
-          <span className="badge agent">{executor}</span>
-        ) : null}
-
         {/* Which list, so a board mixing several stays legible. */}
-        {listName !== null && !needs && !running ? (
-          <span className="badge">{listName}</span>
-        ) : null}
+        {listName !== null ? <span className="badge">{listName}</span> : null}
 
         {task.dueDate !== null && overdue ? <span className="badge late">逾期</span> : null}
-
-        {/*
-          Elapsed time on a running card.
-
-          Measured from `updatedAt`, which is stamped when the status became
-          in_progress — the task carries no run start of its own. It updates without
-          a timer here because a live run polls every four seconds anyway, so the
-          re-render arrives for free.
-        */}
-        {running ? <span className="time">{fmtDuration(task.updatedAt, null)}</span> : null}
       </div>
+
+      {!needs && task.note.trim() !== "" ? <p className="tcard-note">{task.note}</p> : null}
 
       {/* The parked question, in full. The card is the only place it fits. */}
       {needs && task.needsText !== null && task.needsText !== "" ? (
@@ -494,30 +584,53 @@ function TaskCard({
           type="button"
           className={`act ghost sun${pinned ? " on" : ""}`}
           aria-pressed={pinned}
-          aria-label={pinned ? `从我的一天移出「${task.title}」` : `加入我的一天：「${task.title}」`}
-          title={pinned ? "从我的一天移出" : "加入我的一天"}
+          aria-label={pinned ? `从今天移出「${task.title}」` : `加入今天：「${task.title}」`}
+          title={pinned ? "从今天移出" : "加入今天"}
           onClick={() => rowOps.onToggleMyDay(task)}
         >
           <IconToday />
         </button>
 
-        <button
-          type="button"
+        <ConfirmButton
           className="act ghost"
-          aria-label={`删除「${task.title}」`}
+          ariaLabel={`删除「${task.title}」`}
           title="删除"
-          onClick={() => {
-            if (window.confirm(`删除「${task.title}」？`)) onDelete(task);
-          }}
+          heading={`删除「${task.title}」？`}
+          description="任务及其对话记录会被永久删除，这个操作无法撤销。"
+          confirmLabel="删除任务"
+          onConfirm={() => onDelete(task)}
         >
           <IconX />
-        </button>
+        </ConfirmButton>
       </div>
 
       {answer.activeId === task.id ? (
         <AnswerBar task={task} onSubmit={answer.onSubmit} onCancel={answer.onCancel} />
       ) : null}
     </article>
+  );
+}
+
+function TaskStatusLine({ task, executor }: { task: Task; executor: string | null }) {
+  const status =
+    task.status === "needs_you"
+      ? { tone: "warn", label: "等待你的回答" }
+      : task.status === "in_progress"
+        ? { tone: "live", label: executor === null ? "本机 CLI 正在执行" : `${executor} 正在执行` }
+        : task.status === "in_review"
+          ? { tone: "ok", label: "执行完成，等待确认" }
+          : task.status === "done"
+            ? { tone: "done", label: "已完成" }
+            : { tone: "idle", label: "等待派发" };
+
+  return (
+    <div className={`tcard-status ${status.tone}`}>
+      <span className="status-dot" aria-hidden="true" />
+      <span>{status.label}</span>
+      {task.status === "in_progress" ? (
+        <time>{fmtDuration(task.updatedAt, null)}</time>
+      ) : null}
+    </div>
   );
 }
 
@@ -545,118 +658,30 @@ function CardAction({
   onStartAnswer: (task: Task) => void;
 }) {
   if (task.status === "todo") {
-    /*
-     * No repository on the list means no working directory. The button used to be
-     * omitted entirely on the grounds that a dead control cannot explain itself —
-     * and the first dogfooding session hit exactly the failure mode that reasoning
-     * produces: every card silently undispatchable, and nothing anywhere saying
-     * why. Now that a repo can be bound in place (清单菜单 → 绑定仓库), the button
-     * can stay and point at the fix.
-     */
-    if (!canDispatch) {
-      return (
-        <button
-          type="button"
-          className="act ghost"
-          title="清单未绑定仓库，不能派发"
-          onClick={() =>
-            window.alert("这个清单没有绑定仓库，任务无处执行。\n侧栏里打开清单菜单（⋯）→「绑定仓库…」，填一个 git 仓库路径后就能派发了。")
-          }
-        >
-          派发
-        </button>
-      );
-    }
-    return (
-      <button type="button" className="act" onClick={() => onDispatch(task)}>
-        派发
-      </button>
-    );
+    return <Link href={`/tasks/${task.id}`} className="act">开始对话</Link>;
   }
 
   if (task.status === "in_progress") {
     return (
-      <button
-        type="button"
-        className="act"
-        onClick={() => {
-          // Confirmed once: this kills a live CLI process, and whatever it had done
-          // so far in the working tree stays there.
-          if (window.confirm(`取消执行「${task.title}」？已经改动的文件会留在工作区。`)) {
-            onCancel(task);
-          }
-        }}
-      >
-        取消
-      </button>
-    );
-  }
-
-  /*
-   * A parked card with no run behind it.
-   *
-   * 查看 cannot be the answer because there is no result to show, and 重派 would be
-   * the wrong word for work that never started. Dispatching is what unsticks it.
-   */
-  if (task.runId === null) {
-    if (task.status !== "needs_you") return null;
-    // Same story as the todo branch: a parked card on an unbound list still
-    // deserves a button that says what would unstick it.
-    if (!canDispatch) {
-      return (
-        <button
-          type="button"
-          className="act ghost"
-          title="清单未绑定仓库，不能派发"
-          onClick={() =>
-            window.alert("这个清单没有绑定仓库，任务无处执行。\n侧栏里打开清单菜单（⋯）→「绑定仓库…」，填一个 git 仓库路径后就能派发了。")
-          }
-        >
-          派发
-        </button>
-      );
-    }
-    return (
-      <button type="button" className="act" onClick={() => onDispatch(task)}>
-        派发
-      </button>
-    );
-  }
-
-  if (task.status === "in_review") {
-    return (
-      <button type="button" className="act" onClick={() => onOpenResult(task)}>
-        看结果
-      </button>
-    );
-  }
-
-  if (task.status === "needs_you") {
-    if (task.needsKind === "question") {
-      return (
-        <>
-          <button type="button" className="act" onClick={() => onStartAnswer(task)}>
-            回答
-          </button>
-          <button type="button" className="act" onClick={() => onOpenResult(task)}>
-            查看
-          </button>
-        </>
-      );
-    }
-    return (
       <>
-        {canDispatch ? (
-          <button type="button" className="act" onClick={() => onDispatch(task)}>
-            重派
-          </button>
-        ) : null}
-        <button type="button" className="act" onClick={() => onOpenResult(task)}>
-          查看
-        </button>
+        <Link href={`/tasks/${task.id}`} className="act">查看对话</Link>
+        <ConfirmButton
+          className="act ghost"
+          heading={`取消执行「${task.title}」？`}
+          description="CLI 会停止，但已经写入工作目录的文件改动会保留。"
+          confirmLabel="停止执行"
+          onConfirm={() => onCancel(task)}
+        >取消</ConfirmButton>
       </>
     );
   }
+  if (task.status === "needs_you" || task.status === "in_review") {
+    return <Link href={`/tasks/${task.id}`} className="act">继续对话</Link>;
+  }
+  void canDispatch;
+  void onDispatch;
+  void onOpenResult;
+  void onStartAnswer;
   return null;
 }
 
@@ -692,7 +717,7 @@ function AnswerBar({
         className="ain"
         value={draft}
         rows={2}
-        placeholder="回答它，agent 会接着做"
+        placeholder="回答后，CLI 会接着做"
         aria-label={`回答「${task.title}」`}
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {

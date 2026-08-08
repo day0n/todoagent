@@ -9,6 +9,7 @@ import {
   type LineContext,
 } from "./process.ts";
 import {
+  execPathForRuntime,
   filterBlockedArgs,
   type AgentAdapter,
   type AgentEvent,
@@ -147,7 +148,7 @@ export class GeminiAdapter implements AgentAdapter {
 
   execute(prompt: string, opts: ExecOptions) {
     return spawnStream({
-      execPath: "gemini",
+      execPath: execPathForRuntime(this.kind, opts),
       args: buildArgs(prompt, opts),
       cwd: opts.cwd,
       onLine: parseGeminiLine,

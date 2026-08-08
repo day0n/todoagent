@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, writeFile, rm, access } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { defaultExecutableForRuntime } from "../adapters/index.ts";
 import { Store } from "../db/index.ts";
-import { detectAll } from "../adapters/index.ts";
+import { RUNTIME_KINDS } from "../types.ts";
 
 /**
  * What `pnpm seed` actually writes.
@@ -15,9 +16,11 @@ import { detectAll } from "../adapters/index.ts";
  * exercise the real entry point — argv parsing, the git check, and the exit code all
  * live in `main()`.
  *
- * PATH is stubbed with exactly one fake `claude` so the result does not depend on
- * which CLIs the machine happens to have installed. Without that, this suite would
- * assert a different number of experts on every developer's laptop.
+ * PATH is stubbed with all six supported CLI names, ahead of the small system PATH
+ * needed for Git. `which()` also searches common install directories, so stubbing
+ * only Claude is insufficient: another developer's real Codex could otherwise be
+ * version-probed by this test. Providing all six names guarantees every CLI process
+ * is ours, and the invocation log verifies seed only asks for `--version`.
  */
 
 const SEED = join(fileURLToPath(new URL(".", import.meta.url)), "seed.ts");
@@ -27,6 +30,7 @@ interface Fixture {
   dbPath: string;
   repo: string;
   stubbedPath: string;
+  stubLog: string;
   dispose: () => Promise<void>;
 }
 
@@ -53,21 +57,25 @@ async function fixture(): Promise<Fixture> {
     repo,
   );
 
-  /*
-   * A stub that answers `--version` and nothing else.
-   *
-   * `detect()` resolves the executable and probes its version; it never runs a turn,
-   * so this is enough to make seed believe claude is installed.
-   */
-  const stub = join(binDir, "claude");
-  await writeFile(stub, "#!/usr/bin/env node\nprocess.stdout.write('9.9.9 (stub)\\n');\n", "utf8");
-  await chmod(stub, 0o755);
+  const stubLog = join(root, "cli-invocations.log");
+  for (const kind of RUNTIME_KINDS) {
+    const stub = join(binDir, defaultExecutableForRuntime(kind));
+    await writeFile(
+      stub,
+      "#!/bin/sh\nprintf '%s %s\\n' \"$0\" \"$*\" >> \"$TODOAGENT_STUB_LOG\"\nprintf '9.9.9 (stub)\\n'\n",
+      "utf8",
+    );
+    await chmod(stub, 0o755);
+  }
 
   return {
     root,
     dbPath: join(root, "seed.db"),
     repo,
-    stubbedPath: `${binDir}${delimiter}${process.env["PATH"] ?? ""}`,
+    // Deliberately excludes the ambient PATH. Git is the only external program
+    // seed needs besides our six stubs, and macOS/Linux provide it in these dirs.
+    stubbedPath: [binDir, "/usr/bin", "/bin"].join(delimiter),
+    stubLog,
     dispose: () => rm(root, { recursive: true, force: true }),
   };
 }
@@ -83,6 +91,7 @@ function seed(f: Fixture, args: string[], opts: { db?: string } = {}): Promise<R
       env: {
         ...process.env,
         TODOAGENT_DB: opts.db ?? f.dbPath,
+        TODOAGENT_STUB_LOG: f.stubLog,
         PATH: f.stubbedPath,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -94,7 +103,7 @@ function seed(f: Fixture, args: string[], opts: { db?: string } = {}): Promise<R
   });
 }
 
-test("seed <repo>: an expert, the inbox, and a list bound to the repository", async () => {
+test("seed <repo>: detected CLIs and one repository-bound list without experts or an inbox", async () => {
   const f = await fixture();
   try {
     const res = await seed(f, [f.repo]);
@@ -102,40 +111,12 @@ test("seed <repo>: an expert, the inbox, and a list bound to the repository", as
 
     const store = new Store(f.dbPath);
     try {
-      /*
-       * One expert per DETECTED runtime — computed here rather than written as a
-       * number.
-       *
-       * A stubbed PATH cannot make this deterministic: `which()` also searches
-       * /opt/homebrew/bin, /usr/local/bin, ~/.local/bin and ~/.bun/bin
-       * unconditionally, deliberately, so that a GUI-launched process with a minimal
-       * PATH does not report every CLI as missing. Asserting a hard-coded count
-       * therefore passes only on a machine with exactly that many CLIs installed.
-       * The real contract is the mapping, and that is what this checks.
-       */
-      const detected = await detectAll();
-      const experts = store.listExperts();
-      assert.equal(experts.length, detected.length, "one expert per detected CLI");
-      assert.deepEqual(
-        [...new Set(experts.map((e) => e.runtimeKind))].sort(),
-        [...new Set(detected.map((d) => d.kind))].sort(),
-        "and they cover exactly the runtimes that were found",
-      );
-      for (const e of experts) {
-        assert.ok(e.name.length > 0, "each expert is named from its profile");
-        assert.ok(e.systemPrompt.length > 0, `${e.name} carries its profile's prompt`);
-      }
+      assert.equal(store.listExperts().length, 0, "CLI detection must not manufacture personas");
+      assert.match(res.out, /本机 CLI/);
+      for (const kind of RUNTIME_KINDS) assert.match(res.out, new RegExp(`\\b${kind}\\b`));
 
       const lists = store.listChannels().filter((ch) => ch.kind === "channel");
-      /*
-       * The inbox's name must match the engine's `DEFAULT_LIST_NAME` exactly. The
-       * engine finds its inbox by name and creates one on demand if it cannot, so a
-       * different spelling here leaves the user with two inboxes and their tasks
-       * split between them.
-       */
-      const inbox = lists.find((ch) => ch.name === "收件箱");
-      assert.ok(inbox, `expected an inbox, saw ${lists.map((l) => l.name).join(", ")}`);
-      assert.equal(inbox.projectId, null, "the inbox is a plain todo list");
+      assert.ok(!lists.some((ch) => ch.name === "收件箱"), "seed must not invent a default inbox");
 
       const bound = lists.find((ch) => ch.name === "myrepo");
       assert.ok(bound, "a list named after the repository directory");
@@ -146,17 +127,13 @@ test("seed <repo>: an expert, the inbox, and a list bound to the repository", as
       assert.equal(project.repoPath, f.repo);
 
       /*
-       * `project.team_id` is NOT NULL — pipeline-era schema. A stub team satisfies
-       * it, matching what `POST /api/lists` does, and every expert joins in every
-       * role so the retained six-phase route does not 500 on a seeded project.
+       * `project.team_id` is NOT NULL — pipeline-era schema. The compatibility
+       * Team is internal and deliberately empty: direct CLI dispatch has no roster.
        */
-      assert.ok(project.teamId, "a stub team satisfies the NOT NULL column");
+      assert.ok(project.teamId, "an internal team satisfies the NOT NULL column");
+      assert.equal(store.getTeamByName("todoagent-internal")?.id, project.teamId);
       const members = store.listTeamMembers(project.teamId);
-      assert.ok(members.length > 0, "the roster is populated");
-      const roles = new Set(members.map((m) => m.role));
-      for (const role of ["orchestrator", "maker", "reviewer", "verifier"]) {
-        assert.ok(roles.has(role as never), `role ${role} is covered`);
-      }
+      assert.deepEqual(members, [], "no Expert is assigned a role");
 
       // No DMs. `GET /api/lists` returns only `kind: "channel"`, so a DM created
       // here would be invisible in the product being seeded.
@@ -165,6 +142,17 @@ test("seed <repo>: an expert, the inbox, and a list bound to the repository", as
         0,
         "seed no longer creates DM channels",
       );
+
+      const invocations = (await readFile(f.stubLog, "utf8"))
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+      assert.equal(invocations.length, RUNTIME_KINDS.length, "each CLI is version-probed once");
+      assert.deepEqual(
+        invocations.map((line) => basename(line.split(" ")[0] ?? "")).sort(),
+        RUNTIME_KINDS.map(defaultExecutableForRuntime).sort(),
+      );
+      assert.ok(invocations.every((line) => line.endsWith(" --version")), "seed never runs a real turn");
     } finally {
       store.close();
     }
@@ -181,16 +169,13 @@ test("seed: re-running finds what exists instead of stacking duplicates", async 
 
     const store = new Store(f.dbPath);
     try {
-      // Experts are reused BY NAME, so two runs must leave as many as one run did.
-      assert.equal(
-        store.listExperts().length,
-        (await detectAll()).length,
-        "re-seeding reuses experts by name rather than duplicating them",
-      );
+      assert.equal(store.listExperts().length, 0);
       const lists = store.listChannels().filter((ch) => ch.kind === "channel");
-      assert.equal(lists.filter((l) => l.name === "收件箱").length, 1);
       assert.equal(lists.filter((l) => l.name === "myrepo").length, 1);
+      assert.equal(lists.length, 1);
       assert.equal(store.listProjects().length, 1, "the project is matched by repo path");
+      assert.equal(store.listTeams().length, 1, "the internal compatibility team is reused");
+      assert.equal(store.listTeamMembers(store.listTeams()[0]?.id ?? "").length, 0);
     } finally {
       store.close();
     }
@@ -199,7 +184,7 @@ test("seed: re-running finds what exists instead of stacking duplicates", async 
   }
 });
 
-test("seed with no argument: agents and the inbox, and it says nothing can run yet", async () => {
+test("seed with no argument: detects CLIs but creates no inbox, identity, or project rows", async () => {
   const f = await fixture();
   try {
     const res = await seed(f, []);
@@ -209,9 +194,10 @@ test("seed with no argument: agents and the inbox, and it says nothing can run y
 
     const store = new Store(f.dbPath);
     try {
-      assert.ok(store.listExperts().length > 0, "agents are still created");
+      assert.equal(store.listExperts().length, 0);
+      assert.equal(store.listTeams().length, 0, "no project means no compatibility Team is needed");
       const lists = store.listChannels().filter((ch) => ch.kind === "channel");
-      assert.deepEqual(lists.map((l) => l.name), ["收件箱"]);
+      assert.deepEqual(lists, []);
       assert.equal(store.listProjects().length, 0, "no repository means no project");
     } finally {
       store.close();
@@ -245,18 +231,3 @@ test("seed: a path that is not a git repository is refused, and nothing is writt
     await f.dispose();
   }
 });
-
-/*
- * NOT TESTED HERE: the "no CLI installed" path.
- *
- * It cannot be reached from a test on a machine that has any agent CLI. `which()`
- * searches /opt/homebrew/bin, /usr/local/bin, ~/.local/bin and ~/.bun/bin in
- * addition to PATH — unconditionally and on purpose, so that a GUI-launched process
- * with a minimal PATH does not report every CLI as missing (see util/which.ts).
- * Scrubbing PATH therefore proves nothing, and a test that passed only on a machine
- * with zero CLIs installed would be worse than no test: it would sit green in CI
- * while asserting nothing.
- *
- * The branch itself is three lines — `detected.length === 0` prints a message naming
- * the CLIs to install and sets exit code 1 — and is exercised by hand.
- */

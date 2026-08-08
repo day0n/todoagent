@@ -9,6 +9,38 @@
 
 export type RuntimeKind = "claude" | "codex" | "cursor" | "gemini" | "kiro" | "grok";
 
+/** The Runtime Manager's persisted view of one supported local CLI. */
+export type RuntimeStatus =
+  | "missing"
+  | "unverified"
+  | "verifying"
+  | "ready"
+  | "auth_required"
+  | "error";
+
+export interface RuntimeInfo {
+  kind: RuntimeKind;
+  label: string;
+  status: RuntimeStatus;
+  execPath: string | null;
+  version: string | null;
+  detectedAt: string | null;
+  verifiedAt: string | null;
+  verifyError: string | null;
+  activeRuns: number;
+}
+
+/**
+ * Runtime discovery's new shape plus the old fields kept during the migration.
+ * New UI reads `runtimes`; older clients can continue reading the three mirrors.
+ */
+export interface RuntimeEnvelope {
+  runtimes: RuntimeInfo[];
+  detected: DetectedRuntime[];
+  known: string[];
+  missing: string[];
+}
+
 export type Phase = "plan" | "draft" | "review" | "rebuttal" | "adjudicate" | "verify";
 
 export const PHASE_ORDER: readonly Phase[] = [
@@ -50,6 +82,12 @@ export interface Run {
   id: string;
   projectId: string;
   projectName?: string;
+  taskId?: string | null;
+  parentRunId?: string | null;
+  trigger?: "dispatch" | "task_chat" | null;
+  userMessage?: string | null;
+  repositoryRoot?: string | null;
+  workingDirectory?: string | null;
   goal: string;
   acceptance: string | null;
   status: RunStatus;
@@ -63,6 +101,10 @@ export interface Run {
   createdAt: string;
   endedAt: string | null;
   error: string | null;
+  /** Immutable local CLI snapshot captured when this run was dispatched. */
+  runtimeKind?: RuntimeKind | null;
+  runtimeExecPath?: string | null;
+  runtimeVersion?: string | null;
 }
 
 export type SubTaskStatus =
@@ -93,7 +135,8 @@ export interface Attempt {
   id: string;
   runId: string;
   subTaskId: string | null;
-  expertId: string;
+  /** Null for the direct local-CLI path; retained for historical pipeline attempts. */
+  expertId: string | null;
   expertName?: string;
   runtimeKind: RuntimeKind;
   kind: "plan" | "draft" | "review" | "rebuttal" | "adjudicate" | "verify" | "discuss" | "repro";
@@ -282,6 +325,8 @@ export interface TodoList {
 
 /** Sidebar counts for the three aggregated views, computed by the engine. */
 export interface ViewCounts {
+  /** All unfinished tasks across the system Tasks view. */
+  tasks: number;
   today: number;
   needs: number;
   /** Tasks with a live run, for the sidebar's 状态 section. */
@@ -308,7 +353,7 @@ export interface ListsResponse {
  * `api.tasks()`. That split is why `isBoardView` exists rather than callers
  * comparing strings.
  */
-export type ViewKey = "today" | "needs" | "running" | "done" | `list:${string}`;
+export type ViewKey = "today" | "tasks" | "needs" | "running" | "done" | `list:${string}`;
 
 /** Does this view render as the day board? Only 我的一天 does. */
 export function isBoardView(view: ViewKey): boolean {
@@ -358,7 +403,7 @@ export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
  */
 export type SettableTaskStatus = Exclude<TaskStatus, "needs_you">;
 
-export type NeedsKind = "question" | "blocked" | "failed";
+export type NeedsKind = "question" | "reply" | "blocked" | "failed";
 
 export interface Task {
   id: string;
@@ -384,6 +429,10 @@ export interface Task {
   creatorId: string | null;
   sourceMessageId: string | null;
   runId: string | null;
+  /** CLI explicitly chosen for the latest dispatch, if this task has been run. */
+  runtimeKind?: RuntimeKind | null;
+  /** Locked working directory for this task's CLI conversation. */
+  workingDirectory?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -441,6 +490,32 @@ export interface RunResult {
   output: string | null;
   /** Runtime that did the work, e.g. "codex". Null when no attempt exists. */
   executor: string | null;
+}
+
+export interface TaskThreadTurn {
+  run: Run;
+  message: string;
+  output: string | null;
+  executor: string | null;
+  attempts: Attempt[];
+  /** Durable, user-visible execution record for this turn. */
+  events: StreamEvent[];
+}
+
+export interface AssistantWorkspace {
+  path: string;
+  memory: string;
+  refs: string[];
+}
+
+export interface TaskThread {
+  task: Task;
+  list: { id: string; name: string } | null;
+  defaultWorkingDirectory: string | null;
+  knownWorkspaces: Array<{ name: string; path: string }>;
+  turns: TaskThreadTurn[];
+  activeRunId: string | null;
+  replyCount: number;
 }
 
 /**
