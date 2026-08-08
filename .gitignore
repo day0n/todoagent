@@ -10,3 +10,7 @@ dist/
 
 # TypeScript incremental build state — machine-local, churns on every typecheck.
 *.tsbuildinfo
+
+# Native macOS and Rust build products.
+apps/macos/.build/
+apps/engine-rs/target/
