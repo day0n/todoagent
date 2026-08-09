@@ -5,20 +5,26 @@ struct TaskConversationSheet: View {
     let task: TaskItem
     let state: AppState
 
-    @Environment(\.dismiss) private var dismiss
     @State private var draft = ""
     @State private var isSubmitting = false
 
     var body: some View {
         Group {
-            if let session = state.conversation(for: task) {
+            if state.isLoadingSession(for: task) {
+                TaskSessionLoadingView(task: task, onClose: close)
+            } else if let session = state.conversation(for: task) {
                 conversation(session)
             } else {
-                TaskSessionSetupView(task: task, state: state)
+                TaskSessionSetupView(
+                    task: task,
+                    state: state,
+                    onClose: close
+                )
             }
         }
         .frame(minWidth: 900, idealWidth: 980, minHeight: 620, idealHeight: 700)
         .accessibilityIdentifier("task.session.\(task.id.uuidString)")
+        .onDisappear { state.dismissTaskSession(taskID: task.id) }
     }
 
     private func conversation(_ session: TaskConversationSnapshot) -> some View {
@@ -64,7 +70,7 @@ struct TaskConversationSheet: View {
                 }
             }
 
-            Button("关闭", systemImage: "xmark", action: dismiss.callAsFunction)
+            Button("关闭", systemImage: "xmark", action: close)
                 .labelStyle(.iconOnly)
                 .buttonStyle(.borderless)
                 .help("关闭会话")
@@ -159,13 +165,47 @@ struct TaskConversationSheet: View {
             isSubmitting = false
         }
     }
+
+    private func close() {
+        state.dismissTaskSession(taskID: task.id)
+    }
+}
+
+private struct TaskSessionLoadingView: View {
+    let task: TaskItem
+    let onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(task.title)
+                        .font(.title2.bold())
+                    Text("正在载入本地 Agent Session")
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("关闭", systemImage: "xmark", action: onClose)
+                    .labelStyle(.iconOnly)
+                    .buttonStyle(.borderless)
+                    .accessibilityIdentifier("task.session.close")
+            }
+            .padding(24)
+
+            Divider()
+
+            ProgressView("正在恢复完整聊天记录…")
+                .controlSize(.large)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+    }
 }
 
 private struct TaskSessionSetupView: View {
     let task: TaskItem
     let state: AppState
+    let onClose: () -> Void
 
-    @Environment(\.dismiss) private var dismiss
     @State private var runtime = RuntimeKind.codex
     @State private var workspace = ""
     @State private var isStarting = false
@@ -174,13 +214,13 @@ private struct TaskSessionSetupView: View {
         VStack(spacing: 0) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
-                    Text(task.title)
+                    Text("启动本地 Agent")
                         .font(.title2.bold())
-                    Text("创建本地 Agent Session")
+                    Text("选择 Runtime 与执行目录")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("关闭", systemImage: "xmark", action: dismiss.callAsFunction)
+                Button("关闭", systemImage: "xmark", action: onClose)
                     .labelStyle(.iconOnly)
                     .buttonStyle(.borderless)
             }
@@ -229,6 +269,27 @@ private struct TaskSessionSetupView: View {
                     }
                 }
 
+                if let error = state.taskSessionErrorMessage {
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.red)
+                            .accessibilityHidden(true)
+                        Text(error)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                            .textSelection(.enabled)
+                        Spacer()
+                        Button("关闭", systemImage: "xmark") {
+                            state.clearTaskSessionError()
+                        }
+                        .labelStyle(.iconOnly)
+                        .buttonStyle(.borderless)
+                    }
+                    .padding(12)
+                    .background(.red.opacity(0.07), in: .rect(cornerRadius: 9))
+                    .accessibilityIdentifier("task.session.error")
+                }
+
                 Spacer()
 
                 HStack {
@@ -236,17 +297,32 @@ private struct TaskSessionSetupView: View {
                         .font(.callout)
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("启动并进入 Session") {
-                        start()
+                    Button(action: start) {
+                        if isStarting {
+                            Label("正在启动…", systemImage: "hourglass")
+                        } else {
+                            Text("启动并进入 Session")
+                        }
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(workspace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isStarting)
+                    .disabled(
+                        workspace.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            || state.runtime(runtime)?.isSelectable != true
+                            || isStarting
+                    )
                     .accessibilityIdentifier("task.session.start")
                 }
             }
             .padding(32)
             .frame(maxWidth: 760, maxHeight: .infinity)
         }
+        .onAppear {
+            if state.runtime(runtime)?.isSelectable != true,
+               let firstReady = RuntimeKind.allCases.first(where: { state.runtime($0)?.isSelectable == true }) {
+                runtime = firstReady
+            }
+        }
+        .onChange(of: runtime) { _, _ in state.clearTaskSessionError() }
     }
 
     private func chooseDirectory() {
@@ -266,8 +342,11 @@ private struct TaskSessionSetupView: View {
         guard !isStarting else { return }
         isStarting = true
         Task {
-            _ = await state.startSession(task, runtime: runtime, workspace: workspace)
+            let started = await state.startSession(task, runtime: runtime, workspace: workspace)
             isStarting = false
+            if started {
+                workspace = ""
+            }
         }
     }
     private func runtimeTitle(_ kind: RuntimeKind, info: RuntimeInfo?) -> String {

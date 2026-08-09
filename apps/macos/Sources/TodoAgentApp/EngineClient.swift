@@ -199,13 +199,14 @@ actor EngineClient {
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
         method: String,
         params: Params,
-        as resultType: Result.Type = Result.self
+        as resultType: Result.Type = Result.self,
+        timeout: Duration? = nil
     ) async throws -> Result {
         try await performRequest(
             method: method,
             params: params,
             as: resultType,
-            timeout: requestTimeout,
+            timeout: timeout ?? requestTimeout,
             allowWhileStopping: false
         )
     }

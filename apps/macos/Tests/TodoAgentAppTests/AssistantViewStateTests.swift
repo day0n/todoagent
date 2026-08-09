@@ -1,0 +1,710 @@
+import Foundation
+import Testing
+@testable import TodoAgentApp
+
+@MainActor
+struct AssistantViewStateTests {
+    @Test("delta retry replaces an older streaming attempt")
+    func deltaRetryReplacesDraft() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)]
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.consumeAssistantEvent(try sessionChangedEvent(session))
+        await state.selectSession(session.id)
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "旧"))
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "回复"))
+        #expect(state.selectedDraft?.body == "旧回复")
+
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 2, delta: "新"))
+        #expect(state.selectedDraft?.body == "新")
+
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "应忽略"))
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 2, delta: "答案"))
+        #expect(state.selectedDraft?.body == "新答案")
+        #expect(state.selectedDraft?.attempt == 2)
+    }
+
+    @Test("a sequence gap backfills history and duplicate appended events are idempotent")
+    func sequenceGapBackfillsOnce() async throws {
+        let session = sessionDescriptor(lastSequence: 2)
+        let first = assistantMessage(id: "message-1", sequence: 1, role: .user, body: "创建任务")
+        let second = assistantMessage(id: "message-2", sequence: 2, role: .todoAgent, body: "已创建")
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session, messages: [first, second])]
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        let appended = try messageAppendedEvent(second)
+
+        await state.consumeAssistantEvent(appended)
+        await state.consumeAssistantEvent(appended)
+        await state.selectSession(session.id)
+
+        #expect(state.selectedMessages.map(\.sequence) == [1, 2])
+        #expect(state.selectedMessages.filter { $0.id == second.id }.count == 1)
+        #expect(await repository.historyRequests() == [0])
+    }
+
+    @Test("a persisted assistant message replaces the streaming draft")
+    func appendedMessageClearsDraft() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)]
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.consumeAssistantEvent(try sessionChangedEvent(session))
+        await state.selectSession(session.id)
+
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "流式内容"))
+        #expect(state.selectedDraft?.body == "流式内容")
+
+        let final = assistantMessage(id: "assistant-final", sequence: 1, role: .todoAgent, body: "最终内容")
+        await state.consumeAssistantEvent(try messageAppendedEvent(final))
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 2, delta: "迟到分片"))
+
+        #expect(state.selectedDraft == nil)
+        #expect(state.selectedMessages == [final])
+    }
+
+    @Test("session state clears a stale running turn when turn.finished was dropped")
+    func sessionChangedClearsDroppedFinishedTurn() async throws {
+        let runningSession = sessionDescriptor(isRunning: true)
+        let activeTurn = AssistantTurn(
+            id: "turn-1",
+            sessionID: runningSession.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(bundles: [
+            runningSession.id: AssistantSessionBundle(
+                session: runningSession,
+                activeTurn: activeTurn
+            ),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        #expect(state.isSelectedSessionRunning)
+
+        let idleSession = sessionDescriptor(isRunning: false)
+        await state.consumeAssistantEvent(try sessionChangedEvent(idleSession))
+
+        #expect(!state.isSelectedSessionRunning)
+        #expect(state.selectedDraft == nil)
+    }
+
+    @Test("session state backfills a dropped final message")
+    func sessionChangedBackfillsDroppedMessage() async throws {
+        let session = sessionDescriptor(lastSequence: 2)
+        let messages = [
+            assistantMessage(id: "message-1", sequence: 1, role: .user, body: "问题"),
+            assistantMessage(id: "message-2", sequence: 2, role: .todoAgent, body: "最终回复"),
+        ]
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, messages: messages),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+
+        await state.consumeAssistantEvent(try sessionChangedEvent(session))
+        await state.selectSession(session.id)
+
+        #expect(state.selectedMessages == messages)
+        #expect(await repository.historyRequests() == [0])
+    }
+
+    @Test("long histories page until every stable message is loaded")
+    func longHistoryLoadsEveryPage() async {
+        let messages = (1 ... 1_001).map { sequence in
+            assistantMessage(
+                id: "message-\(sequence)",
+                sequence: Int64(sequence),
+                role: sequence.isMultiple(of: 2) ? .todoAgent : .user,
+                body: "message \(sequence)"
+            )
+        }
+        let session = sessionDescriptor(lastSequence: 1_001)
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session, messages: messages)],
+            historyPageSize: 500
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+
+        await state.load()
+
+        #expect(state.selectedMessages.count == 1_001)
+        #expect(await repository.historyRequests() == [0, 500, 1_000])
+    }
+
+    @Test("persisted tools and task references return after a restart")
+    func persistedToolsRestore() async throws {
+        let taskID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000301"))
+        let session = sessionDescriptor(lastSequence: 2)
+        let messages = [
+            assistantMessage(id: "message-1", sequence: 1, role: .user, body: "创建任务"),
+            assistantMessage(id: "message-2", sequence: 2, role: .todoAgent, body: "已创建"),
+        ]
+        let tool = AssistantPersistedTool(
+            id: "tool-execution-1",
+            sessionID: session.id,
+            turnID: "turn-1",
+            callID: "call-1",
+            toolName: "create_tasks",
+            taskRefsJSON: "[\"\(taskID.uuidString.lowercased())\"]",
+            isError: false,
+            status: "completed"
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(
+                session: session,
+                messages: messages,
+                tools: [tool]
+            ),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+
+        await state.load()
+
+        #expect(state.selectedTools.count == 1)
+        #expect(state.selectedTools.first?.name == "create_tasks")
+        #expect(state.selectedTools.first?.state == .completed)
+        #expect(state.selectedTools.first?.taskReferences == [taskID])
+    }
+
+    @Test("turn completion reconciles a dropped tool event from SQLite")
+    func droppedToolEventReconciles() async throws {
+        let taskID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000302"))
+        let runningSession = sessionDescriptor(lastSequence: 1, isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: runningSession.id,
+            clientMessageID: "00000000-0000-4000-8000-000000000303",
+            model: "gemini-test",
+            status: .running
+        )
+        let user = assistantMessage(id: "message-1", sequence: 1, role: .user, body: "创建任务")
+        let repository = AssistantTestRepository(bundles: [
+            runningSession.id: AssistantSessionBundle(
+                session: runningSession,
+                messages: [user],
+                activeTurn: turn
+            ),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        #expect(state.selectedTools.isEmpty)
+
+        let completedSession = sessionDescriptor(lastSequence: 2, isRunning: false)
+        let reply = assistantMessage(id: "message-2", sequence: 2, role: .todoAgent, body: "已创建")
+        let tool = AssistantPersistedTool(
+            id: "tool-execution-2",
+            sessionID: completedSession.id,
+            turnID: turn.id,
+            callID: "call-dropped",
+            toolName: "create_tasks",
+            taskRefsJSON: "[\"\(taskID.uuidString.lowercased())\"]",
+            isError: false,
+            status: "completed"
+        )
+        await repository.setBundle(AssistantSessionBundle(
+            session: completedSession,
+            messages: [user, reply],
+            tools: [tool]
+        ))
+        let finished = AssistantTurn(
+            id: turn.id,
+            sessionID: turn.sessionID,
+            clientMessageID: turn.clientMessageID,
+            model: turn.model,
+            status: .completed
+        )
+        let finishedData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": completedSession.id,
+            "turn": try JSONSerialization.jsonObject(with: JSONEncoder().encode(finished)),
+        ])
+
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.turn.finished",
+            data: finishedData
+        ))
+
+        #expect(state.selectedTools.first?.toolCallID == "call-dropped")
+        #expect(state.selectedTools.first?.taskReferences == [taskID])
+        #expect(state.selectedMessages.last == reply)
+    }
+
+    @Test("background tool events do not retain detailed history")
+    func backgroundToolEventsStayOutOfCache() async throws {
+        let selected = sessionDescriptor()
+        let background = sessionDescriptor(id: "z-background", isRunning: true)
+        let repository = AssistantTestRepository(bundles: [
+            selected.id: AssistantSessionBundle(session: selected),
+            background.id: AssistantSessionBundle(session: background),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        await state.selectSession(selected.id)
+        #expect(state.selectedSessionID == selected.id)
+
+        let started = try JSONSerialization.data(withJSONObject: [
+            "sessionId": background.id,
+            "turnId": "background-turn",
+            "toolCallId": "background-call",
+            "name": "list_state",
+        ])
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.tool.started",
+            data: started
+        ))
+        let finished = try JSONSerialization.data(withJSONObject: [
+            "sessionId": background.id,
+            "turnId": "background-turn",
+            "toolCallId": "background-call",
+            "name": "list_state",
+            "isError": false,
+            "taskReferences": [],
+        ])
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.tool.finished",
+            data: finished
+        ))
+
+        #expect(state.selectedTools.isEmpty)
+        #expect(state.detailedSessionCacheCount == 0)
+    }
+
+    @Test("assistant streaming never mutates the global app snapshot")
+    func streamingIsolatedFromAppSnapshot() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)]
+        )
+        let appState = AppState(repository: repository)
+
+        await appState.assistant.consumeAssistantEvent(try sessionChangedEvent(session))
+        await appState.assistant.selectSession(session.id)
+        await appState.assistant.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "流式内容"))
+
+        #expect(appState.messages.isEmpty)
+        #expect(appState.assistant.selectedDraft?.body == "流式内容")
+    }
+
+    @Test("a busy session rejects another send")
+    func busySessionRejectsSend() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)]
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        let turnJSON = #"{"sessionId":"assistant-session","turn":{"id":"turn-1","sessionId":"assistant-session","clientMessageId":"client-1","model":"gemini-3.6-flash","status":"running"}}"#
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.turn.started",
+            data: Data(turnJSON.utf8)
+        ))
+
+        #expect(state.isSelectedSessionRunning)
+        #expect(await state.send(text: "第二条", model: "gemini-3.6-flash") == false)
+        #expect(await repository.sendCount() == 0)
+    }
+
+    @Test("a failed send retries with the same client message id")
+    func failedSendKeepsIdempotencyKey() async {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)],
+            sendFailuresRemaining: 1
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        #expect(await state.send(text: "创建任务", model: "gemini-test") == false)
+        let firstIdentifier = await repository.sentClientMessageIDs().first
+        let clientMessageID = firstIdentifier?.uuidString ?? "missing"
+        let startedJSON = """
+        {"sessionId":"assistant-session","turn":{"id":"turn-accepted","sessionId":"assistant-session","clientMessageId":"\(clientMessageID)","model":"gemini-test","status":"running"}}
+        """
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.turn.started",
+            data: Data(startedJSON.utf8)
+        ))
+        let finishedJSON = """
+        {"sessionId":"assistant-session","turn":{"id":"turn-accepted","sessionId":"assistant-session","clientMessageId":"\(clientMessageID)","model":"gemini-test","status":"completed"}}
+        """
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.turn.finished",
+            data: Data(finishedJSON.utf8)
+        ))
+        #expect(await state.send(text: "创建任务", model: "gemini-test") == true)
+
+        let identifiers = await repository.sentClientMessageIDs()
+        #expect(identifiers.count == 2)
+        #expect(identifiers.first == identifiers.last)
+    }
+
+    @Test("a persisted send is accepted when its response is lost")
+    func persistedSendSurvivesResponseFailure() async {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)],
+            sendFailuresRemaining: 1,
+            persistFailedSend: true
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        #expect(await state.send(text: "创建任务", model: "gemini-test"))
+        #expect(await repository.sendCount() == 1)
+        #expect(state.selectedMessages.count == 1)
+        #expect(state.selectedMessages.first?.clientMessageID?.isEmpty == false)
+        #expect(state.isSelectedSessionRunning)
+    }
+
+    @Test("creating a conversation evicts the previous detailed history")
+    func createSessionEvictsPreviousHistory() async {
+        let session = sessionDescriptor(lastSequence: 1)
+        let message = assistantMessage(
+            id: "message-1",
+            sequence: 1,
+            role: .user,
+            body: "旧会话"
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, messages: [message]),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        #expect(state.detailedSessionCacheCount == 1)
+
+        #expect(await state.createSession())
+        #expect(state.detailedSessionCacheCount == 0)
+        #expect(state.selectedSessionID != session.id)
+    }
+
+    @Test("engine.ready restores the in-memory key and reloads assistant state")
+    func engineReadyRestoresKey() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)]
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { "key-from-keychain" })
+
+        await state.consumeAssistantEvent(try sessionChangedEvent(session))
+        await state.selectSession(session.id)
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "stale"))
+        #expect(state.selectedDraft?.body == "stale")
+
+        await state.consumeAssistantEvent(EngineEvent(name: "engine.ready", data: Data("{}".utf8)))
+
+        #expect(await repository.keyInjectionCount() == 1)
+        #expect(state.selectedDraft == nil)
+        #expect(state.status?.configured == true)
+        #expect(state.loadState == .loaded)
+    }
+
+    @Test("assistant request payloads keep model on turns, not sessions")
+    func requestWireShapes() throws {
+        let createData = try JSONEncoder().encode(AssistantSessionCreateRequest(title: nil))
+        let createObject = try #require(
+            JSONSerialization.jsonObject(with: createData) as? [String: Any]
+        )
+        #expect(createObject["model"] == nil)
+
+        let clientMessageID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000202"))
+        let attachment = AssistantTextAttachment(
+            name: "plan.md",
+            mediaType: "text/markdown",
+            content: "# Plan",
+            byteCount: 6
+        )
+        let sendData = try JSONEncoder().encode(AssistantSendRequest(
+            sessionID: "assistant-session",
+            clientMessageID: clientMessageID,
+            text: "整理任务",
+            model: "gemini-3.6-flash",
+            attachments: [attachment]
+        ))
+        let sendObject = try #require(
+            JSONSerialization.jsonObject(with: sendData) as? [String: Any]
+        )
+        #expect(sendObject["sessionId"] as? String == "assistant-session")
+        #expect(sendObject["clientMessageId"] as? String == clientMessageID.uuidString)
+        #expect(sendObject["model"] as? String == "gemini-3.6-flash")
+        #expect(sendObject["sessionID"] == nil)
+        let attachments = try #require(sendObject["attachments"] as? [[String: Any]])
+        #expect(attachments.first?["name"] as? String == "plan.md")
+        #expect(attachments.first?["mediaType"] as? String == "text/markdown")
+        #expect(attachments.first?["content"] as? String == "# Plan")
+        #expect(attachments.first?["byteCount"] as? Int == 6)
+    }
+
+    @Test("an attachment-only message reaches the repository")
+    func sendsAttachmentOnlyMessage() async {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)]
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        let attachment = AssistantTextAttachment(
+            name: "notes.txt",
+            mediaType: "text/plain",
+            content: "只处理这个文件",
+            byteCount: 21
+        )
+
+        #expect(await state.send(text: "", model: "gemini-3.6-flash", attachments: [attachment]))
+        #expect(await repository.lastSentAttachments() == [attachment])
+    }
+
+    private func sessionDescriptor(
+        id: String = "assistant-session",
+        lastSequence: Int64 = 0,
+        isRunning: Bool = false
+    ) -> AssistantSessionDescriptor {
+        AssistantSessionDescriptor(
+            id: id,
+            title: "测试会话",
+            createdAt: "2026-08-09T00:00:00Z",
+            updatedAt: "2026-08-09T00:00:00Z",
+            lastSequence: lastSequence,
+            isRunning: isRunning
+        )
+    }
+
+    private func assistantMessage(
+        id: String,
+        sequence: Int64,
+        role: AssistantMessageRole,
+        body: String
+    ) -> AssistantMessage {
+        AssistantMessage(
+            id: id,
+            sessionID: "assistant-session",
+            turnID: "turn-1",
+            sequence: sequence,
+            role: role,
+            body: body
+        )
+    }
+
+    private func sessionChangedEvent(_ session: AssistantSessionDescriptor) throws -> EngineEvent {
+        let sessionData = try JSONEncoder().encode(session)
+        let sessionObject = try JSONSerialization.jsonObject(with: sessionData)
+        let data = try JSONSerialization.data(withJSONObject: ["session": sessionObject])
+        return EngineEvent(name: "assistant.session.changed", data: data)
+    }
+
+    private func deltaEvent(attempt: Int, delta: String) throws -> EngineEvent {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "sessionId": "assistant-session",
+            "turnId": "turn-1",
+            "messageId": "draft-message",
+            "attempt": attempt,
+            "delta": delta,
+        ])
+        return EngineEvent(name: "assistant.message.delta", data: data)
+    }
+
+    private func messageAppendedEvent(_ message: AssistantMessage) throws -> EngineEvent {
+        let messageData = try JSONEncoder().encode(message)
+        let messageObject = try JSONSerialization.jsonObject(with: messageData)
+        let data = try JSONSerialization.data(withJSONObject: [
+            "sessionId": message.sessionID,
+            "message": messageObject,
+        ])
+        return EngineEvent(name: "assistant.message.appended", data: data)
+    }
+}
+
+actor AssistantTestRepository: AppRepository {
+    nonisolated let requiresExecutionConsent = true
+    private let snapshot = AppSnapshot(
+        revision: 0,
+        lists: [],
+        tasks: [],
+        runtimes: [],
+        sessions: [],
+        messages: []
+    )
+    private var bundles: [String: AssistantSessionBundle]
+    private var requestedHistorySequences: [Int64] = []
+    private var injectedKeys = 0
+    private var sentMessages = 0
+    private var sentIDs: [UUID] = []
+    private var sentAttachments: [AssistantTextAttachment] = []
+    private var loadCallCount = 0
+    private var sendFailuresRemaining: Int
+    private let persistFailedSend: Bool
+    private let historyPageSize: Int
+    private var shouldSuspendLoad: Bool
+    private var loadContinuations: [CheckedContinuation<Void, Never>] = []
+    private var loadStartedContinuations: [CheckedContinuation<Void, Never>] = []
+
+    init(
+        bundles: [String: AssistantSessionBundle] = [:],
+        historyPageSize: Int = .max,
+        sendFailuresRemaining: Int = 0,
+        persistFailedSend: Bool = false,
+        suspendLoad: Bool = false
+    ) {
+        self.bundles = bundles
+        self.historyPageSize = historyPageSize
+        self.sendFailuresRemaining = sendFailuresRemaining
+        self.persistFailedSend = persistFailedSend
+        shouldSuspendLoad = suspendLoad
+    }
+
+    func load() async throws -> AppSnapshot {
+        loadCallCount += 1
+        let started = loadStartedContinuations
+        loadStartedContinuations.removeAll()
+        for continuation in started { continuation.resume() }
+        if shouldSuspendLoad {
+            await withCheckedContinuation { continuation in
+                loadContinuations.append(continuation)
+            }
+        }
+        return snapshot
+    }
+    func sync() async throws -> AppSnapshot { snapshot }
+    func events() async -> AsyncStream<EngineEvent> {
+        let (stream, continuation) = AsyncStream.makeStream(of: EngineEvent.self)
+        continuation.finish()
+        return stream
+    }
+    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot { snapshot }
+    func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot { snapshot }
+    func detectRuntimes() async throws -> AppSnapshot { snapshot }
+    func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot { snapshot }
+    func session(taskID: UUID) async throws -> SessionBundle? { nil }
+    func createSession(taskID: UUID, runtime: RuntimeKind, workspace: String) async throws -> SessionBundle { throw AppRepositoryError.sessionNotFound }
+    func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle { throw AppRepositoryError.sessionNotFound }
+    func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle { throw AppRepositoryError.sessionNotFound }
+    func markRead(sessionID: String, through sequence: Int64) async throws {}
+    func cancelTurn(sessionID: String) async throws {}
+    func injectGeminiKey(_ key: String) async throws { injectedKeys += 1 }
+    func clearGeminiKey() async throws {}
+    func testGeminiConnection(model: String) async throws -> GeminiConnectionResult {
+        GeminiConnectionResult(ok: true, model: model, displayName: "Gemini Test", version: "test")
+    }
+
+    func assistantStatus() async throws -> AssistantStatus {
+        AssistantStatus(configured: true, available: true, model: "gemini-3.6-flash", reason: nil)
+    }
+
+    func assistantSessions(includeArchived: Bool) async throws -> [AssistantSessionDescriptor] {
+        bundles.values.map(\.session).filter { includeArchived || !$0.archived }
+    }
+
+    func createAssistantSession(title: String?) async throws -> AssistantSessionBundle {
+        let session = AssistantSessionDescriptor(id: UUID().uuidString, title: title ?? "")
+        let bundle = AssistantSessionBundle(session: session)
+        bundles[session.id] = bundle
+        return bundle
+    }
+
+    func renameAssistantSession(sessionID: String, title: String) async throws -> AssistantSessionBundle {
+        guard let current = bundles[sessionID] else { throw AppRepositoryError.assistantSessionNotFound }
+        let bundle = AssistantSessionBundle(
+            session: current.session.updating(title: title),
+            messages: current.messages,
+            tools: current.tools,
+            activeTurn: current.activeTurn
+        )
+        bundles[sessionID] = bundle
+        return bundle
+    }
+
+    func archiveAssistantSession(sessionID: String) async throws -> AssistantSessionBundle {
+        guard let current = bundles[sessionID] else { throw AppRepositoryError.assistantSessionNotFound }
+        let bundle = AssistantSessionBundle(
+            session: current.session.updating(archived: true),
+            messages: current.messages,
+            tools: current.tools,
+            activeTurn: current.activeTurn
+        )
+        bundles[sessionID] = bundle
+        return bundle
+    }
+
+    func assistantHistory(sessionID: String, after sequence: Int64) async throws -> AssistantSessionBundle {
+        requestedHistorySequences.append(sequence)
+        guard let bundle = bundles[sessionID] else { throw AppRepositoryError.assistantSessionNotFound }
+        return AssistantSessionBundle(
+            session: bundle.session,
+            messages: Array(
+                bundle.messages
+                    .filter { $0.sequence > sequence }
+                    .prefix(historyPageSize)
+            ),
+            tools: bundle.tools,
+            activeTurn: bundle.activeTurn
+        )
+    }
+
+    func sendAssistantMessage(
+        sessionID: String,
+        clientMessageID: UUID,
+        text: String,
+        model: String,
+        attachments: [AssistantTextAttachment]
+    ) async throws -> AssistantSessionBundle {
+        sentMessages += 1
+        sentIDs.append(clientMessageID)
+        sentAttachments = attachments
+        if sendFailuresRemaining > 0 {
+            sendFailuresRemaining -= 1
+            if persistFailedSend, let existing = bundles[sessionID] {
+                let sequence = (existing.messages.map(\.sequence).max() ?? 0) + 1
+                let message = AssistantMessage(
+                    id: "accepted-\(clientMessageID.uuidString)",
+                    sessionID: sessionID,
+                    turnID: "accepted-turn",
+                    sequence: sequence,
+                    clientMessageID: clientMessageID.uuidString,
+                    role: .user,
+                    body: text
+                )
+                bundles[sessionID] = AssistantSessionBundle(
+                    session: existing.session.updating(lastSequence: sequence, isRunning: true),
+                    messages: existing.messages + [message],
+                    tools: existing.tools,
+                    activeTurn: AssistantTurn(
+                        id: "accepted-turn",
+                        sessionID: sessionID,
+                        clientMessageID: clientMessageID.uuidString,
+                        model: model,
+                        status: .running
+                    )
+                )
+            }
+            throw AppRepositoryError.runtimeUnavailable
+        }
+        guard let bundle = bundles[sessionID] else { throw AppRepositoryError.assistantSessionNotFound }
+        return bundle
+    }
+
+    func cancelAssistantTurn(sessionID: String) async throws {}
+    func shutdown() async {}
+
+    func historyRequests() -> [Int64] { requestedHistorySequences }
+    func keyInjectionCount() -> Int { injectedKeys }
+    func sendCount() -> Int { sentMessages }
+    func sentClientMessageIDs() -> [UUID] { sentIDs }
+    func lastSentAttachments() -> [AssistantTextAttachment] { sentAttachments }
+    func loadCount() -> Int { loadCallCount }
+    func setBundle(_ bundle: AssistantSessionBundle) { bundles[bundle.session.id] = bundle }
+    func waitUntilLoadStarts() async {
+        guard loadCallCount == 0 else { return }
+        await withCheckedContinuation { continuation in
+            loadStartedContinuations.append(continuation)
+        }
+    }
+    func releaseLoad() {
+        shouldSuspendLoad = false
+        let continuations = loadContinuations
+        loadContinuations.removeAll()
+        for continuation in continuations { continuation.resume() }
+    }
+}

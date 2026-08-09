@@ -84,6 +84,16 @@ pub fn handshake() -> Event<Handshake> {
                 "runtime.verify",
                 "workspace.authorize",
                 "secret.inject",
+                "secret.clear",
+                "gemini.test",
+                "assistant.status",
+                "assistant.session.list",
+                "assistant.session.create",
+                "assistant.session.rename",
+                "assistant.session.archive",
+                "assistant.history",
+                "assistant.send",
+                "assistant.cancel_turn",
                 "session.create",
                 "session.get",
                 "session.history",
@@ -101,6 +111,8 @@ pub fn handshake() -> Event<Handshake> {
 mod tests {
     use super::*;
 
+    const SHARED_CONTRACT: &str = include_str!("../../../protocol/fixtures/contract.ndjson");
+
     #[test]
     fn request_defaults_params_to_null() {
         let request: Request =
@@ -114,5 +126,39 @@ mod tests {
         let value = serde_json::to_value(handshake()).unwrap();
         assert_eq!(value["data"]["protocolVersion"], 2);
         assert_eq!(value["data"]["runtimes"].as_array().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn rust_decodes_every_shared_ndjson_contract_message() {
+        let values = SHARED_CONTRACT
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(values.len(), 15);
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("assistant.send")
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("event").and_then(Value::as_str) == Some("assistant.message.delta")
+                && value["data"]["attempt"] == 1
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("id").and_then(Value::as_str) == Some("assistant-history-1")
+                && value["result"]["tools"][0]["taskRefsJson"].is_string()
+                && value["result"]["activeTurn"].is_null()
+        }));
+
+        for value in values {
+            if value.get("method").is_some() {
+                serde_json::from_value::<Request>(value).unwrap();
+            } else if value.get("id").is_some() {
+                assert!(value.get("result").is_some() || value.get("error").is_some());
+            } else {
+                assert!(value.get("event").and_then(Value::as_str).is_some());
+                assert!(value.get("data").is_some());
+            }
+        }
     }
 }

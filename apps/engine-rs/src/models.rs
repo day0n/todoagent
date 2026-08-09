@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -284,4 +284,233 @@ pub struct QueuedTurn {
     pub turn: SessionTurn,
     pub prompt: String,
     pub is_new: bool,
+}
+
+/// A persistent conversational session owned by the TodoAgent assistant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantSession {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub archived_at: Option<String>,
+    pub last_sequence: i64,
+    pub is_running: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AssistantTurnStatus {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    Interrupted,
+}
+
+impl AssistantTurnStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "queued" => Some(Self::Queued),
+            "running" => Some(Self::Running),
+            "completed" => Some(Self::Completed),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantTurn {
+    pub id: String,
+    pub session_id: String,
+    pub ordinal: i64,
+    pub user_message_id: String,
+    pub model_id: Option<String>,
+    pub attempt_count: i64,
+    pub status: AssistantTurnStatus,
+    pub final_output: Option<String>,
+    pub usage_json: Option<String>,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub started_at: Option<String>,
+    pub ended_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantMessage {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub sequence: i64,
+    pub client_message_id: Option<String>,
+    pub role: String,
+    pub kind: String,
+    pub body: String,
+    pub payload_json: Option<String>,
+    pub task_refs_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantStep {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub sequence: i64,
+    pub interaction_ordinal: i64,
+    pub provider_step_index: Option<i64>,
+    pub kind: String,
+    pub status: String,
+    pub title: Option<String>,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantToolExecution {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub step_id: Option<String>,
+    pub call_id: String,
+    pub tool_name: String,
+    pub request_json: String,
+    pub response_json: Option<String>,
+    pub task_refs_json: Option<String>,
+    pub is_error: bool,
+    pub status: String,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Bounded tool-card projection returned to the SwiftUI message timeline.
+/// Provider request/response payloads remain private to model context storage.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantToolSummary {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: Option<String>,
+    pub call_id: String,
+    pub tool_name: String,
+    pub task_refs_json: Option<String>,
+    pub is_error: bool,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantToolResult {
+    pub result_json: String,
+    pub is_error: bool,
+    pub task_refs_json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantCompaction {
+    pub session_id: String,
+    pub through_sequence: i64,
+    pub summary: String,
+    pub payload_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantHistory {
+    pub session: AssistantSession,
+    pub messages: Vec<AssistantMessage>,
+    #[serde(default)]
+    pub tools: Vec<AssistantToolSummary>,
+    pub active_turn: Option<AssistantTurn>,
+    pub compaction: Option<AssistantCompaction>,
+}
+
+/// Persistence projection used exclusively to rebuild Gemini's stateless input.
+///
+/// Provider steps deliberately do not share the user-visible message cursor, so
+/// they must never be loaded as a side effect of rendering chat history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantContextHistory {
+    pub messages: Vec<AssistantMessage>,
+    pub steps: Vec<AssistantStep>,
+    pub active_turn: Option<AssistantTurn>,
+    pub compaction: Option<AssistantCompaction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QueuedAssistantTurn {
+    pub session: AssistantSession,
+    pub turn: AssistantTurn,
+    pub message: AssistantMessage,
+    pub is_new: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateTaskInput {
+    pub title: String,
+    #[serde(default)]
+    pub note: String,
+    pub list_id: Option<String>,
+    pub due_date: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateTaskInput {
+    pub title: Option<String>,
+    pub note: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub list_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub due_date: Option<Option<String>>,
+}
+
+fn deserialize_present_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer).map(Some)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskState {
+    pub revision: i64,
+    pub lists: Vec<List>,
+    pub tasks: Vec<Task>,
 }

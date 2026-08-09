@@ -123,14 +123,87 @@ CREATE TABLE IF NOT EXISTS chat_session (
 );
 
 CREATE TABLE IF NOT EXISTS chat_message (
-  id          TEXT PRIMARY KEY,
-  session_id  TEXT NOT NULL REFERENCES chat_session(id) ON DELETE CASCADE,
-  sequence    INTEGER NOT NULL,
-  role        TEXT NOT NULL CHECK(role IN ('user','todoagent','system','tool')),
-  body        TEXT NOT NULL,
-  payload_json TEXT,
-  created_at  TEXT NOT NULL,
+  id                TEXT PRIMARY KEY,
+  session_id        TEXT NOT NULL REFERENCES chat_session(id) ON DELETE CASCADE,
+  turn_id           TEXT REFERENCES assistant_turn(id) ON DELETE SET NULL,
+  sequence          INTEGER NOT NULL,
+  client_message_id TEXT,
+  role              TEXT NOT NULL CHECK(role IN ('user','todoagent','system','tool')),
+  kind              TEXT NOT NULL DEFAULT 'text' CHECK(kind IN ('text','tool_call','tool_result','status','error')),
+  body              TEXT NOT NULL,
+  payload_json      TEXT,
+  task_refs_json    TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  UNIQUE(session_id, sequence),
+  UNIQUE(session_id, client_message_id)
+);
+
+CREATE TABLE IF NOT EXISTS assistant_turn (
+  id                TEXT PRIMARY KEY,
+  session_id        TEXT NOT NULL REFERENCES chat_session(id) ON DELETE CASCADE,
+  ordinal           INTEGER NOT NULL,
+  user_message_id   TEXT NOT NULL REFERENCES chat_message(id) ON DELETE RESTRICT,
+  model_id          TEXT,
+  attempt_count     INTEGER NOT NULL DEFAULT 0,
+  status            TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','cancelled','interrupted')),
+  final_output      TEXT,
+  usage_json        TEXT,
+  error_code        TEXT,
+  error_message     TEXT,
+  started_at        TEXT,
+  ended_at          TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  UNIQUE(session_id, ordinal)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_assistant_one_active_turn
+ON assistant_turn(session_id)
+WHERE status IN ('queued','running');
+
+CREATE TABLE IF NOT EXISTS assistant_step (
+  id            TEXT PRIMARY KEY,
+  session_id    TEXT NOT NULL REFERENCES chat_session(id) ON DELETE CASCADE,
+  turn_id       TEXT NOT NULL REFERENCES assistant_turn(id) ON DELETE CASCADE,
+  sequence      INTEGER NOT NULL,
+  interaction_ordinal INTEGER NOT NULL DEFAULT 1,
+  provider_step_index INTEGER,
+  kind          TEXT NOT NULL,
+  status        TEXT NOT NULL DEFAULT 'completed' CHECK(status IN ('queued','running','completed','failed','cancelled')),
+  title         TEXT,
+  payload_json  TEXT,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL,
   UNIQUE(session_id, sequence)
+);
+
+CREATE TABLE IF NOT EXISTS assistant_tool_execution (
+  id             TEXT PRIMARY KEY,
+  session_id     TEXT NOT NULL REFERENCES chat_session(id) ON DELETE CASCADE,
+  turn_id        TEXT REFERENCES assistant_turn(id) ON DELETE SET NULL,
+  step_id        TEXT REFERENCES assistant_step(id) ON DELETE SET NULL,
+  call_id        TEXT NOT NULL,
+  tool_name      TEXT NOT NULL,
+  request_json   TEXT NOT NULL,
+  response_json  TEXT,
+  task_refs_json TEXT,
+  is_error       INTEGER NOT NULL DEFAULT 0 CHECK(is_error IN (0,1)),
+  status         TEXT NOT NULL CHECK(status IN ('running','completed','failed')),
+  error_code     TEXT,
+  error_message  TEXT,
+  created_at     TEXT NOT NULL,
+  updated_at     TEXT NOT NULL,
+  UNIQUE(session_id, call_id)
+);
+
+CREATE TABLE IF NOT EXISTS assistant_compaction (
+  session_id       TEXT PRIMARY KEY REFERENCES chat_session(id) ON DELETE CASCADE,
+  through_sequence INTEGER NOT NULL,
+  summary          TEXT NOT NULL,
+  payload_json     TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS attachment (
@@ -156,3 +229,6 @@ CREATE INDEX IF NOT EXISTS idx_turn_session ON session_turn(session_id, ordinal)
 CREATE INDEX IF NOT EXISTS idx_message_session ON session_message(session_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_event_turn ON turn_event(turn_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_chat_message_session ON chat_message(session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_assistant_turn_session ON assistant_turn(session_id, ordinal);
+CREATE INDEX IF NOT EXISTS idx_assistant_step_session ON assistant_step(session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_assistant_tool_execution_turn ON assistant_tool_execution(turn_id);

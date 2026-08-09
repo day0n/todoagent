@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var state: AppState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(state: AppState) {
         _state = State(initialValue: state)
@@ -22,22 +23,40 @@ struct ContentView: View {
                     max: TodoAgentUI.sidebarMaximumWidth
                 )
         } detail: {
-            BoardView(state: state)
+            ZStack(alignment: .bottomTrailing) {
+                BoardView(state: state)
+
+                if !state.inspectorPresented {
+                    AssistantFloatingButton {
+                        state.openAssistant()
+                    }
+                    .padding(.trailing, 22)
+                    .padding(.bottom, 24)
+                    .transition(
+                        .scale(scale: 0.88, anchor: .bottomTrailing)
+                            .combined(with: .opacity)
+                    )
+                }
+            }
+            .background(TodoAgentUI.canvasBackground)
         }
         .navigationSplitViewStyle(.balanced)
+        .tint(TodoAgentUI.primaryText)
         .disabled(state.loadState == .loading)
         .inspector(isPresented: $state.inspectorPresented) {
-            TodoAgentInspector(state: state)
+            TodoAgentInspector(state: state) {
+                state.inspectorPresented = false
+            }
                 .inspectorColumnWidth(
-                    min: 320,
+                    min: 380,
                     ideal: TodoAgentUI.inspectorIdealWidth,
-                    max: 460
+                    max: 560
                 )
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button {
-                    state.presentedSheet = .newTask
+                    state.presentNewTask()
                 } label: {
                     Label("新建任务", systemImage: "plus")
                 }
@@ -45,23 +64,36 @@ struct ContentView: View {
                 .accessibilityIdentifier("toolbar.new-task")
 
                 Button {
-                    state.inspectorPresented.toggle()
+                    Task { await state.openNewAssistantConversation() }
+                } label: {
+                    Label("新建 TodoAgent 对话", systemImage: "plus.bubble")
+                }
+                .disabled(state.assistant.isManagingSession)
+                .help("新建 TodoAgent 对话 ⇧⌘O")
+                .accessibilityIdentifier("toolbar.new-assistant-session")
+
+                Button {
+                    state.toggleAssistant()
                 } label: {
                     Label("TodoAgent", systemImage: "sidebar.right")
                 }
-                .help("显示或隐藏 TodoAgent ⌥⌘I")
+                .help(state.inspectorPresented ? "收起 TodoAgent ⌥⌘I" : "打开 TodoAgent ⌥⌘I")
                 .accessibilityIdentifier("toolbar.todoagent")
             }
         }
+        .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: state.inspectorPresented)
         .task { await state.load() }
         .sheet(item: $state.presentedSheet) { destination in
             sheet(destination)
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewTask)) { _ in
-            state.presentedSheet = .newTask
+            state.presentNewTask()
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentToggleInspector)) { _ in
-            state.inspectorPresented.toggle()
+            state.toggleAssistant()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewAssistantConversation)) { _ in
+            Task { await state.openNewAssistantConversation() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentCancelCurrent)) { _ in
             state.presentedSheet = nil
@@ -98,7 +130,7 @@ struct ContentView: View {
     private func sheet(_ destination: AppSheet) -> some View {
         switch destination {
         case .newTask:
-            NewTaskSheet(state: state)
+            NewTaskSheet(state: state, initialListID: state.pendingNewTaskListID)
         case let .taskSession(taskID):
             TaskDestinationSheet(taskID: taskID, state: state)
         }
@@ -112,13 +144,47 @@ struct ContentView: View {
     }
 }
 
+private struct AssistantFloatingButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundStyle(TodoAgentUI.primaryText)
+                .frame(
+                    width: TodoAgentUI.floatingButtonSize,
+                    height: TodoAgentUI.floatingButtonSize
+                )
+                .background(TodoAgentUI.surfaceBackground, in: .circle)
+                .overlay {
+                    Circle()
+                        .stroke(TodoAgentUI.hairline, lineWidth: 1)
+                }
+                .shadow(color: TodoAgentUI.shadowColor, radius: 12, y: 5)
+        }
+        .buttonStyle(.plain)
+        .contentShape(.circle)
+        .help("打开 TodoAgent")
+        .accessibilityLabel("打开 TodoAgent")
+        .accessibilityHint("打开 TodoAgent 对话面板")
+        .accessibilityIdentifier("assistant.floating-button")
+    }
+}
+
 private struct NewTaskSheet: View {
     let state: AppState
+    private let initialListID: UUID?
     @Environment(\.dismiss) private var dismiss
     @State private var title = ""
     @State private var hasDueDate = true
     @State private var dueDate = Date.now
     @State private var isSaving = false
+
+    init(state: AppState, initialListID: UUID?) {
+        self.state = state
+        self.initialListID = initialListID
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -127,7 +193,6 @@ private struct NewTaskSheet: View {
 
             TextField("要完成什么？", text: $title)
                 .textFieldStyle(.roundedBorder)
-                .onSubmit(save)
                 .accessibilityIdentifier("task.title-field")
 
             Toggle("设置日期", isOn: $hasDueDate)
@@ -142,7 +207,7 @@ private struct NewTaskSheet: View {
                 Button("取消", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
                 Button("添加") { save() }
-                    .keyboardShortcut(.defaultAction)
+                    .keyboardShortcut(.return, modifiers: .command)
                     .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSaving)
                     .accessibilityIdentifier("task.save")
             }
@@ -156,7 +221,11 @@ private struct NewTaskSheet: View {
         guard !value.isEmpty, !isSaving else { return }
         isSaving = true
         Task {
-            if await state.createTask(title: value, dueDate: hasDueDate ? dueDate : nil) {
+            if await state.createTask(
+                title: value,
+                listID: initialListID,
+                dueDate: hasDueDate ? dueDate : nil
+            ) {
                 dismiss()
             } else {
                 isSaving = false
@@ -208,5 +277,19 @@ private actor EmptyPreviewRepository: AppRepository {
     func markRead(sessionID: String, through sequence: Int64) async throws {}
     func cancelTurn(sessionID: String) async throws {}
     func injectGeminiKey(_ key: String) async throws {}
+    func clearGeminiKey() async throws {}
+    func testGeminiConnection(model: String) async throws -> GeminiConnectionResult {
+        GeminiConnectionResult(ok: true, model: model, displayName: "Gemini Preview", version: "preview")
+    }
+    func assistantStatus() async throws -> AssistantStatus {
+        AssistantStatus(configured: false, available: false, model: nil, reason: "尚未配置 Gemini API Key。")
+    }
+    func assistantSessions(includeArchived: Bool) async throws -> [AssistantSessionDescriptor] { [] }
+    func createAssistantSession(title: String?) async throws -> AssistantSessionBundle { throw AppRepositoryError.assistantSessionNotFound }
+    func renameAssistantSession(sessionID: String, title: String) async throws -> AssistantSessionBundle { throw AppRepositoryError.assistantSessionNotFound }
+    func archiveAssistantSession(sessionID: String) async throws -> AssistantSessionBundle { throw AppRepositoryError.assistantSessionNotFound }
+    func assistantHistory(sessionID: String, after sequence: Int64) async throws -> AssistantSessionBundle { throw AppRepositoryError.assistantSessionNotFound }
+    func sendAssistantMessage(sessionID: String, clientMessageID: UUID, text: String, model: String, attachments: [AssistantTextAttachment]) async throws -> AssistantSessionBundle { throw AppRepositoryError.assistantSessionNotFound }
+    func cancelAssistantTurn(sessionID: String) async throws {}
     func shutdown() async {}
 }

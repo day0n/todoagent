@@ -50,27 +50,51 @@ struct SidebarView: View {
                 }
             }
             .listStyle(.sidebar)
+            .scrollContentBackground(.hidden)
+            .background(TodoAgentUI.sidebarBackground)
         }
+        .background(TodoAgentUI.sidebarBackground)
         .navigationTitle("TodoAgent")
-        .safeAreaInset(edge: .bottom) {
-            HStack {
-                Circle().fill(.green).frame(width: 7, height: 7)
-                    .accessibilityHidden(true)
-                Text("预览模式")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button { SettingsWindowController.show() } label: {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .help("设置 ⌘,")
-                .accessibilityLabel("打开设置")
-                .accessibilityIdentifier("sidebar.settings")
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            sidebarFooter
+        }
+    }
+
+    private var sidebarFooter: some View {
+        HStack(spacing: 7) {
+            Circle()
+                .fill(.green)
+                .frame(width: 6, height: 6)
+                .accessibilityHidden(true)
+            Text("本机模式")
+                .font(.caption)
+            Spacer()
+            Button { SettingsWindowController.show() } label: {
+                Image(systemName: "gearshape")
+                    .frame(width: 24, height: 20)
+                    .contentShape(.rect)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
-            .background(.ultraThinMaterial)
+            .buttonStyle(.plain)
+            .help("设置 ⌘,")
+            .accessibilityLabel("打开设置")
+            .accessibilityIdentifier("sidebar.settings")
+        }
+        .foregroundStyle(TodoAgentUI.secondaryText)
+        .padding(.horizontal, 12)
+        .padding(.top, 16)
+        .padding(.bottom, 8)
+        .frame(minHeight: TodoAgentUI.sidebarFooterGradientHeight, alignment: .bottom)
+        .background {
+            LinearGradient(
+                colors: [
+                    TodoAgentUI.surfaceBackground.opacity(0),
+                    TodoAgentUI.surfaceBackground.opacity(0.88),
+                    TodoAgentUI.surfaceBackground,
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .allowsHitTesting(false)
         }
     }
 

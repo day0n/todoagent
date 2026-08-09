@@ -25,22 +25,86 @@ private struct EngineTask: Decodable, Sendable {
     let completedAt: String?
     let createdAt: String
     let updatedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case listID = "listId"
+        case title, note, status, dueDate, completedAt, createdAt, updatedAt
+    }
 }
 
-private struct CreateTaskRequest: Encodable, Sendable {
+struct CreateTaskRequest: Encodable, Sendable {
     let title: String
     let note: String
     let listID: UUID?
     let dueDate: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case title, note
+        case listID = "listId"
+        case dueDate
+    }
 }
-private struct TaskIDRequest: Encodable, Sendable { let taskID: UUID }
+struct TaskIDRequest: Encodable, Sendable {
+    let taskID: UUID
+    private enum CodingKeys: String, CodingKey { case taskID = "taskId" }
+}
 private struct RuntimeRequest: Encodable, Sendable { let kind: RuntimeKind; let executable: String? }
-private struct SessionLookup: Encodable, Sendable { let sessionID: String?; let taskID: UUID? }
-private struct CreateSessionRequest: Encodable, Sendable { let taskID: UUID; let runtimeKind: RuntimeKind; let workingDirectory: String; let clientMessageID: UUID }
-private struct SendSessionRequest: Encodable, Sendable { let sessionID: String; let clientMessageID: UUID; let text: String }
-private struct HistoryRequest: Encodable, Sendable { let sessionID: String; let afterSequence: Int64; let limit: Int }
-private struct MarkReadRequest: Encodable, Sendable { let sessionID: String; let throughSequence: Int64 }
-private struct SessionIDRequest: Encodable, Sendable { let sessionID: String }
+struct SessionLookup: Encodable, Sendable {
+    let sessionID: String?
+    let taskID: UUID?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case taskID = "taskId"
+    }
+}
+struct CreateSessionRequest: Encodable, Sendable {
+    let taskID: UUID
+    let runtimeKind: RuntimeKind
+    let workingDirectory: String
+    let clientMessageID: UUID
+
+    private enum CodingKeys: String, CodingKey {
+        case taskID = "taskId"
+        case runtimeKind, workingDirectory
+        case clientMessageID = "clientMessageId"
+    }
+}
+struct SendSessionRequest: Encodable, Sendable {
+    let sessionID: String
+    let clientMessageID: UUID
+    let text: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case clientMessageID = "clientMessageId"
+        case text
+    }
+}
+struct HistoryRequest: Encodable, Sendable {
+    let sessionID: String
+    let afterSequence: Int64
+    let limit: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case afterSequence, limit
+    }
+}
+struct MarkReadRequest: Encodable, Sendable {
+    let sessionID: String
+    let throughSequence: Int64
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case throughSequence
+    }
+}
+struct SessionIDRequest: Encodable, Sendable {
+    let sessionID: String
+    private enum CodingKeys: String, CodingKey { case sessionID = "sessionId" }
+}
 private struct WorkspaceRequest: Encodable, Sendable { let path: String }
 private struct WorkspaceResult: Decodable, Sendable { let path: String }
 struct SecretRequest: Encodable, Sendable {
@@ -50,11 +114,13 @@ struct SecretRequest: Encodable, Sendable {
         case geminiAPIKey = "geminiApiKey"
     }
 }
+struct GeminiTestRequest: Encodable, Sendable { let model: String }
 private struct EmptyRepositoryParams: Encodable, Sendable {}
 private struct EmptyResult: Decodable, Sendable { let ok: Bool }
 
 actor EngineRepository: AppRepository {
     nonisolated let requiresExecutionConsent = true
+    private static let runtimeVerificationTimeout: Duration = .seconds(30)
     private let client: EngineClient
     private var snapshot = AppSnapshot(revision: 0, lists: [], tasks: [], runtimes: [], sessions: [], messages: [])
 
@@ -62,10 +128,6 @@ actor EngineRepository: AppRepository {
 
     func load() async throws -> AppSnapshot {
         try await client.start()
-        _ = try await client.request(method: "runtime.detect", params: EmptyRepositoryParams(), as: [RuntimeInfo].self)
-        for runtime in RuntimeKind.allCases {
-            _ = try? await client.request(method: "runtime.verify", params: RuntimeRequest(kind: runtime, executable: nil), as: RuntimeInfo.self)
-        }
         return try await refresh(method: "app.bootstrap")
     }
 
@@ -90,7 +152,12 @@ actor EngineRepository: AppRepository {
     }
 
     func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot {
-        _ = try await client.request(method: "runtime.verify", params: RuntimeRequest(kind: kind, executable: nil), as: RuntimeInfo.self)
+        _ = try await client.request(
+            method: "runtime.verify",
+            params: RuntimeRequest(kind: kind, executable: nil),
+            as: RuntimeInfo.self,
+            timeout: Self.runtimeVerificationTimeout
+        )
         return try await sync()
     }
 
@@ -126,6 +193,90 @@ actor EngineRepository: AppRepository {
 
     func injectGeminiKey(_ key: String) async throws {
         _ = try await client.request(method: "secret.inject", params: SecretRequest(geminiAPIKey: key), as: EmptyResult.self)
+    }
+
+    func clearGeminiKey() async throws {
+        _ = try await client.request(method: "secret.clear", params: EmptyRepositoryParams(), as: EmptyResult.self)
+    }
+
+    func testGeminiConnection(model: String) async throws -> GeminiConnectionResult {
+        try await client.request(method: "gemini.test", params: GeminiTestRequest(model: model), as: GeminiConnectionResult.self)
+    }
+
+    func assistantStatus() async throws -> AssistantStatus {
+        try await client.request(
+            method: "assistant.status",
+            params: AssistantEmptyRequest(),
+            as: AssistantStatus.self
+        )
+    }
+
+    func assistantSessions(includeArchived: Bool) async throws -> [AssistantSessionDescriptor] {
+        let response: AssistantSessionListResponse = try await client.request(
+            method: "assistant.session.list",
+            params: AssistantSessionListRequest(includeArchived: includeArchived)
+        )
+        return response.sessions
+    }
+
+    func createAssistantSession(title: String?) async throws -> AssistantSessionBundle {
+        let response: AssistantSessionResponse = try await client.request(
+            method: "assistant.session.create",
+            params: AssistantSessionCreateRequest(title: title)
+        )
+        return response.bundle
+    }
+
+    func renameAssistantSession(sessionID: String, title: String) async throws -> AssistantSessionBundle {
+        let response: AssistantSessionResponse = try await client.request(
+            method: "assistant.session.rename",
+            params: AssistantSessionRenameRequest(sessionID: sessionID, title: title)
+        )
+        return response.bundle
+    }
+
+    func archiveAssistantSession(sessionID: String) async throws -> AssistantSessionBundle {
+        let response: AssistantSessionResponse = try await client.request(
+            method: "assistant.session.archive",
+            params: AssistantSessionArchiveRequest(sessionID: sessionID)
+        )
+        return response.bundle
+    }
+
+    func assistantHistory(sessionID: String, after sequence: Int64) async throws -> AssistantSessionBundle {
+        try await client.request(
+            method: "assistant.history",
+            params: AssistantHistoryRequest(sessionID: sessionID, afterSequence: sequence, limit: 500),
+            as: AssistantSessionBundle.self
+        )
+    }
+
+    func sendAssistantMessage(
+        sessionID: String,
+        clientMessageID: UUID,
+        text: String,
+        model: String,
+        attachments: [AssistantTextAttachment]
+    ) async throws -> AssistantSessionBundle {
+        try await client.request(
+            method: "assistant.send",
+            params: AssistantSendRequest(
+                sessionID: sessionID,
+                clientMessageID: clientMessageID,
+                text: text,
+                model: model,
+                attachments: attachments
+            ),
+            as: AssistantSessionBundle.self
+        )
+    }
+
+    func cancelAssistantTurn(sessionID: String) async throws {
+        _ = try await client.request(
+            method: "assistant.cancel_turn",
+            params: AssistantCancelTurnRequest(sessionID: sessionID),
+            as: EmptyResult.self
+        )
     }
 
     func shutdown() async { await client.stop() }

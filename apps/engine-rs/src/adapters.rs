@@ -6,10 +6,12 @@ use agent_client_protocol::schema::ProtocolVersion;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines,
+};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_util::sync::CancellationToken;
 
 use crate::models::RuntimeKind;
@@ -17,6 +19,10 @@ use crate::runtime::merged_path;
 
 const WALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const STDERR_LIMIT: u64 = 64 * 1024;
+const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
+const ACP_PROMPT_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+const ACP_PROMPT_WALL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const ACP_CANCEL_GRACE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub enum ProviderEvent {
@@ -385,19 +391,45 @@ impl StreamParser {
         let mut out = Vec::new();
         match event_type {
             "system" => {
-                if let Some(id) = string_at(value, &["session_id"]) {
+                if let Some(id) =
+                    string_at(value, &["session_id"]).or_else(|| string_at(value, &["sessionId"]))
+                {
                     self.session_id = Some(id.clone());
                     out.push(ProviderEvent::SessionId(id));
                 }
+                out.push(ProviderEvent::Status(
+                    string_at(value, &["subtype"]).unwrap_or_else(|| "system".to_owned()),
+                ));
             }
             "assistant" => {
+                if let Some(message) = value.get("message") {
+                    apply_cursor_usage(&mut self.usage, message);
+                }
                 if let Some(content) = value.pointer("/message/content").and_then(Value::as_array) {
                     for block in content {
-                        if block.get("type").and_then(Value::as_str) == Some("text") {
-                            if let Some(text) = string_at(block, &["text"]) {
-                                self.final_output.push_str(&text);
-                                out.push(ProviderEvent::Text(text));
+                        match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                            "text" | "output_text" => {
+                                if let Some(text) =
+                                    string_at(block, &["text"]).filter(|text| !text.is_empty())
+                                {
+                                    self.final_output.push_str(&text);
+                                    out.push(ProviderEvent::Text(text));
+                                }
                             }
+                            "thinking" => {
+                                if let Some(text) =
+                                    string_at(block, &["text"]).filter(|text| !text.is_empty())
+                                {
+                                    out.push(ProviderEvent::Status(format!("thinking: {text}")));
+                                }
+                            }
+                            "tool_use" => out.push(ProviderEvent::ToolUse {
+                                name: string_at(block, &["name"])
+                                    .unwrap_or_else(|| "unknown".to_owned()),
+                                call_id: string_at(block, &["id"]).unwrap_or_default(),
+                                input: block.get("input").cloned().unwrap_or(Value::Null),
+                            }),
+                            _ => {}
                         }
                     }
                 }
@@ -408,20 +440,37 @@ impl StreamParser {
                     out.push(ProviderEvent::Text(text));
                 }
             }
+            "thinking" => {
+                if value.get("subtype").and_then(Value::as_str) != Some("delta") {
+                    if let Some(text) = string_at(value, &["text"]).filter(|text| !text.is_empty())
+                    {
+                        out.push(ProviderEvent::Status(format!("thinking: {text}")));
+                    }
+                }
+            }
             "tool_call" => {
                 if let Some(inner) = value.get("tool_call").and_then(Value::as_object) {
-                    let key = inner.keys().find(|key| key.ends_with("ToolCall")).cloned();
+                    let key = inner
+                        .iter()
+                        .find(|(key, detail)| key.ends_with("ToolCall") && detail.is_object())
+                        .map(|(key, _)| key.clone());
                     let name = key
                         .as_deref()
-                        .unwrap_or("unknownToolCall")
-                        .trim_end_matches("ToolCall")
-                        .to_owned();
+                        .map(|key| key.trim_end_matches("ToolCall").to_owned())
+                        .or_else(|| string_at(value, &["tool_name"]))
+                        .unwrap_or_else(|| "unknown".to_owned());
                     let detail = key
                         .as_ref()
                         .and_then(|key| inner.get(key))
                         .cloned()
                         .unwrap_or(Value::Null);
                     let call_id = string_at(value, &["call_id"])
+                        .or_else(|| {
+                            inner
+                                .get("toolCallId")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        })
                         .or_else(|| string_at(value, &["tool_id"]))
                         .unwrap_or_default();
                     if value.get("subtype").and_then(Value::as_str) == Some("started") {
@@ -439,17 +488,43 @@ impl StreamParser {
                     }
                 }
             }
+            "tool_use" => out.push(ProviderEvent::ToolUse {
+                name: string_at(value, &["tool_name"]).unwrap_or_else(|| "unknown".to_owned()),
+                call_id: string_at(value, &["tool_id"])
+                    .or_else(|| string_at(value, &["call_id"]))
+                    .unwrap_or_default(),
+                input: value.get("parameters").cloned().unwrap_or(Value::Null),
+            }),
+            "tool_result" => out.push(ProviderEvent::ToolResult {
+                name: string_at(value, &["tool_name"]).unwrap_or_default(),
+                call_id: string_at(value, &["tool_id"])
+                    .or_else(|| string_at(value, &["call_id"]))
+                    .unwrap_or_default(),
+                output: value
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| compact_json(value.get("output").unwrap_or(&Value::Null))),
+            }),
             "connection" | "retry" => out.push(ProviderEvent::Status(format!(
-                "{}: {}",
+                "{}: {}{}",
                 event_type,
                 value
                     .get("subtype")
                     .and_then(Value::as_str)
-                    .unwrap_or("update")
+                    .unwrap_or("update"),
+                value
+                    .get("attempt")
+                    .and_then(Value::as_i64)
+                    .filter(|attempt| *attempt > 0)
+                    .map(|attempt| format!(" (attempt {attempt})"))
+                    .unwrap_or_default()
             ))),
             "result" => {
                 self.terminal = true;
-                if let Some(id) = string_at(value, &["session_id"]) {
+                if let Some(id) =
+                    string_at(value, &["session_id"]).or_else(|| string_at(value, &["sessionId"]))
+                {
                     self.session_id = Some(id.clone());
                     out.push(ProviderEvent::SessionId(id));
                 }
@@ -459,9 +534,14 @@ impl StreamParser {
                 if self.final_output.is_empty() {
                     self.final_output = string_at(value, &["result"]).unwrap_or_default();
                 }
-                self.usage = value.get("usage").cloned();
+                apply_cursor_usage(&mut self.usage, value);
             }
-            "error" => self.failed = Some(compact_json(value)),
+            "error" => {
+                self.failed = string_at(value, &["error"])
+                    .or_else(|| string_at(value, &["detail"]))
+                    .or_else(|| Some(compact_json(value)));
+            }
+            "step_finish" => apply_cursor_usage(&mut self.usage, value),
             _ => {}
         }
         out
@@ -506,6 +586,79 @@ impl StreamParser {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AcpWaitPolicy {
+    hard_timeout: Duration,
+    idle_timeout: Option<Duration>,
+}
+
+impl AcpWaitPolicy {
+    const fn handshake() -> Self {
+        Self {
+            hard_timeout: ACP_HANDSHAKE_TIMEOUT,
+            idle_timeout: None,
+        }
+    }
+
+    const fn prompt() -> Self {
+        Self {
+            hard_timeout: ACP_PROMPT_WALL_TIMEOUT,
+            idle_timeout: Some(ACP_PROMPT_IDLE_TIMEOUT),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct KiroMetering {
+    credits: f64,
+}
+
+struct AcpWaitContext<'a> {
+    phase: AcpPhase,
+    events: &'a mpsc::Sender<ProviderEvent>,
+    cancellation: &'a CancellationToken,
+    cancel_session_id: Option<&'a str>,
+    policy: AcpWaitPolicy,
+    metering: &'a mut KiroMetering,
+}
+
+impl KiroMetering {
+    fn observe(&mut self, params: &Value) {
+        let Some(entries) = params.get("meteringUsage").and_then(Value::as_array) else {
+            return;
+        };
+        for entry in entries {
+            if entry.get("unit").and_then(Value::as_str) != Some("credit") {
+                continue;
+            }
+            if let Some(value) = entry.get("value").and_then(Value::as_f64)
+                && value.is_finite()
+                && value >= 0.0
+            {
+                self.credits += value;
+            }
+        }
+    }
+
+    fn usage(&self, prompt_meta: Option<&Value>) -> Option<Value> {
+        if self.credits == 0.0 && prompt_meta.is_none() {
+            return None;
+        }
+        let mut usage = serde_json::Map::new();
+        usage.insert("provider".to_owned(), Value::String("kiro".to_owned()));
+        if self.credits > 0.0 {
+            usage.insert(
+                "credits".to_owned(),
+                json!({"unit":"credit","value":self.credits}),
+            );
+        }
+        if let Some(meta) = prompt_meta {
+            usage.insert("providerMeta".to_owned(), meta.clone());
+        }
+        Some(Value::Object(usage))
+    }
+}
+
 async fn run_kiro(
     request: TurnRequest,
     cancellation: CancellationToken,
@@ -532,22 +685,31 @@ async fn run_kiro(
     };
     let stderr_task = read_stderr(child.stderr.take());
     let mut lines = BufReader::new(stdout).lines();
+    let mut metering = KiroMetering::default();
     let initialize = json!({
         "jsonrpc":"2.0", "id":1, "method":"initialize",
         "params":{"protocolVersion":1,"clientCapabilities":{"fs":{"readTextFile":false,"writeTextFile":false}},"clientInfo":{"name":"TodoAgent","version":env!("CARGO_PKG_VERSION")}}
     });
     if let Err(error) = write_rpc(&mut stdin, &initialize).await {
-        terminate_group(pid).await;
-        return TurnOutcome::failed("acp_write_failed", error);
+        return finish_kiro_child(
+            child,
+            stderr_task,
+            TurnOutcome::failed("acp_write_failed", error),
+        )
+        .await;
     }
     let init = match wait_rpc(
         &mut lines,
         &mut stdin,
         1,
-        AcpPhase::Replay,
-        &events,
-        &cancellation,
-        pid,
+        AcpWaitContext {
+            phase: AcpPhase::Replay,
+            events: &events,
+            cancellation: &cancellation,
+            cancel_session_id: None,
+            policy: AcpWaitPolicy::handshake(),
+            metering: &mut metering,
+        },
     )
     .await
     {
@@ -560,25 +722,37 @@ async fn run_kiro(
         .unwrap_or(false);
     let provider_session_id = if let Some(existing) = &request.provider_session_id {
         if !can_load {
-            terminate_group(pid).await;
-            return TurnOutcome::failed(
-                "capability_missing",
-                "Kiro ACP does not advertise loadSession",
-            );
+            return finish_kiro_child(
+                child,
+                stderr_task,
+                TurnOutcome::failed(
+                    "capability_missing",
+                    "Kiro ACP does not advertise loadSession",
+                ),
+            )
+            .await;
         }
         let load = json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":existing,"cwd":request.working_directory,"mcpServers":[]}});
         if let Err(error) = write_rpc(&mut stdin, &load).await {
-            terminate_group(pid).await;
-            return TurnOutcome::failed("acp_write_failed", error);
+            return finish_kiro_child(
+                child,
+                stderr_task,
+                TurnOutcome::failed("acp_write_failed", error),
+            )
+            .await;
         }
         match wait_rpc(
             &mut lines,
             &mut stdin,
             2,
-            AcpPhase::Replay,
-            &events,
-            &cancellation,
-            pid,
+            AcpWaitContext {
+                phase: AcpPhase::Replay,
+                events: &events,
+                cancellation: &cancellation,
+                cancel_session_id: Some(existing),
+                policy: AcpWaitPolicy::handshake(),
+                metering: &mut metering,
+            },
         )
         .await
         {
@@ -588,17 +762,25 @@ async fn run_kiro(
     } else {
         let new_session = json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":request.working_directory,"mcpServers":[]}});
         if let Err(error) = write_rpc(&mut stdin, &new_session).await {
-            terminate_group(pid).await;
-            return TurnOutcome::failed("acp_write_failed", error);
+            return finish_kiro_child(
+                child,
+                stderr_task,
+                TurnOutcome::failed("acp_write_failed", error),
+            )
+            .await;
         }
         match wait_rpc(
             &mut lines,
             &mut stdin,
             2,
-            AcpPhase::Replay,
-            &events,
-            &cancellation,
-            pid,
+            AcpWaitContext {
+                phase: AcpPhase::Replay,
+                events: &events,
+                cancellation: &cancellation,
+                cancel_session_id: None,
+                policy: AcpWaitPolicy::handshake(),
+                metering: &mut metering,
+            },
         )
         .await
         {
@@ -621,17 +803,25 @@ async fn run_kiro(
     };
     let prompt = json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":provider_session_id,"prompt":[{"type":"text","text":request.prompt}]}});
     if let Err(error) = write_rpc(&mut stdin, &prompt).await {
-        terminate_group(pid).await;
-        return TurnOutcome::failed("acp_write_failed", error);
+        return finish_kiro_child(
+            child,
+            stderr_task,
+            TurnOutcome::failed("acp_write_failed", error),
+        )
+        .await;
     }
     let prompt_result = match wait_rpc(
         &mut lines,
         &mut stdin,
         3,
-        AcpPhase::Live,
-        &events,
-        &cancellation,
-        pid,
+        AcpWaitContext {
+            phase: AcpPhase::Live,
+            events: &events,
+            cancellation: &cancellation,
+            cancel_session_id: Some(&provider_session_id),
+            policy: AcpWaitPolicy::prompt(),
+            metering: &mut metering,
+        },
     )
     .await
     {
@@ -651,6 +841,7 @@ async fn run_kiro(
         }
     };
     let stderr = stderr_task.await.unwrap_or_default();
+    let usage = metering.usage(prompt_result.get("_meta"));
     if stop == "end_turn" && exit_code == Some(0) {
         TurnOutcome {
             status: "completed",
@@ -659,7 +850,7 @@ async fn run_kiro(
             provider_session_id: Some(provider_session_id),
             error_code: None,
             error_message: None,
-            usage: prompt_result.get("_meta").cloned(),
+            usage,
         }
     } else if stop == "cancelled" {
         TurnOutcome::cancelled()
@@ -675,7 +866,7 @@ async fn run_kiro(
             } else {
                 stderr
             }),
-            usage: prompt_result.get("_meta").cloned(),
+            usage,
         }
     }
 }
@@ -686,28 +877,47 @@ enum AcpPhase {
     Live,
 }
 
-async fn wait_rpc(
-    lines: &mut Lines<BufReader<ChildStdout>>,
-    stdin: &mut tokio::process::ChildStdin,
+async fn wait_rpc<R, W>(
+    lines: &mut Lines<BufReader<R>>,
+    stdin: &mut W,
     request_id: i64,
-    phase: AcpPhase,
-    events: &mpsc::Sender<ProviderEvent>,
-    cancellation: &CancellationToken,
-    pid: Option<u32>,
-) -> Result<Value, TurnOutcome> {
-    let budget = sleep(Duration::from_secs(90));
-    tokio::pin!(budget);
+    context: AcpWaitContext<'_>,
+) -> Result<Value, TurnOutcome>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let hard_deadline = sleep(context.policy.hard_timeout);
+    tokio::pin!(hard_deadline);
+    let idle_deadline = sleep(
+        context
+            .policy
+            .idle_timeout
+            .unwrap_or(context.policy.hard_timeout),
+    );
+    tokio::pin!(idle_deadline);
     loop {
         tokio::select! {
-            _ = cancellation.cancelled() => {
-                let cancel = json!({"jsonrpc":"2.0","method":"session/cancel","params":{}});
-                let _ = write_rpc(stdin, &cancel).await;
-                terminate_group(pid).await;
+            _ = context.cancellation.cancelled() => {
+                if let Some(session_id) = context.cancel_session_id {
+                    let _ = write_rpc(stdin, &cancel_session_notification(session_id)).await;
+                }
                 return Err(TurnOutcome::cancelled());
             }
-            _ = &mut budget => {
-                terminate_group(pid).await;
-                return Err(TurnOutcome::failed("timed_out", "ACP request timed out after 90 seconds"));
+            _ = &mut hard_deadline => {
+                return Err(TurnOutcome::failed(
+                    "timed_out",
+                    format!("ACP request exceeded {} seconds", context.policy.hard_timeout.as_secs()),
+                ));
+            }
+            _ = &mut idle_deadline, if context.policy.idle_timeout.is_some() => {
+                return Err(TurnOutcome::failed(
+                    "timed_out",
+                    format!(
+                        "ACP request produced no protocol activity for {} seconds",
+                        context.policy.idle_timeout.unwrap_or_default().as_secs()
+                    ),
+                ));
             }
             line = lines.next_line() => {
                 let line = match line {
@@ -716,26 +926,48 @@ async fn wait_rpc(
                     Err(error) => return Err(TurnOutcome::failed("stream_failed", error.to_string())),
                 };
                 let Ok(value) = serde_json::from_str::<Value>(&line) else { continue; };
+                if let Some(idle_timeout) = context.policy.idle_timeout {
+                    idle_deadline.as_mut().reset(Instant::now() + idle_timeout);
+                }
                 if value.get("id").and_then(Value::as_i64) == Some(request_id) && value.get("method").is_none() {
                     if let Some(error) = value.get("error") {
                         return Err(TurnOutcome::failed(classify_error(&compact_json(error)), compact_json(error)));
                     }
                     return Ok(value.get("result").cloned().unwrap_or(Value::Null));
                 }
-                if value.get("id").and_then(Value::as_i64).is_some() && value.get("method").and_then(Value::as_str) == Some("session/request_permission") {
-                    answer_permission(stdin, &value).await;
+                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                if value.get("id").is_some_and(|id| !id.is_null()) && !method.is_empty() {
+                    if method == "session/request_permission" {
+                        answer_permission(stdin, &value).await;
+                    } else {
+                        let _ = write_rpc(stdin, &method_not_found_response(&value, method)).await;
+                    }
                     continue;
                 }
-                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
-                if phase == AcpPhase::Live && matches!(method, "session/update" | "session/notification") {
+                if context.phase == AcpPhase::Live && matches!(method, "session/update" | "session/notification") {
                     for event in parse_kiro_update(value.pointer("/params/update").unwrap_or(&Value::Null)) {
-                        let _ = events.send(event).await;
+                        let _ = context.events.send(event).await;
                     }
                 }
-                let _ = events.send(ProviderEvent::Raw { kind: method.to_owned(), payload: value }).await;
+                if context.phase == AcpPhase::Live && method == "_kiro.dev/metadata" {
+                    context.metering.observe(value.get("params").unwrap_or(&Value::Null));
+                }
+                let _ = context.events.send(ProviderEvent::Raw { kind: method.to_owned(), payload: value }).await;
             }
         }
     }
+}
+
+fn cancel_session_notification(session_id: &str) -> Value {
+    json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":session_id}})
+}
+
+fn method_not_found_response(request: &Value, method: &str) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id":request.get("id").cloned().unwrap_or(Value::Null),
+        "error":{"code":-32601,"message":format!("unsupported: {method}")}
+    })
 }
 
 fn parse_kiro_update(update: &Value) -> Vec<ProviderEvent> {
@@ -772,7 +1004,7 @@ fn parse_kiro_update(update: &Value) -> Vec<ProviderEvent> {
     }
 }
 
-async fn answer_permission(stdin: &mut tokio::process::ChildStdin, request: &Value) {
+async fn answer_permission<W: AsyncWrite + Unpin>(stdin: &mut W, request: &Value) {
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     let allow = request
         .pointer("/params/options")
@@ -801,7 +1033,7 @@ async fn answer_permission(stdin: &mut tokio::process::ChildStdin, request: &Val
     let _ = write_rpc(stdin, &response).await;
 }
 
-async fn write_rpc(stdin: &mut tokio::process::ChildStdin, value: &Value) -> Result<(), String> {
+async fn write_rpc<W: AsyncWrite + Unpin>(stdin: &mut W, value: &Value) -> Result<(), String> {
     let mut bytes = serde_json::to_vec(value).map_err(|error| error.to_string())?;
     bytes.push(b'\n');
     stdin
@@ -816,8 +1048,17 @@ async fn finish_kiro_child(
     stderr_task: tokio::task::JoinHandle<String>,
     mut outcome: TurnOutcome,
 ) -> TurnOutcome {
-    terminate_group(child.id()).await;
-    outcome.exit_code = child.wait().await.ok().and_then(|status| status.code());
+    let mut exited = false;
+    if outcome.status == "cancelled" {
+        if let Ok(Ok(status)) = timeout(ACP_CANCEL_GRACE, child.wait()).await {
+            outcome.exit_code = status.code();
+            exited = true;
+        }
+    }
+    if !exited {
+        terminate_group(child.id()).await;
+        outcome.exit_code = child.wait().await.ok().and_then(|status| status.code());
+    }
     let stderr = stderr_task.await.unwrap_or_default();
     if outcome.error_message.as_deref().is_none_or(str::is_empty) && !stderr.is_empty() {
         outcome.error_message = Some(stderr);
@@ -890,6 +1131,63 @@ fn compact_json(value: &Value) -> String {
     value
 }
 
+fn apply_cursor_usage(current: &mut Option<Value>, container: &Value) {
+    let source = container
+        .get("usage")
+        .filter(|usage| usage.is_object())
+        .unwrap_or(container);
+    let delta = [
+        cursor_usage_number(source, &["input_tokens", "inputTokens"]),
+        cursor_usage_number(source, &["output_tokens", "outputTokens"]),
+        cursor_usage_number(
+            source,
+            &[
+                "cached_input_tokens",
+                "cachedInputTokens",
+                "cacheReadTokens",
+                "cache_read_input_tokens",
+                "cacheReadInputTokens",
+            ],
+        ),
+        cursor_usage_number(
+            source,
+            &[
+                "cacheWriteTokens",
+                "cache_creation_input_tokens",
+                "cacheCreationInputTokens",
+            ],
+        ),
+    ];
+    if delta.iter().all(|value| *value == 0) && current.is_none() {
+        return;
+    }
+    let previous = current.as_ref().unwrap_or(&Value::Null);
+    let totals = [
+        cursor_usage_number(previous, &["inputTokens"]).saturating_add(delta[0]),
+        cursor_usage_number(previous, &["outputTokens"]).saturating_add(delta[1]),
+        cursor_usage_number(previous, &["cacheReadTokens"]).saturating_add(delta[2]),
+        cursor_usage_number(previous, &["cacheWriteTokens"]).saturating_add(delta[3]),
+    ];
+    *current = Some(json!({
+        "inputTokens": totals[0],
+        "outputTokens": totals[1],
+        "cacheReadTokens": totals[2],
+        "cacheWriteTokens": totals[3],
+    }));
+}
+
+fn cursor_usage_number(value: &Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|key| {
+            value.get(*key).and_then(|number| {
+                number
+                    .as_u64()
+                    .or_else(|| number.as_i64().and_then(|value| u64::try_from(value).ok()))
+            })
+        })
+        .unwrap_or(0)
+}
+
 fn cursor_tool_output(detail: &Value) -> String {
     let result = detail.get("result").unwrap_or(&Value::Null);
     if let Some(error) = result.get("error").or_else(|| result.get("failure")) {
@@ -928,11 +1226,64 @@ mod tests {
     #[test]
     fn cursor_nested_tool_is_legible() {
         let mut parser = StreamParser::new(StreamKind::Cursor);
-        let value = json!({"type":"tool_call","subtype":"completed","call_id":"c1","tool_call":{"editToolCall":{"args":{"path":"a"},"result":{"success":{"message":"Wrote a"}}}}});
+        let value = json!({"type":"tool_call","subtype":"completed","tool_call":{"toolCallId":"nested-c1","editToolCall":{"args":{"path":"a"},"result":{"success":{"message":"Wrote a"}}}}});
         let events = parser.parse(value);
         assert!(
-            matches!(&events[0], ProviderEvent::ToolResult { name, output, .. } if name == "edit" && output == "Wrote a")
+            matches!(&events[0], ProviderEvent::ToolResult { name, call_id, output } if name == "edit" && call_id == "nested-c1" && output == "Wrote a")
         );
+    }
+
+    #[test]
+    fn cursor_legacy_vocabulary_and_usage_are_preserved() {
+        let mut parser = StreamParser::new(StreamKind::Cursor);
+        let assistant = parser.parse(json!({
+            "type":"assistant",
+            "message":{
+                "usage":{"inputTokens":10,"output_tokens":2},
+                "content":[
+                    {"type":"thinking","text":"checking"},
+                    {"type":"tool_use","name":"read","id":"tool-1","input":{"path":"a"}}
+                ]
+            }
+        }));
+        assert!(
+            matches!(&assistant[0], ProviderEvent::Status(value) if value == "thinking: checking")
+        );
+        assert!(
+            matches!(&assistant[1], ProviderEvent::ToolUse { name, call_id, .. } if name == "read" && call_id == "tool-1")
+        );
+
+        let tool_result = parser.parse(json!({
+            "type":"tool_result","tool_name":"read","tool_id":"tool-1","output":"contents"
+        }));
+        assert!(
+            matches!(&tool_result[0], ProviderEvent::ToolResult { name, call_id, output } if name == "read" && call_id == "tool-1" && output == "contents")
+        );
+
+        assert!(
+            parser
+                .parse(json!({"type":"step_finish","cache_read_input_tokens":3}))
+                .is_empty()
+        );
+        parser.parse(json!({
+            "type":"result",
+            "result":"done",
+            "sessionId":"cursor-session",
+            "input_tokens":5,
+            "outputTokens":4,
+            "cacheCreationInputTokens":1
+        }));
+        let outcome = parser.finish(Some(0), String::new());
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(
+            outcome.provider_session_id.as_deref(),
+            Some("cursor-session")
+        );
+        let usage = outcome.usage.expect("normalized cursor usage");
+        assert_eq!(usage["inputTokens"], 15);
+        assert_eq!(usage["outputTokens"], 6);
+        assert_eq!(usage["cacheReadTokens"], 3);
+        assert_eq!(usage["cacheWriteTokens"], 1);
     }
 
     #[test]
@@ -942,5 +1293,51 @@ mod tests {
             &json!({"sessionUpdate":"agent_message_chunk","content":{"text":"你"}}),
         );
         assert!(matches!(&events[0], ProviderEvent::Text(value) if value == "你"));
+    }
+
+    #[test]
+    fn kiro_prompt_has_separate_idle_and_wall_budgets() {
+        assert_eq!(
+            AcpWaitPolicy::handshake().hard_timeout,
+            Duration::from_secs(90)
+        );
+        assert_eq!(AcpWaitPolicy::handshake().idle_timeout, None);
+        assert_eq!(
+            AcpWaitPolicy::prompt(),
+            AcpWaitPolicy {
+                hard_timeout: Duration::from_secs(30 * 60),
+                idle_timeout: Some(Duration::from_secs(90)),
+            }
+        );
+    }
+
+    #[test]
+    fn kiro_credit_metadata_never_becomes_dollars() {
+        let mut metering = KiroMetering::default();
+        metering.observe(&json!({
+            "meteringUsage":[
+                {"unit":"credit","value":1.25},
+                {"unit":"token","value":500}
+            ]
+        }));
+        let usage = metering
+            .usage(Some(&json!({"usage":{"inputTokens":3}})))
+            .expect("Kiro usage");
+        assert_eq!(usage["provider"], "kiro");
+        assert_eq!(usage["credits"]["unit"], "credit");
+        assert_eq!(usage["credits"]["value"], 1.25);
+        assert!(usage.get("costUsd").is_none());
+    }
+
+    #[test]
+    fn kiro_cancel_and_unknown_request_responses_follow_json_rpc() {
+        let cancel = cancel_session_notification("kiro-session");
+        assert_eq!(cancel["method"], "session/cancel");
+        assert_eq!(cancel["params"]["sessionId"], "kiro-session");
+
+        let request = json!({"jsonrpc":"2.0","id":"agent-1","method":"custom/read"});
+        let response = method_not_found_response(&request, "custom/read");
+        assert_eq!(response["id"], "agent-1");
+        assert_eq!(response["error"]["code"], -32601);
     }
 }

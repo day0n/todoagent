@@ -14,12 +14,18 @@ final class AppContainer {
             let repository = EngineRepository(client: client)
             self.client = client
             self.repository = repository
-            state = AppState(repository: repository)
+            state = AppState(
+                repository: repository,
+                inspectorPresented: UserDefaults.standard.bool(forKey: "showAssistantAtLaunch")
+            )
         } catch {
             client = nil
             let repository = FailedRepository(message: error.localizedDescription)
             self.repository = repository
-            state = AppState(repository: repository)
+            state = AppState(
+                repository: repository,
+                inspectorPresented: UserDefaults.standard.bool(forKey: "showAssistantAtLaunch")
+            )
         }
     }
 }
@@ -42,6 +48,16 @@ private actor FailedRepository: AppRepository {
     func markRead(sessionID: String, through sequence: Int64) async throws { throw failure }
     func cancelTurn(sessionID: String) async throws { throw failure }
     func injectGeminiKey(_ key: String) async throws { throw failure }
+    func clearGeminiKey() async throws { throw failure }
+    func testGeminiConnection(model: String) async throws -> GeminiConnectionResult { throw failure }
+    func assistantStatus() async throws -> AssistantStatus { throw failure }
+    func assistantSessions(includeArchived: Bool) async throws -> [AssistantSessionDescriptor] { throw failure }
+    func createAssistantSession(title: String?) async throws -> AssistantSessionBundle { throw failure }
+    func renameAssistantSession(sessionID: String, title: String) async throws -> AssistantSessionBundle { throw failure }
+    func archiveAssistantSession(sessionID: String) async throws -> AssistantSessionBundle { throw failure }
+    func assistantHistory(sessionID: String, after sequence: Int64) async throws -> AssistantSessionBundle { throw failure }
+    func sendAssistantMessage(sessionID: String, clientMessageID: UUID, text: String, model: String, attachments: [AssistantTextAttachment]) async throws -> AssistantSessionBundle { throw failure }
+    func cancelAssistantTurn(sessionID: String) async throws { throw failure }
     func shutdown() async {}
 }
 

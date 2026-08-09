@@ -13,7 +13,7 @@ struct BoardView: View {
             }
         }
         .navigationTitle(state.titleForSelection())
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(TodoAgentUI.canvasBackground)
     }
 
     private var isTimeline: Bool { state.selection == .smart(.timeline) }
@@ -74,8 +74,12 @@ private struct TimelineTopBar: View {
         .buttonStyle(.plain)
         .padding(.horizontal, TodoAgentUI.sectionSpacing)
         .frame(height: 52)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
+        .background(TodoAgentUI.surfaceBackground)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(TodoAgentUI.hairline)
+                .frame(height: 1)
+        }
     }
 
     private func shiftDate(_ days: Int) {
@@ -114,7 +118,7 @@ private struct TimelineColumns: View {
             }
             .scrollIndicators(.visible)
         }
-        .background(Color(nsColor: .underPageBackgroundColor))
+        .background(TodoAgentUI.canvasBackground)
     }
 
     private func date(for bucket: BoardBucket, selectedDate: Date) -> Date? {
@@ -187,7 +191,7 @@ private struct TimelineColumn: View {
             }
 
             Button {
-                state.presentedSheet = .newTask
+                state.presentNewTask()
             } label: {
                 Label("添加任务", systemImage: "plus.circle")
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -207,12 +211,16 @@ private struct TimelineColumn: View {
             RoundedRectangle(cornerRadius: TodoAgentUI.panelRadius)
                 .stroke(
                     bucket == .today
-                        ? Color.accentColor.opacity(0.28)
-                        : Color(nsColor: .separatorColor).opacity(0.38),
-                    lineWidth: bucket == .today ? 1.25 : 1
+                        ? TodoAgentUI.primaryText.opacity(0.14)
+                        : TodoAgentUI.hairline,
+                    lineWidth: 1
                 )
         }
-        .shadow(color: bucket == .today ? Color.accentColor.opacity(0.06) : .clear, radius: 10, y: 3)
+        .shadow(
+            color: bucket == .today ? TodoAgentUI.shadowColor.opacity(0.45) : .clear,
+            radius: 10,
+            y: 3
+        )
         .accessibilityIdentifier("timeline.\(bucket.rawValue).column")
     }
 
@@ -223,9 +231,9 @@ private struct TimelineColumn: View {
 
     private var columnBackground: Color {
         if bucket == .today {
-            return Color.accentColor.opacity(0.045)
+            return TodoAgentUI.selectionBackground
         }
-        return Color(nsColor: .controlBackgroundColor).opacity(bucket == .later ? 0.5 : 0.78)
+        return TodoAgentUI.surfaceBackground.opacity(bucket == .later ? 0.76 : 1)
     }
 }
 
@@ -253,22 +261,152 @@ private struct TaskListView: View {
     var body: some View {
         let tasks = state.visibleTasks()
 
-        if tasks.isEmpty {
-            ContentUnavailableView(
-                "没有任务",
-                systemImage: "checklist",
-                description: Text("在工具栏或时间线中创建第一个任务。")
-            )
-        } else {
+        VStack(spacing: 0) {
             ScrollView {
                 LazyVStack(spacing: TodoAgentUI.standardSpacing) {
-                    ForEach(tasks) { task in TaskCard(task: task, state: state) }
+                    if tasks.isEmpty {
+                        ContentUnavailableView(
+                            "没有任务",
+                            systemImage: "checklist",
+                            description: Text(emptyDescription)
+                        )
+                        .frame(maxWidth: .infinity, minHeight: 240)
+                    } else {
+                        ForEach(tasks) { task in TaskCard(task: task, state: state) }
+                    }
                 }
                 .frame(maxWidth: 780)
                 .padding(20)
             }
-            .frame(maxWidth: .infinity)
+
+            if let addTaskDestination {
+                InlineAddTaskComposer(state: state, destination: addTaskDestination)
+                    .id(addTaskDestination)
+            }
         }
+        .frame(maxWidth: .infinity)
+        .background(TodoAgentUI.canvasBackground)
+    }
+
+    private var addTaskDestination: InlineAddTaskDestination? {
+        switch state.selection {
+        case .smart(.tasks):
+            .allTasks
+        case let .list(id):
+            .list(id)
+        default:
+            nil
+        }
+    }
+
+    private var emptyDescription: String {
+        switch state.selection {
+        case .smart(.running):
+            "当前没有正在运行的本地 Session。"
+        case .smart(.done):
+            "完成任务后会显示在这里。"
+        case .smart(.tasks), .list:
+            "使用下方的“添加任务”创建第一项。"
+        default:
+            "当前列表为空。"
+        }
+    }
+}
+
+private enum InlineAddTaskDestination: Hashable {
+    case allTasks
+    case list(UUID)
+
+    var listID: UUID? {
+        switch self {
+        case .allTasks: nil
+        case let .list(id): id
+        }
+    }
+
+    var accessibilityIdentifier: String {
+        switch self {
+        case .allTasks:
+            "task-list.add-task"
+        case let .list(id):
+            "task-list.\(id.uuidString).add-task"
+        }
+    }
+}
+
+private struct InlineAddTaskComposer: View {
+    let state: AppState
+    let destination: InlineAddTaskDestination
+
+    @State private var draft = ""
+    @State private var isSubmitting = false
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(TodoAgentUI.hairline)
+                .frame(height: 1)
+
+            HStack(spacing: TodoAgentUI.standardSpacing) {
+                Image(systemName: "plus")
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(TodoAgentUI.secondaryText)
+                    .accessibilityHidden(true)
+
+                TextField("添加任务", text: $draft)
+                    .textFieldStyle(.plain)
+                    .focused($isFocused)
+                    .onSubmit(submit)
+                    .onExitCommand(perform: cancelEditing)
+                    .accessibilityLabel("添加任务")
+                    .accessibilityHint("输入任务标题并按回车创建，按 Escape 清空")
+                    .accessibilityIdentifier(destination.accessibilityIdentifier)
+
+                if isSubmitting {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel("正在添加任务")
+                }
+            }
+            .font(.callout)
+            .foregroundStyle(TodoAgentUI.primaryText)
+            .padding(.horizontal, TodoAgentUI.cardPadding)
+            .frame(maxWidth: 780, minHeight: 44)
+            .background(TodoAgentUI.surfaceBackground, in: .rect(cornerRadius: TodoAgentUI.cardRadius))
+            .overlay {
+                RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
+                    .stroke(TodoAgentUI.hairline, lineWidth: 1)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+        }
+        .frame(maxWidth: .infinity)
+        .background(TodoAgentUI.canvasBackground)
+    }
+
+    private func submit() {
+        let submittedDraft = draft
+        let title = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !isSubmitting else { return }
+
+        isSubmitting = true
+        Task { @MainActor in
+            let succeeded = await state.createTask(
+                title: title,
+                listID: destination.listID,
+                dueDate: nil
+            )
+            isSubmitting = false
+            if succeeded, draft == submittedDraft {
+                draft = ""
+            }
+        }
+    }
+
+    private func cancelEditing() {
+        draft = ""
+        isFocused = false
     }
 }
 
@@ -282,12 +420,12 @@ private struct TaskCard: View {
             sessionButton
         }
         .padding(TodoAgentUI.cardPadding)
-        .background(Color(nsColor: .windowBackgroundColor), in: .rect(cornerRadius: TodoAgentUI.cardRadius))
+        .background(TodoAgentUI.surfaceBackground, in: .rect(cornerRadius: TodoAgentUI.cardRadius))
         .overlay {
             RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
                 .stroke(borderColor, lineWidth: state.hasUnreadAgentMessage(for: task) ? 1.5 : 1)
         }
-        .shadow(color: .black.opacity(0.055), radius: 4, y: 2)
+        .shadow(color: TodoAgentUI.shadowColor.opacity(0.55), radius: 5, y: 2)
         .accessibilityLabel("\(task.title)，\(state.session(for: task) == nil ? "尚未创建 Session" : "进入 Session")")
         .accessibilityIdentifier("task.\(task.id.uuidString).card")
     }
@@ -364,6 +502,6 @@ private struct TaskCard: View {
     }
 
     private var borderColor: Color {
-        state.hasUnreadAgentMessage(for: task) ? .red.opacity(0.58) : Color(nsColor: .separatorColor).opacity(0.38)
+        state.hasUnreadAgentMessage(for: task) ? .red.opacity(0.58) : TodoAgentUI.hairline
     }
 }
