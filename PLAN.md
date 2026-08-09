@@ -1,204 +1,256 @@
-# TodoAgent 实施计划
+# TodoAgent 原生 macOS 产品计划与状态
 
-> **工作方式**：本文档是总纲和唯一事实来源。每个里程碑有一份独立的执行 prompt，直接复制给编码 agent 执行。
-> 每完成一个里程碑：更新 §6 的状态列、把决策沉淀进 §7、再写下一份 prompt。
+> 状态日期：2026-08-09
+> 本文是 `master` 上原生 macOS 产品的实现边界、验收状态和后续路线。已经实现的能力与尚未实现的路线分开记录。
 
-> **关于 `mockups/` 和 `plans/`**：本仓库只收代码。设计原型（HTML）和里程碑 prompt 留在本地，未纳入版本库 ——
-> 前者包含第三方产品（Sunsama、Things）的截图素材，不适合公开分发。代码注释里出现的
-> `mockups/xxx.html` 指的就是这批本地文件，是设计出处的记录，不是仓库里的路径。
+## 0. 仓库与分支基线
 
-设计基准：**布局**照 `opt-h2-sunsama-refined`（2026-08-04 定稿），**配色与字体**留在实现里（见 §7-7）；旧基准 v1d-apple 已废弃。产品承诺：**一个会自己完成任务的待办清单**——添加任务或和 agent 说一句话，任务被派给本地 CLI agent 执行，卡住的任务带着问题回来找你，完成的任务等你确认。
-
-## 0. 目标闭环（V1 全景）
-
-```
-你在 chat 说一句话（或点「添加任务」）
-    ↓
-主 agent（pi runtime）解析 → 建任务卡 → 自动关联清单/仓库/历史任务
-    ↓
-任务派发给本地 CLI（claude/codex/cursor/kiro/grok，直跑，已实现）
-    ↓
-执行中 → 看板实时更新（SSE）
-    ↓
-结束分三路：
-  完成       → 「待确认」，你点「看结果」看 diff/transcript 后勾掉
-  提问/受阻  → 「需要你」，你点「回答」，答案送回 agent 继续
-  失败/超时  → 「需要你」，你看日志决定重派或关闭
-```
-
-主 agent 只做四件事：**解析对话、建卡关联、识别产出类型（完成/提问）、转发你的回答**。不做拆解、不做验收（人是验收者）、不做 workflow。
-
-## 1. 架构
-
-```
-apps/web        Next.js 三栏 UI（照 v1d 原型重做）
-   ↕ HTTP + SSE（仅 localhost）
-apps/engine     Hono
-   ├─ chat 路由 → 主 agent（pi-agent-core + pi-ai，进程内）
-   ├─ 任务/清单 API
-   ├─ 直派执行 runDirect（已完成，d45cb62）
-   └─ SQLite（packages/core/db）
-packages/core   适配器、看门狗、runDirect、Store（全部复用）
-```
-
-主 agent 依赖：`@earendil-works/pi-ai` + `@earendil-works/pi-agent-core`（0.83.x，badlogic 的 pi 已迁移到该组织；旧 `@mariozechner/*` 停更在 0.73.1）。
-
-## 2. 数据模型改动（packages/core）
-
-### 2.1 复用 `channel` 表作为「清单」
-- 加列：`color TEXT`（侧栏色点）
-- 语义：一个清单可绑仓库（`project_id` 非空 → 任务可派发）或不绑（纯待办，如「灵光一现」）
-- 频道消息/DM 功能不再暴露 UI，表保留
-
-### 2.2 `task` 表扩展
-```
-note            TEXT      -- 副标题行（"codex · 4 分钟 · 3 个文件"由前端实时渲染，note 存用户/主agent写的说明）
-my_day          TEXT      -- ISO 日期；等于今天 → 出现在「我的一天」
-needs_kind      TEXT      -- null | question | blocked | failed | timeout
-needs_text      TEXT      -- 提问原文 / 受阻原因摘要
-```
-状态机（在现有 todo|in_progress|in_review|done 上加一个值）：
-```
-todo → in_progress → in_review → done
-              ↘ needs_you ↗（回答后回 in_progress）
-```
-不变量：`needs_you` 必有 `needs_kind`；`in_progress` 必有活着的 run。
-
-### 2.3 新表 `agent_chat`
-```
-id, role (user|agent), body, task_refs (JSON: 本条消息创建/引用的任务id),
-created_at
-```
-V1 单条时间线（不分会话），主 agent 上下文取最近 N 条。
-
-### 2.4 迁移
-Store 已有 migrate 机制（`db/index.ts`），按既有模式加列/建表 + 测试。
-
-## 3. 主 agent（pi runtime）
-
-### 3.1 职责与工具
-系统提示词固定人设：任务秘书，惜字如金。注册工具（TypeBox schema）：
-
-| 工具 | 作用 |
+| 分支 | 定位 |
 |---|---|
-| `create_tasks` | 批量建卡：title/note/listId/是否派发 |
-| `find_related` | 按关键词+仓库查历史任务（关联提示「与上周 X 同仓库」）|
-| `dispatch_task` | 调 engine 内部派发（复用 /tasks/:id/run 的逻辑）|
-| `update_task` | 改清单/标题/note |
-| `list_state` | 读当前看板摘要（回答"现在什么情况"）|
+| `master` | TodoAgent 原生 macOS 产品的主分支与发布基线 |
+| `legacy/web` | 旧 Web + Node Engine 产品及其完整历史 |
 
-### 3.2 两个非对话职责
-- **产出分类**：runDirect 结束时，把 worker 最后输出交给主 agent 单轮调用分类：`done | question | blocked`，question/blocked 时抽出一句摘要写进 `needs_text`。分类失败兜底为 done（宁可让人看一眼，不可吞掉产出）。
-- **回答转发**：你在「需要你」点「回答」→ 主 agent 把你的答案 + 原问题拼成续跑 prompt：claude/cursor 用 `resumeSessionId` 续会话（attempt 表已存 sessionId，适配器已支持，只是从没被调用过）；codex/acp 无 resume，带上一轮输出全文重跑。
+- 原生 App 不读取或导入旧 Web 数据库；两套产品的数据目录与启动方式保持隔离。
+- `master` 的发布门禁只以 SwiftUI/AppKit 前端、Rust Engine sidecar、共享 IPC fixture 和 macOS 构建脚本为准。
+- 旧 Web 的详细 M0–M7 计划不再复制到本文；需要维护旧产品时以 `legacy/web` 上的文档和代码为准。
+- 分支调整不等于删除用户数据，也不要求对现有 Git 历史做重写。
 
-### 3.3 运行位置与凭据
-- 跑在 engine 进程内（无独立服务）
-- 模型走 pi-ai，需要一个 API key（环境变量 `TODOAGENT_MODEL` + `TODOAGENT_API_KEY`，pi-ai 支持任意 OpenAI 兼容端点）
-- **待讨论**：用哪家模型（见 §7-1）
+## 1. 产品定义与首版边界
 
-## 4. Engine API
+TodoAgent 是一个本地优先的 macOS 待办应用，提供两类彼此独立的 Agent 能力：
 
-| 方法 | 路径 | 说明 |
+1. **任务 Session**：把一张任务卡绑定到 Codex、Claude Code、Cursor Agent 或 Kiro CLI，在用户选择的工作目录中持续对话和执行。
+2. **TodoAgent 助手**：使用 Gemini 管理 TodoAgent 内的任务与清单，不启动本地 CLI，也不直接操作用户文件。
+
+首版产品规则：
+
+- 任务生命周期只有 `open | completed`；运行状态、失败状态和未读状态不冒充任务生命周期。
+- 一个任务最多绑定一个长期逻辑 `TaskSession`、一个 Runtime 和一个工作目录；不支持同任务切换 Runtime 或跨 Agent 接力。
+- 每条用户消息启动一次 CLI 进程；进程在本轮结束后退出，供应商 Session ID、聊天历史和未读位置保存在本地。
+- 工作目录是否为 Git 仓库、是否存在未提交修改都不作为启动门槛。用户授权目录后，CLI 可以按自身能力读取或修改其中的文件。
+- 本地 CLI 首版只接收文本消息。TodoAgent 助手额外支持 UTF-8 的 `.txt`、`.md` 文本附件，不支持图片、音频或其他多模态输入。
+- 菜单栏入口首版只展示截止日期为今天且尚未完成的任务。
+
+## 2. 原生架构
+
+```text
+SwiftUI / AppKit App
+  ├─ 主窗口：日历、时间线、任务、清单、状态
+  ├─ 右侧 Inspector：TodoAgent 助手
+  ├─ 设置：Runtime 检测与 Gemini 配置
+  └─ MenuBarExtra：今日任务
+          │
+          │ stdin/stdout NDJSON · TodoAgent IPC v2
+          ▼
+Rust Engine sidecar
+  ├─ SQLite v3 migration / repository
+  ├─ Codex / Claude / Cursor 流式适配器
+  ├─ Kiro ACP v1 适配器
+  ├─ 极简 Pi 风格 Assistant Kernel
+  └─ Runtime、Turn、取消、恢复与事件调度
+          ├──────── 本地 CLI 子进程
+          └──────── Gemini Interactions API
+```
+
+- App 启动并管理随包分发的 Rust sidecar；原生运行路径不依赖 Node.js、Python、LiteLLM、`pie` 或 `yoagent`。
+- Engine 使用 Tokio current-thread runtime；SQLite 写入经独立 Store worker 串行化，避免阻塞 IPC 与流式事件。
+- IPC 使用请求 ID 对应响应，并允许异步事件穿插；握手必须确认协议版本 `2`。
+- Swift 的 `AppRepository` 隔离 IPC 细节；助手流式状态放在独立 `AssistantViewState`，不写入全局任务 Snapshot。
+- App 退出时先请求 Engine shutdown；Engine 取消活动 Turn、回收子进程后退出。
+
+## 3. 数据模型与一致性
+
+### 3.1 任务与本地 CLI Session
+
+```text
+Task → TaskSession → SessionTurn → SessionMessage / TurnEvent
+```
+
+- `Task.status`：`open | completed`。
+- `TaskSession.state`：`idle | queued | running | failed | closed`。
+- `SessionTurn.status`：`queued | running | completed | failed | cancelled | interrupted`。
+- `SessionMessage.sequence` 在 Session 内递增；`lastAgentSequence > lastReadSequence` 表示有未读 Agent 消息。
+- 同一 TaskSession 只允许一个活动 Turn；不同 TaskSession 最多同时运行两个 Turn。
+- `session.send` 使用 UUID `clientMessageId` 幂等，超时重试不会重复启动同一条消息。
+- Engine 重启时，遗留的活动 Turn 标记为 `interrupted` 并留下可见错误；不会自动重跑可能有副作用的 CLI 操作。
+
+### 3.2 TodoAgent 助手
+
+助手持久化使用独立模型：
+
+- `chat_session` / `chat_message`：会话和稳定 UI 时间线；
+- `assistant_turn`：模型、状态、用量、错误和时间；
+- `assistant_step`：完整 Gemini step 投影；
+- `assistant_tool_execution`：唯一 `callId` 工具回执，防止重试时重复创建或修改任务；
+- `assistant_compaction`：结构化摘要及其安全覆盖位置。
+
+同一助手会话只允许一个活动 Turn，不同助手会话最多同时运行两个 Turn。用户消息同样使用 `clientMessageId` 幂等。SQLite 是会话、模型步骤、工具回执和压缩摘要的唯一事实来源。
+
+### 3.3 Migration
+
+- 正式 schema 版本为 v3，支持全新数据库和原生 v2 → v3。
+- migration 在事务内执行并记录版本与 checksum；启用外键和 WAL。
+- 旧 `~/.todoagent` 和旧 Web 数据库永不读取。
+
+## 4. 四个本地 Runtime
+
+| Runtime | 首轮与续聊 | 结构化输入/输出 |
 |---|---|---|
-| GET | `/api/lists` | 清单+计数（我的一天/需要你/已完成 计数一并返回）|
-| POST | `/api/lists` | 建清单（可选绑仓库）|
-| GET | `/api/tasks?view=today\|needs\|done\|list:<id>` | 分组好的任务 |
-| POST | `/api/tasks` | 快速添加（不经过主 agent）|
-| PATCH | `/api/tasks/:id` | 勾选/改清单/myDay |
-| POST | `/api/tasks/:id/run` | 派发（已有，直跑）|
-| POST | `/api/tasks/:id/answer` | 回答提问 → 续跑 |
-| POST | `/api/chat` | 用户消息 → 主 agent，SSE 流式返回（文本 + 建卡事件）|
-| GET | `/api/chat/history` | 对话时间线 |
-| GET | `/api/stream` | 看板增量事件（复用 bus，扩展 task:* 事件）|
-| GET | `/api/runs/:id/diff` | 「看结果」：工作区 git diff + transcript（已有 transcript 端点）|
+| Codex | `exec`，后续使用供应商 Session ID resume | JSON 事件流 |
+| Claude Code | `--print`，后续 `--resume` | `stream-json` |
+| Cursor Agent | 首轮 prompt，后续 `--resume` | `stream-json` |
+| Kiro CLI | 首轮 `session/new`，后续 `session/load` | ACP v1 JSON-RPC |
 
-删除/隐藏：频道消息路由、六阶段闸门路由从 web 不再调用（引擎里保留，深度模式）。
+共同约束：
 
-## 5. 前端重做（apps/web）
+- 设置页通过 `runtime.list / detect / verify` 展示 `missing`、`ready`、`auth_required`、`error` 等真实状态，并提供用户主动检测和恢复入口。
+- 某个 Runtime 未安装或未登录，只影响该 Runtime，不阻塞其他 Runtime、App 构建或 DMG 生成。
+- 每轮捕获文本、工具事件、原始受限事件、terminal 状态、退出码、usage 和供应商 Session ID。
+- 取消和超时针对进程组执行终止与兜底清理，避免残留子进程。
+- Runtime 输出只有在满足对应供应商的合法终态时才标记成功；缺失 terminal、解析失败或认证失败均为显式失败。
 
-- **设计 token**：把原型 `:root` 变量提为 `globals.css`，苹果灰底/毛玻璃/系统蓝/0.5px 分隔线/圆角 18px 组卡
-- **结构**：单页三栏
-  - `Sidebar`：我的一天/需要你(蓝色角标)/已完成 + 清单（色点+计数）+ 新建清单
-  - `TaskPane`：大标题 + 添加任务输入行 + 分组卡（需要你 priority 描边置顶 → 进行中 → 待办 → 已完成折叠）
-  - `ChatPane`：iMessage 风、任务创建卡片内嵌、关联提示行、输入胶囊；≤1050px 隐藏（原型断点照搬）
-- **交互**：
-  - 添加任务行内输入回车即建（默认当前清单）
-  - 勾选圈点击 → done（agent 任务在 in_review 时勾选＝确认通过）
-  - 「回答」弹底部输入条（textarea）→ POST answer
-  - 「看结果」抽屉：diff + transcript
-  - SSE 驱动状态点/计数实时变化
-- **删除页面**：频道页、首页委托表单；`/runs/[id]` 简化为执行详情（供「看结果」跳转）；team 页改「Agent 管理」（列 CLI 探测状态）
-- 旧组件保留可复用：`atoms`、`transcripts`、SSE hooks
+## 5. TodoAgent 极简 Agent Kernel
 
-## 6. 里程碑（每个都可独立验收）
+### 5.1 执行循环
 
-| # | 内容 | 验收标准 | 状态 |
-|---|---|---|---|
-| M0 | 直派执行（任务→单 agent 直跑，无流水线）| 测试过 | ✅ `d45cb62` |
-| M1 | 数据模型迁移 + lists/tasks API | curl 全链路建单/建卡/查视图，测试过 | ✅ `d1a8618` |
-| M2 | 前端三栏重做（照 v1d 原型，接 M1 API）| UI 与原型一致，增删勾选/派发/取消可用 | ✅ `baf7b20`…`b0ef8ce`，452 测试全绿 |
-| M3 | 执行反馈打磨 + M2 遗留缺口 | SSE、看结果抽屉（diff+transcript）、失败重派、CORS/归档修复、任务改标题 | ✅ `1ee8528`…`60b953a`，490 测试全绿 |
-| M4 | 主 agent chat（完全嵌入 pi SDK）| 说一句话 → 建卡出现在清单 + 关联提示；无 key 时优雅降级 | ✅ 代码与测试完成；真实模型路径待 key 验证（脚本化假模型已穿透生产路径）|
-| M5 | 需要你闭环 | 产出分类（模型+启发式双层）进 needs_you；回答 → resume 真续/假续 → 再分类 | ✅ `e1f0ef0`…`cbf3377`，527 测试全绿 |
-| M6 | 打磨与收尾 | e2e 重写、seed 收简、移动清单/我的一天入口、快捷键、README 重写 | ✅ `9ccae53`…`07536e5`（含 .env/代理支持），542 测试全绿 |
-| M7 | UI 重制：日看板 + 常驻秘书 | 三栏 216/1fr/336 顶栏对齐一线；四列日看板（引擎分列）；秘书面板常驻含 needs_you 上下文卡；全链路与测试不回归 | ✅ `a3a6509`…`b810e82`，568 测试全绿 + 125 条浏览器断言 + e2e 14/14 |
+助手直接调用 Gemini Interactions API：
 
-### 待 key 验证清单（key = google/gemini-3.6-flash，2026-08-04 执行）
+- `stream=true`、`store=false`；
+- `thinking_level=minimal`；
+- 每次重新发送 system instruction、工具声明和本机 SQLite 重建的上下文；
+- 严格聚合 `interaction.created → step.start/delta/stop → interaction.completed`，完整保留 `thought_signature`、function call 和 function result；
+- SSE 中途断开时不提交未完成 step，也不执行参数不完整的工具；
+- 模型无工具调用且产生有效文本时，才持久化最终回复并结束本轮。
 
-1. ✅ M4 真模型：真实 Gemini 一轮 6s，两卡创建、taskRefs 正确、遵守「先别派发」
-2. ✅ M5 真续跑：`pnpm e2e --ask` 19/19——真 claude 提问→回答→`resumed=true` 真续→按回答建文件→待确认
-3. ◐ M5 模型分类：e2e 引擎是隔离环境走的启发式（正确）；真 Gemini 分类质量待 dogfood 中首次真实派发观察
-4. ⏳ 降级路径（删 session 文件→假续）：边缘用例，dogfood 期间顺手验
+固定限制：
 
-顺序说明:M2 在 M1 后立即做，让每个后续里程碑都能在真 UI 里看到；M4/M5 依赖 pi 凭据到位。
+| 项目 | 限制 |
+|---|---:|
+| 整轮时长 | 120 秒 |
+| 单次模型请求 | 45 秒 |
+| 单轮模型交互 | 最多 8 次 |
+| 单轮工具调用 | 最多 32 次 |
+| 网络瞬态错误 | 最多重试 2 次 |
+| 用户文本 | 最多 16,000 字符 |
+| 模型输出 | 最多 8,192 Token |
 
-## 7. 已定决策（2026-08-02）
+未知工具、无效参数和普通工具错误会作为 `isError` function result 回灌模型；认证错误和参数错误不做网络重试。用户取消或 Engine 重启后，不自动重放已经产生副作用的工具。
 
-1. **主 agent 凭据**：key 暂缓，M1–M3 先行；M4/M5 等 key 到位再动。不做 CLI 兜底。
-2. **「我的一天」**：方案 B，自动聚合 = 需要你 + 进行中 + 待确认 + 今天新建的待办。
-3. **续跑策略**：claude/cursor 用真 resume（attempt.sessionId 已存）；codex 带上一轮输出全文重跑（假续），接受 token 重复消耗。
-4. **旧频道聊天 UI**：直接删，engine 代码保留。
-> M3 验收补记（2026-08-02）：diff 快照不进 `Run` 接口（列表载荷会爆），读取走独立查询；SSE 发布走中间件
-> 跳过 GET/4xx/5xx；`needsKind=question` 的任务在 M5 落地前没有可用动作（已知死路，M5 解）。
+### 5.2 工具
 
-> M5 验收补记（2026-08-03）：产出判定持久化在 `run.outcome_kind/text`（syncTaskFromRun 有 11 个
-> 调用点，必须保持 (run,task) 纯映射，判定放局部变量会被后续同步冲掉——实现者的方案优于计划原稿）；
-> session 失效只能靠文本匹配（两家 CLI 都无结构化错误码），匹配刻意收窄；启发式不产 blocked，
-> 该 kind 仅模型路径可达。
+首版只注册五个任务工具：
 
-6. **M4 架构决策（2026-08-03，用户拍板）**：主 agent **完全嵌入 pi SDK**（`@earendil-works` 系），
-   不走「pi-ai + 自写循环」。理由：总管的演进路线（读 diff 验收、读仓库补上下文、review 文件、
-   多 agent 沟通）会用上 pi 的内置工具集与会话体系，现在自写将来再迁是两遍工。配套约束：
-   - 工具按里程碑分级启用：M4 只开任务五工具 + 只读文件工具；write/edit/bash 留给总管里程碑
-   - 会话真相单轨：pi 会话是 LLM 上下文的真相，`agent_chat` 表降级为 UI 时间线投影（消息文本 + taskRefs）
-   - 版本锁死精确号，升级是主动动作
-   - 测试注入点在第 0 步调研中确定（假 provider / 假模型端点）
+| 工具 | 能力 |
+|---|---|
+| `create_tasks` | 校验后原子创建 1–10 张任务卡 |
+| `find_related` | 按标题和备注查找最多 10 条相关任务 |
+| `update_task` | 修改标题、备注、清单和截止日期 |
+| `list_state` | 读取 open/completed、运行中 Session 和未读摘要 |
+| `list_lists` | 读取未归档清单 |
 
-7. **M7 UI 方向（2026-08-04，用户拍板）**：**架构照 mockup，视觉留实现**。用户明确要求
-   「不要像素级复刻，整体的黑白 UI 还是参考我们现在的」。落地边界：
-   - 取自 opt-h2：三栏 216/1fr/336、54px 顶栏对齐成一条线、四列日看板、迷你月历、状态筛选区、
-     秘书面板常驻（上下文卡 + 消息流 + 快捷胶囊 + 输入区）、卡片徽章体系、每列进度条
-   - 留在实现：灰阶 + 系统蓝、系统字体栈、0.5px 分隔线手感、M6 的无障碍成果
-   - 拒绝 mockup 的绿主色 / Inter / #f5f6f8：`--ink-3` 等每个灰阶都是按实际背景量过 WCAG AA 的
-     （mockup 的 `#9aa0a8` 在白底是 2.6:1，连大字底线都不过）；Inter 无 CJK 覆盖，这个界面
-     大部分文字会回落到 PingFang
-   - `.card` → `.tcard`、`.group` → `.tgroup` 同一类问题：保留页面（/team、/runs）在用那些原子类
+助手不提供 shell、任意文件读写、MCP、skills、CLI 派发或隐藏扩展工具。任务发生变化后发送 `task.changed`，Swift 再同步权威 Snapshot。
 
-> M7 验收补记（2026-08-04）：**分列归属放引擎**（`GET /api/board`），客户端只原地打补丁不重新分列——
-> 归属规则有五档优先级（活跃状态 > 当天完成 > 手动置顶 > 截止日期 > 创建当天），两份实现必然分叉，
-> 症状是卡片重复或消失。两处判定值得记：**明确的截止日期现在会否决「今天」**（旧 `inToday` 把今天创建
-> 的卡都算进今天，日看板上会挤爆今天列而用户选的那列空着）；**手动置顶胜过截止日期**（我的测试断言
-> 反了、实现是对的——截止日期是「必须在这天前做完」，置顶是「我今天要做」，否则太阳图标在任何有
-> 未来日期的任务上都会静默失灵）。另修一个真缺陷：初始加载把四个请求打包成 `Promise.all`，
-> `/api/runtimes` 要 15 秒（spawn 六个 CLI），把 39ms 的 `chat/status` 拖住——秘书面板在每次加载后的
-> 15 秒里显示「未检测到 CLI」+ 灰色离线点，而机器装了 6 个 CLI 且模型在线。拆成四个独立请求后 1200ms 即正确。
+### 5.3 上下文与附件
 
-> M7 交互补记（2026-08-07）：迷你月历从 V1 的只读展示升级为日期导航。点击任意日期后，
-> `GET /api/board?date=YYYY-MM-DD` 以该日为第一列并继续展示后两天；点击「时间线」回到今天。
-> 非今天的规划视图只收纳当天明确到期的任务，不把此前截止的任务全部滚成“逾期”；正在运行、需要回答
-> 或等待确认的任务仍保持可见，避免切日期时把真实运行状态藏掉。
+- 有效上下文上限为 `min(模型 inputTokenLimit, 128,000)`；取不到模型元数据时使用 128,000。
+- 接近上限前，在完整 Turn 边界生成增量摘要，保留最近约 20,000 Token；function call/result 不拆对。
+- 压缩失败不删除历史；若上下文已经无法安全发送，则返回明确错误。
+- `.txt` / `.md` 附件必须是 UTF-8：每轮最多 4 个，单个最多 128 KiB，总计最多 256 KiB。
+- 附件内容随用户消息持久化到本机 SQLite，重启后可继续进入该会话的短期上下文。
 
-5. **V1 操作清单**（破坏性操作全部二次确认一次）：
-   - 任务：添加、改标题、勾选完成、删除、派发、**取消执行中**（abort run，防烧 token）、回答（需要你）、重派（失败后）
-   - 清单：新建、重命名、归档（不碰仓库本身）
-   - 不做：批量操作、清空已完成、任务移动排序
+## 6. 原生 UI 状态
+
+已实现的首版界面：
+
+- 主窗口：日历日期导航、时间线、任务、清单、进行中/已完成视图；任务与清单视图底部可行内添加任务。
+- 任务卡：完成/重新打开、截止日期、清单归属、CLI Session 入口、运行和未读状态。
+- Session：选择 Runtime 和工作目录后进入完整聊天记录，支持继续发送、取消本轮和重启恢复。
+- 右侧 TodoAgent：折叠/展开、会话新建/切换/重命名/归档、流式草稿、处理中指示、工具状态、任务引用、停止按钮和文本附件。
+- 设置：四个 Runtime 的检测/验证；Gemini 模型、API Key 保存/移除/显示和只读模型连接测试。
+- 菜单栏：查看今天到期且未完成的任务，并打开主窗口。
+
+## 7. 本地存储与安全边界
+
+默认路径：
+
+- 数据库：`~/Library/Application Support/TodoAgent/todoagent.sqlite3`
+- Gemini 凭据：`~/Library/Application Support/TodoAgent/credentials.json`
+- 日志：`~/Library/Logs/TodoAgent/`
+
+约束：
+
+- Application Support 数据目录权限为 `0700`；SQLite 和凭据文件权限为 `0600`。
+- 凭据文件使用同目录临时文件、同步和原子替换；读写拒绝符号链接、异常文件类型、非当前账户所有者、硬链接和权限过宽文件。
+- API Key 不进入 SQLite、UserDefaults、环境变量或日志，只在 App 启动后通过 stdin IPC 注入 Engine 的 `Zeroizing<String>` 内存。
+- 当前凭据文件依赖 macOS 登录账户和文件权限隔离，不是独立加密保险箱；同一登录账户下的其他进程仍可能读取，建议启用 FileVault。
+- 工作目录必须由用户选择并授权。启动 CLI 前不因 Git dirty 状态弹出阻断提示；该目录中的修改属于用户与所选 CLI 的共同工作区。
+
+## 8. 测试与发布门禁
+
+每次准备交付依次执行：
+
+1. `cargo fmt --check`；
+2. `cargo clippy --locked --all-targets -- -D warnings`；
+3. `cargo test --locked`；
+4. Swift 6.2 strict-concurrency 测试并将 warning 视为错误；
+5. arm64 Release 构建；
+6. sidecar 架构、IPC v2 握手、SQLite v3 隔离数据库 smoke test；
+7. ad-hoc 签名校验、DMG 挂载与启动检查；
+8. 空闲 App + Engine footprint 和 CPU 复测。
+
+覆盖范围：
+
+- 数据库 fresh/v2→v3、事务回滚、WAL、外键、权限、未读和 interrupted 恢复；
+- IPC 半行、坏 JSON、超长行、乱序响应、版本不匹配、事件缺口与幂等发送；
+- 四个 Runtime 的真实 fixture、成功终态、resume、认证失败、取消、超时和进程组清理；
+- Assistant SSE、分片工具参数、错误回灌、tool receipt 幂等、取消、并发、压缩和附件重启恢复；
+- Swift Repository/Reducer 的 delta 聚合、去重、补历史、重连、异步退出、菜单栏和凭据文件安全。
+
+## 9. 2026-08-09 验收快照
+
+以下是当前工作区最近一次记录的验收结果，不替代提交前重跑门禁：
+
+- Rust：format、Clippy 和 77 个测试通过。
+- Swift：Swift 6.2 strict-concurrency 下 64 个测试通过。
+- 构建产物：`dist/TodoAgent.app` 与 `dist/TodoAgent-0.1.0-arm64.dmg`；内嵌 Engine 为 arm64，IPC v2 / schema v3 smoke 通过。
+- 真实本地续聊：本机已安装且已登录的 Codex、Claude Code、Kiro CLI 完成至少两轮续聊 smoke；Cursor Agent 在本机返回 `auth_required`，已验证可操作的恢复状态，但尚未计入真实续聊通过项。
+- Gemini 助手：真实文本回复、任务工具执行、多轮上下文、取消和 `.txt` / `.md` 附件路径已打通。
+- 空闲性能记录：App 约 102.7 MiB、Engine 约 2.7 MiB，合计约 105.3 MiB；CPU 0.0%，低于当前 120 MiB 总预算。
+
+## 10. 当前限制
+
+- 只支持 macOS 26、Apple Silicon arm64。
+- 当前 App 仅 ad-hoc 签名，未使用 Developer ID、未公证，不是面向陌生用户的正式公开发行包。
+- 不提供 Intel/Universal 构建、自动更新或崩溃上报服务。
+- 不导入旧 Web 数据；不支持同任务多 Runtime、跨 Agent 接力或任务 Session 分支树。
+- TodoAgent 助手不读取任意文件，不处理图片，不调用本地 CLI；文本附件由用户显式选择并完整写入本机会话历史。
+- API Key 的账户私有文件不是 Keychain，也没有独立静态加密。
+- Cursor 的真实登录态续聊仍需在已认证环境完成验收。
+
+## 11. 后续路线
+
+### 11.1 公开发布阶段
+
+- 加入 Developer ID Application 签名和 Apple 公证，并设计从当前凭据文件迁移到稳定 Keychain 身份的路径。
+- 评估 Apple Silicon + Intel 的 Universal 构建、Sparkle 或等价自动更新、版本回滚和崩溃诊断。
+- 在全新用户账户完成首次安装、覆盖升级、退出无残留进程、删除 App 不删除 Application Support 数据的验收。
+- 在已认证环境补齐四个 Runtime 各至少三轮真实续聊，并把供应商版本矩阵固定进发布记录。
+
+### 11.2 用户长期记忆调研
+
+本轮不创建 `MEMORY.md`、数据库占位表、IPC 占位方法或半成品 UI。开始实现前必须单独确定：
+
+- 哪些内容允许提取，哪些敏感信息永不自动记录；
+- 是否逐条向用户确认，以及查看、修改、删除、导出和批量遗忘流程；
+- 记忆按用户、清单、工作目录还是 Assistant Session 生效；
+- 冲突、过期、误提取和提示注入的处理规则；
+- 本机加密、备份、彻底删除和 Token 预算边界；
+- 注入上下文时如何展示来源和提供可解释性。
+
+只有产品、安全和删除语义通过独立评审后，才设计正式 schema、IPC 和界面。
+
+### 11.3 产品增量
+
+- 在不改变 `open | completed` 生命周期的前提下继续打磨任务排序、搜索、批量操作和可访问性。
+- 根据真实使用数据决定是否增加更多文本格式或图片能力；任何新附件类型都必须先定义大小、持久化和隐私边界。
+- 持续压测长会话、事件洪峰和四个 Runtime 的版本变化，保持空闲总 footprint 低于 120 MiB。

@@ -1,82 +1,105 @@
 # TodoAgent
 
-一个会自己完成任务的待办清单。
+TodoAgent 是一款原生 macOS 待办与本地 Agent 工作台。任务、清单、对话和
+Runtime 状态都保存在本机；SwiftUI/AppKit 前端通过 stdin/stdout 上的 IPC v2
+与随 App 打包的 Rust Engine 通信，不启动 Web 服务或本地 TCP 端口。
 
-别的 to-do list 只记录任务。TodoAgent 把任务派给你本机**已登录**的编码 CLI（Claude Code、Codex、Cursor、Gemini、Kiro、Grok）去干掉：添加一条任务，或者直接和秘书说一句话，任务就会被派发、执行、带着 diff 回来等你确认。卡住的任务会**带着 agent 提的问题**主动来找你，你回一句，它接着做。
+## 分支定位
 
-「完成」永远由人点。跑完的任务进待确认，不会自己变成已完成 —— 没人审过的工作不该声称已通过。
+- `master`：当前主产品，原生 macOS App 与 Rust Engine 的发布基线。
+- `legacy/web`：旧 Web/Node.js 前后端基线；维护旧产品时使用这个分支。
 
-## 前提
+原生版本不会读取旧版 `~/.todoagent` 数据库，也不会自动导入 Web 数据。
 
-至少装一个编码 CLI 并**确认它已登录**。
+## 当前能力
 
-## 快速开始
+- 管理任务、清单、截止日期、未完成/已完成状态和时间线。
+- 菜单栏入口显示今天的未完成任务。
+- 任务启动本地 Agent 后会绑定一个工作目录和一个长期逻辑 Session；每条消息启动
+  一轮 CLI，历史和供应商 Session ID 持久化到 SQLite。
+- 支持四个本地 Runtime：Codex、Claude Code、Cursor Agent、Kiro CLI。
+  Runtime 由用户在设置中主动检测和验证；某个 Runtime 未安装或未登录不会影响
+  其他 Runtime。
+- 内置 Gemini 任务助手：多会话、流式回复、取消、上下文压缩和崩溃恢复。
+  助手只开放 `create_tasks`、`find_related`、`update_task`、`list_state`、
+  `list_lists` 五个任务工具。
+- 助手可读取 UTF-8 `.txt` 和 `.md` 附件；第一版不支持图片、音频或其他多模态
+  附件。
 
-```bash
-pnpm install
-pnpm runtimes --probe         # 实测每个 CLI 能不能完成一轮对话
-pnpm seed ~/你的仓库           # 建 agent + 一个绑这个仓库的清单
-pnpm dev                      # 引擎 :8787
-pnpm dev:web                  # 界面 :3000 —— 另开一个终端
+## 架构
+
+```text
+SwiftUI / AppKit
+       │  IPC v2 · NDJSON · stdin/stdout
+       ▼
+Rust Engine
+  ├─ SQLite v3：任务、Session、消息、事件和助手上下文
+  ├─ CLI adapters：Codex / Claude Code / Cursor Agent / Kiro CLI
+  └─ Gemini Interactions API：store=false，持久化上下文仅保存在本机
 ```
 
-`--probe` 这一步不能省：`detect` 只证明二进制在 PATH 上，凭据过期的 CLI 看起来完全一样，直到派发时才失败。
+`DemoRepository` 仅用于 SwiftUI 预览和确定性的 UI 测试。普通启动始终使用共享的
+`EngineRepository` 和随 App 打包的 Rust sidecar。
 
-命令是 `pnpm runtimes`，**不是** `pnpm doctor` —— pnpm 有个同名内置命令会把它截走，`pnpm doctor --probe` 会报 `Unknown option: 'probe'`。
+## 本地构建
 
-`pnpm seed` 不带仓库路径也能用：那样只建 agent 和收件箱，可以当纯待办清单用，但任务不能派发（没有工作目录）。也可以在界面上「新建清单」时填仓库路径，效果一样。绑定的路径**必须是 git 仓库**：diff 快照靠它，没有 git 就没有「看结果」。
+要求：
 
-## 配置秘书
+- macOS 26+
+- Apple Silicon
+- Xcode 26+
+- Rust 1.88
+- Swift 6.2（由 Xcode 提供）
 
-秘书需要一个模型。**不配也能用**，只是那一栏休眠 —— 清单、任务、派发、diff、确认全都照常，少的是「说一句话自动建卡」，以及产出分类会从模型判断退回启发式（最后一段是短问句就算提问）。
-
-在仓库根目录建 `.env`（已在 `.gitignore` 里）：
-
-```bash
-TODOAGENT_MODEL=google/gemini-3.6-flash
-TODOAGENT_API_KEY=你的-key
-```
-
-`pnpm dev` 会加载它，测试套件不会 —— 真 key 不会漏进测试变成计费请求。
-
-模型走 pi 的 provider 体系，`provider/model` 形式。任何 OpenAI 兼容端点都能接：在 `~/.todoagent/pi/models.json` 里注册一个 provider（`baseUrl` + `api: "openai-completions"`），本地 vLLM / Ollama 同理。机器上有 `https_proxy` 时引擎会自动用它。
-
-## 命令
+在仓库根目录运行：
 
 ```bash
-pnpm dev                # 引擎 :8787（会加载 .env）
-pnpm dev:web            # 界面 :3000
-pnpm runtimes --probe   # 实测每个 CLI 能否完成一轮
-pnpm seed [仓库路径]     # 建 agent + 收件箱（给了路径就再建一个绑定清单）
-pnpm typecheck          # 三个 workspace
-pnpm test               # 全量测试，不烧 token
-pnpm check              # 静态检查：控制字符、CSS 类、断点、死导出
-pnpm e2e                # 真跑一遍闭环（烧真 token）
-pnpm e2e --ask          # 真跑提问 → 回答 → 续跑
+./scripts/build-macos-preview.sh
+open dist/TodoAgent.app
 ```
 
-`pnpm e2e` 不在 `pnpm test` 里：它派发给真 CLI，花真钱。可选参数 `--runtime=codex` 指定 CLI、`--keep` 保留 fixture、`--budget=5` 调 token 上限。
+构建产物：
 
-## 环境变量
+- `dist/TodoAgent.app`：可直接打开的日常调试版本，不需要反复复制到
+  `/Applications`。
+- `dist/TodoAgent-0.1.0-arm64.dmg`：Apple Silicon 本地预览 DMG。
 
-| 变量 | 默认 | 作用 |
-|---|---|---|
-| `TODOAGENT_DB` | `~/.todoagent/todoagent.db` | SQLite 路径 |
-| `TODOAGENT_PORT` | `8787` | 引擎端口 |
-| `TODOAGENT_MODEL` | 无 | 秘书的模型，`provider/model` |
-| `TODOAGENT_API_KEY` | 无 | 上面那个 provider 的 key |
-| `TODOAGENT_AGENT_DIR` | `~/.todoagent/pi` | 秘书的会话/凭据目录 |
-| `TODOAGENT_AGENT_CWD` | `$HOME` | 秘书的工作目录（它的只读文件工具在这里） |
-| `TODOAGENT_MAX_CONCURRENT_AGENTS` | `max(2, min(6, 核数/2))` | 同时活着的 CLI 进程上限 |
-| `TODOAGENT_WEB_ORIGIN` | 无 | 额外允许的 CORS 源，逗号分隔。所有 `localhost:*` / `127.0.0.1:*` 默认已放行 |
-| `TODOAGENT_E2E_PORT` | `8850` | e2e 用的端口 |
+脚本会构建并 strip arm64 Rust sidecar，将其嵌入 App Resources，再对 sidecar 和
+App 做 ad-hoc 签名。
 
-## 安全
+## 验证
 
-**仅 localhost，且故意不做认证。** 所有适配器都以绕过工具确认的方式运行 CLI（`--permission-mode bypassPermissions`、`--force`、`--yolo`）。单人本机工具可以接受；**一旦暴露端口，任何能访问的人都能在你机器上以你的凭据执行任意代码**。对外提供服务前必须先加认证和沙箱。
+```bash
+cargo fmt --manifest-path apps/engine-rs/Cargo.toml --all -- --check
+cargo clippy --manifest-path apps/engine-rs/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path apps/engine-rs/Cargo.toml --locked
 
-agent 直接在你绑定的仓库里工作，**不做 worktree 隔离**。它改的就是你的工作区，改完留在那儿等你看 diff —— 不自动提交。派发和回答走的是同一条执行路径，所以两者都会在真仓库里动手。同一个仓库同时只跑一个任务：第二次派发会被拒并告诉你哪个 run 占着。
+DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
+  swift test --disable-sandbox --package-path apps/macos \
+  -Xswiftc -strict-concurrency=complete \
+  -Xswiftc -warnings-as-errors
+```
 
----
+Swift 和 Rust 共用的 IPC 契约 fixture 位于 `protocol/fixtures/contract.ndjson`。
 
-代码注释里出现的 `mockups/xxx.html` 是本地设计原型，未纳入版本库（含第三方产品截图素材），不是仓库里的路径。`PLAN.md` 是总纲和决策记录。
+## 本地数据与密钥
+
+| 内容 | 路径 |
+|---|---|
+| SQLite | `~/Library/Application Support/TodoAgent/todoagent.sqlite3` |
+| Gemini API Key | `~/Library/Application Support/TodoAgent/credentials.json` |
+| Engine 附件目录 | `~/Library/Application Support/TodoAgent/Attachments` |
+| Engine 日志 | `~/Library/Logs/TodoAgent/engine-stderr.log` |
+
+TodoAgent 将 Application Support 数据目录设置为 `0700`，SQLite 与凭据文件设置为
+`0600`。Gemini Key 不写入 SQLite、环境变量或日志；它是当前 macOS 账户下的普通
+权限隔离文件，并非 Keychain 加密项。同一登录账户下的其他进程仍可能读取，建议
+开启 FileVault。
+
+## 分发边界
+
+当前 App 只有 ad-hoc 签名，不含 Developer ID 签名和苹果公证，适合本机开发与
+预览，不是面向公众的正式安装包。公开下载仍需单独完成 Developer ID 签名、
+notarization、Gatekeeper 验收；Universal 构建和自动更新也不在当前版本范围内。
+
+更详细的实现状态与后续事项见 [`PLAN.md`](PLAN.md)。

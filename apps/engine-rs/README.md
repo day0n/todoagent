@@ -1,16 +1,82 @@
 # TodoAgent Rust Engine
 
-The Engine is an app-bundled sidecar. It communicates exclusively over
-versioned NDJSON on stdin/stdout and never opens a TCP port.
+`apps/engine-rs` 是原生 macOS TodoAgent 随 App 打包的 Rust sidecar。它负责 SQLite
+持久化、四个本地 CLI Runtime、Gemini 助手内核和进程生命周期。Engine 只通过
+stdin/stdout 上的版本化 NDJSON 通信，不监听 TCP 端口。
 
-By default its fresh native data lives in:
+## 模块
 
-- `~/Library/Application Support/TodoAgent/todoagent.sqlite3`
-- `~/Library/Application Support/TodoAgent/Attachments`
-- `~/Library/Logs/TodoAgent`
+- `main.rs` / `protocol.rs`：IPC v2 握手、请求分发、事件输出和 Engine 生命周期。
+- `store.rs` / `store_worker.rs` / `schema.sql`：SQLite v3 migration、事务和串行
+  数据访问。
+- `runtime.rs` / `adapters.rs`：Codex、Claude Code、Cursor Agent、Kiro CLI 的
+  检测、验证、首轮启动、续聊、取消和进程组回收。
+- `assistant/` / `assistant_service.rs`：极简 ReAct Runner、Gemini Interactions SSE、
+  本地上下文、压缩、工具 receipt 和流式事件。
 
-It does not inspect or modify the legacy `~/.todoagent` directory. Tests and
-local smoke runs can set `TODOAGENT_NATIVE_DATA_DIR` to an isolated directory.
+Swift 和 Rust 共用的 NDJSON 契约 fixture 位于仓库根目录
+`protocol/fixtures/contract.ndjson`。
 
-Protocol fixtures shared with Swift live in `protocol/fixtures` at the
-repository root.
+## 数据模型与并发
+
+SQLite 是唯一事实来源，schema version 为 3。Engine 保存任务、清单、
+`TaskSession`、每轮 CLI 执行、稳定消息投影、原始事件，以及助手 Session、Turn、
+模型步骤、工具执行和上下文摘要。
+
+- 同一个 CLI Session 同时只允许一个活动 Turn；不同 Session 最多并行 2 个 Turn。
+- 同一个 Assistant Session 同时只允许一个活动 Turn；不同 Assistant Session 最多
+  并行 2 个 Turn。
+- `clientMessageId` 和持久化工具 receipt 用于防止超时重试产生重复消息或重复任务。
+- Engine 重启时，遗留的运行中 Turn 会被标记为 `interrupted`，不会自动重放有副作用
+  的工具。
+
+## Gemini 助手边界
+
+Provider 使用 Gemini Interactions API 的 SSE 模式，并固定 `store=false`；每次请求
+从本地 SQLite 重建所需上下文。API Key 通过 IPC 注入内存，以敏感 Header 发送，
+不会写入 Engine 数据库、环境变量或日志，Provider 错误也会脱敏。
+
+助手只注册五个任务工具：
+
+- `create_tasks`
+- `find_related`
+- `update_task`
+- `list_state`
+- `list_lists`
+
+Engine 不向助手开放 shell、任意文件读写、MCP 或本地 CLI 派发。
+
+## 本地路径
+
+默认路径：
+
+- 数据库：`~/Library/Application Support/TodoAgent/todoagent.sqlite3`
+- 附件目录：`~/Library/Application Support/TodoAgent/Attachments`
+- 日志目录：`~/Library/Logs/TodoAgent`
+
+Engine 不读取或修改旧版 `~/.todoagent`。测试和隔离 smoke run 可使用：
+
+- `TODOAGENT_NATIVE_DATA_DIR`
+- `TODOAGENT_NATIVE_LOG_DIR`
+
+数据与日志目录会被设置为 `0700`，SQLite 文件会被设置为 `0600`。
+
+## 构建与验证
+
+从仓库根目录运行：
+
+```bash
+cargo fmt --manifest-path apps/engine-rs/Cargo.toml --all -- --check
+cargo clippy --manifest-path apps/engine-rs/Cargo.toml --locked --all-targets -- -D warnings
+cargo test --manifest-path apps/engine-rs/Cargo.toml --locked
+cargo build --release --locked --manifest-path apps/engine-rs/Cargo.toml
+```
+
+完整 App 打包使用：
+
+```bash
+./scripts/build-macos-preview.sh
+```
+
+脚本会把 release binary strip 后嵌入 `TodoAgent.app/Contents/Resources`，并做 ad-hoc
+签名。该签名不是 Developer ID 签名，也没有苹果公证，只适用于本机开发和预览。
