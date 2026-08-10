@@ -1,4 +1,4 @@
-{"event":"engine.ready","data":{"protocolVersion":3,"engineVersion":"0.1.0","capabilities":["app.bootstrap","task.create","task.update","task.create_list","task.delete","task.attachment.add","task.attachment.remove","session.send"],"runtimes":["codex","claude","cursor","kiro"]}}
+{"event":"engine.ready","data":{"protocolVersion":3,"engineVersion":"0.1.0","capabilities":["app.bootstrap","list.rename","list.delete","task.create","task.update","task.create_list","task.delete","task.attachment.add","task.attachment.remove","session.send"],"runtimes":["codex","claude","cursor","kiro"]}}
 {"id":"bootstrap-1","method":"app.bootstrap","params":{}}
 {"id":"bootstrap-1","result":{"revision":0,"lists":[],"tasks":[],"taskAttachments":[],"runtimes":[],"sessions":[]}}
 {"id":"task-create-1","method":"task.create","params":{"title":"测试时间","note":"","executionDate":"2026-08-10","dueDate":"2026-08-12"}}
@@ -20,3 +20,5 @@
 {"event":"assistant.turn.finished","data":{"sessionId":"00000000-0000-4000-8000-000000000201","turn":{"id":"00000000-0000-4000-8000-000000000203","sessionId":"00000000-0000-4000-8000-000000000201","clientMessageId":"00000000-0000-4000-8000-000000000202","model":"gemini-3.6-flash","status":"completed"}}}
 {"id":"assistant-history-1","method":"assistant.history","params":{"sessionId":"00000000-0000-4000-8000-000000000201","afterSequence":0,"limit":500}}
 {"id":"assistant-history-1","result":{"session":{"id":"00000000-0000-4000-8000-000000000201","title":"原生助手","archived":false,"createdAt":"2026-08-09T00:00:00Z","updatedAt":"2026-08-09T00:00:01Z","lastSequence":2,"isRunning":false,"lastModel":"gemini-3.6-flash"},"messages":[],"tools":[{"id":"00000000-0000-4000-8000-000000000205","sessionId":"00000000-0000-4000-8000-000000000201","turnId":"00000000-0000-4000-8000-000000000203","callId":"call-1","toolName":"create_tasks","taskRefsJson":"[\"00000000-0000-4000-8000-000000000101\"]","isError":false,"status":"completed"}],"activeTurn":null}}
+{"id":"list-rename-1","method":"list.rename","params":{"listId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC105","name":"重命名清单"}}
+{"id":"list-delete-1","method":"list.delete","params":{"listId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC105"}}

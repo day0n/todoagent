@@ -76,6 +76,8 @@ pub fn handshake() -> Event<Handshake> {
                 "app.bootstrap",
                 "app.sync",
                 "list.create",
+                "list.rename",
+                "list.delete",
                 "task.create",
                 "task.update",
                 "task.complete",
@@ -132,6 +134,8 @@ mod tests {
         assert_eq!(value["data"]["protocolVersion"], 3);
         assert_eq!(value["data"]["runtimes"].as_array().unwrap().len(), 4);
         let capabilities = value["data"]["capabilities"].as_array().unwrap();
+        assert!(capabilities.contains(&Value::String("list.rename".to_owned())));
+        assert!(capabilities.contains(&Value::String("list.delete".to_owned())));
         assert!(capabilities.contains(&Value::String("task.create_list".to_owned())));
         assert!(capabilities.contains(&Value::String("task.delete".to_owned())));
     }
@@ -144,7 +148,7 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(values.len(), 22);
+        assert_eq!(values.len(), 24);
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("assistant.send")
         }));
@@ -165,6 +169,15 @@ mod tests {
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("task.delete")
                 && value["params"]["taskId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("list.rename")
+                && value["params"]["listId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC105"
+                && value["params"]["name"] == "重命名清单"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("list.delete")
+                && value["params"]["listId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC105"
         }));
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("task.attachment.add")

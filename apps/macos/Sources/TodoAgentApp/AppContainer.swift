@@ -38,6 +38,8 @@ private actor FailedRepository: AppRepository {
     func sync() async throws -> AppSnapshot { throw failure }
     func events() async -> AsyncStream<EngineEvent> { AsyncStream { $0.finish() } }
     func createList(name: String, color: String) async throws -> AppSnapshot { throw failure }
+    func renameList(listID: UUID, name: String) async throws -> AppSnapshot { throw failure }
+    func deleteList(listID: UUID) async throws -> AppSnapshot { throw failure }
     func createTask(title: String, note: String, listID: UUID?, executionDate: LocalDay?, dueDate: LocalDay?) async throws -> AppSnapshot { throw failure }
     func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot { throw failure }
     func deleteTask(taskID: UUID) async throws -> AppSnapshot { throw failure }

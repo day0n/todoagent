@@ -62,6 +62,43 @@ struct AssistantToolGroupPresentation: Equatable, Sendable {
     }
 }
 
+struct AssistantToolGroupDisclosureState: Equatable, Sendable {
+    private(set) var manuallyExpanded = false
+    private(set) var expandedToolIDs: Set<String> = []
+    private(set) var revealedCompletedStepCount = 0
+
+    func isExpanded(isRunning: Bool) -> Bool {
+        isRunning || manuallyExpanded
+    }
+
+    mutating func toggleGroup(isRunning: Bool, totalStepCount: Int, reduceMotion: Bool) {
+        guard !isRunning else { return }
+        manuallyExpanded.toggle()
+        revealedCompletedStepCount = manuallyExpanded && reduceMotion ? totalStepCount : 0
+        if !manuallyExpanded {
+            expandedToolIDs.removeAll()
+        }
+    }
+
+    mutating func toggleTool(_ toolID: String) {
+        if expandedToolIDs.contains(toolID) {
+            expandedToolIDs.remove(toolID)
+        } else {
+            expandedToolIDs.insert(toolID)
+        }
+    }
+
+    mutating func revealNextCompletedStep(totalStepCount: Int) {
+        revealedCompletedStepCount = min(revealedCompletedStepCount + 1, totalStepCount)
+    }
+
+    mutating func finishRunningGroup() {
+        manuallyExpanded = false
+        revealedCompletedStepCount = 0
+        expandedToolIDs.removeAll()
+    }
+}
+
 struct AssistantErrorPresentation: Equatable, Sendable {
     let title: String
     let guidance: String
@@ -138,22 +175,41 @@ struct AssistantToolStepsView: View {
     let state: AppState
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var manuallyExpanded = false
-    @State private var expandedToolIDs: Set<String> = []
+    @State private var disclosure = AssistantToolGroupDisclosureState()
 
     private var presentation: AssistantToolGroupPresentation {
         AssistantToolGroupPresentation(group: group)
     }
 
     private var isExpanded: Bool {
-        group.isRunning || manuallyExpanded
+        disclosure.isExpanded(isRunning: group.isRunning)
+    }
+
+    private var visibleTools: ArraySlice<AssistantToolActivity> {
+        if group.isRunning {
+            return group.tools[...]
+        }
+        return group.tools.prefix(disclosure.revealedCompletedStepCount)
+    }
+
+    private var completedRevealTaskID: String {
+        [
+            group.turnID,
+            group.isRunning.description,
+            disclosure.manuallyExpanded.description,
+            group.tools.map(\.id).joined(separator: ","),
+        ].joined(separator: "|")
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             Button {
                 withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) {
-                    manuallyExpanded.toggle()
+                    disclosure.toggleGroup(
+                        isRunning: group.isRunning,
+                        totalStepCount: group.tools.count,
+                        reduceMotion: reduceMotion
+                    )
                 }
             } label: {
                 HStack(spacing: 7) {
@@ -178,13 +234,14 @@ struct AssistantToolStepsView: View {
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(group.tools) { tool in
+                    ForEach(visibleTools) { tool in
                         AssistantToolStepRow(
                             tool: tool,
                             state: state,
-                            isExpanded: expandedToolIDs.contains(tool.id),
+                            isExpanded: disclosure.expandedToolIDs.contains(tool.id),
                             toggle: { toggle(tool.id) }
                         )
+                        .transition(.opacity.combined(with: .move(edge: .top)))
                     }
                 }
                 .transition(.opacity.combined(with: .move(edge: .top)))
@@ -193,17 +250,35 @@ struct AssistantToolStepsView: View {
         .padding(.vertical, 3)
         .onChange(of: group.isRunning) { wasRunning, isRunning in
             if wasRunning, !isRunning {
-                manuallyExpanded = false
+                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
+                    disclosure.finishRunningGroup()
+                }
             }
+        }
+        .task(id: completedRevealTaskID) {
+            await revealCompletedSteps()
         }
     }
 
     private func toggle(_ toolID: String) {
         withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) {
-            if expandedToolIDs.contains(toolID) {
-                expandedToolIDs.remove(toolID)
-            } else {
-                expandedToolIDs.insert(toolID)
+            disclosure.toggleTool(toolID)
+        }
+    }
+
+    private func revealCompletedSteps() async {
+        guard !group.isRunning, disclosure.manuallyExpanded else { return }
+        guard !reduceMotion else { return }
+
+        while disclosure.revealedCompletedStepCount < group.tools.count {
+            do {
+                try await Task.sleep(for: .milliseconds(45))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, disclosure.manuallyExpanded, !group.isRunning else { return }
+            withAnimation(.easeOut(duration: 0.16)) {
+                disclosure.revealNextCompletedStep(totalStepCount: group.tools.count)
             }
         }
     }

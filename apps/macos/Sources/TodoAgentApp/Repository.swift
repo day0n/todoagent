@@ -6,6 +6,8 @@ protocol AppRepository: Sendable {
     func sync() async throws -> AppSnapshot
     func events() async -> AsyncStream<EngineEvent>
     func createList(name: String, color: String) async throws -> AppSnapshot
+    func renameList(listID: UUID, name: String) async throws -> AppSnapshot
+    func deleteList(listID: UUID) async throws -> AppSnapshot
     func createTask(
         title: String,
         note: String,
@@ -49,12 +51,21 @@ protocol AppRepository: Sendable {
     func shutdown() async
 }
 
-extension AppRepository { var requiresExecutionConsent: Bool { false } }
+extension AppRepository {
+    var requiresExecutionConsent: Bool { false }
+    func renameList(listID _: UUID, name _: String) async throws -> AppSnapshot {
+        throw AppRepositoryError.listNotFound
+    }
+    func deleteList(listID _: UUID) async throws -> AppSnapshot {
+        throw AppRepositoryError.listNotFound
+    }
+}
 
 enum AppRepositoryError: LocalizedError, Equatable, Sendable {
-    case taskNotFound, sessionNotFound, assistantSessionNotFound, runtimeUnavailable
+    case listNotFound, taskNotFound, sessionNotFound, assistantSessionNotFound, runtimeUnavailable
     var errorDescription: String? {
         switch self {
+        case .listNotFound: "找不到这个清单。"
         case .taskNotFound: "找不到这个任务。"
         case .sessionNotFound: "这个任务还没有本地 Session。"
         case .assistantSessionNotFound: "找不到这个 TodoAgent 会话。"
@@ -113,6 +124,28 @@ actor DemoRepository: AppRepository {
         snapshot.lists.append(
             TodoList(id: UUID(), name: name, colorName: color, repositoryPath: nil)
         )
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func renameList(listID: UUID, name: String) async throws -> AppSnapshot {
+        guard let index = snapshot.lists.firstIndex(where: { $0.id == listID }) else {
+            throw AppRepositoryError.listNotFound
+        }
+        snapshot.lists[index].name = name
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func deleteList(listID: UUID) async throws -> AppSnapshot {
+        guard snapshot.lists.contains(where: { $0.id == listID }) else {
+            throw AppRepositoryError.listNotFound
+        }
+        snapshot.lists.removeAll(where: { $0.id == listID })
+        for index in snapshot.tasks.indices where snapshot.tasks[index].listID == listID {
+            snapshot.tasks[index].listID = nil
+            snapshot.tasks[index].updatedAt = ISO8601DateFormatter().string(from: .now)
+        }
         snapshot.revision += 1
         return snapshot
     }

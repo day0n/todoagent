@@ -98,6 +98,22 @@ struct CreateListRequest: Encodable, Sendable {
     let color: String
     let repositoryPath: String?
 }
+struct RenameListRequest: Encodable, Sendable {
+    let listID: UUID
+    let name: String
+
+    private enum CodingKeys: String, CodingKey {
+        case listID = "listId"
+        case name
+    }
+}
+struct ListIDRequest: Encodable, Sendable {
+    let listID: UUID
+
+    private enum CodingKeys: String, CodingKey {
+        case listID = "listId"
+    }
+}
 struct TaskIDRequest: Encodable, Sendable {
     let taskID: UUID
     private enum CodingKeys: String, CodingKey { case taskID = "taskId" }
@@ -187,9 +203,24 @@ actor EngineRepository: AppRepository {
     func events() async -> AsyncStream<EngineEvent> { await client.events() }
 
     func createList(name: String, color: String) async throws -> AppSnapshot {
-        let request = CreateListRequest(name: name, color: color, repositoryPath: nil)
-        _ = try await client.request(method: "list.create", params: request, as: EngineList.self)
-        return try await sync()
+        try await mutate(
+            method: "list.create",
+            params: CreateListRequest(name: name, color: color, repositoryPath: nil)
+        )
+    }
+
+    func renameList(listID: UUID, name: String) async throws -> AppSnapshot {
+        try await mutate(
+            method: "list.rename",
+            params: RenameListRequest(listID: listID, name: name)
+        )
+    }
+
+    func deleteList(listID: UUID) async throws -> AppSnapshot {
+        try await mutate(
+            method: "list.delete",
+            params: ListIDRequest(listID: listID)
+        )
     }
 
     func createTask(

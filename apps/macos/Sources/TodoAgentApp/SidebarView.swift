@@ -5,6 +5,10 @@ struct SidebarView: View {
     @State private var isPresentingNewList = false
     @State private var newListName = ""
     @State private var isCreatingList = false
+    @State private var listBeingRenamed: TodoList?
+    @State private var renameListName = ""
+    @State private var listBeingDeleted: TodoList?
+    @State private var isMutatingList = false
 
     var body: some View {
         @Bindable var state = state
@@ -33,7 +37,27 @@ struct SidebarView: View {
                             if count > 0 { countBadge(count) }
                         }
                         .padding(.vertical, 2)
+                        .contentShape(.rect)
                         .tag(SidebarSelection.list(list.id))
+                        .contextMenu {
+                            Button {
+                                renameListName = list.name
+                                listBeingRenamed = list
+                            } label: {
+                                Label("重命名清单…", systemImage: "pencil")
+                            }
+                            .accessibilityIdentifier("sidebar.list.rename")
+
+                            Divider()
+
+                            Button(role: .destructive) {
+                                listBeingDeleted = list
+                            } label: {
+                                Label("删除清单", systemImage: "trash")
+                            }
+                            .accessibilityIdentifier("sidebar.list.delete")
+                        }
+                        .disabled(isMutatingList)
                         .accessibilityIdentifier("sidebar.list.\(list.id.uuidString)")
                     }
 
@@ -80,6 +104,57 @@ struct SidebarView: View {
         } message: {
             Text("创建后会自动进入这个清单。")
         }
+        .alert("重命名清单", isPresented: isPresentingRenameList) {
+            TextField("清单名称", text: $renameListName)
+            Button("取消", role: .cancel) {}
+            Button("重命名") {
+                guard let list = listBeingRenamed else { return }
+                let name = renameListName
+                isMutatingList = true
+                Task { @MainActor in
+                    _ = await state.renameList(listID: list.id, name: name)
+                    isMutatingList = false
+                }
+            }
+            .disabled(normalizedRenameListName.isEmpty || normalizedRenameListName.unicodeScalars.count > 200)
+        } message: {
+            Text("清单中的任务不会改变。")
+        }
+        .alert("删除清单？", isPresented: isPresentingDeleteList) {
+            Button("取消", role: .cancel) {}
+            Button("删除", role: .destructive) {
+                guard let list = listBeingDeleted else { return }
+                isMutatingList = true
+                Task { @MainActor in
+                    _ = await state.deleteList(listID: list.id)
+                    isMutatingList = false
+                }
+            }
+        } message: {
+            Text("只会删除清单；其中任务仍会保留在“任务”中。")
+        }
+    }
+
+    private var normalizedRenameListName: String {
+        renameListName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var isPresentingRenameList: Binding<Bool> {
+        Binding(
+            get: { listBeingRenamed != nil },
+            set: { presented in
+                if !presented { listBeingRenamed = nil }
+            }
+        )
+    }
+
+    private var isPresentingDeleteList: Binding<Bool> {
+        Binding(
+            get: { listBeingDeleted != nil },
+            set: { presented in
+                if !presented { listBeingDeleted = nil }
+            }
+        )
     }
 
     private var sidebarFooter: some View {

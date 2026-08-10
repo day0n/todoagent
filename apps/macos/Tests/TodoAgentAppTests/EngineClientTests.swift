@@ -58,7 +58,7 @@ struct EngineClientTests {
             try EngineWireMessage.decode(Data($0.utf8))
         }
 
-        try #require(messages.count == 22)
+        try #require(messages.count == 24)
 
         guard case let .event(ready) = messages[0] else {
             Issue.record("The first contract line must be engine.ready.")
@@ -203,7 +203,7 @@ struct EngineClientTests {
         #expect(appended.message.taskReferences == [referencedTaskID])
 
         guard case let .response(historyResponseID, historyResult) = messages[21] else {
-            Issue.record("The final contract line must be an assistant history response.")
+            Issue.record("The assistant history fixture must include its response.")
             return
         }
         #expect(historyResponseID == "assistant-history-1")
@@ -211,6 +211,27 @@ struct EngineClientTests {
         #expect(history.activeTurn == nil)
         #expect(history.tools.first?.callID == "call-1")
         #expect(history.tools.first?.taskReferences == [referencedTaskID])
+
+        guard case let .request(_, renameListMethod, renameListParams) = messages[22] else {
+            Issue.record("The list rename fixture must be a request.")
+            return
+        }
+        #expect(renameListMethod == "list.rename")
+        let renameListObject = try #require(
+            JSONSerialization.jsonObject(with: renameListParams) as? [String: Any]
+        )
+        #expect(renameListObject["name"] as? String == "重命名清单")
+        #expect(renameListObject["listId"] as? String == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC105")
+
+        guard case let .request(_, deleteListMethod, deleteListParams) = messages[23] else {
+            Issue.record("The list delete fixture must be a request.")
+            return
+        }
+        #expect(deleteListMethod == "list.delete")
+        let deleteListObject = try #require(
+            JSONSerialization.jsonObject(with: deleteListParams) as? [String: Any]
+        )
+        #expect(deleteListObject["listId"] as? String == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC105")
     }
 
     @Test("CLI requests use the Engine's camel-case identifier fields")
@@ -276,6 +297,15 @@ struct EngineClientTests {
         #expect(createList["name"] as? String == "工作")
         #expect(createList["color"] as? String == "blue")
         #expect(createList["repositoryPath"] == nil)
+
+        let renameList = try object(RenameListRequest(listID: taskID, name: "工作清单"))
+        #expect(renameList["listId"] as? String == taskID.uuidString)
+        #expect(renameList["name"] as? String == "工作清单")
+        #expect(renameList["listID"] == nil)
+
+        let deleteList = try object(ListIDRequest(listID: taskID))
+        #expect(deleteList["listId"] as? String == taskID.uuidString)
+        #expect(deleteList["listID"] == nil)
 
         let taskStatus = try object(TaskIDRequest(taskID: taskID))
         #expect(taskStatus["taskId"] as? String == taskID.uuidString)

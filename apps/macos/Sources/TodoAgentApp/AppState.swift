@@ -247,6 +247,75 @@ final class AppState {
         return true
     }
 
+    @discardableResult
+    func renameList(listID: UUID, name: String) async -> Bool {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard
+            let existing = lists.first(where: { $0.id == listID }),
+            normalizedName.isEmpty == false,
+            normalizedName.unicodeScalars.count <= 200
+        else { return false }
+        guard existing.name != normalizedName else { return true }
+
+        do {
+            apply(
+                try await repository.renameList(listID: listID, name: normalizedName),
+                acceptingEqualMutationRevision: true
+            )
+        } catch {
+            guard isAmbiguousTaskCommandError(error) else {
+                errorMessage = error.localizedDescription
+                return false
+            }
+            do {
+                apply(try await repository.sync())
+            } catch {
+                errorMessage = error.localizedDescription
+                return false
+            }
+        }
+        guard lists.first(where: { $0.id == listID })?.name == normalizedName else {
+            errorMessage = "清单重命名结果尚未确认，请重试。"
+            return false
+        }
+        errorMessage = nil
+        return true
+    }
+
+    /// Deletes only the list container. Its tasks remain in the canonical task
+    /// collection with a nil list ID and therefore stay visible in “任务”.
+    @discardableResult
+    func deleteList(listID: UUID) async -> Bool {
+        guard lists.contains(where: { $0.id == listID }) else { return false }
+
+        do {
+            apply(
+                try await repository.deleteList(listID: listID),
+                acceptingEqualMutationRevision: true
+            )
+        } catch {
+            guard isAmbiguousTaskCommandError(error) else {
+                errorMessage = error.localizedDescription
+                return false
+            }
+            do {
+                apply(try await repository.sync())
+            } catch {
+                errorMessage = error.localizedDescription
+                return false
+            }
+        }
+        guard lists.contains(where: { $0.id == listID }) == false else {
+            errorMessage = "清单删除结果尚未确认，请重试。"
+            return false
+        }
+        if selection == .list(listID) {
+            selection = .smart(.tasks)
+        }
+        errorMessage = nil
+        return true
+    }
+
     /// Creates a list named after the task and moves that task into it as one
     /// atomic Engine mutation. If the Engine committed but its response was
     /// lost, the authoritative snapshot identifies the newly created list.

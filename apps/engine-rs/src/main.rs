@@ -73,12 +73,27 @@ enum EngineError {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateListParams {
     name: String,
     #[serde(default = "default_color")]
     color: String,
     repository_path: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RenameListParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    list_id: String,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ListIDParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    list_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -361,20 +376,40 @@ impl Engine {
             }
             "list.create" => {
                 let params: CreateListParams = parse(&request.params)?;
-                validate_text(&params.name, 200, "name")?;
-                let list = self
+                let snapshot = self
                     .store
                     .call(move |store| {
                         store.create_list(
                             &params.name,
                             &params.color,
                             params.repository_path.as_deref(),
-                        )
+                        )?;
+                        store.bootstrap()
                     })
                     .await?;
-                let snapshot = self.store.call(|store| store.bootstrap()).await?;
-                self.emit("task.changed", snapshot).await;
-                to_value(list)
+                self.publish_task_snapshot(snapshot).await
+            }
+            "list.rename" => {
+                let params: RenameListParams = parse(&request.params)?;
+                let snapshot = self
+                    .store
+                    .call(move |store| {
+                        store.rename_list(&params.list_id, &params.name)?;
+                        store.bootstrap()
+                    })
+                    .await?;
+                self.publish_task_snapshot(snapshot).await
+            }
+            "list.delete" => {
+                let params: ListIDParams = parse(&request.params)?;
+                let snapshot = self
+                    .store
+                    .call(move |store| {
+                        store.delete_list(&params.list_id)?;
+                        store.bootstrap()
+                    })
+                    .await?;
+                self.publish_task_snapshot(snapshot).await
             }
             "task.create" => {
                 let params: CreateTaskParams = parse(&request.params)?;
@@ -2440,6 +2475,59 @@ mod tests {
         assert!(removed["taskAttachments"].as_array().unwrap().is_empty());
         assert!(source.exists());
         assert!(!data.join(relative_path).exists());
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_rename_and_delete_publish_authoritative_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        let list = worker
+            .call(|store| store.create_list("原清单", "blue", None))
+            .await
+            .unwrap();
+        let task_list_id = list.id.clone();
+        worker
+            .call(move |store| store.create_task("保留任务", "", Some(&task_list_id), None, None))
+            .await
+            .unwrap();
+
+        let renamed = engine
+            .handle(Request {
+                id: "rename-list".to_owned(),
+                method: "list.rename".to_owned(),
+                params: json!({
+                    "listId": list.id.to_uppercase(),
+                    "name": "  新清单  "
+                }),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "task.changed");
+        assert_eq!(event["data"], renamed);
+        assert_eq!(renamed["lists"][0]["name"], "新清单");
+
+        let deleted = engine
+            .handle(Request {
+                id: "delete-list".to_owned(),
+                method: "list.delete".to_owned(),
+                params: json!({"listId": list.id.to_uppercase()}),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "task.changed");
+        assert_eq!(event["data"], deleted);
+        assert!(deleted["lists"].as_array().unwrap().is_empty());
+        assert!(deleted["tasks"][0]["listId"].is_null());
 
         engine.assistant.shutdown().await;
         worker.shutdown().await.unwrap();

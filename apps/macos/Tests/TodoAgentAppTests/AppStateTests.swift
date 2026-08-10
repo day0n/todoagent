@@ -288,6 +288,50 @@ struct AppStateTests {
         #expect(await repository.listCreateNames().isEmpty)
     }
 
+    @Test("renaming and deleting a list preserves its canonical tasks")
+    func listMutationsPreserveTasks() async throws {
+        let listID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000504"))
+        let taskID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000505"))
+        let executionDay = try #require(LocalDay(rawValue: "2026-08-10"))
+        let list = TodoList(id: listID, name: "原清单", colorName: "blue", repositoryPath: nil)
+        let task = TaskItem(
+            id: taskID,
+            listID: listID,
+            title: "保留任务",
+            note: "保留备注",
+            status: .open,
+            executionDate: executionDay,
+            dueDate: nil,
+            completedAt: nil,
+            createdAt: .distantPast,
+            updatedAt: "2026-08-10T00:00:00Z"
+        )
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [list],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.selection = .list(listID)
+
+        #expect(await state.renameList(listID: listID, name: "  新清单  "))
+        #expect(state.lists.first?.name == "新清单")
+
+        #expect(await state.deleteList(listID: listID))
+        #expect(state.lists.isEmpty)
+        #expect(state.selection == .smart(.tasks))
+        let preserved = try #require(state.tasks.first(where: { $0.id == taskID }))
+        #expect(preserved.listID == nil)
+        #expect(preserved.executionDate == executionDay)
+        #expect(preserved.note == "保留备注")
+    }
+
     @Test("an empty user list creates with that list context")
     func emptyUserListCreationKeepsListContext() async {
         let listID = UUID(uuidString: "00000000-0000-4000-8000-000000000501")!
@@ -670,6 +714,31 @@ private actor TaskOpenSpyRepository: AppRepository {
         snapshot.lists.append(
             TodoList(id: UUID(), name: name, colorName: color, repositoryPath: nil)
         )
+        snapshot.revision += 1
+        return snapshot
+    }
+    func renameList(listID: UUID, name: String) async throws -> AppSnapshot {
+        guard let index = snapshot.lists.firstIndex(where: { $0.id == listID }) else {
+            throw AppRepositoryError.listNotFound
+        }
+        let existing = snapshot.lists[index]
+        snapshot.lists[index] = TodoList(
+            id: existing.id,
+            name: name,
+            colorName: existing.colorName,
+            repositoryPath: existing.repositoryPath
+        )
+        snapshot.revision += 1
+        return snapshot
+    }
+    func deleteList(listID: UUID) async throws -> AppSnapshot {
+        guard snapshot.lists.contains(where: { $0.id == listID }) else {
+            throw AppRepositoryError.listNotFound
+        }
+        snapshot.lists.removeAll(where: { $0.id == listID })
+        for index in snapshot.tasks.indices where snapshot.tasks[index].listID == listID {
+            snapshot.tasks[index].listID = nil
+        }
         snapshot.revision += 1
         return snapshot
     }

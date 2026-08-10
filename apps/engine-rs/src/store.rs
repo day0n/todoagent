@@ -130,10 +130,11 @@ impl Store {
         color: &str,
         repository_path: Option<&str>,
     ) -> StoreResult<List> {
+        let name = normalize_list_name(name)?;
         let now = now();
         let list = List {
             id: Uuid::new_v4().to_string(),
-            name: name.to_owned(),
+            name,
             color: color.to_owned(),
             repository_path: repository_path.map(str::to_owned),
             archived_at: None,
@@ -148,6 +149,57 @@ impl Store {
         bump_revision(&transaction)?;
         transaction.commit()?;
         Ok(list)
+    }
+
+    /// Renames one list without changing any task membership.
+    pub fn rename_list(&self, list_id: &str, name: &str) -> StoreResult<List> {
+        let list_id = canonical_uuid(list_id, "listId")?;
+        let name = normalize_list_name(name)?;
+        let timestamp = now();
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE list SET name=?1,updated_at=?2 WHERE id=?3",
+            params![name, timestamp, list_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        self.connection
+            .query_row(
+                "SELECT id,name,color,repository_path,archived_at,created_at,updated_at
+                 FROM list WHERE id=?1",
+                [&list_id],
+                row_to_list,
+            )
+            .map_err(StoreError::from)
+    }
+
+    /// Deletes only the list container. Tasks remain canonical task records and
+    /// are moved back to the unlisted Tasks view in the same transaction.
+    pub fn delete_list(&self, list_id: &str) -> StoreResult<()> {
+        let list_id = canonical_uuid(list_id, "listId")?;
+        let timestamp = now();
+        let transaction = self.connection.unchecked_transaction()?;
+        let exists = transaction
+            .query_row("SELECT 1 FROM list WHERE id=?1", [&list_id], |_| Ok(()))
+            .optional()?
+            .is_some();
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
+        let moved_tasks = transaction.execute(
+            "UPDATE task SET list_id=NULL,updated_at=?1 WHERE list_id=?2",
+            params![timestamp, list_id],
+        )?;
+        transaction.execute("DELETE FROM list WHERE id=?1", [&list_id])?;
+        if moved_tasks > 0 {
+            bump_task_data_revision(&transaction)?;
+        }
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Creates a blue list from the task title and moves the source task into it.
@@ -4358,6 +4410,18 @@ fn session_select(suffix: &str) -> String {
     )
 }
 
+fn row_to_list(row: &rusqlite::Row<'_>) -> rusqlite::Result<List> {
+    Ok(List {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        color: row.get(2)?,
+        repository_path: row.get(3)?,
+        archived_at: row.get(4)?,
+        created_at: row.get(5)?,
+        updated_at: row.get(6)?,
+    })
+}
+
 fn row_to_task(row: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     let raw: String = row.get(4)?;
     Ok(Task {
@@ -4624,6 +4688,16 @@ fn validate_session_title(value: &str) -> StoreResult<()> {
         ));
     }
     Ok(())
+}
+
+fn normalize_list_name(value: &str) -> StoreResult<String> {
+    let value = value.trim();
+    if value.is_empty() || value.chars().count() > 200 {
+        return Err(StoreError::Invalid(
+            "list name must be 1-200 characters".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn validate_task_input(input: &CreateTaskInput) -> StoreResult<()> {
@@ -5072,6 +5146,67 @@ mod tests {
         ));
         assert!(matches!(
             store.create_list_from_task("not-a-uuid"),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn rename_and_delete_list_preserve_tasks_and_advance_revisions_atomically() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let list = store.create_list("  原清单  ", "blue", None).unwrap();
+        assert_eq!(list.name, "原清单");
+        let task = store
+            .create_task("保留任务", "", Some(&list.id), Some("2026-08-10"), None)
+            .unwrap();
+        let before_rename = store.revision().unwrap();
+
+        let renamed = store
+            .rename_list(&list.id.to_uppercase(), "  新清单  ")
+            .unwrap();
+
+        assert_eq!(renamed.name, "新清单");
+        assert_eq!(store.revision().unwrap(), before_rename + 1);
+        assert_eq!(
+            store.task(&task.id).unwrap().unwrap().list_id.as_deref(),
+            Some(list.id.as_str())
+        );
+
+        let before_delete = store.revision().unwrap();
+        let task_revision: i64 = store
+            .connection
+            .query_row(
+                "SELECT revision FROM task_data_revision WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        store.delete_list(&list.id.to_uppercase()).unwrap();
+
+        let preserved = store.task(&task.id).unwrap().unwrap();
+        assert!(preserved.list_id.is_none());
+        assert_eq!(preserved.execution_date.as_deref(), Some("2026-08-10"));
+        assert_eq!(store.revision().unwrap(), before_delete + 1);
+        let updated_task_revision: i64 = store
+            .connection
+            .query_row(
+                "SELECT revision FROM task_data_revision WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_task_revision, task_revision + 1);
+        assert!(store.bootstrap().unwrap().lists.is_empty());
+        assert!(matches!(
+            store.rename_list(&list.id, "不存在"),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.delete_list(&list.id),
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store.rename_list(&Uuid::new_v4().to_string(), "  "),
             Err(StoreError::Invalid(_))
         ));
     }
@@ -7154,14 +7289,18 @@ mod tests {
         );
 
         for index in 0..60 {
+            let timestamp = now();
             store
-                .create_list(
-                    &format!("清单 {index} {}", "名".repeat(500)),
-                    "blue",
-                    Some(&format!(
-                        "/Users/example/TopSecret/{index}/{}",
-                        "目录/".repeat(500)
-                    )),
+                .connection
+                .execute(
+                    "INSERT INTO list(id,name,color,repository_path,created_at,updated_at)
+                 VALUES(?1,?2,'blue',?3,?4,?4)",
+                    params![
+                        Uuid::new_v4().to_string(),
+                        format!("清单 {index} {}", "名".repeat(500)),
+                        format!("/Users/example/TopSecret/{index}/{}", "目录/".repeat(500)),
+                        timestamp,
+                    ],
                 )
                 .unwrap();
         }

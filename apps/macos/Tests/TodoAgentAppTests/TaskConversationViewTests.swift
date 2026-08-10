@@ -92,6 +92,30 @@ struct TaskConversationViewTests {
         #expect(runningHeight < 500)
     }
 
+    @Test("completed tool steps reveal in order and collapse when a run finishes")
+    func toolGroupDisclosureLifecycle() {
+        var disclosure = AssistantToolGroupDisclosureState()
+
+        #expect(disclosure.isExpanded(isRunning: false) == false)
+        disclosure.toggleGroup(isRunning: false, totalStepCount: 8, reduceMotion: false)
+        #expect(disclosure.isExpanded(isRunning: false))
+        #expect(disclosure.revealedCompletedStepCount == 0)
+
+        disclosure.revealNextCompletedStep(totalStepCount: 8)
+        disclosure.revealNextCompletedStep(totalStepCount: 8)
+        disclosure.toggleTool("step-1")
+        #expect(disclosure.revealedCompletedStepCount == 2)
+        #expect(disclosure.expandedToolIDs == ["step-1"])
+
+        disclosure.finishRunningGroup()
+        #expect(disclosure.isExpanded(isRunning: false) == false)
+        #expect(disclosure.revealedCompletedStepCount == 0)
+        #expect(disclosure.expandedToolIDs.isEmpty)
+
+        disclosure.toggleGroup(isRunning: false, totalStepCount: 8, reduceMotion: true)
+        #expect(disclosure.revealedCompletedStepCount == 8)
+    }
+
     @Test("tool results are collapsed by default and toggle their complete body")
     func toolResultDisclosureState() throws {
         let rawResult = #"{"error":"provider failed","detail":"RAW_RESULT_SENTINEL"}"#
