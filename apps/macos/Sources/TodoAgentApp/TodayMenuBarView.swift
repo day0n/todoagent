@@ -335,31 +335,28 @@ struct TodoAgentMainWindowMarker: NSViewRepresentable {
 }
 
 final class MainWindowMarkerView: NSView {
-    private var placementScheduled = false
+    private var configurationScheduled = false
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
         window.identifier = NSUserInterfaceItemIdentifier(TodoAgentMainWindow.identifier)
 
-        let defaults = UserDefaults.standard
-        guard defaults.integer(forKey: TodoAgentMainWindowPlacement.appliedVersionKey)
-            < TodoAgentMainWindowPlacement.layoutVersion,
-            !placementScheduled
-        else { return }
-
-        placementScheduled = true
+        guard !configurationScheduled else { return }
+        configurationScheduled = true
 
         // viewDidMoveToWindow runs while SwiftUI is still resolving its initial
-        // window preferences. Mutating the frame synchronously here re-enters
-        // that preference graph and can trip AttributeGraph's recursion guard.
-        // Yield once, then apply a single AppKit frame mutation.
+        // window preferences. Mutating toolbar chrome or the frame
+        // synchronously here re-enters that preference graph and can trip
+        // AttributeGraph's recursion guard. Yield once before either change.
         Task { @MainActor [weak self, weak window] in
             await Task.yield()
             guard let self, let window, self.window === window else {
-                self?.placementScheduled = false
+                self?.configurationScheduled = false
                 return
             }
+
+            TodoAgentMainWindowChrome.configure(window)
 
             let defaults = UserDefaults.standard
             guard defaults.integer(forKey: TodoAgentMainWindowPlacement.appliedVersionKey)
@@ -385,5 +382,14 @@ final class MainWindowMarkerView: NSView {
                 forKey: TodoAgentMainWindowPlacement.appliedVersionKey
             )
         }
+    }
+}
+
+@MainActor
+enum TodoAgentMainWindowChrome {
+    static let toolbarStyle: NSWindow.ToolbarStyle = .unifiedCompact
+
+    static func configure(_ window: NSWindow) {
+        window.toolbarStyle = toolbarStyle
     }
 }

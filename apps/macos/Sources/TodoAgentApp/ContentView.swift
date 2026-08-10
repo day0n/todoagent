@@ -74,6 +74,10 @@ struct ContentView: View {
                     .frame(width: assistantContainerWidth, alignment: .trailing)
                     .clipped()
                 }
+                // The divider itself moves while it is being dragged. Keep
+                // the gesture in this fixed workspace coordinate space so
+                // its translation does not feed back into the next event.
+                .coordinateSpace(name: AssistantWorkspaceCoordinateSpace.name)
                 .clipped()
                 .animation(
                     AssistantWorkspaceMotion.animation(reduceMotion: reduceMotion),
@@ -312,6 +316,10 @@ enum AssistantWorkspaceMotion {
     }
 }
 
+private enum AssistantWorkspaceCoordinateSpace {
+    static let name = "todoagent.assistant-workspace"
+}
+
 private struct AssistantResizeDivider: View {
     let assistantWidth: CGFloat
     let onDragChanged: (CGFloat) -> Void
@@ -331,7 +339,10 @@ private struct AssistantResizeDivider: View {
             }
             .contentShape(.rect)
             .gesture(
-                DragGesture(minimumDistance: 0)
+                DragGesture(
+                    minimumDistance: 0,
+                    coordinateSpace: .named(AssistantWorkspaceCoordinateSpace.name)
+                )
                     .onChanged { onDragChanged($0.translation.width) }
                     .onEnded { _ in onDragEnded() }
             )

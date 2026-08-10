@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import TodoAgentApp
@@ -96,6 +97,16 @@ struct AppStateTests {
             assistantRequested: true,
             preferredAssistantWidth: 430
         ) == .sideBySide(assistantWidth: 430))
+    }
+
+    @Test("main timeline uses compact native toolbar chrome")
+    @MainActor
+    func mainWindowToolbarIsCompact() {
+        let window = NSWindow()
+
+        TodoAgentMainWindowChrome.configure(window)
+
+        #expect(window.toolbarStyle == .unifiedCompact)
     }
 
     @Test("assistant rail uses a visible native-paced transition")

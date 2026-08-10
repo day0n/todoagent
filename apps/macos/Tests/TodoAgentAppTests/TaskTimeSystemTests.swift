@@ -276,8 +276,28 @@ struct TaskTimeSystemTests {
         #expect(await state.flushTaskEdits(taskID: item.id))
         #expect(await repository.updateCallCount() == 1)
         #expect(state.taskSaveState(taskID: item.id) == .idle)
-        try await Task.sleep(for: .milliseconds(450))
+        try await Task.sleep(for: .milliseconds(850))
         #expect(await repository.updateCallCount() == 1)
+    }
+
+    @Test("a typing burst is merged into one trailing autosave")
+    func typingBurstCoalescesIntoOneAutosave() async throws {
+        let item = task("原始")
+        let repository = TaskMutationSpyRepository(snapshot: snapshot(tasks: [item]))
+        let state = AppState(repository: repository)
+        await state.load()
+
+        state.scheduleTaskUpdate(taskID: item.id, patch: TaskPatch(note: "三"))
+        state.scheduleTaskUpdate(taskID: item.id, patch: TaskPatch(note: "三个"))
+        state.scheduleTaskUpdate(taskID: item.id, patch: TaskPatch(note: "三个 skill"))
+
+        #expect(state.taskSaveState(taskID: item.id) == .debouncing)
+        #expect(state.task(id: item.id)?.note == "三个 skill")
+        #expect(await repository.updateCallCount() == 0)
+
+        #expect(await state.flushTaskEdits(taskID: item.id))
+        #expect(await repository.updateCallCount() == 1)
+        #expect(await repository.persistedTask(id: item.id)?.note == "三个 skill")
     }
 
     @Test("failed autosave retains its draft and retries the same patch")
@@ -326,7 +346,7 @@ struct TaskTimeSystemTests {
         #expect(await repository.persistedTask(id: item.id)?.title == "关闭前必须保存")
         #expect(state.taskSaveState(taskID: item.id) == .idle)
 
-        try await Task.sleep(for: .milliseconds(450))
+        try await Task.sleep(for: .milliseconds(850))
         #expect(await repository.updateCallCount() == 1)
     }
 
@@ -900,7 +920,7 @@ struct TaskTimeSystemTests {
         #expect(state.conversation(for: item) == nil)
         #expect(state.sessions.isEmpty)
 
-        try await Task.sleep(for: .milliseconds(450))
+        try await Task.sleep(for: .milliseconds(850))
         #expect(await repository.updateCallCount() == 0)
     }
 
@@ -993,7 +1013,7 @@ struct TaskTimeSystemTests {
         // Models task.changed arriving before the matching mutation response.
         #expect(await state.detectRuntimes())
         #expect(state.task(id: item.id)?.title == "  权威标题  ")
-        draft.reconcile(
+        draft = draft.reconciled(
             with: try #require(state.task(id: item.id)),
             saveState: state.taskSaveState(taskID: item.id)
         )
@@ -1004,7 +1024,7 @@ struct TaskTimeSystemTests {
         #expect(state.task(id: item.id)?.title == "权威标题")
         #expect(state.taskSaveState(taskID: item.id) == .idle)
 
-        draft.reconcile(
+        draft = draft.reconciled(
             with: try #require(state.task(id: item.id)),
             saveState: state.taskSaveState(taskID: item.id)
         )
@@ -1034,7 +1054,7 @@ struct TaskTimeSystemTests {
         external.updatedAt = "2026-08-09T00:00:02Z"
         await repository.replaceSnapshot(snapshot(revision: 2, tasks: [external]))
         #expect(await state.detectRuntimes())
-        draft.reconcile(
+        draft = draft.reconciled(
             with: try #require(state.task(id: item.id)),
             saveState: state.taskSaveState(taskID: item.id)
         )
@@ -1043,12 +1063,38 @@ struct TaskTimeSystemTests {
 
         await repository.releaseUpdate(1)
         #expect(await state.flushTaskEdits(taskID: item.id))
-        draft.reconcile(
+        draft = draft.reconciled(
             with: try #require(state.task(id: item.id)),
             saveState: state.taskSaveState(taskID: item.id)
         )
         #expect(draft.title == "Agent 改名")
         #expect(draft.note == "本地备注")
+    }
+
+    @Test("an active note edit cannot be overwritten by an autosave response")
+    func activeNoteEditSurvivesAutosaveReconciliation() {
+        let item = task("输入保护")
+        var draft = TaskDetailDraft(task: item)
+        draft.note = "三个 skill"
+
+        var staleResponse = item
+        staleResponse.title = "Engine 同时改了标题"
+        staleResponse.note = "三个 sk"
+        draft = draft.reconciled(
+            with: staleResponse,
+            saveState: .idle,
+            preserving: .note
+        )
+
+        #expect(draft.title == "输入保护")
+        #expect(draft.note == "三个 skill")
+
+        draft = draft.reconciled(
+            with: staleResponse,
+            saveState: .idle
+        )
+        #expect(draft.title == "Engine 同时改了标题")
+        #expect(draft.note == "三个 sk")
     }
 
     @Test("same-value task patches never create a mutation")
@@ -1071,7 +1117,7 @@ struct TaskTimeSystemTests {
             )
         ))
         state.scheduleTaskUpdate(taskID: item.id, patch: TaskPatch(title: item.title))
-        try await Task.sleep(for: .milliseconds(450))
+        try await Task.sleep(for: .milliseconds(850))
 
         #expect(await repository.updateCallCount() == 0)
         #expect(state.revision == 1)

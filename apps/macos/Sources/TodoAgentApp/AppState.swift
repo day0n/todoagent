@@ -34,6 +34,7 @@ final class AppState {
 
     private let repository: any AppRepository
     private let calendar: Calendar
+    private let taskTextAutosaveDelay: Duration
     private var projection = TaskProjection.empty
     private var hasAppliedSnapshot = false
     private var eventTask: Task<Void, Never>?
@@ -85,10 +86,12 @@ final class AppState {
         repository: any AppRepository,
         inspectorPresented: Bool = false,
         now: Date = .now,
-        calendar: Calendar = .todoAgentLocal
+        calendar: Calendar = .todoAgentLocal,
+        taskTextAutosaveDelay: Duration = .milliseconds(800)
     ) {
         self.repository = repository
         self.calendar = calendar
+        self.taskTextAutosaveDelay = taskTextAutosaveDelay
         self.inspectorPresented = inspectorPresented
         let today = LocalDay(now, calendar: calendar)
         selectedDay = today
@@ -528,17 +531,18 @@ final class AppState {
         beginImmediateTaskFlush(taskID: taskID)
     }
 
-    /// Queues a title/note patch for the 400 ms autosave window. The draft is
-    /// projected immediately and remains visible if persistence fails.
+    /// Queues a title/note patch for the 800 ms trailing autosave window.
+    /// The draft is projected immediately and remains visible if persistence fails.
     func scheduleTaskUpdate(taskID: UUID, patch: TaskPatch) {
         guard isTaskCommandInFlight(taskID: taskID) == false else { return }
         guard let patch = changedTaskPatch(taskID: taskID, patch: patch) else { return }
         queueTaskPatch(taskID: taskID, patch: patch)
         taskSaveStates[taskID] = activeTaskFlushes[taskID] == nil ? .debouncing : .saving
         taskDebounceTasks[taskID]?.cancel()
+        let autosaveDelay = taskTextAutosaveDelay
         taskDebounceTasks[taskID] = Task { @MainActor [weak self] in
             do {
-                try await Task.sleep(for: .milliseconds(400))
+                try await Task.sleep(for: autosaveDelay)
             } catch { return }
             guard !Task.isCancelled else { return }
             _ = await self?.flushTaskEdits(taskID: taskID)

@@ -13,6 +13,7 @@ struct TaskConversationSheet: View {
     @State private var detailDraft: TaskDetailDraft
     @State private var isClosing = false
     @State private var isStartingSession = false
+    @FocusState private var focusedTextField: TaskDetailTextField?
 
     init(
         task: TaskItem,
@@ -34,14 +35,33 @@ struct TaskConversationSheet: View {
             if let task = state.task(id: taskID) {
                 taskLayout(task, layout: layout)
                 .onChange(of: task) { _, authoritativeTask in
-                    detailDraft.reconcile(
+                    reconcileDetailDraft(
                         with: authoritativeTask,
                         saveState: state.taskSaveState(taskID: taskID)
                     )
                 }
                 .onChange(of: state.taskSaveState(taskID: taskID)) { _, saveState in
                     guard let authoritativeTask = state.task(id: taskID) else { return }
-                    detailDraft.reconcile(with: authoritativeTask, saveState: saveState)
+                    reconcileDetailDraft(with: authoritativeTask, saveState: saveState)
+                }
+                .onChange(of: focusedTextField) { _, field in
+                    Task { @MainActor in
+                        // AppKit can publish focus loss before NSTextView has
+                        // committed its final marked text. Let that binding
+                        // update land before flushing or reconciling the draft.
+                        await Task.yield()
+                        guard focusedTextField == field else { return }
+
+                        if field == nil {
+                            _ = await state.flushTaskEdits(taskID: taskID)
+                        }
+
+                        guard let authoritativeTask = state.task(id: taskID) else { return }
+                        reconcileDetailDraft(
+                            with: authoritativeTask,
+                            saveState: state.taskSaveState(taskID: taskID)
+                        )
+                    }
                 }
             } else {
                 ContentUnavailableView(
@@ -88,6 +108,7 @@ struct TaskConversationSheet: View {
         TaskDetailsPane(
             task: task,
             draft: $detailDraft,
+            focusedTextField: $focusedTextField,
             state: state
         )
         .disabled(isClosing || isStartingSession)
@@ -119,6 +140,19 @@ struct TaskConversationSheet: View {
 
     private func flushTaskEdits() async -> Bool {
         await state.flushTaskEdits(taskID: taskID)
+    }
+
+    private func reconcileDetailDraft(
+        with task: TaskItem,
+        saveState: TaskSaveState
+    ) {
+        let reconciled = detailDraft.reconciled(
+            with: task,
+            saveState: saveState,
+            preserving: focusedTextField
+        )
+        guard reconciled != detailDraft else { return }
+        detailDraft = reconciled
     }
 
     private func close() {
@@ -210,6 +244,11 @@ enum TaskConversationSheetLayoutPolicy {
     }
 }
 
+enum TaskDetailTextField: Hashable {
+    case title
+    case note
+}
+
 struct TaskDetailDraft: Equatable {
     var title: String
     var note: String
@@ -225,15 +264,23 @@ struct TaskDetailDraft: Equatable {
         dueDate = task.dueDate
     }
 
-    mutating func reconcile(with task: TaskItem, saveState: TaskSaveState) {
-        guard saveState == .idle else { return }
-        self = TaskDetailDraft(task: task)
+    func reconciled(
+        with task: TaskItem,
+        saveState: TaskSaveState,
+        preserving focusedField: TaskDetailTextField? = nil
+    ) -> TaskDetailDraft {
+        // Do not write to the compound @State value while either native text
+        // control owns focus. Even changing another field can reconfigure the
+        // underlying NSTextView and discard its marked text or selection.
+        guard saveState == .idle, focusedField == nil else { return self }
+        return TaskDetailDraft(task: task)
     }
 }
 
 private struct TaskDetailsPane: View {
     let task: TaskItem
     @Binding var draft: TaskDetailDraft
+    var focusedTextField: FocusState<TaskDetailTextField?>.Binding
     let state: AppState
 
     var body: some View {
@@ -274,22 +321,32 @@ private struct TaskDetailsPane: View {
 
     @ViewBuilder
     private var saveStateLabel: some View {
-        switch state.taskSaveState(taskID: task.id) {
-        case .idle:
-            Label("已保存", systemImage: "checkmark.circle")
-                .foregroundStyle(.secondary)
-        case .debouncing:
-            Label("等待保存", systemImage: "clock")
-                .foregroundStyle(.secondary)
-        case .saving:
-            HStack(spacing: 6) {
-                ProgressView().controlSize(.small)
-                Text("保存中")
+        let saveState = state.taskSaveState(taskID: task.id)
+
+        if focusedTextField.wrappedValue != nil {
+            switch saveState {
+            case .failed:
+                Label("保存失败", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+            case .idle, .debouncing, .saving:
+                Label("自动保存", systemImage: "pencil")
+                    .foregroundStyle(.secondary)
             }
-            .foregroundStyle(.secondary)
-        case .failed:
-            Label("保存失败", systemImage: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
+        } else {
+            switch saveState {
+            case .idle:
+                Label("已保存", systemImage: "checkmark.circle")
+                    .foregroundStyle(.secondary)
+            case .debouncing:
+                Label("待保存", systemImage: "clock")
+                    .foregroundStyle(.secondary)
+            case .saving:
+                Label("保存中", systemImage: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(.secondary)
+            case .failed:
+                Label("保存失败", systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.red)
+            }
         }
     }
 
@@ -311,6 +368,7 @@ private struct TaskDetailsPane: View {
                 .textFieldStyle(.plain)
                 .lineLimit(1 ... 3)
                 .strikethrough(draft.status == .completed)
+                .focused(focusedTextField, equals: .title)
                 .accessibilityIdentifier("task.details.title")
         }
     }
@@ -398,6 +456,7 @@ private struct TaskDetailsPane: View {
                 .scrollContentBackground(.hidden)
                 .padding(8)
                 .frame(minHeight: 150)
+                .focused(focusedTextField, equals: .note)
                 .background(Color(nsColor: .textBackgroundColor), in: .rect(cornerRadius: 9))
                 .overlay {
                     RoundedRectangle(cornerRadius: 9)

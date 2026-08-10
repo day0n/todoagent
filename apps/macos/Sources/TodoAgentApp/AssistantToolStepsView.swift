@@ -241,10 +241,23 @@ struct AssistantToolStepsView: View {
                             isExpanded: disclosure.expandedToolIDs.contains(tool.id),
                             toggle: { toggle(tool.id) }
                         )
-                        .transition(.opacity.combined(with: .move(edge: .top)))
+                        .transition(
+                            .asymmetric(
+                                insertion: .opacity.combined(with: .move(edge: .top)),
+                                removal: .opacity
+                            )
+                        )
                     }
                 }
-                .transition(.opacity.combined(with: .move(edge: .top)))
+                // Insertion grows naturally from the group heading. Removal
+                // only fades while the stack closes, avoiding the old upward
+                // fly-out above the heading.
+                .transition(
+                    .asymmetric(
+                        insertion: .opacity.combined(with: .move(edge: .top)),
+                        removal: .opacity
+                    )
+                )
             }
         }
         .padding(.vertical, 3)
