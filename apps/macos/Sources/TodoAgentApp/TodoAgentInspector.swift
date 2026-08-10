@@ -12,6 +12,7 @@ struct TodoAgentInspector: View {
     @State private var sessionSwitcherPresented = false
     @State private var renamingSession: AssistantSessionDescriptor?
     @State private var pendingArchive: AssistantSessionDescriptor?
+    @State private var pointerNearTranscriptIndicator = false
     @FocusState private var composerFocused: Bool
 
     private var assistant: AssistantViewState { state.assistant }
@@ -32,8 +33,12 @@ struct TodoAgentInspector: View {
 
                 Divider()
 
-                if let error = assistant.errorMessage {
-                    AssistantErrorBanner(message: error) { assistant.clearError() }
+                if let error = assistant.errorMessage,
+                   error != assistant.selectedTurnError
+                {
+                    AssistantFriendlyErrorView(rawMessage: error) { assistant.clearError() }
+                        .padding(.horizontal, 10)
+                        .padding(.top, 8)
                 }
                 content
             }
@@ -200,67 +205,92 @@ struct TodoAgentInspector: View {
     }
 
     private var transcript: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: TodoAgentUI.standardSpacing) {
-                    if assistant.isLoadingHistory, assistant.selectedTimelineItems.isEmpty {
-                        Text("正在载入历史…")
-                            .font(.caption)
-                            .foregroundStyle(TodoAgentUI.secondaryText)
-                            .padding(.vertical, 30)
-                    } else if assistant.selectedTimelineItems.isEmpty, assistant.selectedDraft == nil {
-                        AssistantConversationEmptyState { suggestion in
-                            draft = suggestion
-                            composerFocused = true
+        GeometryReader { geometry in
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: TodoAgentUI.standardSpacing) {
+                        if assistant.isLoadingHistory, assistant.selectedTimelineItems.isEmpty {
+                            Text("正在载入历史…")
+                                .font(.caption)
+                                .foregroundStyle(TodoAgentUI.secondaryText)
+                                .padding(.vertical, 30)
+                        } else if assistant.selectedTimelineItems.isEmpty, assistant.selectedDraft == nil {
+                            AssistantConversationEmptyState { suggestion in
+                                draft = suggestion
+                                composerFocused = true
+                            }
+                                .padding(.vertical, 32)
                         }
-                            .padding(.vertical, 32)
-                    }
 
-                    ForEach(assistant.selectedTimelineItems) { item in
-                        switch item {
-                        case let .message(message):
-                            AssistantMessageRow(message: message, state: state)
-                        case let .tool(tool):
-                            AssistantToolRow(tool: tool, state: state)
+                        ForEach(assistant.selectedTimelineItems) { item in
+                            switch item {
+                            case let .message(message):
+                                AssistantMessageRow(message: message, state: state)
+                            case let .toolGroup(group):
+                                AssistantToolStepsView(group: group, state: state)
+                            }
                         }
-                    }
 
-                    if let draft = assistant.selectedDraft, !draft.body.isEmpty {
-                        AssistantStreamingRow(draft: draft)
-                            .id("streaming-\(draft.messageID)-\(draft.attempt)")
-                    }
+                        if let draft = assistant.selectedDraft, !draft.body.isEmpty {
+                            AssistantStreamingRow(draft: draft)
+                                .id("streaming-\(draft.messageID)-\(draft.attempt)")
+                        }
 
-                    if let processingPhase {
-                        AssistantProcessingRow(phase: processingPhase)
-                            .id("assistant-processing")
-                    }
+                        if let processingPhase {
+                            AssistantProcessingRow(phase: processingPhase)
+                                .id("assistant-processing")
+                        }
 
-                    if let turnError = assistant.selectedTurnError {
-                        Label(turnError, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                            .background(.red.opacity(0.08), in: .rect(cornerRadius: 8))
-                    }
+                        if let turnError = assistant.selectedTurnError {
+                            AssistantFriendlyErrorView(rawMessage: turnError)
+                                .id("assistant-turn-error")
+                        }
 
-                    Color.clear.frame(height: 1).id("assistant-bottom")
+                        Color.clear.frame(height: 1).id("assistant-bottom")
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 14)
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 14)
-            }
-            .background(TodoAgentUI.canvasBackground)
-            .onChange(of: assistant.selectedMessages.last?.id) {
-                scrollToBottom(proxy)
-            }
-            .onChange(of: assistant.selectedTimelineItems.last?.id) {
-                scrollToBottom(proxy)
-            }
-            .onChange(of: assistant.selectedDraft?.body) {
-                scrollToBottom(proxy)
-            }
-            .onChange(of: assistant.selectedSessionID) {
-                scrollToBottom(proxy, animated: false)
+                .scrollIndicators(
+                    AssistantScrollIndicatorPolicy.showsIndicators(
+                        pointerNearIndicator: pointerNearTranscriptIndicator
+                    ) ? .visible : .hidden,
+                    axes: .vertical
+                )
+                .background(TodoAgentUI.canvasBackground)
+                .onContinuousHover { phase in
+                    switch phase {
+                    case let .active(location):
+                        pointerNearTranscriptIndicator = location.x
+                            >= geometry.size.width - AssistantScrollIndicatorPolicy.hoverZoneWidth
+                    case .ended:
+                        pointerNearTranscriptIndicator = false
+                    }
+                }
+                .overlay(alignment: .trailing) {
+                    Rectangle()
+                        .fill(TodoAgentUI.canvasBackground)
+                        .frame(width: AssistantScrollIndicatorPolicy.coverWidth)
+                        .opacity(
+                            AssistantScrollIndicatorPolicy.coverOpacity(
+                                pointerNearIndicator: pointerNearTranscriptIndicator
+                            )
+                        )
+                        .allowsHitTesting(false)
+                }
+                .animation(.easeOut(duration: 0.18), value: pointerNearTranscriptIndicator)
+                .onChange(of: assistant.selectedMessages.last?.id) {
+                    scrollToBottom(proxy)
+                }
+                .onChange(of: assistant.selectedTimelineItems.last?.id) {
+                    scrollToBottom(proxy)
+                }
+                .onChange(of: assistant.selectedDraft?.body) {
+                    scrollToBottom(proxy)
+                }
+                .onChange(of: assistant.selectedSessionID) {
+                    scrollToBottom(proxy, animated: false)
+                }
             }
         }
     }
@@ -369,7 +399,9 @@ struct TodoAgentInspector: View {
     private var processingPhase: AssistantProcessingPhase? {
         guard assistant.isSelectedSessionRunning else { return nil }
         if assistant.selectedTools.contains(where: { $0.state == .running }) {
-            return .processing
+            // The active tool group already carries the animated progress
+            // treatment, so a second status row would duplicate it.
+            return nil
         }
         if assistant.selectedDraft?.body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false {
             return .organizing
@@ -719,34 +751,6 @@ private struct AssistantSwitcherActionButtonStyle: ButtonStyle {
     }
 }
 
-private struct AssistantErrorBanner: View {
-    let message: String
-    let dismiss: () -> Void
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-                .accessibilityHidden(true)
-            Text(message)
-                .font(.caption)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-            Button("关闭", systemImage: "xmark", action: dismiss)
-                .labelStyle(.iconOnly)
-                .buttonStyle(.borderless)
-        }
-        .padding(10)
-        .background(.orange.opacity(0.07))
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(TodoAgentUI.hairline)
-                .frame(height: 1)
-        }
-        .accessibilityElement(children: .combine)
-    }
-}
-
 private struct AssistantConversationEmptyState: View {
     private struct Suggestion: Identifiable {
         let title: String
@@ -866,9 +870,8 @@ private struct AssistantMessageRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label(message.kind, systemImage: "wrench.and.screwdriver")
                     .font(.caption.bold())
-                Text(message.body)
+                AssistantMarkdownView(message.body)
                     .font(.caption)
-                    .textSelection(.enabled)
                 taskReferences
             }
             .padding(10)
@@ -919,10 +922,9 @@ private struct AssistantMessageRow: View {
 
         case .todoAgent:
             VStack(alignment: .leading, spacing: 7) {
-                Text(message.body)
+                AssistantMarkdownView(message.body)
                     .font(.callout)
                     .foregroundStyle(TodoAgentUI.primaryText)
-                    .textSelection(.enabled)
                 taskReferences
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -998,9 +1000,8 @@ private struct AssistantStreamingRow: View {
     var body: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 7) {
-                Text(draft.body)
+                AssistantMarkdownView(draft.body)
                     .font(.callout)
-                    .textSelection(.enabled)
             }
             .foregroundStyle(TodoAgentUI.primaryText)
             Spacer(minLength: 38)
@@ -1029,117 +1030,13 @@ private struct AssistantProcessingRow: View {
 
     var body: some View {
         HStack(spacing: 7) {
-            Image(systemName: "ellipsis")
-                .font(.caption.bold())
-                .foregroundStyle(TodoAgentUI.secondaryText)
-                .accessibilityHidden(true)
-            Text(phase.label)
+            AssistantWaveText(text: phase.label)
                 .font(.caption)
-                .foregroundStyle(TodoAgentUI.secondaryText)
             Spacer(minLength: 0)
         }
         .padding(.vertical, 4)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("TodoAgent \(phase.label)")
-    }
-}
-
-struct AssistantToolCardPresentation: Equatable, Sendable {
-    let systemImage: String
-    let stateTitle: String
-    let state: AssistantToolState
-
-    init(state: AssistantToolState) {
-        self.state = state
-        switch state {
-        case .running:
-            systemImage = "ellipsis"
-            stateTitle = "处理中"
-        case .completed:
-            systemImage = "checkmark"
-            stateTitle = "完成"
-        case .failed:
-            systemImage = "xmark"
-            stateTitle = "失败"
-        }
-    }
-}
-
-private struct AssistantToolRow: View {
-    let tool: AssistantToolActivity
-    let state: AppState
-
-    private var presentation: AssistantToolCardPresentation {
-        AssistantToolCardPresentation(state: tool.state)
-    }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: presentation.systemImage)
-                .font(.caption.bold())
-                .foregroundStyle(stateColor)
-                .frame(width: 26, height: 26)
-                .background(stateColor.opacity(0.13), in: .circle)
-                .overlay {
-                    Circle().stroke(stateColor.opacity(0.24), lineWidth: 1)
-                }
-                .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 7) {
-                HStack(spacing: 7) {
-                    Text(tool.name)
-                        .font(.caption.weight(.semibold))
-                        .fontDesign(.monospaced)
-                        .lineLimit(1)
-                    Spacer(minLength: 8)
-                    Text(presentation.stateTitle)
-                        .font(.caption2.weight(.medium))
-                        .foregroundStyle(stateColor)
-                        .padding(.horizontal, 7)
-                        .frame(height: 20)
-                        .background(stateColor.opacity(0.10), in: .capsule)
-                }
-
-                if !tool.taskReferences.isEmpty {
-                    FlowLayout(spacing: 5) {
-                        ForEach(tool.taskReferences, id: \.self) { taskID in
-                            AssistantTaskReferenceButton(taskID: taskID, state: state)
-                        }
-                    }
-                }
-            }
-        }
-        .padding(10)
-        .foregroundStyle(TodoAgentUI.primaryText)
-        .background {
-            ZStack {
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(.thinMaterial)
-                RoundedRectangle(cornerRadius: 10)
-                    .fill(
-                        LinearGradient(
-                            colors: [.clear, stateColor.opacity(tool.state == .failed ? 0.13 : 0.07)],
-                            startPoint: .leading,
-                            endPoint: .trailing
-                        )
-                    )
-            }
-        }
-        .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .strokeBorder(stateColor.opacity(tool.state == .running ? 0.16 : 0.28), lineWidth: 1)
-        }
-        .shadow(color: TodoAgentUI.shadowColor.opacity(0.45), radius: 5, y: 2)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("工具 \(tool.name)，\(presentation.stateTitle)")
-    }
-
-    private var stateColor: Color {
-        switch tool.state {
-        case .running: TodoAgentUI.secondaryText
-        case .completed: .green
-        case .failed: .red
-        }
     }
 }
 
@@ -1220,7 +1117,7 @@ private struct RenameAssistantSessionSheet: View {
 
 /// A compact wrapping layout keeps task references readable inside the narrow
 /// native inspector without nesting horizontal scroll views.
-private struct FlowLayout: Layout {
+struct FlowLayout: Layout {
     let spacing: CGFloat
 
     func sizeThatFits(

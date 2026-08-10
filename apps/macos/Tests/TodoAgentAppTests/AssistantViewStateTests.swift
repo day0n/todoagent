@@ -251,12 +251,20 @@ struct AssistantViewStateTests {
 
         #expect(state.selectedTimelineItems.map(\.id) == [
             "message-message-user-1",
-            "tool-z-first",
-            "tool-a-second",
+            "tool-group-turn-1",
             "message-message-agent-1",
             "message-message-user-2",
-            "tool-m-third",
+            "tool-group-turn-2",
             "message-message-agent-2",
+        ])
+
+        let groups = state.selectedTimelineItems.compactMap { item -> AssistantToolGroup? in
+            guard case let .toolGroup(group) = item else { return nil }
+            return group
+        }
+        #expect(groups.map { $0.tools.map(\.toolCallID) } == [
+            ["z-first", "a-second"],
+            ["m-third"],
         ])
     }
 

@@ -502,24 +502,41 @@ struct AssistantToolActivity: Identifiable, Equatable, Sendable {
     var taskReferences: [UUID]
 }
 
+/// All tool activity produced by one assistant turn. The group keeps a stable
+/// identity while individual tools move from running to completed, allowing the
+/// compact transcript disclosure to preserve its local expansion state.
+struct AssistantToolGroup: Identifiable, Equatable, Sendable {
+    var id: String { "tool-group-\(turnID)" }
+    let turnID: String
+    var tools: [AssistantToolActivity]
+
+    var isRunning: Bool {
+        tools.contains(where: { $0.state == .running })
+    }
+
+    var hasFailure: Bool {
+        tools.contains(where: { $0.state == .failed })
+    }
+}
+
 /// One stable row in the TodoAgent conversation. Messages and tool activity
 /// share a turn ID, so the UI can keep every tool beside the user request that
 /// caused it instead of rendering a second tool list at the end of the chat.
 enum AssistantConversationTimelineItem: Identifiable, Equatable, Sendable {
     case message(AssistantMessage)
-    case tool(AssistantToolActivity)
+    case toolGroup(AssistantToolGroup)
 
     var id: String {
         switch self {
         case let .message(message): "message-\(message.id)"
-        case let .tool(tool): "tool-\(tool.toolCallID)"
+        case let .toolGroup(group): group.id
         }
     }
 
     var turnID: String? {
         switch self {
         case let .message(message): message.turnID
-        case let .tool(tool): tool.turnID
+        case let .toolGroup(group): group.turnID
         }
     }
 }

@@ -6,18 +6,90 @@ import Testing
 @Suite("Task conversation presentation")
 @MainActor
 struct TaskConversationViewTests {
-    @Test("assistant tool cards expose quiet notification states without animated status")
-    func assistantToolCardPresentation() {
-        let running = AssistantToolCardPresentation(state: .running)
-        let completed = AssistantToolCardPresentation(state: .completed)
-        let failed = AssistantToolCardPresentation(state: .failed)
+    @Test("assistant tools use friendly actions and collapse into one turn summary")
+    func assistantToolStepPresentation() {
+        let completed = assistantTool(name: "create_tasks", state: .completed, callID: "create")
+        let running = assistantTool(name: "list_state", state: .running, callID: "list")
+        let failed = assistantTool(name: "delete_task", state: .failed, callID: "delete")
+        let sixSteps = AssistantToolGroup(
+            turnID: "turn-six",
+            tools: (0 ..< 6).map {
+                assistantTool(name: "find_related", state: .completed, callID: "call-\($0)")
+            }
+        )
 
-        #expect(running.systemImage == "ellipsis")
-        #expect(running.stateTitle == "处理中")
-        #expect(completed.systemImage == "checkmark")
-        #expect(completed.stateTitle == "完成")
-        #expect(failed.systemImage == "xmark")
-        #expect(failed.stateTitle == "失败")
+        #expect(AssistantToolStepPresentation(tool: completed).title == "已创建任务")
+        #expect(AssistantToolStepPresentation(tool: running).title == "正在读取任务")
+        #expect(AssistantToolStepPresentation(tool: failed).title == "删除任务时遇到问题")
+        #expect(AssistantToolGroupPresentation(group: sixSteps).title == "6 个步骤")
+        #expect(AssistantToolGroupPresentation(group: sixSteps).accessibilityValue == "已完成")
+    }
+
+    @Test("markdown keeps block structure and removes inline syntax markers")
+    func assistantMarkdownPresentation() {
+        let document = AssistantMarkdownDocument(
+            markdown: "已成功删除你的 **6 个任务**：\n\n1. **测试 cc**\n2. **123**（未完成）"
+        )
+        let inline = AssistantMarkdownInlineParser.parse("已删除 **6 个任务**")
+
+        #expect(document.blocks.count == 2)
+        #expect(document.blocks.first == .paragraph("已成功删除你的 **6 个任务**："))
+        #expect(
+            document.blocks.last == .orderedList([
+                (number: 1, text: "**测试 cc**"),
+                (number: 2, text: "**123**（未完成）"),
+            ])
+        )
+        #expect(String(inline.characters) == "已删除 6 个任务")
+    }
+
+    @Test("technical provider failures are hidden behind a friendly summary")
+    func assistantErrorPresentation() {
+        let raw = "Gemini 请求失败：provider network error: error sending request for url (https://example.invalid/v1)"
+        let presentation = AssistantErrorPresentation(rawMessage: raw)
+
+        #expect(presentation.title == "连接 Gemini 时遇到网络问题")
+        #expect(presentation.guidance == "请检查网络或代理设置，然后重试。")
+        #expect(presentation.guidance.contains("https://") == false)
+        #expect(presentation.technicalDetails == raw)
+    }
+
+    @Test("assistant scrollbar stays quiet until the pointer reaches the trailing edge")
+    func assistantScrollbarPolicy() {
+        #expect(AssistantScrollIndicatorPolicy.showsIndicators(pointerNearIndicator: false) == false)
+        #expect(AssistantScrollIndicatorPolicy.showsIndicators(pointerNearIndicator: true))
+        #expect(AssistantScrollIndicatorPolicy.coverOpacity(pointerNearIndicator: false) == 0.97)
+        #expect(AssistantScrollIndicatorPolicy.coverOpacity(pointerNearIndicator: true) == 0)
+        #expect(AssistantScrollIndicatorPolicy.hoverZoneWidth > AssistantScrollIndicatorPolicy.coverWidth)
+    }
+
+    @Test("six completed tools occupy one compact transcript row")
+    func completedToolGroupHasCompactHeight() {
+        let state = AppState(repository: AssistantTestRepository())
+        let completed = AssistantToolGroup(
+            turnID: "completed-turn",
+            tools: (0 ..< 6).map {
+                assistantTool(name: "find_related", state: .completed, callID: "done-\($0)")
+            }
+        )
+        let running = AssistantToolGroup(
+            turnID: "running-turn",
+            tools: (0 ..< 6).map {
+                assistantTool(
+                    name: $0 == 5 ? "create_tasks" : "find_related",
+                    state: $0 == 5 ? .running : .completed,
+                    callID: "running-\($0)"
+                )
+            }
+        )
+
+        let completedHeight = hostedToolGroupHeight(group: completed, state: state)
+        let runningHeight = hostedToolGroupHeight(group: running, state: state)
+
+        #expect(completedHeight > 0)
+        #expect(completedHeight < 80)
+        #expect(runningHeight > completedHeight * 3)
+        #expect(runningHeight < 500)
     }
 
     @Test("tool results are collapsed by default and toggle their complete body")
@@ -172,6 +244,33 @@ struct TaskConversationViewTests {
             body: body,
             payloadJSON: payloadJSON
         )
+    }
+
+    private func assistantTool(
+        name: String,
+        state: AssistantToolState,
+        callID: String
+    ) -> AssistantToolActivity {
+        AssistantToolActivity(
+            sessionID: "session-1",
+            turnID: "turn-1",
+            toolCallID: callID,
+            name: name,
+            state: state,
+            taskReferences: []
+        )
+    }
+
+    private func hostedToolGroupHeight(
+        group: AssistantToolGroup,
+        state: AppState
+    ) -> CGFloat {
+        let host = NSHostingView(
+            rootView: AssistantToolStepsView(group: group, state: state)
+                .frame(width: 360)
+        )
+        host.layoutSubtreeIfNeeded()
+        return host.fittingSize.height
     }
 
     private func hostedHeight(

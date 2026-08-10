@@ -1524,8 +1524,13 @@ final class AssistantViewState {
 
         func appendTools(for turnID: String?) {
             guard let turnID, let turnTools = toolsByTurn[turnID] else { return }
-            for tool in turnTools where insertedToolIDs.insert(tool.toolCallID).inserted {
-                timeline.append(.tool(tool))
+            let uninserted = turnTools.filter {
+                insertedToolIDs.insert($0.toolCallID).inserted
+            }
+            if !uninserted.isEmpty {
+                timeline.append(
+                    .toolGroup(AssistantToolGroup(turnID: turnID, tools: uninserted))
+                )
             }
         }
 
@@ -1546,8 +1551,20 @@ final class AssistantViewState {
             }
         }
 
-        for tool in tools where insertedToolIDs.insert(tool.toolCallID).inserted {
-            timeline.append(.tool(tool))
+        let remaining = tools.filter {
+            insertedToolIDs.insert($0.toolCallID).inserted
+        }
+        var remainingByTurn: [String: [AssistantToolActivity]] = [:]
+        var remainingTurnIDs: [String] = []
+        for tool in remaining {
+            if remainingByTurn[tool.turnID] == nil {
+                remainingTurnIDs.append(tool.turnID)
+            }
+            remainingByTurn[tool.turnID, default: []].append(tool)
+        }
+        for turnID in remainingTurnIDs {
+            guard let group = remainingByTurn[turnID] else { continue }
+            timeline.append(.toolGroup(AssistantToolGroup(turnID: turnID, tools: group)))
         }
         return timeline
     }
