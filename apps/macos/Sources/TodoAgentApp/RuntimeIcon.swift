@@ -1,6 +1,27 @@
 import AppKit
 import SwiftUI
 
+enum TodoAgentResourceBundle {
+    private static let bundleName = "TodoAgentNative_TodoAgentApp"
+
+    /// SwiftPM's generated `Bundle.module` accessor looks beside the app
+    /// bundle, while a valid signed macOS app must keep resources under
+    /// Contents/Resources. Prefer that packaged location and only evaluate the
+    /// generated accessor for `swift run` and tests.
+    static func url(forResource name: String, withExtension extensionName: String) -> URL? {
+        if let resources = Bundle.main.resourceURL,
+           let packagedBundle = Bundle(
+               url: resources.appendingPathComponent(bundleName + ".bundle")
+           ),
+           let url = packagedBundle.url(forResource: name, withExtension: extensionName)
+        {
+            return url
+        }
+
+        return Bundle.module.url(forResource: name, withExtension: extensionName)
+    }
+}
+
 /// Loads the bundled brand marks for the CLI runtimes.
 ///
 /// The glyphs ship as vector PDFs rather than an asset catalog because this
@@ -24,7 +45,7 @@ enum RuntimeIcon {
     static func image(for kind: RuntimeKind, dark: Bool) -> NSImage? {
         guard let name = resourceName(for: kind, dark: dark) else { return nil }
         if let cached = cache[name] { return cached }
-        guard let url = Bundle.module.url(forResource: name, withExtension: "pdf"),
+        guard let url = TodoAgentResourceBundle.url(forResource: name, withExtension: "pdf"),
               let image = NSImage(contentsOf: url)
         else { return nil }
         image.isTemplate = false

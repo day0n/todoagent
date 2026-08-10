@@ -238,7 +238,7 @@ enum MainWorkspaceLayout: Equatable, Sendable {
 
 enum MainWorkspaceLayoutPolicy {
     static let dividerWidth: CGFloat = 10
-    static let assistantMinimumWidth: CGFloat = 280
+    static let assistantMinimumWidth: CGFloat = 260
     static let boardMinimumVisibleWidth = TimelineColumnLayoutPolicy.viewportWidth(
         showingDayCount: 1
     )
@@ -297,7 +297,9 @@ enum MainWorkspaceLayoutPolicy {
 }
 
 enum AssistantPanePreferences {
-    static let widthKey = "assistantPaneWidth"
+    // v3 aligns the default divider with the midpoint between timeline days.
+    // Once the user drags it, the custom width remains persistent as usual.
+    static let widthKey = "assistantPaneWidth.v3"
 }
 
 enum AssistantWorkspaceMotion {
@@ -365,9 +367,7 @@ private struct AssistantFloatingButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: "sparkles")
-                .font(.system(size: 18, weight: .semibold))
-                .foregroundStyle(TodoAgentUI.primaryText)
+            TodoAgentBrandMarkView(size: 28)
                 .frame(
                     width: TodoAgentUI.floatingButtonSize,
                     height: TodoAgentUI.floatingButtonSize

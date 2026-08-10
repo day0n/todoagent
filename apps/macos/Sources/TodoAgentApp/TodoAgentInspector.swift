@@ -765,9 +765,7 @@ private struct AssistantConversationEmptyState: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Image(systemName: "sparkles")
-                .font(.title2.weight(.semibold))
-                .foregroundStyle(TodoAgentUI.primaryText)
+            TodoAgentBrandMarkView(size: 34)
                 .frame(width: 48, height: 48)
                 .background(TodoAgentUI.surfaceBackground, in: .circle)
                 .overlay {

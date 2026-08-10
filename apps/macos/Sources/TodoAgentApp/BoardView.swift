@@ -95,6 +95,8 @@ struct BoardView: View {
 private struct TimelineColumns: View {
     let state: AppState
 
+    @State private var pointerNearScrollIndicator = false
+
     var body: some View {
         let days = state.timelineDays()
 
@@ -113,7 +115,38 @@ private struct TimelineColumns: View {
                 }
                 .padding(TodoAgentUI.boardPadding)
             }
-            .scrollIndicators(.visible, axes: .horizontal)
+            .scrollIndicators(
+                TimelineScrollIndicatorPolicy.showsIndicators(
+                    pointerNearIndicator: pointerNearScrollIndicator
+                )
+                    ? .visible
+                    : .hidden,
+                axes: .horizontal
+            )
+            .onContinuousHover { phase in
+                switch phase {
+                case let .active(location):
+                    pointerNearScrollIndicator = location.y
+                        >= proxy.size.height - TimelineScrollIndicatorPolicy.hoverZoneHeight
+                case .ended:
+                    pointerNearScrollIndicator = false
+                }
+            }
+            .overlay(alignment: .bottom) {
+                // macOS can force scrollbars to remain visible system-wide.
+                // This quiet cover preserves scrolling while making the track
+                // visually disappear until the pointer enters the timeline.
+                Rectangle()
+                    .fill(TodoAgentUI.canvasBackground)
+                    .frame(height: TimelineScrollIndicatorPolicy.coverHeight)
+                    .opacity(
+                        TimelineScrollIndicatorPolicy.coverOpacity(
+                            pointerNearIndicator: pointerNearScrollIndicator
+                        )
+                    )
+                    .allowsHitTesting(false)
+            }
+            .animation(.easeOut(duration: 0.18), value: pointerNearScrollIndicator)
         }
         .background(TodoAgentUI.canvasBackground)
     }
@@ -123,23 +156,52 @@ private struct TimelineColumns: View {
     }
 }
 
-enum TimelineColumnLayoutPolicy {
-    static let dayCount: CGFloat = 4
+enum TimelineScrollIndicatorPolicy {
+    static let coverHeight: CGFloat = 18
+    static let hoverZoneHeight: CGFloat = 26
 
-    static func viewportWidth(showingDayCount visibleDayCount: Int) -> CGFloat {
-        let safeDayCount = max(visibleDayCount, 1)
-        let columns = CGFloat(safeDayCount) * TodoAgentUI.columnMinimumWidth
-        let spacing = CGFloat(safeDayCount - 1) * TodoAgentUI.boardSpacing
-        return (TodoAgentUI.boardPadding * 2) + columns + spacing
+    static func showsIndicators(pointerNearIndicator: Bool) -> Bool {
+        pointerNearIndicator
     }
 
-    /// Four calendar days always share one continuous sizing rule. Once the
-    /// minimum width is reached, the horizontal viewport simply reveals fewer
-    /// days; there is no breakpoint where every card suddenly changes size.
+    static func coverOpacity(pointerNearIndicator: Bool) -> Double {
+        pointerNearIndicator ? 0 : 0.96
+    }
+}
+
+enum TimelineColumnLayoutPolicy {
+    static let dayCount: CGFloat = 4
+    static let preferredVisibleDayCount: CGFloat = 3
+
+    static func viewportWidth(showingDayCount visibleDayCount: Int) -> CGFloat {
+        let totalDayCount = Int(dayCount)
+        let safeDayCount = min(max(visibleDayCount, 1), totalDayCount)
+        let columns = CGFloat(safeDayCount) * TodoAgentUI.columnMinimumWidth
+        let spacing = CGFloat(safeDayCount - 1) * TodoAgentUI.boardSpacing
+
+        if safeDayCount == totalDayCount {
+            return (TodoAgentUI.boardPadding * 2) + columns + spacing
+        }
+
+        // The viewport ends in the middle of the following inter-column gap.
+        // This lets the Assistant rail meet the timeline cleanly between two
+        // complete days without revealing a sliver of the next card.
+        return TodoAgentUI.boardPadding
+            + columns
+            + spacing
+            + (TodoAgentUI.boardSpacing / 2)
+    }
+
+    /// Day cards grow continuously so a medium launch window ends in the gap
+    /// after the third complete day instead of exposing a distracting sliver
+    /// of day four. Once the minimum width is reached, a narrower viewport
+    /// naturally reveals two days; wider windows can eventually reveal all
+    /// four without a breakpoint-sized jump.
     static func columnWidth(availableWidth: CGFloat) -> CGFloat {
-        let spacing = TodoAgentUI.boardSpacing * (dayCount - 1)
-        let padding = TodoAgentUI.boardPadding * 2
-        let proposed = (availableWidth - spacing - padding) / dayCount
+        let gapAllowance = TodoAgentUI.boardSpacing * (preferredVisibleDayCount - 0.5)
+        let proposed = (
+            availableWidth - TodoAgentUI.boardPadding - gapAllowance
+        ) / preferredVisibleDayCount
         return min(
             max(proposed, TodoAgentUI.columnMinimumWidth),
             TodoAgentUI.columnMaximumWidth

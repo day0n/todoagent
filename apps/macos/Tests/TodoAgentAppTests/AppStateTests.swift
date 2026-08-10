@@ -34,7 +34,7 @@ struct AppStateTests {
             Issue.record("窄窗口也应保留任务区并将 TodoAgent 停靠在右侧")
             return
         }
-        #expect(assistantWidth == 280)
+        #expect(assistantWidth == 260)
 
         guard case let .sideBySide(proportionalWidth) = MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 960,
@@ -43,40 +43,54 @@ struct AppStateTests {
             Issue.record("常规宽度应继续保持右侧双栏")
             return
         }
-        #expect(proportionalWidth == 370)
+        #expect(proportionalWidth == 378)
         #expect(
             960 - proportionalWidth - MainWorkspaceLayoutPolicy.dividerWidth
                 == TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 2)
         )
+        #expect(TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 2) == 572)
 
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 1_340,
             assistantRequested: true
-        ) == .sideBySide(assistantWidth: 750))
+        ) == .sideBySide(assistantWidth: 758))
 
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 500,
             assistantRequested: true
-        ) == .sideBySide(assistantWidth: 192))
+        ) == .sideBySide(assistantWidth: 200))
+    }
+
+    @Test("timeline scroller stays hidden until the pointer reaches its track")
+    func timelineScrollerUsesHoverVisibility() {
+        #expect(
+            TimelineScrollIndicatorPolicy.showsIndicators(pointerNearIndicator: false) == false
+        )
+        #expect(TimelineScrollIndicatorPolicy.showsIndicators(pointerNearIndicator: true))
+        #expect(
+            TimelineScrollIndicatorPolicy.coverOpacity(pointerNearIndicator: false) == 0.96
+        )
+        #expect(TimelineScrollIndicatorPolicy.coverOpacity(pointerNearIndicator: true) == 0)
+        #expect(TimelineScrollIndicatorPolicy.hoverZoneHeight > TimelineScrollIndicatorPolicy.coverHeight)
     }
 
     @Test("assistant divider resizes in both directions and preserves one timeline day")
     func assistantDividerClampsResize() {
         #expect(MainWorkspaceLayoutPolicy.resizedAssistantWidth(
             availableWidth: 960,
-            startingWidth: 370,
+            startingWidth: 378,
             dividerTranslation: 50
-        ) == 320)
+        ) == 328)
         #expect(MainWorkspaceLayoutPolicy.resizedAssistantWidth(
             availableWidth: 960,
-            startingWidth: 370,
+            startingWidth: 378,
             dividerTranslation: -80
-        ) == 450)
+        ) == 458)
         #expect(MainWorkspaceLayoutPolicy.resizedAssistantWidth(
             availableWidth: 960,
-            startingWidth: 370,
+            startingWidth: 378,
             dividerTranslation: -2_000
-        ) == 652)
+        ) == 660)
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 960,
             assistantRequested: true,
@@ -88,7 +102,7 @@ struct AppStateTests {
     func assistantWorkspaceMotionIsPerceptible() {
         #expect(AssistantWorkspaceMotion.duration >= 0.30)
         #expect(AssistantWorkspaceMotion.duration <= 0.40)
-        #expect(MainWorkspaceLayoutPolicy.assistantWidth(availableWidth: 960) == 370)
+        #expect(MainWorkspaceLayoutPolicy.assistantWidth(availableWidth: 960) == 378)
     }
 
     @Test("timeline columns resize continuously without breakpoint jumps")
@@ -106,6 +120,15 @@ struct AppStateTests {
             $0 >= TodoAgentUI.columnMinimumWidth
                 && $0 <= TodoAgentUI.columnMaximumWidth
         })
+
+        let launchDetailWidth: CGFloat = 896
+        let launchColumnWidth = TimelineColumnLayoutPolicy.columnWidth(
+            availableWidth: launchDetailWidth
+        )
+        let fourthDayLeadingEdge = TodoAgentUI.boardPadding
+            + (launchColumnWidth * 3)
+            + (TodoAgentUI.boardSpacing * 3)
+        #expect(fourthDayLeadingEdge > launchDetailWidth)
     }
 
     @Test("right-click menu keeps its task highlighted through nested submenus")
@@ -129,13 +152,45 @@ struct AppStateTests {
 
     @Test("first window placement stays medium sized on large and small displays")
     func firstWindowPlacementCapsItsContentSize() {
+        #expect(
+            TodoAgentMainWindowPlacement.preferredTimelineWidth
+                == TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 3)
+        )
+        #expect(
+            TodoAgentMainWindowPlacement.preferredContentSize.width
+                - TodoAgentUI.sidebarIdealWidth
+                == TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 3)
+        )
         #expect(TodoAgentMainWindowPlacement.contentSize(
             for: CGRect(x: 0, y: 0, width: 2_048, height: 1_260)
-        ) == CGSize(width: 1_120, height: 720))
+        ) == CGSize(width: 1_114, height: 820))
 
         #expect(TodoAgentMainWindowPlacement.contentSize(
             for: CGRect(x: 0, y: 0, width: 900, height: 650)
         ) == CGSize(width: 760, height: 560))
+
+        #expect(TodoAgentMainWindowPlacement.windowOrigin(
+            for: CGSize(width: 1_114, height: 848),
+            in: CGRect(x: 0, y: 40, width: 2_048, height: 1_220)
+        ) == CGPoint(x: 467, y: 412))
+    }
+
+    @Test("default window shows three days and the assistant replaces exactly one")
+    func defaultWindowAndAssistantShareTimelineColumns() {
+        let detailWidth = TodoAgentMainWindowPlacement.preferredTimelineWidth
+        let threeDays = TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 3)
+        let twoDays = TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 2)
+
+        #expect(detailWidth == threeDays)
+
+        let assistantWidth = MainWorkspaceLayoutPolicy.assistantWidth(
+            availableWidth: detailWidth
+        )
+        #expect(assistantWidth == 272)
+        #expect(
+            detailWidth - assistantWidth - MainWorkspaceLayoutPolicy.dividerWidth
+                == twoDays
+        )
     }
 
     @Test("opening TodoAgent creates and selects one default conversation")

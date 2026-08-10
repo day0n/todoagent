@@ -63,9 +63,9 @@ fi
 rm -rf "$APP_DIR" "$DMG_ROOT"
 mkdir -p "$CONTENTS_DIR/MacOS" "$CONTENTS_DIR/Resources" "$DMG_ROOT"
 cp "$BIN_DIR/TodoAgent" "$CONTENTS_DIR/MacOS/TodoAgent"
-# SwiftPM emits target resources as a separate bundle that `Bundle.module`
-# resolves against Bundle.main.resourceURL. Omitting it makes the packaged app
-# trap in the generated accessor the first time a runtime icon is loaded.
+# A signed macOS app must keep its SwiftPM resource bundle inside the standard
+# Resources directory. TodoAgentResourceBundle resolves this packaged location
+# before falling back to SwiftPM's generated development accessor.
 cp -R "$BIN_DIR/TodoAgentNative_TodoAgentApp.bundle" "$CONTENTS_DIR/Resources/"
 cp "$ENGINE_BIN" "$CONTENTS_DIR/Resources/todoagent-engine"
 cp "$PACKAGE_DIR/Resources/TodoAgent.icns" "$CONTENTS_DIR/Resources/TodoAgent.icns"

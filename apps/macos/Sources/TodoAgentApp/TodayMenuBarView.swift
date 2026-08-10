@@ -226,13 +226,16 @@ enum TodoAgentMainWindow {
 }
 
 /// Versioned once-per-install placement fixes the oversized legacy default
-/// without fighting the user's later window moves or resizes. SwiftUI's
-/// `.defaultPosition(.center)` covers new installs; this migration also covers
-/// an existing install whose restored frame still fills most of the display.
+/// without fighting the user's later window moves or resizes. New and migrated
+/// windows are horizontally centered at the usable screen's top edge.
 enum TodoAgentMainWindowPlacement {
-    static let layoutVersion = 1
+    static let layoutVersion = 3
     static let appliedVersionKey = "TodoAgentMainWindowCenteredLayoutVersion"
-    static let preferredContentSize = CGSize(width: 1_120, height: 720)
+    // Keep launch sizing independent from the live SwiftUI layout graph. The
+    // value matches a 260-point sidebar plus three complete 270-point day
+    // columns, their gaps, and the board padding.
+    static let preferredTimelineWidth: CGFloat = 854
+    static let preferredContentSize = CGSize(width: 1_114, height: 820)
     static let minimumContentSize = CGSize(width: 760, height: 560)
     static let maximumVisibleFraction: CGFloat = 0.82
 
@@ -248,6 +251,18 @@ enum TodoAgentMainWindowPlacement {
             )
         )
     }
+
+    /// Mirrors compact desktop tools: horizontally centered, touching the
+    /// usable screen's top edge, with breathing room left below the window.
+    static func windowOrigin(
+        for windowFrameSize: CGSize,
+        in visibleFrame: CGRect
+    ) -> CGPoint {
+        CGPoint(
+            x: visibleFrame.midX - (windowFrameSize.width / 2),
+            y: visibleFrame.maxY - windowFrameSize.height
+        )
+    }
 }
 
 struct TodoAgentMainWindowMarker: NSViewRepresentable {
@@ -259,6 +274,8 @@ struct TodoAgentMainWindowMarker: NSViewRepresentable {
 }
 
 final class MainWindowMarkerView: NSView {
+    private var placementScheduled = false
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         guard let window else { return }
@@ -267,14 +284,45 @@ final class MainWindowMarkerView: NSView {
         let defaults = UserDefaults.standard
         guard defaults.integer(forKey: TodoAgentMainWindowPlacement.appliedVersionKey)
             < TodoAgentMainWindowPlacement.layoutVersion,
-            let visibleFrame = window.screen?.visibleFrame
+            !placementScheduled
         else { return }
 
-        window.setContentSize(TodoAgentMainWindowPlacement.contentSize(for: visibleFrame))
-        window.center()
-        defaults.set(
-            TodoAgentMainWindowPlacement.layoutVersion,
-            forKey: TodoAgentMainWindowPlacement.appliedVersionKey
-        )
+        placementScheduled = true
+
+        // viewDidMoveToWindow runs while SwiftUI is still resolving its initial
+        // window preferences. Mutating the frame synchronously here re-enters
+        // that preference graph and can trip AttributeGraph's recursion guard.
+        // Yield once, then apply a single AppKit frame mutation.
+        Task { @MainActor [weak self, weak window] in
+            await Task.yield()
+            guard let self, let window, self.window === window else {
+                self?.placementScheduled = false
+                return
+            }
+
+            let defaults = UserDefaults.standard
+            guard defaults.integer(forKey: TodoAgentMainWindowPlacement.appliedVersionKey)
+                < TodoAgentMainWindowPlacement.layoutVersion,
+                let visibleFrame = window.screen?.visibleFrame
+            else { return }
+
+            let contentSize = TodoAgentMainWindowPlacement.contentSize(for: visibleFrame)
+            let frameSize = window.frameRect(
+                forContentRect: CGRect(origin: .zero, size: contentSize)
+            ).size
+            let targetFrame = CGRect(
+                origin: TodoAgentMainWindowPlacement.windowOrigin(
+                    for: frameSize,
+                    in: visibleFrame
+                ),
+                size: frameSize
+            )
+
+            window.setFrame(targetFrame, display: true)
+            defaults.set(
+                TodoAgentMainWindowPlacement.layoutVersion,
+                forKey: TodoAgentMainWindowPlacement.appliedVersionKey
+            )
+        }
     }
 }
