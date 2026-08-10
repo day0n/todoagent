@@ -45,6 +45,7 @@ struct Engine {
     gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
     assistant: assistant_service::AssistantService,
     data_directory: Arc<PathBuf>,
+    task_file_mutation: Arc<Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -286,10 +287,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Ok(())
     });
     let gemini_key = Arc::new(Mutex::new(None));
+    let data_directory = Arc::new(paths.data);
+    let task_file_mutation = Arc::new(Mutex::new(()));
     let assistant = assistant_service::AssistantService::new(
         store.clone(),
         writer_tx.clone(),
         gemini_key.clone(),
+        data_directory.clone(),
+        task_file_mutation.clone(),
     );
     let engine = Engine {
         store,
@@ -299,7 +304,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         authorized_directories: Arc::new(Mutex::new(HashSet::new())),
         gemini_key,
         assistant,
-        data_directory: Arc::new(paths.data),
+        data_directory,
+        task_file_mutation,
     };
     engine.send(&protocol::handshake()).await;
 
@@ -1172,6 +1178,7 @@ impl Engine {
         &self,
         params: AddTaskAttachmentsParams,
     ) -> Result<models::Bootstrap, EngineError> {
+        let _file_mutation = self.task_file_mutation.lock().await;
         let task_id = params.task_id;
         let source_paths = params.source_paths;
         let client_mutation_id = params.client_mutation_id;
@@ -1237,6 +1244,7 @@ impl Engine {
         &self,
         params: RemoveTaskAttachmentParams,
     ) -> Result<models::Bootstrap, EngineError> {
+        let _file_mutation = self.task_file_mutation.lock().await;
         let task_id = params.task_id;
         let attachment_id = params.attachment_id;
         let client_mutation_id = params.client_mutation_id;
@@ -1297,6 +1305,7 @@ impl Engine {
     }
 
     async fn delete_task(&self, task_id: String) -> Result<models::Bootstrap, EngineError> {
+        let _file_mutation = self.task_file_mutation.lock().await;
         let prepare_task_id = task_id.clone();
         let attachments = self
             .store
@@ -1871,10 +1880,14 @@ mod tests {
     ) -> (Engine, std::sync::mpsc::Receiver<Value>) {
         let (writer, receiver) = sync_channel(512);
         let gemini_key = Arc::new(Mutex::new(None));
+        let data_directory = Arc::new(data_directory);
+        let task_file_mutation = Arc::new(Mutex::new(()));
         let assistant = assistant_service::AssistantService::new(
             store.clone(),
             writer.clone(),
             gemini_key.clone(),
+            data_directory.clone(),
+            task_file_mutation.clone(),
         );
         (
             Engine {
@@ -1885,7 +1898,8 @@ mod tests {
                 authorized_directories: Arc::new(Mutex::new(HashSet::new())),
                 gemini_key,
                 assistant,
-                data_directory: Arc::new(data_directory),
+                data_directory,
+                task_file_mutation,
             },
             receiver,
         )

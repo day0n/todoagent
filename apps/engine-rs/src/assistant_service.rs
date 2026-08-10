@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex, mpsc::SyncSender};
 use std::time::{Duration, Instant};
 
@@ -23,6 +26,7 @@ use crate::models::{
     AssistantToolSummary, AssistantTurn, AssistantTurnStatus, QueuedAssistantTurn,
 };
 use crate::protocol::Event;
+use crate::store::AssistantDeleteTaskOutcome;
 use crate::store::StoreError;
 use crate::store_worker::{StoreWorker, StoreWorkerError};
 
@@ -54,6 +58,8 @@ pub struct AssistantService {
     store: StoreWorker,
     writer: SyncSender<Value>,
     gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
+    data_directory: Arc<PathBuf>,
+    task_file_mutation: Arc<Mutex<()>>,
     active: Arc<Mutex<HashMap<String, ActiveAssistantTurn>>>,
     concurrency: Arc<Semaphore>,
     model_input_limits: Arc<Mutex<HashMap<String, usize>>>,
@@ -216,11 +222,15 @@ impl AssistantService {
         store: StoreWorker,
         writer: SyncSender<Value>,
         gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
+        data_directory: Arc<PathBuf>,
+        task_file_mutation: Arc<Mutex<()>>,
     ) -> Self {
         Self {
             store,
             writer,
             gemini_key,
+            data_directory,
+            task_file_mutation,
             active: Arc::new(Mutex::new(HashMap::new())),
             concurrency: Arc::new(Semaphore::new(MAX_ASSISTANT_CONCURRENCY)),
             model_input_limits: Arc::new(Mutex::new(HashMap::new())),
@@ -1123,6 +1133,18 @@ impl AssistantHost for EngineAssistantHost {
                 message: "unknown TodoAgent tool".to_owned(),
             });
         }
+        if request.name == "delete_task" {
+            let service = self.service.clone();
+            let cancellation = cancellation.clone();
+            return tokio::spawn(async move {
+                execute_assistant_delete_tool(service, request, cancellation).await
+            })
+            .await
+            .map_err(|error| ToolError {
+                kind: ToolErrorKind::Failed,
+                message: format!("delete_task worker failed: {error}"),
+            })?;
+        }
         let arguments = request.arguments.to_string();
         let turn_id = request.turn_id.clone();
         let call_id = request.call_id.clone();
@@ -1132,21 +1154,7 @@ impl AssistantHost for EngineAssistantHost {
             .store
             .call(move |store| store.execute_assistant_tool(&turn_id, &call_id, &name, &arguments))
             .await
-            .map_err(|error| ToolError {
-                kind: match &error {
-                    StoreWorkerError::Store(StoreError::Invalid(_) | StoreError::NotFound) => {
-                        ToolErrorKind::InvalidArguments
-                    }
-                    StoreWorkerError::Store(
-                        StoreError::Conflict(_) | StoreError::Sql(_) | StoreError::Io(_),
-                    )
-                    | StoreWorkerError::Closed
-                    | StoreWorkerError::ResponseCancelled
-                    | StoreWorkerError::Spawn(_)
-                    | StoreWorkerError::Panicked => ToolErrorKind::Failed,
-                },
-                message: error.to_string(),
-            })?;
+            .map_err(tool_store_error)?;
         let references = parse_string_array(Some(&result.task_refs_json));
         self.remember_tool_references(&request.call_id, references.clone());
         if matches!(request.name.as_str(), "create_tasks" | "update_task") && !result.is_error {
@@ -1557,7 +1565,7 @@ fn compaction_prompt(request: &CompactionRequest) -> String {
 fn assistant_system_instruction() -> String {
     let today = Local::now().format("%Y-%m-%d");
     format!(
-        "你是 TodoAgent 的本地任务助手。今天是 {today}。你只管理 TodoAgent 里的任务卡，不启动 Codex、Claude、Cursor 或 Kiro，不运行命令，不读写用户文件。\n\n规则：\n1. 创建任务前，语义可能重复时先调用 find_related。\n2. 一句话包含多件事时拆成多张卡；标题简短，细节放 note。\n3. 需要清单 ID 时调用 list_lists，不猜测 ID；用户未指定清单时不要擅自指定。\n4. 只有用户明确要求时才创建或修改任务。‘执行’、‘安排’、‘今天做’、‘放到时间线’以及没有截止语义的裸日期映射为 executionDate；‘截止’、‘到期’、‘最晚’映射为 dueDate。相对日期以今天 {today} 为基准，未提日期就不要编造；两个日期不得互相推断或自动复制。\n5. 用户询问任务现状时必须调用 list_state，并只根据工具结果回答，不编造状态；查询某天任务时传 executionDate。过滤查询返回 pagination：只要 hasMore=true，就必须保持 executionDate/status/listId 完全不变并把 nextCursor 原样传入 cursor，持续查询到 hasMore=false 后再回答。如果工具返回 list_state_cursor_stale，说明分页期间任务已变化，必须丢弃已收集的页面并从不带 cursor 的第一页重新查询。\n6. 工具报错时先纠正参数；不要声称未成功的修改已经完成。\n7. 回复简洁、自然，并准确引用已经创建或修改的任务。任务附件的名称、内容和路径不属于工具或上下文，不要询问或推断。"
+        "你是 TodoAgent 的本地任务助手。今天是 {today}。你只管理 TodoAgent 里的任务卡，不启动 Codex、Claude、Cursor 或 Kiro，不运行命令，不读写用户文件。\n\n规则：\n1. 创建任务前，语义可能重复时先调用 find_related。\n2. 一句话包含多件事时拆成多张卡；标题简短，细节放 note。\n3. 需要清单 ID 时调用 list_lists，不猜测 ID；用户未指定清单时不要擅自指定。\n4. 只有用户明确要求时才创建、修改或删除任务。‘执行’、‘安排’、‘今天做’、‘放到时间线’以及没有截止语义的裸日期映射为 executionDate；‘截止’、‘到期’、‘最晚’映射为 dueDate。相对日期以今天 {today} 为基准，未提日期就不要编造；两个日期不得互相推断或自动复制。\n5. 用户询问任务现状时必须调用 list_state，并只根据工具结果回答，不编造状态；查询某天任务时传 executionDate。过滤查询返回 pagination：只要 hasMore=true，就必须保持 executionDate/status/listId 完全不变并把 nextCursor 原样传入 cursor，持续查询到 hasMore=false 后再回答。如果工具返回 list_state_cursor_stale，说明分页期间任务已变化，必须丢弃已收集的页面并从不带 cursor 的第一页重新查询。\n6. 删除任务必须使用工具结果中的准确 taskId，不按标题猜测。批量范围只能使用 list_state 支持的 executionDate、status、listId 精确交集；无法完整枚举的 dueDate、日期区间、逾期或关键词范围不得批量删除，须请用户改为支持的精确范围或分批指定。任何批量删除都先用 pageSize=50 查询目标首屏并读取 pagination.total；未指定 status 时分别查询 status=open 和 status=completed 首屏，并确保两页 taskRevision 完全相同，任一 revision 不同就丢弃两页并重查。单次用户请求最多删除 20 个任务；首屏 total 合计超过 20 时不得继续分页或删除任何一个，须说明数量并请用户拆成每批不超过 20 个。只有 total 合计不超过 20 才完成所有分页，且后续每页 taskRevision 也必须相同；在开始任何删除前先收集完所有 taskId。删除会使分页 cursor 失效，不能边分页边删除。\n7. 工具报错时先纠正参数；任一删除失败就停止继续删除，并准确说明已删除和未删除的任务，不要声称未成功的创建、修改或删除已经完成。\n8. 回复简洁、自然，并准确引用已经创建、修改或删除的任务。任务附件的名称、内容和路径不属于工具或上下文，不要询问或推断。"
     )
 }
 
@@ -1609,6 +1617,15 @@ fn assistant_tools() -> Vec<ToolDefinition> {
                     "executionDate":{"type":"string","maxLength":10,"description":"YYYY-MM-DD；空字符串表示清除执行日期"},
                     "dueDate":{"type":"string","maxLength":10,"description":"YYYY-MM-DD；空字符串表示清除截止日期"}
                 },
+                "required":["taskId"],"additionalProperties":false
+            }),
+        ),
+        ToolDefinition::function(
+            "delete_task",
+            "永久删除一个 TodoAgent 任务。只有用户明确要求删除时才能调用；taskId 必须来自工具结果，不得按标题猜测。单次用户请求最多删除 20 个任务，且必须在任何删除前完成目标枚举。任务存在运行中或排队中的本地 Session 时会拒绝删除。",
+            json!({
+                "type":"object",
+                "properties":{"taskId":{"type":"string"}},
                 "required":["taskId"],"additionalProperties":false
             }),
         ),
@@ -1782,6 +1799,245 @@ fn global_draft_attempt(model_interaction: usize, provider_attempt: usize) -> us
         .saturating_add(provider_attempt.max(1))
 }
 
+async fn execute_assistant_delete_tool(
+    service: AssistantService,
+    request: ToolRequest,
+    cancellation: CancellationToken,
+) -> Result<ToolReceipt, ToolError> {
+    let task_id = assistant_delete_task_id(&request.arguments)?;
+    if let Some(receipt) =
+        lookup_assistant_delete_receipt(&service, &request.session_id, &request.call_id, &task_id)
+            .await?
+    {
+        return Ok(receipt);
+    }
+
+    // Once filesystem preparation starts, this owned task deliberately runs to
+    // completion even if the surrounding assistant turn is cancelled. Dropping
+    // its JoinHandle cannot strand quarantine links after SQLite commits.
+    let file_mutation = tokio::select! {
+        _ = cancellation.cancelled() => return Err(cancelled_delete_tool_error()),
+        file_mutation = service.task_file_mutation.lock() => file_mutation,
+    };
+    if let Some(receipt) =
+        lookup_assistant_delete_receipt(&service, &request.session_id, &request.call_id, &task_id)
+            .await?
+    {
+        return Ok(receipt);
+    }
+    if cancellation.is_cancelled() {
+        return Err(cancelled_delete_tool_error());
+    }
+
+    let prepare_task_id = task_id.clone();
+    let attachments = service
+        .store
+        .call(move |store| store.prepare_delete_task(&prepare_task_id))
+        .await
+        .map_err(tool_store_error)?;
+    // This is the final cancellation point. Once the first managed file is
+    // prepared, the owned task must run through SQLite commit/rollback and all
+    // cleanup even if its parent assistant turn is dropped.
+    if cancellation.is_cancelled() {
+        return Err(cancelled_delete_tool_error());
+    }
+    let prepared_attachments = attachments
+        .iter()
+        .map(|attachment| (attachment.id.clone(), attachment.relative_path.clone()))
+        .collect::<Vec<_>>();
+    let mut final_paths = Vec::with_capacity(attachments.len());
+    let mut quarantine_paths = Vec::with_capacity(attachments.len());
+    for attachment in attachments {
+        let final_path = match crate::managed_attachment_path(
+            service.data_directory.as_ref(),
+            &attachment.relative_path,
+        ) {
+            Ok(path) => path,
+            Err(error) => {
+                cleanup_delete_paths(&quarantine_paths, "rolling back prepared quarantine");
+                return Err(ToolError {
+                    kind: ToolErrorKind::Failed,
+                    message: error.to_string(),
+                });
+            }
+        };
+        let quarantine = service
+            .data_directory
+            .join("Attachments")
+            .join(format!(".removing-{}", attachment.id));
+        let prepared = match crate::prepare_managed_attachment_deletion(&final_path, &quarantine) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                cleanup_delete_paths(&quarantine_paths, "rolling back prepared quarantine");
+                return Err(ToolError {
+                    kind: ToolErrorKind::Failed,
+                    message: error.to_string(),
+                });
+            }
+        };
+        if let Some(path) = prepared.0 {
+            final_paths.push(path);
+        }
+        if let Some(path) = prepared.1 {
+            quarantine_paths.push(path);
+        }
+    }
+
+    let turn_id = request.turn_id.clone();
+    let call_id = request.call_id.clone();
+    let delete_task_id = task_id.clone();
+    let arguments = request.arguments.to_string();
+    let outcome = match service
+        .store
+        .call(move |store| {
+            store.execute_assistant_delete_task(
+                &turn_id,
+                &call_id,
+                &delete_task_id,
+                &prepared_attachments,
+                &arguments,
+            )
+        })
+        .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            cleanup_delete_paths(&quarantine_paths, "rolling back prepared quarantine");
+            return Err(tool_store_error(error));
+        }
+    };
+    let (result, applied) = match outcome {
+        AssistantDeleteTaskOutcome::Applied(result) => (result, true),
+        AssistantDeleteTaskOutcome::Replayed(result) => (result, false),
+    };
+    if applied || !result.is_error {
+        cleanup_delete_paths(&final_paths, "cleaning committed task attachment");
+        cleanup_delete_paths(
+            &quarantine_paths,
+            "cleaning committed task attachment quarantine",
+        );
+    } else {
+        cleanup_delete_paths(&quarantine_paths, "rolling back prepared quarantine");
+    }
+    drop(file_mutation);
+
+    if applied {
+        match service.store.call(|store| store.bootstrap()).await {
+            Ok(snapshot) => service.emit("task.changed", snapshot),
+            Err(error) => {
+                tracing::warn!(
+                    task_id,
+                    "assistant delete committed but task.changed snapshot failed: {error}"
+                );
+            }
+        }
+    }
+    Ok(ToolReceipt {
+        call_id: request.call_id,
+        name: request.name,
+        result: serde_json::from_str(&result.result_json).unwrap_or(Value::Null),
+        is_error: result.is_error,
+    })
+}
+
+fn cancelled_delete_tool_error() -> ToolError {
+    ToolError {
+        kind: ToolErrorKind::Cancelled,
+        message: "assistant turn was cancelled before task deletion started".to_owned(),
+    }
+}
+
+fn cleanup_delete_paths(paths: &[PathBuf], action: &'static str) {
+    for path in paths {
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %path.display(), "{action}: {error}");
+        }
+    }
+}
+
+async fn lookup_assistant_delete_receipt(
+    service: &AssistantService,
+    session_id: &str,
+    call_id: &str,
+    task_id: &str,
+) -> Result<Option<ToolReceipt>, ToolError> {
+    let stored_session_id = session_id.to_owned();
+    let stored_call_id = call_id.to_owned();
+    let execution = service
+        .store
+        .call(move |store| store.assistant_tool_execution(&stored_session_id, &stored_call_id))
+        .await
+        .map_err(tool_store_error)?;
+    let Some(execution) = execution else {
+        return Ok(None);
+    };
+    let stored_task_id = serde_json::from_str::<Value>(&execution.request_json)
+        .ok()
+        .and_then(|value| assistant_delete_task_id(&value).ok());
+    if execution.tool_name != "delete_task" || stored_task_id.as_deref() != Some(task_id) {
+        return Err(ToolError {
+            kind: ToolErrorKind::Failed,
+            message: "assistant tool call ID was already used for a different request".to_owned(),
+        });
+    }
+    Ok(Some(ToolReceipt {
+        call_id: execution.call_id,
+        name: execution.tool_name,
+        result: execution
+            .response_json
+            .as_deref()
+            .and_then(|value| serde_json::from_str(value).ok())
+            .unwrap_or(Value::Null),
+        is_error: execution.is_error,
+    }))
+}
+
+fn assistant_delete_task_id(arguments: &Value) -> Result<String, ToolError> {
+    let object = arguments.as_object().ok_or_else(|| ToolError {
+        kind: ToolErrorKind::InvalidArguments,
+        message: "delete_task arguments must be an object".to_owned(),
+    })?;
+    if object.len() != 1 || !object.contains_key("taskId") {
+        return Err(ToolError {
+            kind: ToolErrorKind::InvalidArguments,
+            message: "delete_task accepts exactly one taskId field".to_owned(),
+        });
+    }
+    let task_id = object
+        .get("taskId")
+        .and_then(Value::as_str)
+        .ok_or_else(|| ToolError {
+            kind: ToolErrorKind::InvalidArguments,
+            message: "delete_task.taskId must be a UUID string".to_owned(),
+        })?;
+    uuid::Uuid::parse_str(task_id)
+        .map(|value| value.to_string())
+        .map_err(|_| ToolError {
+            kind: ToolErrorKind::InvalidArguments,
+            message: "delete_task.taskId must be a UUID string".to_owned(),
+        })
+}
+
+fn tool_store_error(error: StoreWorkerError) -> ToolError {
+    ToolError {
+        kind: match &error {
+            StoreWorkerError::Store(StoreError::Invalid(_) | StoreError::NotFound) => {
+                ToolErrorKind::InvalidArguments
+            }
+            StoreWorkerError::Store(
+                StoreError::Conflict(_) | StoreError::Sql(_) | StoreError::Io(_),
+            )
+            | StoreWorkerError::Closed
+            | StoreWorkerError::ResponseCancelled
+            | StoreWorkerError::Spawn(_)
+            | StoreWorkerError::Panicked => ToolErrorKind::Failed,
+        },
+        message: error.to_string(),
+    }
+}
+
 fn parse_string_array(value: Option<&str>) -> Vec<String> {
     value
         .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
@@ -1840,13 +2096,14 @@ fn user_facing_assistant_error(error: &AssistantError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{AssistantCompaction, AssistantSession};
+
+    use crate::models::{AssistantCompaction, AssistantSession, TaskAttachment};
     use crate::store::Store;
 
     #[test]
-    fn assistant_tool_registry_is_exactly_the_five_task_tools() {
+    fn assistant_tool_registry_is_exactly_the_six_task_tools() {
         let tools = assistant_tools();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 6);
         assert_eq!(
             tools
                 .iter()
@@ -1872,6 +2129,30 @@ mod tests {
         assert_eq!(properties["dueDate"]["type"], "string");
         assert!(!properties.contains_key("update"));
         assert_eq!(update.parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn delete_task_declaration_and_prompt_require_explicit_exact_deletion() {
+        let delete = assistant_tools()
+            .into_iter()
+            .find(|tool| tool.name == "delete_task")
+            .unwrap();
+        assert_eq!(delete.parameters["required"], json!(["taskId"]));
+        assert_eq!(delete.parameters["additionalProperties"], false);
+        assert_eq!(delete.parameters["properties"]["taskId"]["type"], "string");
+
+        let instruction = assistant_system_instruction();
+        assert!(instruction.contains("明确要求时才创建、修改或删除"));
+        assert!(instruction.contains("准确 taskId"));
+        assert!(instruction.contains("完成所有分页"));
+        assert!(instruction.contains("status=open 和 status=completed"));
+        assert!(instruction.contains("开始任何删除前先收集完所有 taskId"));
+        assert!(instruction.contains("不能边分页边删除"));
+        assert!(instruction.contains("taskRevision 完全相同"));
+        assert!(instruction.contains("单次用户请求最多删除 20 个任务"));
+        assert!(instruction.contains("超过 20 时不得继续分页或删除任何一个"));
+        assert!(instruction.contains("只有 total 合计不超过 20 才完成所有分页"));
+        assert!(instruction.contains("dueDate、日期区间、逾期或关键词范围不得批量删除"));
     }
 
     #[test]
@@ -2171,7 +2452,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
         let (writer, _receiver) = std::sync::mpsc::sync_channel(4);
-        let service = AssistantService::new(worker.clone(), writer, Arc::new(Mutex::new(None)));
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(directory.path().to_path_buf()),
+            Arc::new(Mutex::new(())),
+        );
         let error = service
             .send(AssistantSendParams {
                 session_id: "missing-session".to_owned(),
@@ -2183,6 +2470,254 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.to_string(), "text or attachments is required");
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assistant_delete_tool_cleans_managed_files_emits_snapshot_and_replays() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_directory = directory.path().join("data");
+        fs::create_dir_all(data_directory.join("Attachments")).unwrap();
+        let database_path = data_directory.join("assistant.sqlite3");
+        let worker = StoreWorker::open(&database_path).unwrap();
+        let attachment_id = uuid::Uuid::new_v4().to_string();
+        let relative_path = format!("Attachments/{attachment_id}.txt");
+        let setup_attachment_id = attachment_id.clone();
+        let setup_relative_path = relative_path.clone();
+        let (task, queued) = worker
+            .call(move |store| {
+                let task = store.create_task("Agent 删除", "", None, None, None)?;
+                store.add_task_attachments(
+                    &task.id,
+                    &[TaskAttachment {
+                        id: setup_attachment_id,
+                        task_id: task.id.clone(),
+                        original_name: "memo.txt".to_owned(),
+                        size_bytes: 4,
+                        mime_type: "text/plain".to_owned(),
+                        relative_path: setup_relative_path,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    }],
+                )?;
+                let session = store.create_assistant_session("删除任务")?;
+                let queued = store.begin_assistant_turn(
+                    &session.id,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "删除这项任务",
+                    None,
+                    Some("model-x"),
+                )?;
+                store.mark_assistant_turn_running(&queued.turn.id)?;
+                Ok((task, queued))
+            })
+            .await
+            .unwrap();
+        let managed_path = data_directory.join(&relative_path);
+        fs::write(&managed_path, b"memo").unwrap();
+        let quarantine_path = data_directory
+            .join("Attachments")
+            .join(format!(".removing-{attachment_id}"));
+        let (writer, receiver) = std::sync::mpsc::sync_channel(16);
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(data_directory),
+            Arc::new(Mutex::new(())),
+        );
+        let host = EngineAssistantHost::new(
+            service,
+            queued.turn.session_id.clone(),
+            queued.turn.id.clone(),
+        );
+        let request = ToolRequest {
+            session_id: queued.turn.session_id.clone(),
+            turn_id: queued.turn.id.clone(),
+            call_id: "delete-managed".to_owned(),
+            name: "delete_task".to_owned(),
+            arguments: json!({"taskId":task.id.to_uppercase()}),
+        };
+
+        let failure_connection = rusqlite::Connection::open(&database_path).unwrap();
+        failure_connection
+            .execute_batch(
+                "CREATE TRIGGER fail_assistant_delete_receipt
+                 BEFORE INSERT ON assistant_tool_execution
+                 WHEN NEW.tool_name='delete_task'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'forced delete receipt failure');
+                 END;",
+            )
+            .unwrap();
+        drop(failure_connection);
+        let mut failed_request = request.clone();
+        failed_request.call_id = "delete-receipt-fails".to_owned();
+        let failure = host
+            .execute_named_tool_once(failed_request, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, ToolErrorKind::Failed);
+        assert!(managed_path.exists());
+        assert!(!quarantine_path.exists());
+        let retained_task_id = task.id.clone();
+        assert!(
+            worker
+                .call(move |store| store.task(&retained_task_id))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(receiver.try_recv().is_err());
+        let failure_connection = rusqlite::Connection::open(&database_path).unwrap();
+        failure_connection
+            .execute_batch("DROP TRIGGER fail_assistant_delete_receipt;")
+            .unwrap();
+        drop(failure_connection);
+
+        let receipt = host
+            .execute_named_tool_once(request.clone(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!receipt.is_error);
+        assert_eq!(receipt.result["deletedTask"]["id"], task.id);
+        assert!(!managed_path.exists());
+        assert!(!quarantine_path.exists());
+        let deleted_task_id = task.id.clone();
+        assert!(
+            worker
+                .call(move |store| store.task(&deleted_task_id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let receipt_session_id = queued.turn.session_id.clone();
+        let execution = worker
+            .call(move |store| {
+                store.assistant_tool_execution(&receipt_session_id, "delete-managed")
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.task_refs_json.as_deref(), Some("[]"));
+        assert!(receiver.try_iter().any(|event| {
+            event["event"] == "task.changed"
+                && event["data"]["tasks"]
+                    .as_array()
+                    .is_some_and(|tasks| tasks.iter().all(|value| value["id"] != task.id))
+        }));
+
+        let replay = host
+            .execute_named_tool_once(request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(replay, receipt);
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn assistant_delete_cancelled_while_waiting_for_file_lock_preserves_everything() {
+        let directory = tempfile::tempdir().unwrap();
+        let data_directory = directory.path().join("data");
+        fs::create_dir_all(data_directory.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data_directory.join("assistant.sqlite3")).unwrap();
+        let attachment_id = uuid::Uuid::new_v4().to_string();
+        let relative_path = format!("Attachments/{attachment_id}.txt");
+        let setup_attachment_id = attachment_id.clone();
+        let setup_relative_path = relative_path.clone();
+        let (task, queued) = worker
+            .call(move |store| {
+                let task = store.create_task("等待锁时取消", "", None, None, None)?;
+                store.add_task_attachments(
+                    &task.id,
+                    &[TaskAttachment {
+                        id: setup_attachment_id,
+                        task_id: task.id.clone(),
+                        original_name: "keep.txt".to_owned(),
+                        size_bytes: 4,
+                        mime_type: "text/plain".to_owned(),
+                        relative_path: setup_relative_path,
+                        created_at: chrono::Utc::now().to_rfc3339(),
+                    }],
+                )?;
+                let session = store.create_assistant_session("取消删除")?;
+                let queued = store.begin_assistant_turn(
+                    &session.id,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "删除后立刻取消",
+                    None,
+                    Some("model-x"),
+                )?;
+                store.mark_assistant_turn_running(&queued.turn.id)?;
+                Ok((task, queued))
+            })
+            .await
+            .unwrap();
+        let managed_path = data_directory.join(&relative_path);
+        fs::write(&managed_path, b"keep").unwrap();
+        let quarantine_path = data_directory
+            .join("Attachments")
+            .join(format!(".removing-{attachment_id}"));
+        let task_file_mutation = Arc::new(Mutex::new(()));
+        let held_file_lock = task_file_mutation.lock().await;
+        let (writer, receiver) = std::sync::mpsc::sync_channel(16);
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(data_directory),
+            task_file_mutation.clone(),
+        );
+        let host = EngineAssistantHost::new(
+            service,
+            queued.turn.session_id.clone(),
+            queued.turn.id.clone(),
+        );
+        let request = ToolRequest {
+            session_id: queued.turn.session_id.clone(),
+            turn_id: queued.turn.id.clone(),
+            call_id: "cancelled-delete".to_owned(),
+            name: "delete_task".to_owned(),
+            arguments: json!({"taskId":task.id}),
+        };
+        let cancellation = CancellationToken::new();
+        let call_cancellation = cancellation.clone();
+        let execution = tokio::spawn(async move {
+            host.execute_named_tool_once(request, &call_cancellation)
+                .await
+        });
+        sleep(Duration::from_millis(20)).await;
+        assert!(!execution.is_finished());
+
+        cancellation.cancel();
+        let failure = tokio::time::timeout(Duration::from_secs(1), execution)
+            .await
+            .expect("cancellation should win without releasing the file lock")
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failure.kind, ToolErrorKind::Cancelled);
+        drop(held_file_lock);
+
+        assert!(managed_path.exists());
+        assert!(!quarantine_path.exists());
+        let retained_task_id = task.id.clone();
+        assert!(
+            worker
+                .call(move |store| store.task(&retained_task_id))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let receipt_session_id = queued.turn.session_id.clone();
+        assert!(
+            worker
+                .call(move |store| {
+                    store.assistant_tool_execution(&receipt_session_id, "cancelled-delete")
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(receiver.try_recv().is_err());
         worker.shutdown().await.unwrap();
     }
 
@@ -2231,7 +2766,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
         let (writer, receiver) = std::sync::mpsc::sync_channel(16);
-        let service = AssistantService::new(worker.clone(), writer, Arc::new(Mutex::new(None)));
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(directory.path().to_path_buf()),
+            Arc::new(Mutex::new(())),
+        );
         let host = EngineAssistantHost::new(service, "session".to_owned(), "turn".to_owned());
         host.begin_model_interaction();
         let _ = receiver.try_recv();
@@ -2251,7 +2792,13 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("active.sqlite3")).unwrap();
         let (writer, _receiver) = std::sync::mpsc::sync_channel(16);
-        let service = AssistantService::new(worker.clone(), writer, Arc::new(Mutex::new(None)));
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(directory.path().to_path_buf()),
+            Arc::new(Mutex::new(())),
+        );
         let session_id = uuid::Uuid::new_v4().to_string();
         let next = CancellationToken::new();
         service.active.lock().await.insert(

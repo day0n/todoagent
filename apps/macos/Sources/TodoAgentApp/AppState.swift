@@ -264,6 +264,10 @@ final class AppState {
         clearRetriableTaskCommandFailure(taskID: taskID)
 
         guard await flushTaskEdits(taskID: taskID) else { return false }
+        guard task(id: taskID) != nil else {
+            errorMessage = nil
+            return false
+        }
         let previousListIDs = Set(lists.map(\.id))
         taskSaveStates[taskID] = .saving
 
@@ -279,6 +283,12 @@ final class AppState {
                ) {
                 // The Engine committed before its response was lost.
             } else {
+                // A concurrent Agent deletion supersedes this task-scoped
+                // command. Do not recreate failure state for the removed ID.
+                guard task(id: taskID) != nil else {
+                    errorMessage = nil
+                    return false
+                }
                 failedTaskCommands[taskID] = .createList(
                     previousListIDs: previousListIDs,
                     recoveryOnly: isAmbiguous
@@ -289,6 +299,10 @@ final class AppState {
             }
         }
 
+        guard task(id: taskID) != nil else {
+            errorMessage = nil
+            return false
+        }
         failedTaskCommands[taskID] = nil
         taskSaveStates[taskID] = .idle
         errorMessage = nil
@@ -317,12 +331,26 @@ final class AppState {
         clearRetriableTaskCommandFailure(taskID: taskID)
 
         guard await flushTaskEdits(taskID: taskID) else { return false }
+        // A task.changed snapshot may have removed this task while its local
+        // edits were draining. Treat that authoritative deletion as success
+        // instead of issuing a second delete for an ID that no longer exists.
+        guard task(id: taskID) != nil else {
+            errorMessage = nil
+            return true
+        }
         taskSaveStates[taskID] = .saving
 
         do {
             let snapshot = try await repository.deleteTask(taskID: taskID)
             apply(snapshot, acceptingEqualMutationRevision: true)
         } catch {
+            // The Agent may have deleted the same task while this request was
+            // in flight. apply(_:) already removed every task-scoped draft and
+            // failure in that case, so do not recreate a failed delete command.
+            guard task(id: taskID) != nil else {
+                errorMessage = nil
+                return true
+            }
             let isAmbiguous = isAmbiguousTaskCommandError(error)
             if isAmbiguous, await recoverDeletedTask(taskID: taskID) {
                 // The Engine committed before its response was lost.
@@ -341,7 +369,6 @@ final class AppState {
             errorMessage = message
             return false
         }
-        cleanUpDeletedTask(taskID: taskID)
         errorMessage = nil
         return true
     }
@@ -478,12 +505,29 @@ final class AppState {
 
         while true {
             if let active = activeTaskFlushes[taskID] {
-                guard await active.task.value else { return false }
+                guard await active.task.value else {
+                    guard task(id: taskID) != nil else {
+                        cleanUpDeletedTask(taskID: taskID)
+                        return true
+                    }
+                    return false
+                }
                 continue
             }
 
+            guard task(id: taskID) != nil else {
+                cleanUpDeletedTask(taskID: taskID)
+                return true
+            }
+
             if let flush = startTaskFlushIfNeeded(taskID: taskID) {
-                guard await flush.value else { return false }
+                guard await flush.value else {
+                    guard task(id: taskID) != nil else {
+                        cleanUpDeletedTask(taskID: taskID)
+                        return true
+                    }
+                    return false
+                }
                 continue
             }
 
@@ -495,6 +539,10 @@ final class AppState {
 
     @discardableResult
     func retryTaskEdits(taskID: UUID) async -> Bool {
+        guard task(id: taskID) != nil else {
+            cleanUpDeletedTask(taskID: taskID)
+            return true
+        }
         if let command = failedTaskCommands.removeValue(forKey: taskID) {
             taskSaveStates[taskID] = .idle
             return await retryTaskCommand(command, taskID: taskID)
@@ -553,6 +601,7 @@ final class AppState {
     }
 
     func openTask(_ task: TaskItem) {
+        guard self.task(id: task.id) != nil else { return }
         cancelSessionLoad()
         presentedSheet = .taskSession(task.id)
         // `app.bootstrap` already tells us whether this task owns a Session.
@@ -616,7 +665,8 @@ final class AppState {
             guard
                 !Task.isCancelled,
                 sessionLoadGeneration == generation,
-                presentedSheet == .taskSession(taskID)
+                presentedSheet == .taskSession(taskID),
+                task(id: taskID) != nil
             else { return }
 
             if let bundle {
@@ -631,7 +681,8 @@ final class AppState {
         } catch {
             guard
                 sessionLoadGeneration == generation,
-                presentedSheet == .taskSession(taskID)
+                presentedSheet == .taskSession(taskID),
+                task(id: taskID) != nil
             else { return }
             errorMessage = error.localizedDescription
         }
@@ -662,8 +713,17 @@ final class AppState {
     @discardableResult
     func startSession(_ task: TaskItem, runtime: RuntimeKind, workspace: String) async -> Bool {
         taskSessionErrorMessage = nil
+        guard self.task(id: task.id) != nil else { return false }
         guard await flushTaskEdits(taskID: task.id) else {
+            guard self.task(id: task.id) != nil else {
+                taskSessionErrorMessage = nil
+                return false
+            }
             taskSessionErrorMessage = "任务修改尚未保存，请重试后再启动 Session。"
+            return false
+        }
+        guard self.task(id: task.id) != nil else {
+            taskSessionErrorMessage = nil
             return false
         }
         let directory = workspace.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -677,12 +737,24 @@ final class AppState {
         }
         do {
             let bundle = try await repository.createSession(taskID: task.id, runtime: runtime, workspace: directory)
+            guard self.task(id: task.id) != nil else {
+                taskSessionErrorMessage = nil
+                return false
+            }
             merge(bundle, taskID: task.id)
             if let snapshot = try? await repository.sync() {
                 apply(snapshot)
             }
+            guard self.task(id: task.id) != nil else {
+                taskSessionErrorMessage = nil
+                return false
+            }
             return true
         } catch {
+            guard self.task(id: task.id) != nil else {
+                taskSessionErrorMessage = nil
+                return false
+            }
             taskSessionErrorMessage = error.localizedDescription
             return false
         }
@@ -848,6 +920,9 @@ final class AppState {
     }
 
     private func merge(_ incoming: SessionBundle, taskID: UUID) {
+        // A late session event must not recreate UI state for a task already
+        // removed by a newer authoritative task snapshot.
+        guard task(id: taskID) != nil else { return }
         let existing = bundles[taskID]
         var bySequence = Dictionary(uniqueKeysWithValues: (existing?.messages ?? []).map { ($0.sequence, $0) })
         for message in incoming.messages { bySequence[message.sequence] = message }
@@ -917,11 +992,11 @@ final class AppState {
         pendingTaskPatches[taskID] = nil
         inFlightTaskPatches[taskID] = nil
         pendingTaskAttachmentMutations[taskID] = nil
-        activeTaskFlushes[taskID] = nil
         taskSaveStates[taskID] = nil
         failedTaskCommands[taskID] = nil
         bundles[taskID] = nil
-        if presentedSheet == .taskSession(taskID) {
+        sessions.removeAll(where: { $0.taskID == taskID })
+        if presentedSheet == .taskSession(taskID) || loadingSessionTaskID == taskID {
             finishDismissingTaskSession(taskID: taskID)
         }
     }
@@ -963,6 +1038,10 @@ final class AppState {
         }
 
         guard recovered else {
+            guard task(id: taskID) != nil else {
+                errorMessage = nil
+                return false
+            }
             let message = "任务操作结果尚未确认。请恢复 Engine 后重试确认，系统不会重复执行。"
             failedTaskCommands[taskID] = command
             taskSaveStates[taskID] = .failed(message)
@@ -974,7 +1053,7 @@ final class AppState {
         case .createList:
             taskSaveStates[taskID] = .idle
         case .delete:
-            cleanUpDeletedTask(taskID: taskID)
+            break
         }
         errorMessage = nil
         return true
@@ -989,6 +1068,9 @@ final class AppState {
                 || snapshot.revision > revision
                 || (acceptingEqualMutationRevision && snapshot.revision == revision)
         else { return }
+        let removedTaskIDs = Set(tasks.map(\.id)).subtracting(
+            Set(snapshot.tasks.map(\.id))
+        )
         hasAppliedSnapshot = true
         revision = snapshot.revision
         lists = snapshot.lists
@@ -996,6 +1078,9 @@ final class AppState {
         runtimes = snapshot.runtimes
         sessions = snapshot.sessions
         messages = snapshot.messages
+        for taskID in removedTaskIDs {
+            cleanUpDeletedTask(taskID: taskID)
+        }
         reapplyTaskDrafts()
         rebuildProjection()
     }
@@ -1088,6 +1173,11 @@ final class AppState {
     /// before close, Session start, or app termination is allowed to continue.
     private func drainTaskMutations(taskID: UUID) async -> Bool {
         while true {
+            guard task(id: taskID) != nil else {
+                cleanUpDeletedTask(taskID: taskID)
+                return true
+            }
+
             if let patch = pendingTaskPatches.removeValue(forKey: taskID) {
                 taskSaveStates[taskID] = .saving
                 inFlightTaskPatches[taskID] = patch
@@ -1100,11 +1190,13 @@ final class AppState {
                     apply(snapshot, acceptingEqualMutationRevision: true)
                 } catch is CancellationError {
                     inFlightTaskPatches[taskID] = nil
+                    guard task(id: taskID) != nil else { return true }
                     restoreFailedTaskPatch(patch, taskID: taskID)
                     taskSaveStates[taskID] = .failed("任务保存已取消，请重试。")
                     return false
                 } catch {
                     inFlightTaskPatches[taskID] = nil
+                    guard task(id: taskID) != nil else { return true }
                     restoreFailedTaskPatch(patch, taskID: taskID)
                     taskSaveStates[taskID] = .failed(error.localizedDescription)
                     return false
@@ -1125,6 +1217,7 @@ final class AppState {
                 )
                 apply(snapshot, acceptingEqualMutationRevision: true)
             } catch {
+                guard task(id: taskID) != nil else { return true }
                 if await recoverAmbiguousAttachmentMutation(
                     attachmentMutation,
                     taskID: taskID,
@@ -1132,6 +1225,10 @@ final class AppState {
                 ) {
                     continue
                 }
+                // Recovery performs a sync and can discover that an Agent
+                // deleted the task. Never put the attachment mutation back on
+                // a queue whose owner no longer exists.
+                guard task(id: taskID) != nil else { return true }
                 restoreFailedAttachmentMutation(attachmentMutation, taskID: taskID)
                 taskSaveStates[taskID] = .failed(
                     isAmbiguousAttachmentMutationError(error)

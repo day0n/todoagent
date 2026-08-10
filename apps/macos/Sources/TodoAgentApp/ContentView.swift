@@ -1,8 +1,12 @@
+import AppKit
 import SwiftUI
 
 struct ContentView: View {
     @State private var state: AppState
     @State private var availableContentSize = TodoAgentMainWindowPlacement.preferredContentSize
+    @State private var assistantResizeStartWidth: CGFloat?
+    @State private var assistantLiveWidth: CGFloat?
+    @AppStorage(AssistantPanePreferences.widthKey) private var storedAssistantWidth = 0.0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(state: AppState) {
@@ -24,7 +28,8 @@ struct ContentView: View {
         } detail: {
             GeometryReader { proxy in
                 let assistantWidth = MainWorkspaceLayoutPolicy.assistantWidth(
-                    availableWidth: proxy.size.width
+                    availableWidth: proxy.size.width,
+                    preferredWidth: assistantLiveWidth ?? persistedAssistantWidth
                 )
                 let assistantContainerWidth = state.inspectorPresented
                     ? assistantWidth + MainWorkspaceLayoutPolicy.dividerWidth
@@ -37,7 +42,24 @@ struct ContentView: View {
                     ZStack(alignment: .trailing) {
                         if state.inspectorPresented {
                             HStack(spacing: 0) {
-                                Divider()
+                                AssistantResizeDivider(
+                                    assistantWidth: assistantWidth,
+                                    onDragChanged: { translation in
+                                        resizeAssistantPane(
+                                            translation: translation,
+                                            currentWidth: assistantWidth,
+                                            availableWidth: proxy.size.width
+                                        )
+                                    },
+                                    onDragEnded: finishResizingAssistantPane,
+                                    onNudge: { delta in
+                                        nudgeAssistantPane(
+                                            by: delta,
+                                            currentWidth: assistantWidth,
+                                            availableWidth: proxy.size.width
+                                        )
+                                    }
+                                )
 
                                 TodoAgentInspector(state: state)
                                     .frame(width: assistantWidth)
@@ -149,6 +171,46 @@ struct ContentView: View {
         )
     }
 
+    private var persistedAssistantWidth: CGFloat? {
+        storedAssistantWidth > 0 ? CGFloat(storedAssistantWidth) : nil
+    }
+
+    private func resizeAssistantPane(
+        translation: CGFloat,
+        currentWidth: CGFloat,
+        availableWidth: CGFloat
+    ) {
+        let startingWidth = assistantResizeStartWidth ?? currentWidth
+        assistantResizeStartWidth = startingWidth
+        assistantLiveWidth = MainWorkspaceLayoutPolicy.resizedAssistantWidth(
+            availableWidth: availableWidth,
+            startingWidth: startingWidth,
+            dividerTranslation: translation
+        )
+    }
+
+    private func finishResizingAssistantPane() {
+        if let assistantLiveWidth {
+            storedAssistantWidth = Double(assistantLiveWidth)
+        }
+        assistantResizeStartWidth = nil
+        assistantLiveWidth = nil
+    }
+
+    private func nudgeAssistantPane(
+        by delta: CGFloat,
+        currentWidth: CGFloat,
+        availableWidth: CGFloat
+    ) {
+        let width = MainWorkspaceLayoutPolicy.clampedAssistantWidth(
+            currentWidth + delta,
+            availableWidth: availableWidth
+        )
+        storedAssistantWidth = Double(width)
+        assistantResizeStartWidth = nil
+        assistantLiveWidth = nil
+    }
+
     @ViewBuilder
     private func sheet(_ destination: AppSheet, availableSize: CGSize) -> some View {
         switch destination {
@@ -175,35 +237,67 @@ enum MainWorkspaceLayout: Equatable, Sendable {
 }
 
 enum MainWorkspaceLayoutPolicy {
-    static let dividerWidth: CGFloat = 1
-    static let assistantWidthFraction: CGFloat = 0.34
-    static let assistantMinimumWidth: CGFloat = 320
-    static let assistantMaximumWidth: CGFloat = 400
-    static let boardMinimumVisibleWidth: CGFloat = 220
+    static let dividerWidth: CGFloat = 10
+    static let assistantMinimumWidth: CGFloat = 280
+    static let boardMinimumVisibleWidth = TimelineColumnLayoutPolicy.viewportWidth(
+        showingDayCount: 1
+    )
+    static let defaultBoardWidth = TimelineColumnLayoutPolicy.viewportWidth(
+        showingDayCount: 2
+    )
 
     static func resolve(
         availableWidth: CGFloat,
-        assistantRequested: Bool
+        assistantRequested: Bool,
+        preferredAssistantWidth: CGFloat? = nil
     ) -> MainWorkspaceLayout {
         guard assistantRequested else { return .boardOnly }
 
         return .sideBySide(
-            assistantWidth: assistantWidth(availableWidth: availableWidth)
+            assistantWidth: assistantWidth(
+                availableWidth: availableWidth,
+                preferredWidth: preferredAssistantWidth
+            )
         )
     }
 
-    static func assistantWidth(availableWidth: CGFloat) -> CGFloat {
-        let proposed = min(
-            max(availableWidth * assistantWidthFraction, assistantMinimumWidth),
-            assistantMaximumWidth
+    static func assistantWidth(
+        availableWidth: CGFloat,
+        preferredWidth: CGFloat? = nil
+    ) -> CGFloat {
+        let defaultWidth = availableWidth - defaultBoardWidth - dividerWidth
+        return clampedAssistantWidth(
+            preferredWidth ?? defaultWidth,
+            availableWidth: availableWidth
         )
-        let widthThatPreservesBoard = max(
-            availableWidth - boardMinimumVisibleWidth,
+    }
+
+    static func resizedAssistantWidth(
+        availableWidth: CGFloat,
+        startingWidth: CGFloat,
+        dividerTranslation: CGFloat
+    ) -> CGFloat {
+        clampedAssistantWidth(
+            startingWidth - dividerTranslation,
+            availableWidth: availableWidth
+        )
+    }
+
+    static func clampedAssistantWidth(
+        _ proposedWidth: CGFloat,
+        availableWidth: CGFloat
+    ) -> CGFloat {
+        let maximumWidth = max(
+            availableWidth - boardMinimumVisibleWidth - dividerWidth,
             0
         )
-
-        return min(proposed, widthThatPreservesBoard)
+        let minimumWidth = min(assistantMinimumWidth, maximumWidth)
+        return min(max(proposedWidth, minimumWidth), maximumWidth)
     }
+}
+
+enum AssistantPanePreferences {
+    static let widthKey = "assistantPaneWidth"
 }
 
 enum AssistantWorkspaceMotion {
@@ -213,6 +307,56 @@ enum AssistantWorkspaceMotion {
 
     static func animation(reduceMotion: Bool) -> Animation? {
         reduceMotion ? nil : .easeInOut(duration: duration)
+    }
+}
+
+private struct AssistantResizeDivider: View {
+    let assistantWidth: CGFloat
+    let onDragChanged: (CGFloat) -> Void
+    let onDragEnded: () -> Void
+    let onNudge: (CGFloat) -> Void
+
+    @State private var pointerInside = false
+
+    var body: some View {
+        Rectangle()
+            .fill(.clear)
+            .frame(width: MainWorkspaceLayoutPolicy.dividerWidth)
+            .overlay {
+                Rectangle()
+                    .fill(TodoAgentUI.hairline)
+                    .frame(width: 1)
+            }
+            .contentShape(.rect)
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { onDragChanged($0.translation.width) }
+                    .onEnded { _ in onDragEnded() }
+            )
+            .onHover { isInside in
+                pointerInside = isInside
+                (isInside ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
+            }
+            .onDisappear {
+                if pointerInside {
+                    NSCursor.arrow.set()
+                }
+            }
+            .accessibilityElement()
+            .accessibilityLabel("调整 TodoAgent 宽度")
+            .accessibilityValue("宽度 \(Int(assistantWidth)) 点")
+            .accessibilityHint("左右拖动调整对话面板大小")
+            .accessibilityIdentifier("assistant.resize-divider")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment:
+                    onNudge(24)
+                case .decrement:
+                    onNudge(-24)
+                @unknown default:
+                    break
+                }
+            }
     }
 }
 

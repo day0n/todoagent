@@ -10,6 +10,8 @@
     <string>TodoAgent</string>
     <key>CFBundleIdentifier</key>
     <string>org.niuzj.todoagent</string>
+    <key>CFBundleIconFile</key>
+    <string>TodoAgent</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

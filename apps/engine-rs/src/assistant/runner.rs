@@ -228,11 +228,13 @@ where
             }
 
             budget.consume_tools(calls.len())?;
+            let mut delete_failed = false;
             let mut result_steps = Vec::with_capacity(calls.len());
             for call in calls {
                 if cancellation.is_cancelled() {
                     return Err(AssistantError::Cancelled);
                 }
+                let is_delete_call = call.name == "delete_task";
                 self.host.emit(
                     &request.session_id,
                     &request.turn_id,
@@ -242,7 +244,16 @@ where
                     },
                 );
 
-                let receipt = if call.id.is_empty() || call.name.is_empty() {
+                let receipt = if delete_failed && is_delete_call {
+                    self.error_receipt(
+                        request,
+                        &call.id,
+                        &call.name,
+                        "delete_skipped_after_failure",
+                        "an earlier delete_task call failed; no later delete calls were executed",
+                    )
+                    .await?
+                } else if call.id.is_empty() || call.name.is_empty() {
                     self.error_receipt(
                         request,
                         &call.id,
@@ -277,7 +288,49 @@ where
                     .lookup_receipt(&request.session_id, &call.id)
                     .await?
                 {
-                    receipt
+                    if receipt.call_id != call.id || receipt.name != call.name {
+                        return Err(AssistantError::Host(HostError::new(
+                            "invalid_tool_receipt",
+                            "durable receipt belongs to a different tool call",
+                        )));
+                    }
+                    if call.name == "delete_task" && !receipt.is_error {
+                        let tool_request = ToolRequest {
+                            session_id: request.session_id.clone(),
+                            turn_id: request.turn_id.clone(),
+                            call_id: call.id.clone(),
+                            name: call.name.clone(),
+                            arguments: call.arguments.clone(),
+                        };
+                        match self
+                            .host
+                            .execute_named_tool_once(tool_request, cancellation)
+                            .await
+                        {
+                            Ok(receipt)
+                                if receipt.call_id == call.id && receipt.name == call.name =>
+                            {
+                                receipt
+                            }
+                            Ok(_) => {
+                                return Err(AssistantError::Host(HostError::new(
+                                    "invalid_tool_receipt",
+                                    "host returned a receipt for a different tool call",
+                                )));
+                            }
+                            Err(error) if error.kind == ToolErrorKind::Cancelled => {
+                                return Err(AssistantError::Cancelled);
+                            }
+                            Err(error) => {
+                                return Err(AssistantError::Host(HostError::new(
+                                    "invalid_tool_receipt",
+                                    error.message,
+                                )));
+                            }
+                        }
+                    } else {
+                        receipt
+                    }
                 } else {
                     let tool_request = ToolRequest {
                         session_id: request.session_id.clone(),
@@ -315,6 +368,9 @@ where
                         }
                     }
                 };
+                if is_delete_call && receipt.is_error {
+                    delete_failed = true;
+                }
 
                 self.host.emit(
                     &request.session_id,
@@ -545,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_rejects_every_tool_outside_the_five_explicit_names() {
+    fn registry_rejects_every_tool_outside_the_six_explicit_names() {
         let bad = super::super::ToolDefinition::function(
             "bash",
             "must never be exposed",
@@ -806,6 +862,167 @@ mod tests {
                 .unwrap();
             assert!(call_index < result_index);
         }
+    }
+
+    #[tokio::test]
+    async fn successful_delete_receipts_reenter_the_host_for_argument_validation() {
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                interaction(
+                    "delete-call",
+                    TerminalStatus::Completed,
+                    vec![json!({
+                        "type":"function_call",
+                        "id":"delete-1",
+                        "name":"delete_task",
+                        "arguments":{"taskId":"00000000-0000-0000-0000-000000000001"}
+                    })],
+                ),
+                interaction(
+                    "delete-final",
+                    TerminalStatus::Completed,
+                    vec![json!({
+                        "type":"model_output",
+                        "content":[{"type":"text","text":"已删除"}]
+                    })],
+                ),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let host = MockHost::default();
+        host.state.lock().unwrap().receipts.insert(
+            "delete-1".to_owned(),
+            ToolReceipt {
+                call_id: "delete-1".to_owned(),
+                name: "delete_task".to_owned(),
+                result: json!({"deletedTask":{"id":"00000000-0000-0000-0000-000000000001"}}),
+                is_error: false,
+            },
+        );
+        let runner = AgentRunner::new(provider, host);
+        let mut request = AgentRunRequest::text("session", "turn", "model", "删除任务");
+        request.tools = vec![super::super::ToolDefinition::function(
+            "delete_task",
+            "delete",
+            json!({"type":"object"}),
+        )];
+
+        let result = runner
+            .run(request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.final_text, "已删除");
+        assert_eq!(runner.host.state.lock().unwrap().executions, 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_delete_skips_later_deletes_in_the_same_model_batch() {
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([
+                interaction(
+                    "delete-batch",
+                    TerminalStatus::Completed,
+                    vec![
+                        json!({
+                            "type":"function_call",
+                            "id":"delete-failed",
+                            "name":"delete_task",
+                            "arguments":{"taskId":"00000000-0000-0000-0000-000000000001"}
+                        }),
+                        json!({
+                            "type":"function_call",
+                            "id":"delete-must-skip",
+                            "name":"delete_task",
+                            "arguments":{"taskId":"00000000-0000-0000-0000-000000000002"}
+                        }),
+                    ],
+                ),
+                interaction(
+                    "delete-summary",
+                    TerminalStatus::Completed,
+                    vec![json!({
+                        "type":"model_output",
+                        "content":[{"type":"text","text":"第一个删除失败，后续未执行"}]
+                    })],
+                ),
+            ])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let host = MockHost::default();
+        host.state.lock().unwrap().receipts.insert(
+            "delete-failed".to_owned(),
+            ToolReceipt {
+                call_id: "delete-failed".to_owned(),
+                name: "delete_task".to_owned(),
+                result: json!({"error":{"code":"task_session_active"}}),
+                is_error: true,
+            },
+        );
+        let runner = AgentRunner::new(provider, host);
+        let mut request = AgentRunRequest::text("session", "turn", "model", "删除两个任务");
+        request.tools = vec![super::super::ToolDefinition::function(
+            "delete_task",
+            "delete",
+            json!({"type":"object"}),
+        )];
+
+        let result = runner
+            .run(request, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(result.final_text, "第一个删除失败，后续未执行");
+        let state = runner.host.state.lock().unwrap();
+        assert_eq!(state.executions, 0);
+        let skipped = state.receipts.get("delete-must-skip").unwrap();
+        assert!(skipped.is_error);
+        assert_eq!(
+            skipped.result["error"]["code"],
+            "delete_skipped_after_failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_receipt_for_a_different_tool_name_is_rejected() {
+        let provider = MockProvider {
+            responses: Mutex::new(VecDeque::from([interaction(
+                "mismatch",
+                TerminalStatus::Completed,
+                vec![json!({
+                    "type":"function_call",
+                    "id":"reused-call",
+                    "name":"create_tasks",
+                    "arguments":{"tasks":[{"title":"不能执行"}]}
+                })],
+            )])),
+            requests: Mutex::new(Vec::new()),
+        };
+        let host = MockHost::default();
+        host.state.lock().unwrap().receipts.insert(
+            "reused-call".to_owned(),
+            ToolReceipt {
+                call_id: "reused-call".to_owned(),
+                name: "update_task".to_owned(),
+                result: json!({"ok":true}),
+                is_error: false,
+            },
+        );
+        let runner = AgentRunner::new(provider, host);
+        let mut request = AgentRunRequest::text("session", "turn", "model", "创建任务");
+        request.tools = vec![super::super::ToolDefinition::function(
+            "create_tasks",
+            "create",
+            json!({"type":"object"}),
+        )];
+
+        let error = runner
+            .run(request, &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            AssistantError::Host(HostError { ref code, .. }) if code == "invalid_tool_receipt"
+        ));
+        assert_eq!(runner.host.state.lock().unwrap().executions, 0);
     }
 
     #[tokio::test]

@@ -71,6 +71,12 @@ pub enum RemoveTaskAttachmentPreparation {
     Replayed,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssistantDeleteTaskOutcome {
+    Applied(AssistantToolResult),
+    Replayed(AssistantToolResult),
+}
+
 pub struct Store {
     connection: Connection,
 }
@@ -1618,6 +1624,162 @@ impl Store {
             is_error: false,
             task_refs_json,
         })
+    }
+
+    /// Commits the assistant's filesystem-prepared task deletion and its durable
+    /// tool receipt atomically. The caller must first hard-link every managed
+    /// attachment to its quarantine name, then pass the exact prepared attachment
+    /// ID/path manifest. Rechecking that manifest here closes the gap in which
+    /// another request could attach or replace a managed file between preparation
+    /// and the cascading DELETE.
+    pub fn execute_assistant_delete_task(
+        &self,
+        turn_id: &str,
+        call_id: &str,
+        task_id: &str,
+        prepared_attachments: &[(String, String)],
+        arguments_json: &str,
+    ) -> StoreResult<AssistantDeleteTaskOutcome> {
+        if call_id.trim().is_empty() {
+            return Err(StoreError::Invalid("tool callId is required".to_owned()));
+        }
+        let task_id = canonical_uuid(task_id, "delete_task.taskId")?;
+        let arguments: Value = serde_json::from_str(arguments_json)
+            .map_err(|_| StoreError::Invalid("tool arguments must be JSON".to_owned()))?;
+        let argument_task_id = assistant_delete_task_id(&arguments)?;
+        if argument_task_id != task_id {
+            return Err(StoreError::Invalid(
+                "delete_task.taskId does not match the prepared task".to_owned(),
+            ));
+        }
+        let mut prepared_attachments = prepared_attachments
+            .iter()
+            .map(|(id, relative_path)| {
+                let id = canonical_uuid(id, "delete_task.attachmentId")?;
+                let managed_name = managed_attachment_file_name(relative_path)?;
+                validate_managed_attachment_name(&managed_name, &id)?;
+                Ok((id, relative_path.clone()))
+            })
+            .collect::<StoreResult<Vec<_>>>()?;
+        prepared_attachments.sort_unstable();
+        if prepared_attachments
+            .windows(2)
+            .any(|pair| pair[0].0 == pair[1].0)
+        {
+            return Err(StoreError::Invalid(
+                "delete_task prepared attachment IDs must be unique".to_owned(),
+            ));
+        }
+
+        let transaction = self.connection.unchecked_transaction()?;
+        let (session_id, turn_status): (String, String) = transaction
+            .query_row(
+                "SELECT session_id,status FROM assistant_turn WHERE id=?1",
+                [turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let existing = transaction
+            .query_row(
+                "SELECT tool_name,request_json,response_json,is_error,task_refs_json
+                 FROM assistant_tool_execution WHERE session_id=?1 AND call_id=?2",
+                params![session_id, call_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if let Some((tool_name, request_json, response_json, is_error, task_refs_json)) = existing {
+            let stored_task_id = request_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .and_then(|value| assistant_delete_task_id(&value).ok());
+            if tool_name != "delete_task" || stored_task_id.as_deref() != Some(task_id.as_str()) {
+                return Err(StoreError::Conflict("assistant_tool_call_mismatch"));
+            }
+            return Ok(AssistantDeleteTaskOutcome::Replayed(AssistantToolResult {
+                result_json: bounded_tool_result_text(
+                    "delete_task",
+                    response_json.as_deref().unwrap_or("null"),
+                ),
+                is_error: is_error != 0,
+                task_refs_json: task_refs_json.unwrap_or_else(|| "[]".to_owned()),
+            }));
+        }
+        if turn_status != "running" {
+            return Err(StoreError::Conflict("assistant_turn_not_running"));
+        }
+
+        let task: Task = transaction
+            .query_row(
+                "SELECT id,list_id,title,note,status,execution_date,due_date,completed_at,created_at,updated_at
+                 FROM task WHERE id=?1",
+                [&task_id],
+                row_to_task,
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        ensure_task_session_inactive(&transaction, &task_id)?;
+        let mut attachment_statement = transaction
+            .prepare("SELECT id,relative_path FROM task_attachment WHERE task_id=?1 ORDER BY id")?;
+        let mut current_attachments = attachment_statement
+            .query_map([&task_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(attachment_statement);
+        current_attachments.sort_unstable();
+        if current_attachments != prepared_attachments {
+            return Err(StoreError::Conflict("task_attachments_changed"));
+        }
+
+        let changed = transaction.execute("DELETE FROM task WHERE id=?1", [&task_id])?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        let (deleted_task, truncated) = bounded_task_projection(&task);
+        let result_json = bounded_tool_result_json(
+            "delete_task",
+            &json!({
+                "deletedTask": deleted_task,
+                "truncated": truncated,
+            }),
+        );
+        let task_refs_json = "[]".to_owned();
+        let timestamp = now();
+        transaction.execute(
+            "INSERT INTO assistant_tool_execution(id,session_id,turn_id,call_id,tool_name,request_json,response_json,task_refs_json,is_error,status,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'delete_task',?5,?6,?7,0,'completed',?8,?8)",
+            params![
+                Uuid::new_v4().to_string(),
+                session_id,
+                turn_id,
+                call_id,
+                arguments_json,
+                result_json,
+                task_refs_json,
+                timestamp
+            ],
+        )?;
+        bump_task_data_revision(&transaction)?;
+        transaction.execute(
+            "UPDATE chat_session SET updated_at=?1 WHERE id=?2",
+            params![timestamp, session_id],
+        )?;
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(AssistantDeleteTaskOutcome::Applied(AssistantToolResult {
+            result_json,
+            is_error: false,
+            task_refs_json,
+        }))
     }
 
     pub fn assistant_tool_execution(
@@ -3565,6 +3727,15 @@ fn tool_arguments_object<'a>(
     arguments
         .as_object()
         .ok_or_else(|| StoreError::Invalid(format!("{tool} arguments must be an object")))
+}
+
+fn assistant_delete_task_id(arguments: &Value) -> StoreResult<String> {
+    let object = tool_arguments_object("delete_task", arguments)?;
+    ensure_only_fields("delete_task", object, &["taskId"])?;
+    canonical_uuid(
+        required_string_field("delete_task", object, "taskId")?,
+        "delete_task.taskId",
+    )
 }
 
 fn ensure_only_fields(
@@ -5762,6 +5933,200 @@ mod tests {
     }
 
     #[test]
+    fn assistant_delete_task_is_atomic_idempotent_and_keeps_deleted_refs_empty() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("删除一次", "保留删除摘要", None, None, None)
+            .unwrap();
+        let attachment_id = Uuid::new_v4().to_string();
+        let attachment = TaskAttachment {
+            id: attachment_id.clone(),
+            task_id: task.id.clone(),
+            original_name: "memo.txt".to_owned(),
+            size_bytes: 4,
+            mime_type: "text/plain".to_owned(),
+            relative_path: format!("Attachments/{attachment_id}.txt"),
+            created_at: now(),
+        };
+        store
+            .add_task_attachments(&task.id, std::slice::from_ref(&attachment))
+            .unwrap();
+        let queued = running_assistant_turn(&store, "删除任务");
+        let arguments = json!({"taskId":task.id.to_uppercase()}).to_string();
+        let prepared = store
+            .prepare_delete_task(&task.id)
+            .unwrap()
+            .into_iter()
+            .map(|attachment| (attachment.id, attachment.relative_path))
+            .collect::<Vec<_>>();
+        let app_revision = store.revision().unwrap();
+        let task_revision: i64 = store
+            .connection
+            .query_row(
+                "SELECT revision FROM task_data_revision WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let first = store
+            .execute_assistant_delete_task(
+                &queued.turn.id,
+                "delete-once",
+                &task.id,
+                &prepared,
+                &arguments,
+            )
+            .unwrap();
+        let first = match first {
+            AssistantDeleteTaskOutcome::Applied(result) => result,
+            AssistantDeleteTaskOutcome::Replayed(_) => panic!("first delete must apply"),
+        };
+        let result = serde_json::from_str::<Value>(&first.result_json).unwrap();
+        assert_eq!(result["deletedTask"]["id"], task.id);
+        assert_eq!(result["deletedTask"]["title"], "删除一次");
+        assert_eq!(first.task_refs_json, "[]");
+        assert!(store.task(&task.id).unwrap().is_none());
+        assert!(store.bootstrap().unwrap().task_attachments.is_empty());
+        assert_eq!(store.revision().unwrap(), app_revision + 1);
+        assert_eq!(
+            store
+                .connection
+                .query_row(
+                    "SELECT revision FROM task_data_revision WHERE singleton=1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            task_revision + 1
+        );
+        let receipt = store
+            .assistant_tool_execution(&queued.turn.session_id, "delete-once")
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.tool_name, "delete_task");
+        assert_eq!(receipt.task_refs_json.as_deref(), Some("[]"));
+
+        let replay_revision = store.revision().unwrap();
+        let replay = store
+            .execute_assistant_delete_task(
+                &queued.turn.id,
+                "delete-once",
+                &task.id,
+                &prepared,
+                &arguments,
+            )
+            .unwrap();
+        match replay {
+            AssistantDeleteTaskOutcome::Replayed(result) => assert_eq!(result, first),
+            AssistantDeleteTaskOutcome::Applied(_) => panic!("replay must not delete twice"),
+        }
+        assert_eq!(store.revision().unwrap(), replay_revision);
+
+        let other = store
+            .create_task("不能复用 callId", "", None, None, None)
+            .unwrap();
+        let mismatch = store.execute_assistant_delete_task(
+            &queued.turn.id,
+            "delete-once",
+            &other.id,
+            &[],
+            &json!({"taskId":other.id}).to_string(),
+        );
+        assert!(matches!(
+            mismatch,
+            Err(StoreError::Conflict("assistant_tool_call_mismatch"))
+        ));
+        assert!(store.task(&other.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn assistant_delete_task_rechecks_active_sessions_and_attachment_manifest() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let active_task = store
+            .create_task("运行中不能删除", "", None, None, None)
+            .unwrap();
+        let task_session = store
+            .create_session(&active_task.id, RuntimeKind::Codex, "/tmp")
+            .unwrap();
+        store
+            .send_message(&task_session.id, &Uuid::new_v4().to_string(), "正在运行")
+            .unwrap();
+        let queued = running_assistant_turn(&store, "安全删除");
+        let active_result = store.execute_assistant_delete_task(
+            &queued.turn.id,
+            "delete-active",
+            &active_task.id,
+            &[],
+            &json!({"taskId":active_task.id}).to_string(),
+        );
+        assert!(matches!(
+            active_result,
+            Err(StoreError::Conflict("task_session_active"))
+        ));
+        assert!(store.task(&active_task.id).unwrap().is_some());
+        assert!(
+            store
+                .assistant_tool_execution(&queued.turn.session_id, "delete-active")
+                .unwrap()
+                .is_none()
+        );
+
+        let changed_task = store
+            .create_task("附件变化不能删除", "", None, None, None)
+            .unwrap();
+        let first_id = Uuid::new_v4().to_string();
+        let first = TaskAttachment {
+            id: first_id.clone(),
+            task_id: changed_task.id.clone(),
+            original_name: "first.txt".to_owned(),
+            size_bytes: 1,
+            mime_type: "text/plain".to_owned(),
+            relative_path: format!("Attachments/{first_id}.txt"),
+            created_at: now(),
+        };
+        store
+            .add_task_attachments(&changed_task.id, std::slice::from_ref(&first))
+            .unwrap();
+        let prepared = vec![(first.id.clone(), first.relative_path.clone())];
+        let second_id = Uuid::new_v4().to_string();
+        store
+            .add_task_attachments(
+                &changed_task.id,
+                &[TaskAttachment {
+                    id: second_id.clone(),
+                    task_id: changed_task.id.clone(),
+                    original_name: "second.txt".to_owned(),
+                    size_bytes: 1,
+                    mime_type: "text/plain".to_owned(),
+                    relative_path: format!("Attachments/{second_id}.txt"),
+                    created_at: now(),
+                }],
+            )
+            .unwrap();
+        let changed_result = store.execute_assistant_delete_task(
+            &queued.turn.id,
+            "delete-changed",
+            &changed_task.id,
+            &prepared,
+            &json!({"taskId":changed_task.id}).to_string(),
+        );
+        assert!(matches!(
+            changed_result,
+            Err(StoreError::Conflict("task_attachments_changed"))
+        ));
+        assert!(store.task(&changed_task.id).unwrap().is_some());
+        assert!(
+            store
+                .assistant_tool_execution(&queued.turn.session_id, "delete-changed")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn assistant_update_task_can_set_and_clear_both_dates_and_list() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
@@ -5827,11 +6192,11 @@ mod tests {
     }
 
     #[test]
-    fn assistant_five_task_tools_execute_happy_paths() {
+    fn assistant_non_delete_task_tools_execute_happy_paths() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
         let list = store.create_list("生活", "orange", None).unwrap();
-        let queued = running_assistant_turn(&store, "五工具");
+        let queued = running_assistant_turn(&store, "非删除工具");
 
         let created = store
             .execute_assistant_tool(

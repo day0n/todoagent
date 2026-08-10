@@ -411,6 +411,64 @@ struct TaskTimeSystemTests {
         #expect(await repository.sessionCreateCallCount() == 1)
     }
 
+    @Test("Agent deletion ignores a late successful Session creation")
+    func taskDeletionDuringSessionCreationDropsLateSuccess() async throws {
+        let item = task("创建 Session 时被删除")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item], runtimes: [readyRuntime()]),
+            gatedSessionCreateCalls: [1]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(item)
+
+        let creation = Task {
+            await state.startSession(
+                item,
+                runtime: .codex,
+                workspace: "/tmp/todoagent-project"
+            )
+        }
+        await repository.waitUntilSessionCreateStarted(1)
+        await state.consume(try taskRemovalEvent(revision: 2))
+        await repository.releaseSessionCreate(1)
+
+        #expect(await creation.value == false)
+        #expect(state.task(id: item.id) == nil)
+        #expect(state.presentedSheet == nil)
+        #expect(state.conversation(for: item) == nil)
+        #expect(state.sessions.isEmpty)
+        #expect(state.taskSessionErrorMessage == nil)
+    }
+
+    @Test("Agent deletion suppresses a late Session creation error")
+    func taskDeletionDuringSessionCreationDropsLateFailure() async throws {
+        let item = task("创建 Session 失败前被删除")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item], runtimes: [readyRuntime()]),
+            gatedSessionCreateCalls: [1],
+            sessionCreateError: .taskNotFound
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(item)
+
+        let creation = Task {
+            await state.startSession(
+                item,
+                runtime: .codex,
+                workspace: "/tmp/todoagent-project"
+            )
+        }
+        await repository.waitUntilSessionCreateStarted(1)
+        await state.consume(try taskRemovalEvent(revision: 2))
+        await repository.releaseSessionCreate(1)
+
+        #expect(await creation.value == false)
+        #expect(state.taskSessionErrorMessage == nil)
+        #expect(state.taskSaveStates[item.id] == nil)
+    }
+
     @Test("failed in-flight attachment blocks close and remains retryable")
     func failedAttachmentBlocksClose() async throws {
         let item = task("原始")
@@ -803,6 +861,113 @@ struct TaskTimeSystemTests {
         #expect(await repository.persistedTask(id: item.id)?.title == "Agent 改名")
         #expect(await repository.persistedTask(id: item.id)?.note == "本地草稿")
         #expect(state.taskSaveState(taskID: item.id) == .idle)
+    }
+
+    @Test("task.changed deletion clears debounced drafts and task detail state")
+    func taskChangedDeletionCleansLocalState() async throws {
+        let item = task("由 Agent 删除")
+        let repository = TaskMutationSpyRepository(snapshot: snapshot(tasks: [item]))
+        let state = AppState(repository: repository)
+        await state.load()
+
+        let bundle = sessionBundle(taskID: item.id)
+        await state.consume(try sessionChangedEvent(bundle))
+        state.openTask(item)
+        state.scheduleTaskUpdate(
+            taskID: item.id,
+            patch: TaskPatch(title: "不会在删除后落盘")
+        )
+        #expect(state.conversation(for: item) != nil)
+        #expect(state.presentedSheet == .taskSession(item.id))
+        #expect(state.taskSaveState(taskID: item.id) == .debouncing)
+
+        await repository.replaceSnapshot(snapshot(revision: 2))
+        await state.consume(try taskRemovalEvent(revision: 2))
+
+        #expect(state.task(id: item.id) == nil)
+        #expect(state.conversation(for: item) == nil)
+        #expect(state.sessions.isEmpty)
+        #expect(state.presentedSheet == nil)
+        #expect(state.taskSaveState(taskID: item.id) == .idle)
+        #expect(state.taskSaveStates[item.id] == nil)
+        #expect(await state.flushTaskEdits(taskID: item.id))
+        #expect(await state.retryTaskEdits(taskID: item.id))
+        #expect(state.taskSaveStates[item.id] == nil)
+
+        // A stale session event arriving after the deletion cannot recreate
+        // the removed task's bundle or detail state.
+        await state.consume(try sessionChangedEvent(bundle))
+        #expect(state.conversation(for: item) == nil)
+        #expect(state.sessions.isEmpty)
+
+        try await Task.sleep(for: .milliseconds(450))
+        #expect(await repository.updateCallCount() == 0)
+    }
+
+    @Test("task.changed deletion does not restore an in-flight failed patch")
+    func taskChangedDeletionDropsInFlightPatch() async throws {
+        let item = task("保存中被 Agent 删除")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item]),
+            gatedUpdateCalls: [1]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        state.enqueueImmediateTaskUpdate(
+            taskID: item.id,
+            patch: TaskPatch(note: "不能复活")
+        )
+        await repository.waitUntilUpdateStarted(1)
+        let flush = Task { await state.flushTaskEdits(taskID: item.id) }
+        await Task.yield()
+
+        await repository.replaceSnapshot(snapshot(revision: 2))
+        await state.consume(try taskRemovalEvent(revision: 2))
+        await repository.releaseUpdate(1)
+
+        #expect(await flush.value)
+        #expect(state.task(id: item.id) == nil)
+        #expect(state.taskSaveState(taskID: item.id) == .idle)
+        #expect(state.taskSaveStates[item.id] == nil)
+        #expect(await state.retryTaskEdits(taskID: item.id))
+        #expect(state.taskSaveStates[item.id] == nil)
+        #expect(await repository.updateCallCount() == 1)
+    }
+
+    @Test("task.changed deletion drops queued attachment work after the active call")
+    func taskChangedDeletionDropsAttachmentQueue() async throws {
+        let item = task("附件上传中被 Agent 删除")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item]),
+            gatedAttachmentCalls: [1]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        state.enqueueTaskAttachmentAdd(
+            taskID: item.id,
+            sourcePaths: ["/tmp/first.txt"]
+        )
+        await repository.waitUntilAttachmentStarted(1)
+        state.enqueueTaskAttachmentAdd(
+            taskID: item.id,
+            sourcePaths: ["/tmp/second.txt"]
+        )
+        let flush = Task { await state.flushTaskEdits(taskID: item.id) }
+        await Task.yield()
+
+        await repository.replaceSnapshot(snapshot(revision: 2))
+        await state.consume(try taskRemovalEvent(revision: 2))
+        await repository.releaseAttachment(1)
+
+        #expect(await flush.value)
+        #expect(state.task(id: item.id) == nil)
+        #expect(state.taskSaveState(taskID: item.id) == .idle)
+        #expect(state.taskSaveStates[item.id] == nil)
+        #expect(await state.retryTaskEdits(taskID: item.id))
+        #expect(state.taskSaveStates[item.id] == nil)
+        #expect(await repository.attachmentCallCount() == 1)
     }
 
     @Test("equal-revision mutation response reconciles Engine-normalized detail draft")
@@ -1312,6 +1477,44 @@ struct TaskTimeSystemTests {
         )
     }
 
+    private func taskRemovalEvent(revision: Int64) throws -> EngineEvent {
+        let data = try JSONSerialization.data(withJSONObject: [
+            "revision": revision,
+            "lists": [],
+            "tasks": [],
+            "taskAttachments": [],
+            "runtimes": [],
+            "sessions": [],
+        ])
+        return EngineEvent(name: "task.changed", data: data)
+    }
+
+    private func sessionChangedEvent(_ bundle: SessionBundle) throws -> EngineEvent {
+        EngineEvent(name: "session.changed", data: try JSONEncoder().encode(bundle))
+    }
+
+    private func sessionBundle(taskID: UUID) -> SessionBundle {
+        SessionBundle(
+            session: TaskSessionDescriptor(
+                id: "session-\(taskID.uuidString)",
+                taskID: taskID,
+                runtimeKind: .codex,
+                workingDirectory: "/tmp/project",
+                providerSessionID: nil,
+                providerEngine: nil,
+                state: .idle,
+                lastAgentSequence: 0,
+                lastReadSequence: 0,
+                lastErrorCode: nil,
+                lastErrorMessage: nil,
+                createdAt: "2026-08-09T00:00:00Z",
+                updatedAt: "2026-08-09T00:00:00Z"
+            ),
+            messages: [],
+            activeTurn: nil
+        )
+    }
+
     private func readyRuntime() -> RuntimeInfo {
         RuntimeInfo(
             kind: .codex,
@@ -1373,6 +1576,8 @@ private actor TaskMutationSpyRepository: AppRepository {
     private let gatedAttachmentCalls: Set<Int>
     private let gatedSyncCalls: Set<Int>
     private let gatedDeleteCalls: Set<Int>
+    private let gatedSessionCreateCalls: Set<Int>
+    private let sessionCreateError: AppRepositoryError?
     private let normalizesTaskTitles: Bool
     private let commitsTaskUpdateBeforeGate: Bool
     private var creates: [TaskCreateObservation] = []
@@ -1399,6 +1604,9 @@ private actor TaskMutationSpyRepository: AppRepository {
     private var startedDeleteCalls: Set<Int> = []
     private var deleteStartWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
     private var deleteReleaseContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
+    private var startedSessionCreateCalls: Set<Int> = []
+    private var sessionCreateStartWaiters: [Int: [CheckedContinuation<Void, Never>]] = [:]
+    private var sessionCreateReleaseContinuations: [Int: CheckedContinuation<Void, Never>] = [:]
 
     init(
         snapshot: AppSnapshot,
@@ -1413,6 +1621,8 @@ private actor TaskMutationSpyRepository: AppRepository {
         gatedAttachmentCalls: Set<Int> = [],
         gatedSyncCalls: Set<Int> = [],
         gatedDeleteCalls: Set<Int> = [],
+        gatedSessionCreateCalls: Set<Int> = [],
+        sessionCreateError: AppRepositoryError? = nil,
         normalizesTaskTitles: Bool = false,
         commitsTaskUpdateBeforeGate: Bool = false,
         staleRuntimeSnapshot: AppSnapshot? = nil
@@ -1429,6 +1639,8 @@ private actor TaskMutationSpyRepository: AppRepository {
         self.gatedAttachmentCalls = gatedAttachmentCalls
         self.gatedSyncCalls = gatedSyncCalls
         self.gatedDeleteCalls = gatedDeleteCalls
+        self.gatedSessionCreateCalls = gatedSessionCreateCalls
+        self.sessionCreateError = sessionCreateError
         self.normalizesTaskTitles = normalizesTaskTitles
         self.commitsTaskUpdateBeforeGate = commitsTaskUpdateBeforeGate
         self.staleRuntimeSnapshot = staleRuntimeSnapshot
@@ -1632,8 +1844,18 @@ private actor TaskMutationSpyRepository: AppRepository {
         workspace: String
     ) async throws -> SessionBundle {
         sessionCreates += 1
+        let call = sessionCreates
+        startedSessionCreateCalls.insert(call)
+        let waiters = sessionCreateStartWaiters.removeValue(forKey: call) ?? []
+        for waiter in waiters { waiter.resume() }
+        if gatedSessionCreateCalls.contains(call) {
+            await withCheckedContinuation { continuation in
+                sessionCreateReleaseContinuations[call] = continuation
+            }
+        }
+        if let sessionCreateError { throw sessionCreateError }
         let session = TaskSessionDescriptor(
-            id: "task-session-\(sessionCreates)",
+            id: "task-session-\(call)",
             taskID: taskID,
             runtimeKind: runtime,
             workingDirectory: workspace,
@@ -1722,6 +1944,17 @@ private actor TaskMutationSpyRepository: AppRepository {
 
     func releaseDelete(_ call: Int) {
         deleteReleaseContinuations.removeValue(forKey: call)?.resume()
+    }
+
+    func waitUntilSessionCreateStarted(_ call: Int) async {
+        guard !startedSessionCreateCalls.contains(call) else { return }
+        await withCheckedContinuation { continuation in
+            sessionCreateStartWaiters[call, default: []].append(continuation)
+        }
+    }
+
+    func releaseSessionCreate(_ call: Int) {
+        sessionCreateReleaseContinuations.removeValue(forKey: call)?.resume()
     }
 
     private func normalizedPatch(_ patch: TaskPatch) -> TaskPatch {

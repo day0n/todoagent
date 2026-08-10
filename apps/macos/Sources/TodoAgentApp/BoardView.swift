@@ -126,6 +126,13 @@ private struct TimelineColumns: View {
 enum TimelineColumnLayoutPolicy {
     static let dayCount: CGFloat = 4
 
+    static func viewportWidth(showingDayCount visibleDayCount: Int) -> CGFloat {
+        let safeDayCount = max(visibleDayCount, 1)
+        let columns = CGFloat(safeDayCount) * TodoAgentUI.columnMinimumWidth
+        let spacing = CGFloat(safeDayCount - 1) * TodoAgentUI.boardSpacing
+        return (TodoAgentUI.boardPadding * 2) + columns + spacing
+    }
+
     /// Four calendar days always share one continuous sizing rule. Once the
     /// minimum width is reached, the horizontal viewport simply reveals fewer
     /// days; there is no breakpoint where every card suddenly changes size.

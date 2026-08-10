@@ -20,7 +20,7 @@ struct AppStateTests {
         #expect(state.inspectorPresented == false)
     }
 
-    @Test("TodoAgent always docks beside the board at a Notion-like ratio")
+    @Test("TodoAgent defaults to the boundary after two timeline days")
     func assistantWorkspaceAdaptsWithoutOverlayingSidebar() {
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 640,
@@ -34,7 +34,7 @@ struct AppStateTests {
             Issue.record("窄窗口也应保留任务区并将 TodoAgent 停靠在右侧")
             return
         }
-        #expect(assistantWidth == 320)
+        #expect(assistantWidth == 280)
 
         guard case let .sideBySide(proportionalWidth) = MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 960,
@@ -43,24 +43,52 @@ struct AppStateTests {
             Issue.record("常规宽度应继续保持右侧双栏")
             return
         }
-        #expect(abs(proportionalWidth - 326.4) < 0.001)
+        #expect(proportionalWidth == 370)
+        #expect(
+            960 - proportionalWidth - MainWorkspaceLayoutPolicy.dividerWidth
+                == TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 2)
+        )
 
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 1_340,
             assistantRequested: true
-        ) == .sideBySide(assistantWidth: 400))
+        ) == .sideBySide(assistantWidth: 750))
 
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 500,
             assistantRequested: true
-        ) == .sideBySide(assistantWidth: 280))
+        ) == .sideBySide(assistantWidth: 192))
+    }
+
+    @Test("assistant divider resizes in both directions and preserves one timeline day")
+    func assistantDividerClampsResize() {
+        #expect(MainWorkspaceLayoutPolicy.resizedAssistantWidth(
+            availableWidth: 960,
+            startingWidth: 370,
+            dividerTranslation: 50
+        ) == 320)
+        #expect(MainWorkspaceLayoutPolicy.resizedAssistantWidth(
+            availableWidth: 960,
+            startingWidth: 370,
+            dividerTranslation: -80
+        ) == 450)
+        #expect(MainWorkspaceLayoutPolicy.resizedAssistantWidth(
+            availableWidth: 960,
+            startingWidth: 370,
+            dividerTranslation: -2_000
+        ) == 652)
+        #expect(MainWorkspaceLayoutPolicy.resolve(
+            availableWidth: 960,
+            assistantRequested: true,
+            preferredAssistantWidth: 430
+        ) == .sideBySide(assistantWidth: 430))
     }
 
     @Test("assistant rail uses a visible native-paced transition")
     func assistantWorkspaceMotionIsPerceptible() {
         #expect(AssistantWorkspaceMotion.duration >= 0.30)
         #expect(AssistantWorkspaceMotion.duration <= 0.40)
-        #expect(abs(MainWorkspaceLayoutPolicy.assistantWidth(availableWidth: 960) - 326.4) < 0.001)
+        #expect(MainWorkspaceLayoutPolicy.assistantWidth(availableWidth: 960) == 370)
     }
 
     @Test("timeline columns resize continuously without breakpoint jumps")

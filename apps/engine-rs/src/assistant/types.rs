@@ -31,10 +31,11 @@ impl ToolDefinition {
     }
 }
 
-pub const ALLOWED_ASSISTANT_TOOLS: [&str; 5] = [
+pub const ALLOWED_ASSISTANT_TOOLS: [&str; 6] = [
     "create_tasks",
     "find_related",
     "update_task",
+    "delete_task",
     "list_state",
     "list_lists",
 ];
