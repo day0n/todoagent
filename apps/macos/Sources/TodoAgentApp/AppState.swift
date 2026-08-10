@@ -759,16 +759,7 @@ final class AppState {
     func isOverdue(_ task: TaskItem) -> Bool { projection.isOverdue(task) }
     var readyRuntimeCount: Int { runtimes.count(where: \.isSelectable) }
     func visibleTasks() -> [TaskItem] {
-        guard let selection else { return tasks }
-        switch selection {
-        case let .smart(view):
-            switch view {
-            case .timeline, .tasks: return tasks
-            case .running: return tasks.filter { task in session(for: task)?.state.isBusy == true }
-            case .done: return tasks.filter { $0.status == .completed }
-            }
-        case let .list(id): return tasks.filter { $0.listID == id }
-        }
+        projection.visibleTasks(for: selection, sessions: sessions)
     }
     func titleForSelection() -> String {
         guard let selection else { return "时间线" }

@@ -93,6 +93,72 @@ struct TaskTimeSystemTests {
         #expect(openOnly.hasCompletedSection == false)
     }
 
+    @Test("one authoritative task row drives timeline, tasks and list surfaces")
+    func oneAuthoritativeTaskAcrossSurfaces() async throws {
+        let list = TodoList(
+            id: UUID(),
+            name: "项目清单",
+            colorName: "blue",
+            repositoryPath: nil
+        )
+        let originalDay = try day("2026-08-10")
+        let movedDay = try day("2026-08-11")
+        var item = task("同一条任务", execution: originalDay)
+        item.listID = list.id
+
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(lists: [list], tasks: [item])
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        state.selection = .smart(.tasks)
+        #expect(state.visibleTasks().map(\.id) == [item.id])
+        state.selection = .list(list.id)
+        #expect(state.visibleTasks().map(\.id) == [item.id])
+        #expect(state.tasks(executingOn: originalDay).map(\.id) == [item.id])
+        #expect(state.tasks.count == 1)
+
+        #expect(await state.updateTask(
+            taskID: item.id,
+            patch: TaskPatch(
+                title: "三个界面同步更新",
+                status: .completed,
+                executionDate: .set(movedDay)
+            )
+        ))
+
+        state.selection = .smart(.tasks)
+        let allVisibleTasks = state.visibleTasks()
+        #expect(allVisibleTasks.count == 1)
+        let allTask = try #require(allVisibleTasks.first)
+        #expect(allTask.id == item.id)
+        #expect(allTask.title == "三个界面同步更新")
+        #expect(allTask.status == .completed)
+
+        state.selection = .list(list.id)
+        let listVisibleTasks = state.visibleTasks()
+        #expect(listVisibleTasks.count == 1)
+        let listTask = try #require(listVisibleTasks.first)
+        #expect(listTask == allTask)
+        let listSections = TaskStatusSections(tasks: listVisibleTasks)
+        #expect(listSections.openTasks.isEmpty)
+        #expect(listSections.completedTasks.map(\.id) == [item.id])
+        #expect(state.tasks(executingOn: originalDay).isEmpty)
+        #expect(state.tasks(executingOn: movedDay) == [allTask])
+        #expect(state.tasks.count == 1)
+
+        #expect(await state.deleteTask(taskID: item.id))
+
+        state.selection = .smart(.tasks)
+        #expect(state.visibleTasks().isEmpty)
+        state.selection = .list(list.id)
+        #expect(state.visibleTasks().isEmpty)
+        #expect(state.tasks(executingOn: movedDay).isEmpty)
+        #expect(state.task(id: item.id) == nil)
+        #expect(state.tasks.isEmpty)
+    }
+
     @Test("overdue and timeline ordering share the documented rule")
     func overdueOrdering() throws {
         let today = try day("2026-08-09")

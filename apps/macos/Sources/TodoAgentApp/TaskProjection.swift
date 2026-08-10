@@ -14,8 +14,9 @@ struct TaskStatusSections: Equatable, Sendable {
     var hasCompletedSection: Bool { completedTasks.isEmpty == false }
 }
 
-/// The single schedule projection consumed by the timeline, sidebar badge and
-/// menu-bar surface. Membership is based only on `executionDate`.
+/// The single projection over the authoritative task rows. Timeline, task,
+/// list, sidebar and menu-bar surfaces never own task copies; they only select
+/// the same `TaskItem.id` values by execution date, list or status.
 struct TaskProjection: Equatable, Sendable {
     static let empty = TaskProjection(tasks: [], today: .today())
 
@@ -58,6 +59,29 @@ struct TaskProjection: Equatable, Sendable {
 
     func activeCount(forList id: UUID) -> Int { activeListCounts[id, default: 0] }
     func task(id: UUID) -> TaskItem? { tasksByID[id] }
+
+    func visibleTasks(
+        for selection: SidebarSelection?,
+        sessions: [TaskSessionDescriptor]
+    ) -> [TaskItem] {
+        guard let selection else { return tasks }
+        switch selection {
+        case let .smart(view):
+            switch view {
+            case .timeline, .tasks:
+                return tasks
+            case .running:
+                let busyTaskIDs = Set(
+                    sessions.lazy.filter { $0.state.isBusy }.map(\.taskID)
+                )
+                return tasks.filter { busyTaskIDs.contains($0.id) }
+            case .done:
+                return tasks.filter { $0.status == .completed }
+            }
+        case let .list(id):
+            return tasks.filter { $0.listID == id }
+        }
+    }
 
     func tasks(executingOn day: LocalDay) -> [TaskItem] {
         tasksByExecutionDay[day, default: []]
