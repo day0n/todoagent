@@ -1,4 +1,5 @@
 import Darwin
+import CFNetwork
 import Foundation
 
 enum EngineClientError: LocalizedError, Equatable {
@@ -689,7 +690,7 @@ actor EngineClient {
         environment["PATH"] = Array(NSOrderedSet(array: additions + current))
             .compactMap { $0 as? String }
             .joined(separator: ":")
-        return environment
+        return MacSystemProxyEnvironment.mergingCurrentSystemProxy(into: environment)
     }
 
     private nonisolated static func logEngineError(_ message: String) {
@@ -705,6 +706,105 @@ actor EngineClient {
         } else {
             try? Data(line.utf8).write(to: url, options: .atomic)
         }
+    }
+}
+
+/// `reqwest` reads proxy settings from its process environment, while a macOS
+/// app launched from Finder receives its network proxy from CFNetwork instead.
+/// Bridge the explicit macOS HTTP/HTTPS settings into the Engine process so
+/// Gemini uses the same route as the rest of the user's desktop apps.
+enum MacSystemProxyEnvironment {
+    static func mergingCurrentSystemProxy(
+        into environment: [String: String]
+    ) -> [String: String] {
+        guard let dictionary = CFNetworkCopySystemProxySettings()?.takeRetainedValue()
+            as? [String: Any]
+        else {
+            return environment
+        }
+        return merging(proxySettings: dictionary, into: environment)
+    }
+
+    static func merging(
+        proxySettings: [String: Any],
+        into environment: [String: String]
+    ) -> [String: String] {
+        var result = environment
+
+        if let proxy = proxyURL(
+            enabled: proxySettings["HTTPEnable"],
+            host: proxySettings["HTTPProxy"],
+            port: proxySettings["HTTPPort"]
+        ) {
+            set(proxy, lowerKey: "http_proxy", upperKey: "HTTP_PROXY", in: &result)
+        }
+
+        if let proxy = proxyURL(
+            enabled: proxySettings["HTTPSEnable"],
+            host: proxySettings["HTTPSProxy"],
+            port: proxySettings["HTTPSPort"]
+        ) {
+            set(proxy, lowerKey: "https_proxy", upperKey: "HTTPS_PROXY", in: &result)
+        }
+
+        if let exceptions = proxySettings["ExceptionsList"] as? [String],
+           exceptions.isEmpty == false
+        {
+            let existing = result["no_proxy"] ?? result["NO_PROXY"] ?? ""
+            let combined = (existing.split(separator: ",").map(String.init) + exceptions)
+                .reduce(into: [String]()) { values, value in
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.isEmpty == false, values.contains(trimmed) == false {
+                        values.append(trimmed)
+                    }
+                }
+                .joined(separator: ",")
+            if combined.isEmpty == false {
+                result["no_proxy"] = combined
+            }
+        }
+
+        return result
+    }
+
+    private static func set(
+        _ value: String,
+        lowerKey: String,
+        upperKey: String,
+        in environment: inout [String: String]
+    ) {
+        guard environment[lowerKey] == nil, environment[upperKey] == nil else { return }
+        environment[lowerKey] = value
+    }
+
+    private static func proxyURL(
+        enabled: Any?,
+        host: Any?,
+        port: Any?
+    ) -> String? {
+        guard number(enabled)?.boolValue == true,
+              let host = host as? String,
+              host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false,
+              let port = number(port)?.intValue,
+              (1 ... 65_535).contains(port)
+        else {
+            return nil
+        }
+
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = host
+        components.port = port
+        return components.url?.absoluteString
+    }
+
+    private static func number(_ value: Any?) -> NSNumber? {
+        if let number = value as? NSNumber { return number }
+        if let integer = value as? Int { return NSNumber(value: integer) }
+        if let string = value as? String, let integer = Int(string) {
+            return NSNumber(value: integer)
+        }
+        return nil
     }
 }
 

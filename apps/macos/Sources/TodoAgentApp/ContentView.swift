@@ -28,18 +28,21 @@ struct ContentView: View {
                     assistantRequested: state.inspectorPresented
                 )
 
-                switch layout {
-                case .boardOnly:
+                HStack(spacing: 0) {
                     boardWorkspace
-                case let .sideBySide(assistantWidth):
-                    HStack(spacing: 0) {
-                        boardWorkspace
-                        Divider()
-                        TodoAgentInspector(state: state)
-                            .frame(width: assistantWidth)
-                            .transition(.move(edge: .trailing).combined(with: .opacity))
+
+                    if case let .sideBySide(assistantWidth) = layout {
+                        HStack(spacing: 0) {
+                            Divider()
+
+                            TodoAgentInspector(state: state)
+                                .frame(width: assistantWidth)
+                        }
+                        .frame(width: assistantWidth + 1)
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
                 }
+                .clipped()
             }
         }
         .navigationSplitViewStyle(.balanced)

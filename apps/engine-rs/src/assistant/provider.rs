@@ -256,6 +256,7 @@ fn network_error(error: reqwest::Error) -> ProviderError {
     } else {
         RetryClass::Permanent
     };
+    tracing::warn!(error = ?error, "Gemini network request failed");
     ProviderError::Network {
         message: error.to_string(),
         retry,

@@ -1053,6 +1053,8 @@ struct TaskTimeSystemTests {
         #expect(open.completionTitle == "标记为完成")
         #expect(open.currentDate(for: .execution) == expectedExecutionDate)
         #expect(open.currentDate(for: .due) == expectedDueDate)
+        #expect(open.dateMenuTitle(for: .execution) == "执行日期 · 8月10日")
+        #expect(open.dateMenuTitle(for: .due) == "截止日期 · 8月12日")
         #expect(open.moveDestinations.count == 3)
         #expect(open.moveDestinations.first?.title == "任务（无清单）")
         #expect(open.moveDestinations.first(where: { $0.listID == firstList.id })?.isSelected == true)
@@ -1076,6 +1078,23 @@ struct TaskTimeSystemTests {
             TaskContextMenuAccessibility.deleteConfirmation,
         ]
         #expect(Set(identifiers).count == identifiers.count)
+    }
+
+    @Test("compact date picker week strip always runs Monday through Sunday")
+    func compactDatePickerWeekStrip() throws {
+        let midweek = TodoAgentWeekStripPresentation(selectedDay: try day("2026-08-12"))
+        #expect(midweek.days.map(\.rawValue) == [
+            "2026-08-10",
+            "2026-08-11",
+            "2026-08-12",
+            "2026-08-13",
+            "2026-08-14",
+            "2026-08-15",
+            "2026-08-16",
+        ])
+
+        let sunday = TodoAgentWeekStripPresentation(selectedDay: try day("2026-08-16"))
+        #expect(sunday.days == midweek.days)
     }
 
     @Test("lost create-list response syncs the atomic result without duplicating it")

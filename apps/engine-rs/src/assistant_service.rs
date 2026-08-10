@@ -15,7 +15,7 @@ use crate::assistant::{
     AgentEvent, AgentRunRequest, AgentRunner, AssistantError, AssistantHost, CompactionRequest,
     CompactionResult, ContextBuilder, ContextBuilderConfig, ContextSnapshot,
     GeminiInteractionsProvider, HostError, InteractionProvider, InteractionRequest, PersistSteps,
-    StoredTurn, ToolDefinition, ToolError, ToolErrorKind, ToolReceipt, ToolRequest,
+    ProviderError, StoredTurn, ToolDefinition, ToolError, ToolErrorKind, ToolReceipt, ToolRequest,
     estimate_tokens,
 };
 use crate::models::{
@@ -1822,6 +1822,13 @@ fn user_facing_assistant_error(error: &AssistantError) -> String {
         AssistantError::Limit { .. } => {
             "本轮对话达到安全上限，请换一种更具体的说法重试。".to_owned()
         }
+        AssistantError::Provider(ProviderError::Network { .. }) => {
+            "Gemini 网络连接失败，TodoAgent 已自动重试。请确认 macOS 代理或 VPN 可用后再试。"
+                .to_owned()
+        }
+        AssistantError::Provider(ProviderError::Timeout) => {
+            "Gemini 连接超时，TodoAgent 已自动重试。请稍后再试或检查代理设置。".to_owned()
+        }
         AssistantError::Provider(provider) => format!("Gemini 请求失败：{provider}"),
         AssistantError::EmptyResponse => "Gemini 没有返回可显示的内容。".to_owned(),
         AssistantError::Host(host) => host.message.clone(),
@@ -1912,6 +1919,20 @@ mod tests {
         assert_eq!(global_draft_attempt(1, 2), 2);
         assert_eq!(global_draft_attempt(2, 1), 4);
         assert_eq!(global_draft_attempt(3, 3), 9);
+    }
+
+    #[test]
+    fn network_failures_have_actionable_redacted_user_copy() {
+        let error = AssistantError::Provider(ProviderError::Network {
+            message: "error sending request for url (https://example.invalid)".to_owned(),
+            retry: crate::assistant::RetryClass::Transient,
+        });
+
+        let message = user_facing_assistant_error(&error);
+        assert!(message.contains("已自动重试"));
+        assert!(message.contains("macOS 代理或 VPN"));
+        assert!(!message.contains("example.invalid"));
+        assert!(!message.contains("provider network error"));
     }
 
     #[test]

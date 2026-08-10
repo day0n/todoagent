@@ -326,6 +326,7 @@ private struct TaskDetailsPane: View {
                 title: "执行日期",
                 systemImage: "sun.max",
                 day: executionDateBinding,
+                today: state.currentDay,
                 tint: isDraftDateOverdue(draft.executionDate) ? .red : .primary,
                 accessibilityIdentifier: "task.details.execution-date"
             )
@@ -336,6 +337,7 @@ private struct TaskDetailsPane: View {
                 title: "截止日期",
                 systemImage: "calendar",
                 day: dueDateBinding,
+                today: state.currentDay,
                 tint: isDraftDateOverdue(draft.dueDate) ? .red : .primary,
                 accessibilityIdentifier: "task.details.due-date"
             )
@@ -530,8 +532,11 @@ private struct OptionalLocalDayRow: View {
     let title: String
     let systemImage: String
     @Binding var day: LocalDay?
+    let today: LocalDay
     let tint: Color
     let accessibilityIdentifier: String
+
+    @State private var datePickerPresented = false
 
     private static var calendar: Calendar { .todoAgentLocal }
 
@@ -543,16 +548,47 @@ private struct OptionalLocalDayRow: View {
 
             Spacer(minLength: 8)
 
-            if day != nil {
-                DatePicker("", selection: dateBinding, displayedComponents: .date)
-                    .labelsHidden()
-                    .datePickerStyle(.field)
+            if let day {
+                Button {
+                    datePickerPresented = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Text(dateLabel(day))
+                            .monospacedDigit()
+                        Image(systemName: "chevron.down")
+                            .font(.caption2.weight(.semibold))
+                            .foregroundStyle(TodoAgentUI.secondaryText)
+                            .accessibilityHidden(true)
+                    }
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(tint)
+                    .padding(.horizontal, 9)
+                    .frame(height: 28)
+                    .background(TodoAgentUI.selectionBackground.opacity(0.6), in: .capsule)
+                    .overlay {
+                        Capsule().stroke(TodoAgentUI.hairline, lineWidth: 1)
+                    }
+                }
+                .buttonStyle(.plain)
+                .help("选择\(title)")
+                .popover(isPresented: $datePickerPresented) {
+                    TodoAgentDatePickerPanel(
+                        title: "选择\(title)",
+                        initialDay: day,
+                        today: today,
+                        onCancel: { datePickerPresented = false },
+                        onApply: { selectedDay in
+                            self.day = selectedDay
+                            datePickerPresented = false
+                        }
+                    )
+                }
             }
 
-            Toggle("", isOn: isEnabledBinding)
+            Toggle(title, isOn: isEnabledBinding)
                 .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.small)
+                .toggleStyle(TodoAgentCompactSwitchStyle())
+                .accessibilityLabel("启用\(title)")
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(accessibilityIdentifier)
@@ -563,20 +599,14 @@ private struct OptionalLocalDayRow: View {
             get: { day != nil },
             set: { enabled in
                 guard enabled != (day != nil) else { return }
-                day = enabled ? .today(calendar: Self.calendar) : nil
+                day = enabled ? today : nil
             }
         )
     }
 
-    private var dateBinding: Binding<Date> {
-        Binding(
-            get: { day?.date(in: Self.calendar) ?? .now },
-            set: { value in
-                let newDay = LocalDay(value, calendar: Self.calendar)
-                guard newDay != day else { return }
-                day = newDay
-            }
-        )
+    private func dateLabel(_ day: LocalDay) -> String {
+        day.date(in: Self.calendar)?.formatted(.dateTime.month().day().weekday(.abbreviated))
+            ?? day.rawValue
     }
 }
 

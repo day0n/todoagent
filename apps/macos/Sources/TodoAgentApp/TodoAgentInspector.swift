@@ -338,10 +338,7 @@ struct TodoAgentInspector: View {
             }
         }
         .padding(13)
-        .background(
-            TodoAgentUI.surfaceBackground,
-            in: .rect(cornerRadius: TodoAgentUI.composerRadius)
-        )
+        .todoAgentGlassSurface(cornerRadius: TodoAgentUI.composerRadius, elevated: true)
         .overlay {
             RoundedRectangle(cornerRadius: TodoAgentUI.composerRadius)
                 .stroke(
@@ -349,7 +346,6 @@ struct TodoAgentInspector: View {
                     lineWidth: composerFocused ? 1.5 : 1
                 )
         }
-        .shadow(color: TodoAgentUI.shadowColor, radius: 10, y: 3)
         .padding(.horizontal, 12)
         .padding(.top, 8)
         .padding(.bottom, 12)
@@ -543,12 +539,7 @@ struct AssistantSessionSwitcherPanel: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .background(TodoAgentUI.surfaceBackground, in: .rect(cornerRadius: TodoAgentUI.panelRadius))
-        .overlay {
-            RoundedRectangle(cornerRadius: TodoAgentUI.panelRadius)
-                .stroke(TodoAgentUI.hairline, lineWidth: 1)
-        }
-        .shadow(color: TodoAgentUI.shadowColor, radius: 16, y: 8)
+        .todoAgentGlassSurface(cornerRadius: TodoAgentUI.panelRadius, elevated: true)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("assistant.session-switcher")
     }
@@ -943,48 +934,94 @@ private struct AssistantProcessingRow: View {
     }
 }
 
+struct AssistantToolCardPresentation: Equatable, Sendable {
+    let systemImage: String
+    let stateTitle: String
+    let state: AssistantToolState
+
+    init(state: AssistantToolState) {
+        self.state = state
+        switch state {
+        case .running:
+            systemImage = "ellipsis"
+            stateTitle = "处理中"
+        case .completed:
+            systemImage = "checkmark"
+            stateTitle = "完成"
+        case .failed:
+            systemImage = "xmark"
+            stateTitle = "失败"
+        }
+    }
+}
+
 private struct AssistantToolRow: View {
     let tool: AssistantToolActivity
     let state: AppState
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(spacing: 7) {
-                Image(systemName: stateIcon)
-                    .foregroundStyle(stateColor)
-                    .accessibilityHidden(true)
-                Text(tool.name)
-                    .font(.caption.weight(.semibold))
-                    .fontDesign(.monospaced)
-                    .lineLimit(1)
-                Spacer()
-                Text(stateTitle)
-                    .font(.caption2)
-                    .foregroundStyle(tool.state == .failed ? Color.red : TodoAgentUI.secondaryText)
-            }
+    private var presentation: AssistantToolCardPresentation {
+        AssistantToolCardPresentation(state: tool.state)
+    }
 
-            if !tool.taskReferences.isEmpty {
-                FlowLayout(spacing: 5) {
-                    ForEach(tool.taskReferences, id: \.self) { taskID in
-                        AssistantTaskReferenceButton(taskID: taskID, state: state)
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: presentation.systemImage)
+                .font(.caption.bold())
+                .foregroundStyle(stateColor)
+                .frame(width: 26, height: 26)
+                .background(stateColor.opacity(0.13), in: .circle)
+                .overlay {
+                    Circle().stroke(stateColor.opacity(0.24), lineWidth: 1)
+                }
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 7) {
+                HStack(spacing: 7) {
+                    Text(tool.name)
+                        .font(.caption.weight(.semibold))
+                        .fontDesign(.monospaced)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(presentation.stateTitle)
+                        .font(.caption2.weight(.medium))
+                        .foregroundStyle(stateColor)
+                        .padding(.horizontal, 7)
+                        .frame(height: 20)
+                        .background(stateColor.opacity(0.10), in: .capsule)
+                }
+
+                if !tool.taskReferences.isEmpty {
+                    FlowLayout(spacing: 5) {
+                        ForEach(tool.taskReferences, id: \.self) { taskID in
+                            AssistantTaskReferenceButton(taskID: taskID, state: state)
+                        }
                     }
                 }
             }
         }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 7)
+        .padding(10)
         .foregroundStyle(TodoAgentUI.primaryText)
-        .background(TodoAgentUI.selectionBackground.opacity(0.55), in: .rect(cornerRadius: 8))
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("工具 \(tool.name)，\(stateTitle)")
-    }
-
-    private var stateIcon: String {
-        switch tool.state {
-        case .running: "ellipsis.circle"
-        case .completed: "checkmark.circle.fill"
-        case .failed: "xmark.circle.fill"
+        .background {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(.thinMaterial)
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(
+                        LinearGradient(
+                            colors: [.clear, stateColor.opacity(tool.state == .failed ? 0.13 : 0.07)],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+                    )
+            }
         }
+        .overlay {
+            RoundedRectangle(cornerRadius: 10)
+                .strokeBorder(stateColor.opacity(tool.state == .running ? 0.16 : 0.28), lineWidth: 1)
+        }
+        .shadow(color: TodoAgentUI.shadowColor.opacity(0.45), radius: 5, y: 2)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("工具 \(tool.name)，\(presentation.stateTitle)")
     }
 
     private var stateColor: Color {
@@ -992,14 +1029,6 @@ private struct AssistantToolRow: View {
         case .running: TodoAgentUI.secondaryText
         case .completed: .green
         case .failed: .red
-        }
-    }
-
-    private var stateTitle: String {
-        switch tool.state {
-        case .running: "处理中"
-        case .completed: "完成"
-        case .failed: "失败"
         }
     }
 }

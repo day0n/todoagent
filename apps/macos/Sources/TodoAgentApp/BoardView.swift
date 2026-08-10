@@ -683,7 +683,8 @@ struct TaskCard: View {
             Button {
                 datePickerRequest = TaskDatePickerRequest(
                     field: field,
-                    initialDay: presentation.currentDate(for: field) ?? state.currentDay
+                    initialDay: presentation.currentDate(for: field) ?? state.currentDay,
+                    today: state.currentDay
                 )
             } label: {
                 Label("选择日期…", systemImage: "calendar")
@@ -700,7 +701,7 @@ struct TaskCard: View {
                 .accessibilityIdentifier(TaskContextMenuAccessibility.dateClear(field))
             }
         } label: {
-            Label(field.menuTitle, systemImage: field.systemImage)
+            Label(presentation.dateMenuTitle(for: field), systemImage: field.systemImage)
         }
         .disabled(state.isTaskCommandInFlight(taskID: task.id))
         .accessibilityIdentifier(TaskContextMenuAccessibility.dateMenu(field))
@@ -926,6 +927,11 @@ struct TaskContextMenuPresentation: Equatable, Sendable {
         case .due: task.dueDate
         }
     }
+
+    func dateMenuTitle(for field: TaskContextDateField) -> String {
+        guard let day = currentDate(for: field) else { return field.menuTitle }
+        return "\(field.menuTitle) · \(day.month)月\(day.day)日"
+    }
 }
 
 enum TaskContextMenuAccessibility {
@@ -963,6 +969,7 @@ enum TaskContextMenuAccessibility {
 struct TaskDatePickerRequest: Identifiable {
     let field: TaskContextDateField
     let initialDay: LocalDay
+    let today: LocalDay
 
     var id: String { field.id }
 }
@@ -972,43 +979,22 @@ private struct TaskDatePickerPopover: View {
     let onApply: (LocalDay) -> Void
 
     @Environment(\.dismiss) private var dismiss
-    @State private var selection: Date
-
     init(request: TaskDatePickerRequest, onApply: @escaping (LocalDay) -> Void) {
         self.request = request
         self.onApply = onApply
-        _selection = State(
-            initialValue: request.initialDay.date(in: .todoAgentLocal) ?? .now
-        )
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
-            Text("选择\(request.field.menuTitle)")
-                .font(.headline)
-
-            DatePicker(
-                request.field.menuTitle,
-                selection: $selection,
-                displayedComponents: .date
-            )
-            .labelsHidden()
-            .datePickerStyle(.graphical)
-            .accessibilityIdentifier("task.context.\(request.field.rawValue)-date.picker")
-
-            HStack {
-                Spacer()
-                Button("取消", role: .cancel) { dismiss() }
-                Button("应用") {
-                    onApply(LocalDay(selection, calendar: .todoAgentLocal))
-                    dismiss()
-                }
-                .keyboardShortcut(.defaultAction)
-                .accessibilityIdentifier("task.context.\(request.field.rawValue)-date.apply")
+        TodoAgentDatePickerPanel(
+            title: "选择\(request.field.menuTitle)",
+            initialDay: request.initialDay,
+            today: request.today,
+            onCancel: { dismiss() },
+            onApply: { day in
+                onApply(day)
+                dismiss()
             }
-        }
-        .padding(TodoAgentUI.sectionSpacing)
-        .frame(width: 320)
-        .environment(\.calendar, Calendar.todoAgentLocal)
+        )
+        .accessibilityIdentifier("task.context.\(request.field.rawValue)-date.picker")
     }
 }

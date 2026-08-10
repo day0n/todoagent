@@ -6,6 +6,20 @@ import Testing
 @Suite("Task conversation presentation")
 @MainActor
 struct TaskConversationViewTests {
+    @Test("assistant tool cards expose quiet notification states without animated status")
+    func assistantToolCardPresentation() {
+        let running = AssistantToolCardPresentation(state: .running)
+        let completed = AssistantToolCardPresentation(state: .completed)
+        let failed = AssistantToolCardPresentation(state: .failed)
+
+        #expect(running.systemImage == "ellipsis")
+        #expect(running.stateTitle == "处理中")
+        #expect(completed.systemImage == "checkmark")
+        #expect(completed.stateTitle == "完成")
+        #expect(failed.systemImage == "xmark")
+        #expect(failed.stateTitle == "失败")
+    }
+
     @Test("tool results are collapsed by default and toggle their complete body")
     func toolResultDisclosureState() throws {
         let rawResult = #"{"error":"provider failed","detail":"RAW_RESULT_SENTINEL"}"#

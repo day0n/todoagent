@@ -4,6 +4,51 @@ import Testing
 
 @Suite("Rust Engine client", .serialized)
 struct EngineClientTests {
+    @Test("Engine inherits explicit macOS HTTP proxy settings")
+    func macOSSystemProxyIsBridgedToEngineEnvironment() {
+        let environment = MacSystemProxyEnvironment.merging(
+            proxySettings: [
+                "HTTPEnable": 1,
+                "HTTPProxy": "127.0.0.1",
+                "HTTPPort": 7890,
+                "HTTPSEnable": true,
+                "HTTPSProxy": "127.0.0.1",
+                "HTTPSPort": NSNumber(value: 7890),
+                "ExceptionsList": ["localhost", "127.0.0.1", "*.local"],
+            ],
+            into: ["PATH": "/usr/bin", "no_proxy": "internal.example"]
+        )
+
+        #expect(environment["http_proxy"] == "http://127.0.0.1:7890")
+        #expect(environment["https_proxy"] == "http://127.0.0.1:7890")
+        #expect(
+            environment["no_proxy"]
+                == "internal.example,localhost,127.0.0.1,*.local"
+        )
+    }
+
+    @Test("Explicit Engine proxy environment wins over macOS settings")
+    func explicitProxyEnvironmentIsPreserved() {
+        let environment = MacSystemProxyEnvironment.merging(
+            proxySettings: [
+                "HTTPEnable": 1,
+                "HTTPProxy": "127.0.0.1",
+                "HTTPPort": 7890,
+                "HTTPSEnable": 1,
+                "HTTPSProxy": "127.0.0.1",
+                "HTTPSPort": 7890,
+            ],
+            into: [
+                "HTTP_PROXY": "http://managed-http.example:8080",
+                "https_proxy": "http://managed-https.example:8443",
+            ]
+        )
+
+        #expect(environment["HTTP_PROXY"] == "http://managed-http.example:8080")
+        #expect(environment["http_proxy"] == nil)
+        #expect(environment["https_proxy"] == "http://managed-https.example:8443")
+    }
+
     @Test("Swift decodes every shared NDJSON contract message")
     func sharedContract() throws {
         let fixtureURL = repositoryRoot
