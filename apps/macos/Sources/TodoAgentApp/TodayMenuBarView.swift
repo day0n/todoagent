@@ -4,22 +4,36 @@ import SwiftUI
 struct TodayMenuBarProjection: Equatable, Sendable {
     let tasks: [TaskItem]
 
-    init(tasks: [TaskItem], now: Date = .now, calendar: Calendar = .current) {
-        self.tasks = tasks.filter { task in
-            guard task.status == .open, let dueDate = task.dueDate else { return false }
-            return calendar.isDate(dueDate, inSameDayAs: now)
-        }
+    init(todayTasks: [TaskItem]) {
+        tasks = todayTasks
+    }
+
+    init(tasks: [TaskItem], now: Date = .now, calendar: Calendar = .todoAgentLocal) {
+        let today = LocalDay(date: now, calendar: calendar)
+        self.init(todayTasks: TaskProjection(tasks: tasks, today: today).todayTasks())
+    }
+}
+
+/// The menu-bar popover cannot infer a useful ideal height from a ScrollView.
+/// Giving the real task region a finite, nonzero height prevents the rows from
+/// collapsing while still capping long lists.
+enum TodayMenuBarTaskAreaMetrics {
+    static let rowHeight: CGFloat = 52
+    static let minimumHeight: CGFloat = 52
+    static let maximumHeight: CGFloat = 300
+
+    static func height(taskCount: Int) -> CGFloat {
+        min(max(CGFloat(taskCount) * rowHeight, minimumHeight), maximumHeight)
     }
 }
 
 struct TodayMenuBarView: View {
     let state: AppState
 
-    @Environment(\.calendar) private var calendar
     @Environment(\.openWindow) private var openWindow
 
     private var projection: TodayMenuBarProjection {
-        TodayMenuBarProjection(tasks: state.tasks, calendar: calendar)
+        TodayMenuBarProjection(todayTasks: state.todayTasks())
     }
 
     var body: some View {
@@ -58,7 +72,7 @@ struct TodayMenuBarView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
                 .background(TodoAgentUI.selectionBackground, in: .capsule)
-                .accessibilityLabel("今日未完成任务 \(projection.tasks.count) 项")
+                .accessibilityLabel("今日任务 \(projection.tasks.count) 项")
         }
         .padding(.bottom, 10)
         .accessibilityIdentifier("menubar.today.header")
@@ -99,9 +113,9 @@ struct TodayMenuBarView: View {
                 Image(systemName: "checkmark.circle")
                     .font(.title2)
                     .foregroundStyle(.secondary)
-                Text("今天没有未完成任务")
+                Text("今天还没有安排")
                     .font(.callout.weight(.medium))
-                Text("可以安心开始新的一天。")
+                Text("在时间线中安排任务后会显示在这里。")
                     .font(.caption)
                     .foregroundStyle(TodoAgentUI.secondaryText)
             }
@@ -110,42 +124,11 @@ struct TodayMenuBarView: View {
             .accessibilityIdentifier("menubar.today.empty")
 
         case .loaded:
-            ScrollView {
-                LazyVStack(alignment: .leading, spacing: 2) {
-                    ForEach(projection.tasks) { task in
-                        taskRow(task)
-                    }
-                }
+            TodayMenuTaskList(tasks: projection.tasks) { task in
+                state.openTask(task)
+                TodoAgentMainWindow.show(using: openWindow)
             }
-            .frame(maxHeight: 300)
         }
-    }
-
-    private func taskRow(_ task: TaskItem) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: "circle")
-                .font(.callout)
-                .foregroundStyle(TodoAgentUI.secondaryText)
-                .padding(.top, 2)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(task.title)
-                    .font(.callout.weight(.medium))
-                    .foregroundStyle(TodoAgentUI.primaryText)
-                    .lineLimit(2)
-                Text("未完成")
-                    .font(.caption)
-                    .foregroundStyle(TodoAgentUI.secondaryText)
-            }
-
-            Spacer(minLength: 0)
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
-        .contentShape(.rect)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("\(task.title)，未完成")
-        .accessibilityIdentifier("menubar.today.task.\(task.id.uuidString)")
     }
 
     private var openAppButton: some View {
@@ -160,6 +143,67 @@ struct TodayMenuBarView: View {
         .help("打开 TodoAgent 主窗口")
         .accessibilityHint("激活已有主窗口，或在主窗口已关闭时重新打开")
         .accessibilityIdentifier("menubar.open-main-window")
+    }
+}
+
+/// Internal so the AppKit hosting/layout regression test exercises the same
+/// SwiftUI tree that ships in MenuBarExtra.
+struct TodayMenuTaskList: View {
+    let tasks: [TaskItem]
+    var onOpen: (TaskItem) -> Void = { _ in }
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                ForEach(tasks) { task in
+                    Button {
+                        onOpen(task)
+                    } label: {
+                        TodayMenuTaskRow(task: task)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+        .frame(
+            minHeight: TodayMenuBarTaskAreaMetrics.minimumHeight,
+            idealHeight: TodayMenuBarTaskAreaMetrics.height(taskCount: tasks.count),
+            maxHeight: TodayMenuBarTaskAreaMetrics.height(taskCount: tasks.count)
+        )
+        .accessibilityIdentifier("menubar.today.task-list")
+    }
+}
+
+private struct TodayMenuTaskRow: View {
+    let task: TaskItem
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: task.status == .completed ? "checkmark.circle.fill" : "circle")
+                .font(.callout)
+                .foregroundStyle(task.status == .completed ? Color.green : TodoAgentUI.secondaryText)
+                .padding(.top, 2)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(task.title)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(TodoAgentUI.primaryText)
+                    .strikethrough(task.status == .completed)
+                    .lineLimit(2)
+                Text(task.status.title)
+                    .font(.caption)
+                    .foregroundStyle(TodoAgentUI.secondaryText)
+            }
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, minHeight: TodayMenuBarTaskAreaMetrics.rowHeight, alignment: .leading)
+        .contentShape(.rect)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(task.title)，\(task.status.title)")
+        .accessibilityIdentifier("menubar.today.task.\(task.id.uuidString)")
     }
 }
 
@@ -181,6 +225,31 @@ enum TodoAgentMainWindow {
     }
 }
 
+/// Versioned once-per-install placement fixes the oversized legacy default
+/// without fighting the user's later window moves or resizes. SwiftUI's
+/// `.defaultPosition(.center)` covers new installs; this migration also covers
+/// an existing install whose restored frame still fills most of the display.
+enum TodoAgentMainWindowPlacement {
+    static let layoutVersion = 1
+    static let appliedVersionKey = "TodoAgentMainWindowCenteredLayoutVersion"
+    static let preferredContentSize = CGSize(width: 1_120, height: 720)
+    static let minimumContentSize = CGSize(width: 760, height: 560)
+    static let maximumVisibleFraction: CGFloat = 0.82
+
+    static func contentSize(for visibleFrame: CGRect) -> CGSize {
+        CGSize(
+            width: min(
+                preferredContentSize.width,
+                max(minimumContentSize.width, visibleFrame.width * maximumVisibleFraction)
+            ),
+            height: min(
+                preferredContentSize.height,
+                max(minimumContentSize.height, visibleFrame.height * maximumVisibleFraction)
+            )
+        )
+    }
+}
+
 struct TodoAgentMainWindowMarker: NSViewRepresentable {
     func makeNSView(context: Context) -> MainWindowMarkerView {
         MainWindowMarkerView()
@@ -192,6 +261,20 @@ struct TodoAgentMainWindowMarker: NSViewRepresentable {
 final class MainWindowMarkerView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        window?.identifier = NSUserInterfaceItemIdentifier(TodoAgentMainWindow.identifier)
+        guard let window else { return }
+        window.identifier = NSUserInterfaceItemIdentifier(TodoAgentMainWindow.identifier)
+
+        let defaults = UserDefaults.standard
+        guard defaults.integer(forKey: TodoAgentMainWindowPlacement.appliedVersionKey)
+            < TodoAgentMainWindowPlacement.layoutVersion,
+            let visibleFrame = window.screen?.visibleFrame
+        else { return }
+
+        window.setContentSize(TodoAgentMainWindowPlacement.contentSize(for: visibleFrame))
+        window.center()
+        defaults.set(
+            TodoAgentMainWindowPlacement.layoutVersion,
+            forKey: TodoAgentMainWindowPlacement.appliedVersionKey
+        )
     }
 }

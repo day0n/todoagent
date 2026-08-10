@@ -44,10 +44,23 @@ pub struct Task {
     pub title: String,
     pub note: String,
     pub status: TaskStatus,
+    pub execution_date: Option<String>,
     pub due_date: Option<String>,
     pub completed_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskAttachment {
+    pub id: String,
+    pub task_id: String,
+    pub original_name: String,
+    pub size_bytes: i64,
+    pub mime_type: String,
+    pub relative_path: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -266,6 +279,7 @@ pub struct Bootstrap {
     pub revision: i64,
     pub lists: Vec<List>,
     pub tasks: Vec<Task>,
+    pub task_attachments: Vec<TaskAttachment>,
     pub runtimes: Vec<Runtime>,
     pub sessions: Vec<TaskSession>,
 }
@@ -485,16 +499,20 @@ pub struct CreateTaskInput {
     #[serde(default)]
     pub note: String,
     pub list_id: Option<String>,
+    pub execution_date: Option<String>,
     pub due_date: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct UpdateTaskInput {
     pub title: Option<String>,
     pub note: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub status: Option<TaskStatus>,
+    #[serde(default, deserialize_with = "deserialize_present_uuid_option")]
     pub list_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "deserialize_present_option")]
+    pub execution_date: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_present_option")]
     pub due_date: Option<Option<String>>,
 }
@@ -505,6 +523,23 @@ where
     T: Deserialize<'de>,
 {
     Option::<T>::deserialize(deserializer).map(Some)
+}
+
+fn deserialize_present_uuid_option<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    value
+        .map(|value| {
+            uuid::Uuid::parse_str(&value)
+                .map(|value| value.to_string())
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+        .map(Some)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

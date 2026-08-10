@@ -1,7 +1,7 @@
 # TodoAgent
 
 TodoAgent 是一款原生 macOS 待办与本地 Agent 工作台。任务、清单、对话和
-Runtime 状态都保存在本机；SwiftUI/AppKit 前端通过 stdin/stdout 上的 IPC v2
+Runtime 状态都保存在本机；SwiftUI/AppKit 前端通过 stdin/stdout 上的 IPC v3
 与随 App 打包的 Rust Engine 通信，不启动 Web 服务或本地 TCP 端口。
 
 ## 分支定位
@@ -13,27 +13,39 @@ Runtime 状态都保存在本机；SwiftUI/AppKit 前端通过 stdin/stdout 上�
 
 ## 当前能力
 
-- 管理任务、清单、截止日期、未完成/已完成状态和时间线。
-- 菜单栏入口显示今天的未完成任务。
-- 任务启动本地 Agent 后会绑定一个工作目录和一个长期逻辑 Session；每条消息启动
-  一轮 CLI，历史和供应商 Session ID 持久化到 SQLite。
+- 管理任务、清单、执行日期、截止日期、附件和未完成/已完成状态。
+- 时间线、总任务和自定义清单统一将未完成任务直接排在上方；已完成任务只在存在时
+  显示于下方“已完成”分组。未完成任务的截止日或执行日已经过去时，统一以红色
+  显示需要处理的日期和星期。
+- 任务卡支持原生右键菜单，可完成/重新打开、设置两个日期、移动清单、根据任务创建清单和安全删除；菜单打开期间任务卡保持选中阴影，清楚标示当前操作目标。
+- 时间线固定显示所选日期起连续四天，只按执行日期排期；每列的快速添加栏固定在
+  底部，任务较多时只滚动中间任务区。菜单栏显示今天全部任务。
+- 任务详情与本地 Session 按当前主窗口尺寸展示为紧凑双栏，窄窗自动切换上下布局，不再用接近全屏的固定 Sheet 遮住主界面。
+- 任务启动本地 Agent 后会先建立一个空的长期逻辑 Session，不会自动发送任务信息；
+  用户主动发送消息后才启动一轮 CLI，历史和供应商 Session ID 持久化到 SQLite，
+  较长的工具结果默认折叠并可点击展开。
 - 支持四个本地 Runtime：Codex、Claude Code、Cursor Agent、Kiro CLI。
   Runtime 由用户在设置中主动检测和验证；某个 Runtime 未安装或未登录不会影响
   其他 Runtime。
 - 内置 Gemini 任务助手：多会话、流式回复、取消、上下文压缩和崩溃恢复。
   助手只开放 `create_tasks`、`find_related`、`update_task`、`list_state`、
   `list_lists` 五个任务工具。
-- 助手可读取 UTF-8 `.txt` 和 `.md` 附件；第一版不支持图片、音频或其他多模态
-  附件。
+- 助手工具调用按实际 Turn 穿插在对应问答之间，不再集中堆到对话末尾；运行状态
+  使用静态文字与图标。右侧对话栏顶部只保留会话选择、“开始新对话”和“隐藏对话”，
+  会话记录使用栏内的 TodoAgent 风格下拉卡片，不再弹出覆盖顶部的系统菜单。
+- 主窗口首次以 1120×720 左右的居中中等尺寸出现；TodoAgent 始终按类似 Notion
+  的比例停靠在任务板右侧，窄窗或左右分屏时也保留任务区、左侧日历与导航。
+- 助手对话可读取 UTF-8 `.txt` 和 `.md` 附件；任务附件是独立的本地备忘，名称、
+  路径和内容都不会进入助手或本地 CLI Session。
 
 ## 架构
 
 ```text
 SwiftUI / AppKit
-       │  IPC v2 · NDJSON · stdin/stdout
+       │  IPC v3 · NDJSON · stdin/stdout
        ▼
 Rust Engine
-  ├─ SQLite v3：任务、Session、消息、事件和助手上下文
+  ├─ SQLite v4：任务双日期、任务附件、Session、消息、事件和助手上下文
   ├─ CLI adapters：Codex / Claude Code / Cursor Agent / Kiro CLI
   └─ Gemini Interactions API：store=false，持久化上下文仅保存在本机
 ```

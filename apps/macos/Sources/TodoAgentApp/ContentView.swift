@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var state: AppState
+    @State private var availableContentSize = TodoAgentMainWindowPlacement.preferredContentSize
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     init(state: AppState) {
@@ -13,110 +14,93 @@ struct ContentView: View {
     }
 
     var body: some View {
-        @Bindable var state = state
-
         NavigationSplitView {
             SidebarView(state: state)
                 .navigationSplitViewColumnWidth(
-                    min: 230,
+                    min: 210,
                     ideal: TodoAgentUI.sidebarIdealWidth,
                     max: TodoAgentUI.sidebarMaximumWidth
                 )
         } detail: {
-            ZStack(alignment: .bottomTrailing) {
-                BoardView(state: state)
+            GeometryReader { proxy in
+                let layout = MainWorkspaceLayoutPolicy.resolve(
+                    availableWidth: proxy.size.width,
+                    assistantRequested: state.inspectorPresented
+                )
 
-                if !state.inspectorPresented {
-                    AssistantFloatingButton {
-                        state.openAssistant()
+                switch layout {
+                case .boardOnly:
+                    boardWorkspace
+                case let .sideBySide(assistantWidth):
+                    HStack(spacing: 0) {
+                        boardWorkspace
+                        Divider()
+                        TodoAgentInspector(state: state)
+                            .frame(width: assistantWidth)
+                            .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
-                    .padding(.trailing, 22)
-                    .padding(.bottom, 24)
-                    .transition(
-                        .scale(scale: 0.88, anchor: .bottomTrailing)
-                            .combined(with: .opacity)
-                    )
                 }
             }
-            .background(TodoAgentUI.canvasBackground)
         }
         .navigationSplitViewStyle(.balanced)
         .tint(TodoAgentUI.primaryText)
-        .disabled(state.loadState == .loading)
-        .inspector(isPresented: $state.inspectorPresented) {
-            TodoAgentInspector(state: state) {
-                state.inspectorPresented = false
-            }
-                .inspectorColumnWidth(
-                    min: 380,
-                    ideal: TodoAgentUI.inspectorIdealWidth,
-                    max: 560
-                )
-        }
-        .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
-                Button {
-                    state.presentNewTask()
-                } label: {
-                    Label("新建任务", systemImage: "plus")
-                }
-                .help("新建任务 ⌘N")
-                .accessibilityIdentifier("toolbar.new-task")
-
-                Button {
-                    Task { await state.openNewAssistantConversation() }
-                } label: {
-                    Label("新建 TodoAgent 对话", systemImage: "plus.bubble")
-                }
-                .disabled(state.assistant.isManagingSession)
-                .help("新建 TodoAgent 对话 ⇧⌘O")
-                .accessibilityIdentifier("toolbar.new-assistant-session")
-
-                Button {
-                    state.toggleAssistant()
-                } label: {
-                    Label("TodoAgent", systemImage: "sidebar.right")
-                }
-                .help(state.inspectorPresented ? "收起 TodoAgent ⌥⌘I" : "打开 TodoAgent ⌥⌘I")
-                .accessibilityIdentifier("toolbar.todoagent")
-            }
-        }
+        .disabled(state.loadState == .loading || state.isPreparingToTerminate)
         .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: state.inspectorPresented)
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: ContentSizePreferenceKey.self,
+                    value: proxy.size
+                )
+            }
+        }
+        .onPreferenceChange(ContentSizePreferenceKey.self) { size in
+            guard size.width > 0, size.height > 0 else { return }
+            availableContentSize = size
+        }
         .task { await state.load() }
         .sheet(item: $state.presentedSheet) { destination in
-            sheet(destination)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewTask)) { _ in
-            state.presentNewTask()
+            sheet(destination, availableSize: availableContentSize)
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentToggleInspector)) { _ in
-            state.toggleAssistant()
+            Task { await state.toggleAssistant() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewAssistantConversation)) { _ in
             Task { await state.openNewAssistantConversation() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentCancelCurrent)) { _ in
-            state.presentedSheet = nil
+            if case .taskSession = state.presentedSheet {
+                NotificationCenter.default.post(name: .todoAgentRequestTaskSheetClose, object: nil)
+            } else {
+                state.presentedSheet = nil
+            }
         }
         .overlay {
-            switch state.loadState {
-            case .loading:
-                ProgressView("正在准备 TodoAgent…")
+            if state.isPreparingToTerminate {
+                ProgressView("正在保存任务并退出…")
                     .padding(18)
                     .background(.regularMaterial, in: .rect(cornerRadius: 12))
-            case let .failed(message):
-                ContentUnavailableView {
-                    Label("无法载入任务", systemImage: "exclamationmark.triangle")
-                } description: {
-                    Text(message)
-                } actions: {
-                    Button("重新载入") {
-                        Task { await state.load() }
+                    .accessibilityIdentifier("app.saving-before-quit")
+            } else {
+                switch state.loadState {
+                case .loading:
+                    ProgressView("正在准备 TodoAgent…")
+                        .padding(18)
+                        .background(.regularMaterial, in: .rect(cornerRadius: 12))
+                case let .failed(message):
+                    ContentUnavailableView {
+                        Label("无法载入任务", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(message)
+                    } actions: {
+                        Button("重新载入") {
+                            Task { await state.load() }
+                        }
+                        .accessibilityIdentifier("app.retry-load")
                     }
-                    .accessibilityIdentifier("app.retry-load")
+                case .loaded:
+                    EmptyView()
                 }
-            case .loaded:
-                EmptyView()
             }
         }
         .alert("操作未完成", isPresented: errorPresented) {
@@ -126,13 +110,34 @@ struct ContentView: View {
         }
     }
 
+    private var boardWorkspace: some View {
+        ZStack(alignment: .bottomTrailing) {
+            BoardView(state: state)
+
+            if !state.inspectorPresented {
+                AssistantFloatingButton {
+                    Task { await state.openAssistant() }
+                }
+                .padding(.trailing, 22)
+                .padding(.bottom, 24)
+                .transition(
+                    .scale(scale: 0.88, anchor: .bottomTrailing)
+                        .combined(with: .opacity)
+                )
+            }
+        }
+        .background(TodoAgentUI.canvasBackground)
+    }
+
     @ViewBuilder
-    private func sheet(_ destination: AppSheet) -> some View {
+    private func sheet(_ destination: AppSheet, availableSize: CGSize) -> some View {
         switch destination {
-        case .newTask:
-            NewTaskSheet(state: state, initialListID: state.pendingNewTaskListID)
         case let .taskSession(taskID):
-            TaskDestinationSheet(taskID: taskID, state: state)
+            TaskDestinationSheet(
+                taskID: taskID,
+                state: state,
+                availableSize: availableSize
+            )
         }
     }
 
@@ -140,6 +145,38 @@ struct ContentView: View {
         Binding(
             get: { state.errorMessage != nil },
             set: { if !$0 { state.errorMessage = nil } }
+        )
+    }
+}
+
+enum MainWorkspaceLayout: Equatable, Sendable {
+    case boardOnly
+    case sideBySide(assistantWidth: CGFloat)
+}
+
+enum MainWorkspaceLayoutPolicy {
+    static let assistantWidthFraction: CGFloat = 0.34
+    static let assistantMinimumWidth: CGFloat = 320
+    static let assistantMaximumWidth: CGFloat = 400
+    static let boardMinimumVisibleWidth: CGFloat = 220
+
+    static func resolve(
+        availableWidth: CGFloat,
+        assistantRequested: Bool
+    ) -> MainWorkspaceLayout {
+        guard assistantRequested else { return .boardOnly }
+
+        let proposed = min(
+            max(availableWidth * assistantWidthFraction, assistantMinimumWidth),
+            assistantMaximumWidth
+        )
+        let widthThatPreservesBoard = max(
+            availableWidth - boardMinimumVisibleWidth,
+            0
+        )
+
+        return .sideBySide(
+            assistantWidth: min(proposed, widthThatPreservesBoard)
         )
     }
 }
@@ -172,75 +209,18 @@ private struct AssistantFloatingButton: View {
     }
 }
 
-private struct NewTaskSheet: View {
-    let state: AppState
-    private let initialListID: UUID?
-    @Environment(\.dismiss) private var dismiss
-    @State private var title = ""
-    @State private var hasDueDate = true
-    @State private var dueDate = Date.now
-    @State private var isSaving = false
-
-    init(state: AppState, initialListID: UUID?) {
-        self.state = state
-        self.initialListID = initialListID
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text("新建任务")
-                .font(.title2.bold())
-
-            TextField("要完成什么？", text: $title)
-                .textFieldStyle(.roundedBorder)
-                .accessibilityIdentifier("task.title-field")
-
-            Toggle("设置日期", isOn: $hasDueDate)
-
-            if hasDueDate {
-                DatePicker("日期", selection: $dueDate, displayedComponents: .date)
-                    .datePickerStyle(.field)
-            }
-
-            HStack {
-                Spacer()
-                Button("取消", role: .cancel) { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button("添加") { save() }
-                    .keyboardShortcut(.return, modifiers: .command)
-                    .disabled(title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSaving)
-                    .accessibilityIdentifier("task.save")
-            }
-        }
-        .padding(24)
-        .frame(width: 440)
-    }
-
-    private func save() {
-        let value = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty, !isSaving else { return }
-        isSaving = true
-        Task {
-            if await state.createTask(
-                title: value,
-                listID: initialListID,
-                dueDate: hasDueDate ? dueDate : nil
-            ) {
-                dismiss()
-            } else {
-                isSaving = false
-            }
-        }
-    }
-}
-
 private struct TaskDestinationSheet: View {
     let taskID: UUID
     let state: AppState
+    let availableSize: CGSize
 
     var body: some View {
         if let task = state.task(id: taskID) {
-            TaskConversationSheet(task: task, state: state)
+            TaskConversationSheet(
+                task: task,
+                state: state,
+                availableSize: availableSize
+            )
         } else {
             ContentUnavailableView(
                 "任务已不存在",
@@ -248,6 +228,17 @@ private struct TaskDestinationSheet: View {
                 description: Text("关闭窗口后刷新任务列表。")
             )
             .frame(width: 420, height: 260)
+        }
+    }
+}
+
+private struct ContentSizePreferenceKey: PreferenceKey {
+    static let defaultValue = CGSize.zero
+
+    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+        let next = nextValue()
+        if next.width > 0, next.height > 0 {
+            value = next
         }
     }
 }
@@ -266,7 +257,19 @@ private actor EmptyPreviewRepository: AppRepository {
     func load() async throws -> AppSnapshot { snapshot }
     func sync() async throws -> AppSnapshot { snapshot }
     func events() async -> AsyncStream<EngineEvent> { AsyncStream { $0.finish() } }
-    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot { snapshot }
+    func createList(name: String, color: String) async throws -> AppSnapshot { snapshot }
+    func createTask(
+        title: String,
+        note: String,
+        listID: UUID?,
+        executionDate: LocalDay?,
+        dueDate: LocalDay?
+    ) async throws -> AppSnapshot { snapshot }
+    func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot { snapshot }
+    func deleteTask(taskID: UUID) async throws -> AppSnapshot { snapshot }
+    func createListFromTask(taskID: UUID) async throws -> AppSnapshot { snapshot }
+    func addTaskAttachments(taskID: UUID, sourcePaths: [String], clientMutationID: UUID) async throws -> AppSnapshot { snapshot }
+    func removeTaskAttachment(taskID: UUID, attachmentID: UUID, clientMutationID: UUID) async throws -> AppSnapshot { snapshot }
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot { snapshot }
     func detectRuntimes() async throws -> AppSnapshot { snapshot }
     func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot { snapshot }

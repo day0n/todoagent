@@ -8,7 +8,7 @@ license = "MIT"
 agent-client-protocol = "=2.0.0"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
-nix = { version = "0.30", features = ["signal", "process"] }
+nix = { version = "0.30", features = ["signal", "process", "fs"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

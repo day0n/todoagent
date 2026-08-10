@@ -5,7 +5,7 @@ import Testing
 @Suite("Native task and session state")
 @MainActor
 struct AppStateTests {
-    @Test("Gemini secret uses the IPC v2 field spelling")
+    @Test("Gemini secret uses the IPC v3 field spelling")
     func geminiSecretWireName() throws {
         let data = try JSONEncoder().encode(SecretRequest(geminiAPIKey: "test-secret"))
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: String])
@@ -20,15 +20,101 @@ struct AppStateTests {
         #expect(state.inspectorPresented == false)
     }
 
-    @Test("opening TodoAgent expands the inspector without creating a conversation")
-    func openingAssistantDoesNotCreateSession() async throws {
+    @Test("TodoAgent always docks beside the board at a Notion-like ratio")
+    func assistantWorkspaceAdaptsWithoutOverlayingSidebar() {
+        #expect(MainWorkspaceLayoutPolicy.resolve(
+            availableWidth: 640,
+            assistantRequested: false
+        ) == .boardOnly)
+
+        guard case let .sideBySide(assistantWidth) = MainWorkspaceLayoutPolicy.resolve(
+            availableWidth: 640,
+            assistantRequested: true
+        ) else {
+            Issue.record("窄窗口也应保留任务区并将 TodoAgent 停靠在右侧")
+            return
+        }
+        #expect(assistantWidth == 320)
+
+        guard case let .sideBySide(proportionalWidth) = MainWorkspaceLayoutPolicy.resolve(
+            availableWidth: 960,
+            assistantRequested: true
+        ) else {
+            Issue.record("常规宽度应继续保持右侧双栏")
+            return
+        }
+        #expect(abs(proportionalWidth - 326.4) < 0.001)
+
+        #expect(MainWorkspaceLayoutPolicy.resolve(
+            availableWidth: 1_340,
+            assistantRequested: true
+        ) == .sideBySide(assistantWidth: 400))
+
+        #expect(MainWorkspaceLayoutPolicy.resolve(
+            availableWidth: 500,
+            assistantRequested: true
+        ) == .sideBySide(assistantWidth: 280))
+    }
+
+    @Test("right-click menu keeps its task highlighted through nested submenus")
+    func taskContextMenuHighlightTracksMenuLifetime() {
+        var highlight = TaskContextHighlightState(pointerInside: true)
+
+        highlight.menuDidBeginTracking()
+        #expect(highlight.isHighlighted)
+        #expect(highlight.trackingDepth == 1)
+
+        highlight.pointerInside = false
+        highlight.menuDidBeginTracking()
+        highlight.menuDidEndTracking()
+        #expect(highlight.isHighlighted)
+        #expect(highlight.trackingDepth == 1)
+
+        highlight.menuDidEndTracking()
+        #expect(highlight.isHighlighted == false)
+        #expect(highlight.trackingDepth == 0)
+    }
+
+    @Test("first window placement stays medium sized on large and small displays")
+    func firstWindowPlacementCapsItsContentSize() {
+        #expect(TodoAgentMainWindowPlacement.contentSize(
+            for: CGRect(x: 0, y: 0, width: 2_048, height: 1_260)
+        ) == CGSize(width: 1_120, height: 720))
+
+        #expect(TodoAgentMainWindowPlacement.contentSize(
+            for: CGRect(x: 0, y: 0, width: 900, height: 650)
+        ) == CGSize(width: 760, height: 560))
+    }
+
+    @Test("opening TodoAgent creates and selects one default conversation")
+    func openingAssistantCreatesDefaultSession() async throws {
         let repository = AssistantTestRepository()
         let state = AppState(repository: repository)
+        await state.load()
 
-        state.openAssistant()
+        #expect(await state.openAssistant())
 
         #expect(state.inspectorPresented)
-        #expect(try await repository.assistantSessions(includeArchived: false).isEmpty)
+        let sessions = try await repository.assistantSessions(includeArchived: false)
+        let session = try #require(sessions.first)
+        #expect(sessions.count == 1)
+        #expect(state.assistant.selectedSessionID == session.id)
+
+        #expect(await state.openAssistant())
+        #expect(try await repository.assistantSessions(includeArchived: false).count == 1)
+    }
+
+    @Test("showing TodoAgent at launch also provisions one default conversation")
+    func visibleAssistantAtLaunchCreatesDefaultSession() async throws {
+        let repository = AssistantTestRepository()
+        let state = AppState(repository: repository, inspectorPresented: true)
+
+        await state.load()
+
+        let sessions = try await repository.assistantSessions(includeArchived: false)
+        let session = try #require(sessions.first)
+        #expect(sessions.count == 1)
+        #expect(state.assistant.selectedSessionID == session.id)
     }
 
     @Test("an unconfigured TodoAgent opens recovery without creating a conversation")
@@ -60,20 +146,42 @@ struct AppStateTests {
         #expect(state.assistant.selectedSessionID == session.id)
     }
 
-    @Test("the total tasks add row presents creation without forcing a list")
+    @Test("the total tasks composer creates without forcing a list")
     func totalTasksCreationHasNoListContext() async {
         let repository = TaskOpenSpyRepository(snapshot: emptySnapshot())
         let state = AppState(repository: repository)
+        await state.load()
         state.selection = .smart(.tasks)
 
-        state.presentNewTask()
+        #expect(await state.createTask(title: "收件箱任务"))
 
-        #expect(state.presentedSheet == .newTask)
-        #expect(state.pendingNewTaskListID == nil)
-        #expect(await repository.taskCreateCalls().isEmpty)
+        #expect(await repository.taskCreateCalls().first?.listID == nil)
     }
 
-    @Test("an empty user list still presents creation with that list context")
+    @Test("creating a list persists it and selects the new destination")
+    func creatingListSelectsIt() async throws {
+        let repository = TaskOpenSpyRepository(snapshot: emptySnapshot())
+        let state = AppState(repository: repository)
+        await state.load()
+
+        #expect(await state.createList(name: "  工作  "))
+
+        let list = try #require(state.lists.first)
+        #expect(list.name == "工作")
+        #expect(state.selection == .list(list.id))
+        #expect(await repository.listCreateNames() == ["工作"])
+    }
+
+    @Test("an empty list name is rejected before reaching the Engine")
+    func emptyListNameIsRejected() async {
+        let repository = TaskOpenSpyRepository(snapshot: emptySnapshot())
+        let state = AppState(repository: repository)
+
+        #expect(await state.createList(name: "  \n ") == false)
+        #expect(await repository.listCreateNames().isEmpty)
+    }
+
+    @Test("an empty user list creates with that list context")
     func emptyUserListCreationKeepsListContext() async {
         let listID = UUID(uuidString: "00000000-0000-4000-8000-000000000501")!
         let list = TodoList(id: listID, name: "空清单", colorName: "blue", repositoryPath: nil)
@@ -82,43 +190,18 @@ struct AppStateTests {
         await state.load()
         state.selection = .list(listID)
 
-        #expect(state.visibleTasks().isEmpty)
-        state.presentNewTask()
+        #expect(await state.createTask(title: "清单任务"))
 
-        #expect(state.presentedSheet == .newTask)
-        #expect(state.pendingNewTaskListID == listID)
-        #expect(await repository.taskCreateCalls().isEmpty)
+        #expect(await repository.taskCreateCalls().first?.listID == listID)
     }
 
-    @Test("repeating the same add entry only keeps one presentation and never creates a task")
-    func repeatedTaskPresentationHasNoRepositorySideEffect() async {
-        let listID = UUID(uuidString: "00000000-0000-4000-8000-000000000502")!
-        let repository = TaskOpenSpyRepository(snapshot: emptySnapshot())
-        let state = AppState(repository: repository)
-        state.selection = .list(listID)
-
-        state.presentNewTask()
-        let firstDestination = state.presentedSheet
-        state.presentNewTask()
-
-        #expect(firstDestination == .newTask)
-        #expect(state.presentedSheet == firstDestination)
-        #expect(state.pendingNewTaskListID == listID)
-        #expect(await repository.taskCreateCalls().isEmpty)
-    }
-
-    @Test("saving uses the list captured at presentation even after navigation changes")
+    @Test("explicit inline list context survives navigation changes")
     func taskCreationUsesCapturedListContext() async throws {
         let capturedListID = UUID(uuidString: "00000000-0000-4000-8000-000000000503")!
         let repository = TaskOpenSpyRepository(snapshot: emptySnapshot())
         let state = AppState(repository: repository)
-        state.selection = .list(capturedListID)
-        state.presentNewTask()
-        let capturedContext = try #require(state.pendingNewTaskListID)
-
         state.selection = .smart(.tasks)
-        #expect(state.pendingNewTaskListID == capturedListID)
-        #expect(await state.createTask(title: "保留原清单", listID: capturedContext, dueDate: nil))
+        #expect(await state.createTask(title: "保留原清单", listID: capturedListID))
 
         let calls = await repository.taskCreateCalls()
         let call = try #require(calls.first)
@@ -299,6 +382,27 @@ struct AppStateTests {
         #expect(session.providerEngine == "v2")
     }
 
+    @Test("starting a task Session stays empty until the user sends")
+    func taskSessionStartsWithoutAutomaticTurn() async throws {
+        let repository = DemoRepository()
+        let state = AppState(repository: repository)
+        await state.load()
+        let task = try #require(state.tasks.first)
+
+        #expect(await state.startSession(task, runtime: .codex, workspace: "/tmp/project"))
+
+        let created = try #require(try await repository.session(taskID: task.id))
+        #expect(created.messages.isEmpty)
+        #expect(created.activeTurn == nil)
+        #expect(created.session.state == .idle)
+        #expect(state.conversation(for: task)?.entries.isEmpty == true)
+
+        #expect(await state.sendToSession(task, text: "现在开始执行"))
+        let sent = try #require(try await repository.session(taskID: task.id))
+        #expect(sent.messages.map(\.body) == ["现在开始执行"])
+        #expect(state.conversation(for: task)?.entries.map(\.body) == ["现在开始执行"])
+    }
+
     @Test("composer sends into the bound logical session")
     func sessionMessage() async throws {
         let state = AppState(repository: DemoRepository())
@@ -354,7 +458,7 @@ struct AppStateTests {
     @Test("projection separates completion from active session state")
     func projectionCounts() {
         let now = Date(timeIntervalSince1970: 1_786_080_000)
-        let task = TaskItem(id: UUID(), listID: nil, title: "任务", note: "", status: .open, dueDate: now, completedAt: nil, createdAt: now, updatedAt: "")
+        let task = TaskItem(id: UUID(), listID: nil, title: "任务", note: "", status: .open, executionDate: LocalDay(now), dueDate: nil, completedAt: nil, createdAt: now, updatedAt: "")
         let projection = TaskProjection(tasks: [task], now: now)
         let session = TaskSessionDescriptor(id: UUID().uuidString, taskID: task.id, runtimeKind: .claude, workingDirectory: "/tmp", providerSessionID: nil, providerEngine: nil, state: .running, lastAgentSequence: 3, lastReadSequence: 2, lastErrorCode: nil, lastErrorMessage: nil, createdAt: "", updatedAt: "")
 
@@ -415,11 +519,12 @@ private struct TaskCreateCall: Equatable, Sendable {
 }
 
 private actor TaskOpenSpyRepository: AppRepository {
-    private let snapshot: AppSnapshot
+    private var snapshot: AppSnapshot
     private let sessionBundle: SessionBundle?
     private let delaysSessionLookup: Bool
     private let lookupFailure: AppRepositoryError?
     private var sessionLookups = 0
+    private var createdListNames: [String] = []
     private var taskCreations: [TaskCreateCall] = []
     private var sessionLookupWaiters: [CheckedContinuation<Void, Never>] = []
     private var delayedSessionLookup: CheckedContinuation<SessionBundle?, any Error>?
@@ -453,10 +558,48 @@ private actor TaskOpenSpyRepository: AppRepository {
     func load() async throws -> AppSnapshot { snapshot }
     func sync() async throws -> AppSnapshot { snapshot }
     func events() async -> AsyncStream<EngineEvent> { AsyncStream { $0.finish() } }
-    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot {
-        taskCreations.append(TaskCreateCall(title: title, listID: listID))
+    func createList(name: String, color: String) async throws -> AppSnapshot {
+        createdListNames.append(name)
+        snapshot.lists.append(
+            TodoList(id: UUID(), name: name, colorName: color, repositoryPath: nil)
+        )
+        snapshot.revision += 1
         return snapshot
     }
+    func createTask(title: String, note: String, listID: UUID?, executionDate: LocalDay?, dueDate: LocalDay?) async throws -> AppSnapshot {
+        taskCreations.append(TaskCreateCall(title: title, listID: listID))
+        snapshot.revision += 1
+        return snapshot
+    }
+    func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot {
+        if let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) {
+            snapshot.tasks[index].apply(patch)
+            snapshot.revision += 1
+        }
+        return snapshot
+    }
+    func deleteTask(taskID: UUID) async throws -> AppSnapshot {
+        snapshot.tasks.removeAll(where: { $0.id == taskID })
+        snapshot.revision += 1
+        return snapshot
+    }
+    func createListFromTask(taskID: UUID) async throws -> AppSnapshot {
+        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else {
+            throw AppRepositoryError.taskNotFound
+        }
+        let list = TodoList(
+            id: UUID(),
+            name: snapshot.tasks[index].title,
+            colorName: "blue",
+            repositoryPath: nil
+        )
+        snapshot.lists.append(list)
+        snapshot.tasks[index].listID = list.id
+        snapshot.revision += 1
+        return snapshot
+    }
+    func addTaskAttachments(taskID: UUID, sourcePaths: [String], clientMutationID: UUID) async throws -> AppSnapshot { snapshot }
+    func removeTaskAttachment(taskID: UUID, attachmentID: UUID, clientMutationID: UUID) async throws -> AppSnapshot { snapshot }
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot { snapshot }
     func detectRuntimes() async throws -> AppSnapshot { snapshot }
     func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot { snapshot }
@@ -521,6 +664,7 @@ private actor TaskOpenSpyRepository: AppRepository {
 
     func sessionLookupCount() -> Int { sessionLookups }
     func taskCreateCalls() -> [TaskCreateCall] { taskCreations }
+    func listCreateNames() -> [String] { createdListNames }
 
     func completeDelayedSessionLookup() {
         guard let delayedSessionLookup else { return }

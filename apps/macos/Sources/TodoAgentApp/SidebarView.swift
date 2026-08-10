@@ -2,6 +2,9 @@ import SwiftUI
 
 struct SidebarView: View {
     let state: AppState
+    @State private var isPresentingNewList = false
+    @State private var newListName = ""
+    @State private var isCreatingList = false
 
     var body: some View {
         @Bindable var state = state
@@ -34,14 +37,17 @@ struct SidebarView: View {
                         .accessibilityIdentifier("sidebar.list.\(list.id.uuidString)")
                     }
 
-                    Button {} label: {
+                    Button {
+                        newListName = ""
+                        isPresentingNewList = true
+                    } label: {
                         Label("新建清单", systemImage: "plus")
                     }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
-                        .disabled(true)
-                        .help("清单管理将在 Engine 接入后开放")
-                        .accessibilityHint("当前预览版本暂不可用")
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .disabled(isCreatingList)
+                    .help("新建清单")
+                    .accessibilityIdentifier("sidebar.new-list")
                 }
 
                 Section("状态") {
@@ -52,11 +58,27 @@ struct SidebarView: View {
             .listStyle(.sidebar)
             .scrollContentBackground(.hidden)
             .background(TodoAgentUI.sidebarBackground)
+            .padding(.top, TodoAgentUI.sidebarNavigationTopSpacing)
         }
         .background(TodoAgentUI.sidebarBackground)
         .navigationTitle("TodoAgent")
         .safeAreaInset(edge: .bottom, spacing: 0) {
             sidebarFooter
+        }
+        .alert("新建清单", isPresented: $isPresentingNewList) {
+            TextField("清单名称", text: $newListName)
+            Button("取消", role: .cancel) {}
+            Button("创建") {
+                let name = newListName
+                isCreatingList = true
+                Task { @MainActor in
+                    _ = await state.createList(name: name)
+                    isCreatingList = false
+                }
+            }
+            .disabled(newListName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        } message: {
+            Text("创建后会自动进入这个清单。")
         }
     }
 
@@ -136,7 +158,7 @@ private struct SidebarCalendar: View {
     @FocusState private var focusedDate: Date?
 
     private static let calendar: Calendar = {
-        var value = Calendar(identifier: .gregorian)
+        var value = Calendar.todoAgentLocal
         value.locale = Locale(identifier: "zh_CN")
         value.firstWeekday = 2
         return value

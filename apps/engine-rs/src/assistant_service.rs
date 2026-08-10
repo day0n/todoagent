@@ -280,7 +280,7 @@ impl AssistantService {
         title: &str,
     ) -> Result<AssistantSessionView, AssistantServiceError> {
         validate_characters(title, 120, "title")?;
-        let session_id = session_id.to_owned();
+        let session_id = canonical_assistant_uuid(session_id, "sessionId")?;
         let title = title.to_owned();
         let session = self
             .store
@@ -295,7 +295,7 @@ impl AssistantService {
         &self,
         session_id: &str,
     ) -> Result<AssistantSessionView, AssistantServiceError> {
-        let persisted_session_id = session_id.to_owned();
+        let persisted_session_id = canonical_assistant_uuid(session_id, "sessionId")?;
         let session = self
             .store
             .call(move |store| store.archive_assistant_session(&persisted_session_id))
@@ -316,7 +316,8 @@ impl AssistantService {
                 "afterSequence must not be negative".to_owned(),
             ));
         }
-        self.bundle(session_id, after_sequence, limit).await
+        let session_id = canonical_assistant_uuid(session_id, "sessionId")?;
+        self.bundle(&session_id, after_sequence, limit).await
     }
 
     pub async fn send(
@@ -340,8 +341,9 @@ impl AssistantService {
                 message: "请先在设置中保存并测试 Gemini API Key。".to_owned(),
             });
         }
-        let session_id = params.session_id.clone();
-        let client_message_id = params.client_message_id.clone();
+        let session_id = canonical_assistant_uuid(&params.session_id, "sessionId")?;
+        let client_message_id =
+            canonical_assistant_uuid(&params.client_message_id, "clientMessageId")?;
         let visible_user_text = if user_text.is_empty() {
             "请处理这些附件".to_owned()
         } else {
@@ -355,12 +357,13 @@ impl AssistantService {
         let model = params.model.trim().to_owned();
         let persisted_user_text = visible_user_text.clone();
         let persisted_payload_json = payload_json.clone();
+        let persisted_session_id = session_id.clone();
         let queued = self
             .store
             .call(move |store| {
                 if let Some(payload_json) = persisted_payload_json.as_deref() {
                     store.begin_assistant_turn_with_payload(
-                        &session_id,
+                        &persisted_session_id,
                         &client_message_id,
                         &persisted_user_text,
                         Some(payload_json),
@@ -369,7 +372,7 @@ impl AssistantService {
                     )
                 } else {
                     store.begin_assistant_turn(
-                        &session_id,
+                        &persisted_session_id,
                         &client_message_id,
                         &persisted_user_text,
                         None,
@@ -386,7 +389,7 @@ impl AssistantService {
         {
             let title = first_characters(&visible_user_text, 30);
             if !title.is_empty() {
-                let session_id = params.session_id.clone();
+                let session_id = session_id.clone();
                 if let Ok(renamed) = self
                     .store
                     .call(move |store| store.rename_assistant_session(&session_id, &title))
@@ -409,7 +412,8 @@ impl AssistantService {
     }
 
     pub async fn cancel_turn(&self, session_id: &str) -> Result<(), AssistantServiceError> {
-        let active = self.active.lock().await.get(session_id).cloned().ok_or(
+        let session_id = canonical_assistant_uuid(session_id, "sessionId")?;
+        let active = self.active.lock().await.get(&session_id).cloned().ok_or(
             AssistantServiceError::Conflict("assistant_session_not_running"),
         )?;
         active.cancellation.cancel();
@@ -1133,7 +1137,9 @@ impl AssistantHost for EngineAssistantHost {
                     StoreWorkerError::Store(StoreError::Invalid(_) | StoreError::NotFound) => {
                         ToolErrorKind::InvalidArguments
                     }
-                    StoreWorkerError::Store(StoreError::Conflict(_) | StoreError::Sql(_))
+                    StoreWorkerError::Store(
+                        StoreError::Conflict(_) | StoreError::Sql(_) | StoreError::Io(_),
+                    )
                     | StoreWorkerError::Closed
                     | StoreWorkerError::ResponseCancelled
                     | StoreWorkerError::Spawn(_)
@@ -1544,14 +1550,14 @@ fn compaction_prompt(request: &CompactionRequest) -> String {
     let previous = request.previous_summary.as_deref().unwrap_or("无");
     let history = serde_json::to_string(&request.turns_to_summarize).unwrap_or_default();
     format!(
-        "请把下面的旧摘要与对话步骤更新成一份独立可用的累计摘要。\n\n旧摘要：\n{previous}\n\n新增历史：\n{history}\n\n摘要必须保留：用户偏好、明确决定、任务标题/状态/日期/清单、工具结果、未完成问题。"
+        "请把下面的旧摘要与对话步骤更新成一份独立可用的累计摘要。\n\n旧摘要：\n{previous}\n\n新增历史：\n{history}\n\n摘要必须保留：用户偏好、明确决定、任务标题/状态/执行日期 executionDate/截止日期 dueDate/清单、工具结果、未完成问题。执行日期与截止日期必须分别保留，不得合并或互相推断。"
     )
 }
 
 fn assistant_system_instruction() -> String {
     let today = Local::now().format("%Y-%m-%d");
     format!(
-        "你是 TodoAgent 的本地任务助手。今天是 {today}。你只管理 TodoAgent 里的任务卡，不启动 Codex、Claude、Cursor 或 Kiro，不运行命令，不读写用户文件。\n\n规则：\n1. 创建任务前，语义可能重复时先调用 find_related。\n2. 一句话包含多件事时拆成多张卡；标题简短，细节放 note。\n3. 需要清单 ID 时调用 list_lists，不猜测 ID；用户未指定清单时不要擅自指定。\n4. 只有用户明确要求时才创建或修改任务。用户明确提到日期才填写 dueDate；相对日期以今天 {today} 为基准，未提日期就不要编造。\n5. 用户询问任务现状时必须调用 list_state，并只根据工具结果回答，不编造状态。\n6. 工具报错时先纠正参数；不要声称未成功的修改已经完成。\n7. 回复简洁、自然，并准确引用已经创建或修改的任务。"
+        "你是 TodoAgent 的本地任务助手。今天是 {today}。你只管理 TodoAgent 里的任务卡，不启动 Codex、Claude、Cursor 或 Kiro，不运行命令，不读写用户文件。\n\n规则：\n1. 创建任务前，语义可能重复时先调用 find_related。\n2. 一句话包含多件事时拆成多张卡；标题简短，细节放 note。\n3. 需要清单 ID 时调用 list_lists，不猜测 ID；用户未指定清单时不要擅自指定。\n4. 只有用户明确要求时才创建或修改任务。‘执行’、‘安排’、‘今天做’、‘放到时间线’以及没有截止语义的裸日期映射为 executionDate；‘截止’、‘到期’、‘最晚’映射为 dueDate。相对日期以今天 {today} 为基准，未提日期就不要编造；两个日期不得互相推断或自动复制。\n5. 用户询问任务现状时必须调用 list_state，并只根据工具结果回答，不编造状态；查询某天任务时传 executionDate。过滤查询返回 pagination：只要 hasMore=true，就必须保持 executionDate/status/listId 完全不变并把 nextCursor 原样传入 cursor，持续查询到 hasMore=false 后再回答。如果工具返回 list_state_cursor_stale，说明分页期间任务已变化，必须丢弃已收集的页面并从不带 cursor 的第一页重新查询。\n6. 工具报错时先纠正参数；不要声称未成功的修改已经完成。\n7. 回复简洁、自然，并准确引用已经创建或修改的任务。任务附件的名称、内容和路径不属于工具或上下文，不要询问或推断。"
     )
 }
 
@@ -1568,9 +1574,10 @@ fn assistant_tools() -> Vec<ToolDefinition> {
                         "items":{
                             "type":"object",
                             "properties":{
-                                "title":{"type":"string","maxLength":120},
+                                "title":{"type":"string","maxLength":500},
                                 "note":{"type":"string","maxLength":4000},
                                 "listId":{"type":"string"},
+                                "executionDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
                                 "dueDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
                             },
                             "required":["title"],"additionalProperties":false
@@ -1591,14 +1598,15 @@ fn assistant_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "update_task",
-            "修改一个现有任务的标题、备注、清单或截止日期；不改变完成状态。dueDate 传空字符串可清除截止日期。",
+            "修改一个现有任务的标题、备注、清单、执行日期或截止日期；不改变完成状态。日期传空字符串可清除对应日期，两种日期不得互相推断。",
             json!({
                 "type":"object",
                 "properties":{
                     "taskId":{"type":"string"},
-                    "title":{"type":"string","maxLength":120},
+                    "title":{"type":"string","maxLength":500},
                     "note":{"type":"string","maxLength":4000},
                     "listId":{"type":"string"},
+                    "executionDate":{"type":"string","maxLength":10,"description":"YYYY-MM-DD；空字符串表示清除执行日期"},
                     "dueDate":{"type":"string","maxLength":10,"description":"YYYY-MM-DD；空字符串表示清除截止日期"}
                 },
                 "required":["taskId"],"additionalProperties":false
@@ -1606,8 +1614,31 @@ fn assistant_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "list_state",
-            "读取未完成/已完成任务摘要、运行中的本地 Session 与未读 Agent 消息摘要。",
-            json!({"type":"object","properties":{},"additionalProperties":false}),
+            "读取未完成/已完成任务摘要、运行中的本地 Session 与未读 Agent 消息摘要。按执行日期、状态或清单过滤时使用快照游标分页；pagination.hasMore 为 true 时保持过滤条件不变，并把 nextCursor 原样传入 cursor，直到 hasMore 为 false。若返回 list_state_cursor_stale，丢弃旧页面并从第一页重新查询。",
+            json!({
+                "type":"object",
+                "properties":{
+                    "executionDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+                    "status":{"type":"string","enum":["open","completed"]},
+                    "listId":{"type":"string"},
+                    "pageSize":{"type":"integer","minimum":1,"maximum":50},
+                    "cursor":{
+                        "type":"object",
+                        "properties":{
+                            "taskRevision":{"type":"integer","minimum":0},
+                            "status":{"type":"string","enum":["open","completed"]},
+                            "updatedAt":{"type":"string"},
+                            "taskId":{"type":"string"},
+                            "filterExecutionDate":{"type":"string"},
+                            "filterStatus":{"type":"string","enum":["open","completed"]},
+                            "filterListId":{"type":"string"}
+                        },
+                        "required":["taskRevision","status","updatedAt","taskId"],
+                        "additionalProperties":false
+                    }
+                },
+                "additionalProperties":false
+            }),
         ),
         ToolDefinition::function(
             "list_lists",
@@ -1717,6 +1748,12 @@ fn assistant_user_model_text(body: &str, payload_json: Option<&str>) -> String {
     model_text
 }
 
+fn canonical_assistant_uuid(value: &str, field: &str) -> Result<String, AssistantServiceError> {
+    uuid::Uuid::parse_str(value)
+        .map(|value| value.to_string())
+        .map_err(|_| AssistantServiceError::Invalid(format!("{field} must be a UUID")))
+}
+
 fn validate_characters(
     value: &str,
     maximum: usize,
@@ -1757,6 +1794,7 @@ fn host_store_error(error: StoreWorkerError) -> HostError {
         StoreWorkerError::Store(StoreError::Conflict(code)) => code,
         StoreWorkerError::Store(StoreError::Invalid(_)) => "invalid_data",
         StoreWorkerError::Store(StoreError::Sql(_)) => "database_error",
+        StoreWorkerError::Store(StoreError::Io(_)) => "filesystem_error",
         StoreWorkerError::Closed
         | StoreWorkerError::ResponseCancelled
         | StoreWorkerError::Spawn(_)
@@ -1823,9 +1861,49 @@ mod tests {
         assert!(properties.contains_key("title"));
         assert!(properties.contains_key("note"));
         assert!(properties.contains_key("listId"));
+        assert_eq!(properties["executionDate"]["type"], "string");
         assert_eq!(properties["dueDate"]["type"], "string");
         assert!(!properties.contains_key("update"));
         assert_eq!(update.parameters["additionalProperties"], false);
+    }
+
+    #[test]
+    fn task_date_prompt_and_tools_keep_execution_and_deadline_semantics_distinct() {
+        let instruction = assistant_system_instruction();
+        assert!(instruction.contains("放到时间线"));
+        assert!(instruction.contains("executionDate"));
+        assert!(instruction.contains("最晚"));
+        assert!(instruction.contains("dueDate"));
+        assert!(instruction.contains("不得互相推断或自动复制"));
+
+        let tools = assistant_tools();
+        let create = tools
+            .iter()
+            .find(|tool| tool.name == "create_tasks")
+            .unwrap();
+        let item = &create.parameters["properties"]["tasks"]["items"]["properties"];
+        assert!(item["executionDate"].is_object());
+        assert!(item["dueDate"].is_object());
+        let list_state = tools.iter().find(|tool| tool.name == "list_state").unwrap();
+        let filters = &list_state.parameters["properties"];
+        assert!(filters["executionDate"].is_object());
+        assert!(filters["status"].is_object());
+        assert!(filters["listId"].is_object());
+        assert!(filters["pageSize"].is_object());
+        assert!(filters["cursor"].is_object());
+        assert!(filters["cursor"]["properties"]["taskRevision"].is_object());
+        assert!(instruction.contains("hasMore=true"));
+        assert!(instruction.contains("nextCursor"));
+        assert!(instruction.contains("list_state_cursor_stale"));
+
+        let compact = compaction_prompt(&CompactionRequest {
+            previous_summary: None,
+            turns_to_summarize: Vec::new(),
+            turns_to_keep: Vec::new(),
+            target_tokens: 0,
+        });
+        assert!(compact.contains("执行日期 executionDate"));
+        assert!(compact.contains("截止日期 dueDate"));
     }
 
     #[test]
@@ -2153,19 +2231,27 @@ mod tests {
         let worker = StoreWorker::open(&directory.path().join("active.sqlite3")).unwrap();
         let (writer, _receiver) = std::sync::mpsc::sync_channel(16);
         let service = AssistantService::new(worker.clone(), writer, Arc::new(Mutex::new(None)));
+        let session_id = uuid::Uuid::new_v4().to_string();
         let next = CancellationToken::new();
         service.active.lock().await.insert(
-            "session".to_owned(),
+            session_id.clone(),
             ActiveAssistantTurn {
                 turn_id: "next-turn".to_owned(),
                 cancellation: next.clone(),
             },
         );
 
-        assert!(!service.remove_active_if_turn("session", "old-turn").await);
-        service.cancel_turn("session").await.unwrap();
+        assert!(!service.remove_active_if_turn(&session_id, "old-turn").await);
+        service
+            .cancel_turn(&session_id.to_uppercase())
+            .await
+            .unwrap();
         assert!(next.is_cancelled());
-        assert!(service.remove_active_if_turn("session", "next-turn").await);
+        assert!(
+            service
+                .remove_active_if_turn(&session_id, "next-turn")
+                .await
+        );
 
         worker.shutdown().await.unwrap();
     }

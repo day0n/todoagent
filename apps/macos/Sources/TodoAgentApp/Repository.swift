@@ -5,7 +5,27 @@ protocol AppRepository: Sendable {
     func load() async throws -> AppSnapshot
     func sync() async throws -> AppSnapshot
     func events() async -> AsyncStream<EngineEvent>
-    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot
+    func createList(name: String, color: String) async throws -> AppSnapshot
+    func createTask(
+        title: String,
+        note: String,
+        listID: UUID?,
+        executionDate: LocalDay?,
+        dueDate: LocalDay?
+    ) async throws -> AppSnapshot
+    func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot
+    func deleteTask(taskID: UUID) async throws -> AppSnapshot
+    func createListFromTask(taskID: UUID) async throws -> AppSnapshot
+    func addTaskAttachments(
+        taskID: UUID,
+        sourcePaths: [String],
+        clientMutationID: UUID
+    ) async throws -> AppSnapshot
+    func removeTaskAttachment(
+        taskID: UUID,
+        attachmentID: UUID,
+        clientMutationID: UUID
+    ) async throws -> AppSnapshot
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot
     func detectRuntimes() async throws -> AppSnapshot
     func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot
@@ -54,7 +74,7 @@ actor DemoRepository: AppRepository {
         snapshot = AppSnapshot(
             revision: 1,
             lists: [TodoList(id: listID, name: "TodoAgent", colorName: "blue", repositoryPath: "~/Desktop/todoagent")],
-            tasks: [TaskItem(id: taskID, listID: listID, title: "接通真实本地 Agent", note: "选择 Runtime 与目录后进入完整 Session", status: .open, dueDate: Calendar.current.startOfDay(for: now), completedAt: nil, createdAt: now, updatedAt: ISO8601DateFormatter().string(from: now))],
+            tasks: [TaskItem(id: taskID, listID: listID, title: "接通真实本地 Agent", note: "选择 Runtime 与目录后进入完整 Session", status: .open, executionDate: LocalDay(now), dueDate: nil, completedAt: nil, createdAt: now, updatedAt: ISO8601DateFormatter().string(from: now))],
             runtimes: RuntimeKind.allCases.map { RuntimeInfo(kind: $0, launchPath: nil, resolvedPath: nil, version: "preview", status: .ready, authStatus: "ready", capabilities: [:], providerEngine: $0 == .kiro ? "v2" : nil, detectedAt: nil, verifiedAt: nil, verifyError: nil) },
             sessions: [],
             messages: []
@@ -89,17 +109,107 @@ actor DemoRepository: AppRepository {
     func sync() async throws -> AppSnapshot { snapshot }
     func events() async -> AsyncStream<EngineEvent> { AsyncStream { $0.finish() } }
 
-    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot {
-        snapshot.tasks.insert(TaskItem(id: UUID(), listID: listID, title: title, note: note, status: .open, dueDate: dueDate, completedAt: nil, createdAt: .now, updatedAt: ISO8601DateFormatter().string(from: .now)), at: 0)
+    func createList(name: String, color: String) async throws -> AppSnapshot {
+        snapshot.lists.append(
+            TodoList(id: UUID(), name: name, colorName: color, repositoryPath: nil)
+        )
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func createTask(
+        title: String,
+        note: String,
+        listID: UUID?,
+        executionDate: LocalDay?,
+        dueDate: LocalDay?
+    ) async throws -> AppSnapshot {
+        snapshot.tasks.insert(TaskItem(id: UUID(), listID: listID, title: title, note: note, status: .open, executionDate: executionDate, dueDate: dueDate, completedAt: nil, createdAt: .now, updatedAt: ISO8601DateFormatter().string(from: .now)), at: 0)
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot {
+        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else {
+            throw AppRepositoryError.taskNotFound
+        }
+        snapshot.tasks[index].apply(patch)
+        snapshot.tasks[index].updatedAt = ISO8601DateFormatter().string(from: .now)
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func deleteTask(taskID: UUID) async throws -> AppSnapshot {
+        guard snapshot.tasks.contains(where: { $0.id == taskID }) else {
+            throw AppRepositoryError.taskNotFound
+        }
+        snapshot.tasks.removeAll(where: { $0.id == taskID })
+        snapshot.sessions.removeAll(where: { $0.taskID == taskID })
+        bundles[taskID] = nil
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func createListFromTask(taskID: UUID) async throws -> AppSnapshot {
+        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else {
+            throw AppRepositoryError.taskNotFound
+        }
+        let list = TodoList(
+            id: UUID(),
+            name: snapshot.tasks[index].title,
+            colorName: "blue",
+            repositoryPath: nil
+        )
+        snapshot.lists.append(list)
+        snapshot.tasks[index].listID = list.id
+        snapshot.tasks[index].updatedAt = ISO8601DateFormatter().string(from: .now)
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func addTaskAttachments(
+        taskID: UUID,
+        sourcePaths: [String],
+        clientMutationID _: UUID
+    ) async throws -> AppSnapshot {
+        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else {
+            throw AppRepositoryError.taskNotFound
+        }
+        let timestamp = ISO8601DateFormatter().string(from: .now)
+        snapshot.tasks[index].attachments.append(contentsOf: sourcePaths.map { sourcePath in
+            let url = URL(fileURLWithPath: sourcePath)
+            return TaskAttachment(
+                id: UUID(),
+                taskID: taskID,
+                originalName: url.lastPathComponent,
+                sizeBytes: 0,
+                mimeType: "application/octet-stream",
+                relativePath: "Attachments/\(UUID().uuidString)-\(url.lastPathComponent)",
+                createdAt: timestamp
+            )
+        })
+        snapshot.revision += 1
+        return snapshot
+    }
+
+    func removeTaskAttachment(
+        taskID: UUID,
+        attachmentID: UUID,
+        clientMutationID _: UUID
+    ) async throws -> AppSnapshot {
+        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else {
+            throw AppRepositoryError.taskNotFound
+        }
+        snapshot.tasks[index].attachments.removeAll(where: { $0.id == attachmentID })
         snapshot.revision += 1
         return snapshot
     }
 
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot {
-        guard let index = snapshot.tasks.firstIndex(where: { $0.id == taskID }) else { throw AppRepositoryError.taskNotFound }
-        snapshot.tasks[index].status = completed ? .completed : .open
-        snapshot.revision += 1
-        return snapshot
+        try await updateTask(
+            taskID: taskID,
+            patch: TaskPatch(status: completed ? .completed : .open)
+        )
     }
 
     func detectRuntimes() async throws -> AppSnapshot { snapshot }

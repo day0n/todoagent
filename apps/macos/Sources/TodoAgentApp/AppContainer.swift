@@ -37,7 +37,13 @@ private actor FailedRepository: AppRepository {
     func load() async throws -> AppSnapshot { throw failure }
     func sync() async throws -> AppSnapshot { throw failure }
     func events() async -> AsyncStream<EngineEvent> { AsyncStream { $0.finish() } }
-    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot { throw failure }
+    func createList(name: String, color: String) async throws -> AppSnapshot { throw failure }
+    func createTask(title: String, note: String, listID: UUID?, executionDate: LocalDay?, dueDate: LocalDay?) async throws -> AppSnapshot { throw failure }
+    func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot { throw failure }
+    func deleteTask(taskID: UUID) async throws -> AppSnapshot { throw failure }
+    func createListFromTask(taskID: UUID) async throws -> AppSnapshot { throw failure }
+    func addTaskAttachments(taskID: UUID, sourcePaths: [String], clientMutationID: UUID) async throws -> AppSnapshot { throw failure }
+    func removeTaskAttachment(taskID: UUID, attachmentID: UUID, clientMutationID: UUID) async throws -> AppSnapshot { throw failure }
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot { throw failure }
     func detectRuntimes() async throws -> AppSnapshot { throw failure }
     func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot { throw failure }
@@ -63,10 +69,25 @@ private actor FailedRepository: AppRepository {
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var terminationTask: Task<Void, Never>?
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        Task {
-            await AppContainer.shared.state.shutdown()
-            sender.reply(toApplicationShouldTerminate: true)
+        guard terminationTask == nil else { return .terminateLater }
+
+        terminationTask = Task { @MainActor [weak self] in
+            let canTerminate = await AppContainer.shared.state.shutdown()
+            self?.terminationTask = nil
+            sender.reply(toApplicationShouldTerminate: canTerminate)
+
+            if !canTerminate {
+                NSApp.activate(ignoringOtherApps: true)
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "任务修改尚未保存"
+                alert.informativeText = "TodoAgent 已取消退出并保留当前草稿。请返回任务详情重试保存，然后再次退出。"
+                alert.addButton(withTitle: "返回任务")
+                alert.runModal()
+            }
         }
         return .terminateLater
     }

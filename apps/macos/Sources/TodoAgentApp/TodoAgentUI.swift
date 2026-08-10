@@ -58,6 +58,7 @@ enum TodoAgentUI {
     static let sectionSpacing: CGFloat = 14
 
     static let sidebarFooterGradientHeight: CGFloat = 64
+    static let sidebarNavigationTopSpacing: CGFloat = 8
     static let floatingButtonSize: CGFloat = 46
     static let composerRadius: CGFloat = 16
 

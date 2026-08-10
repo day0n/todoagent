@@ -9,7 +9,8 @@ mod store_worker;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,10 +18,10 @@ use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
 use adapters::{ProviderEvent, TurnOutcome, TurnRequest};
-use models::{MessageRole, QueuedTurn, RuntimeKind, TurnStatus};
+use models::{MessageRole, QueuedTurn, RuntimeKind, TaskAttachment, TurnStatus, UpdateTaskInput};
 use protocol::{Request, Response};
-use serde::Deserialize;
 use serde::Serialize;
+use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
 use store::StoreError;
 use store_worker::{StoreWorker, StoreWorkerError};
@@ -32,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+const MAX_TASK_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Clone)]
 struct Engine {
@@ -42,6 +44,7 @@ struct Engine {
     authorized_directories: Arc<Mutex<HashSet<PathBuf>>>,
     gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
     assistant: assistant_service::AssistantService,
+    data_directory: Arc<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -78,19 +81,51 @@ struct CreateListParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct CreateTaskParams {
     title: String,
     #[serde(default)]
     note: String,
+    #[serde(default, deserialize_with = "deserialize_optional_canonical_uuid")]
     list_id: Option<String>,
+    execution_date: Option<String>,
     due_date: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct TaskIDParams {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UpdateTaskParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     task_id: String,
+    patch: UpdateTaskInput,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TaskIDParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    task_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AddTaskAttachmentsParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    task_id: String,
+    source_paths: Vec<String>,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    client_mutation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RemoveTaskAttachmentParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    task_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    attachment_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    client_mutation_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -103,28 +138,32 @@ struct VerifyRuntimeParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateSessionParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     task_id: String,
     runtime_kind: String,
     working_directory: String,
-    client_message_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionIDParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     session_id: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SessionLookupParams {
+    #[serde(default, deserialize_with = "deserialize_optional_canonical_uuid")]
     session_id: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_canonical_uuid")]
     task_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionHistoryParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     session_id: String,
     #[serde(default)]
     after_sequence: i64,
@@ -135,7 +174,9 @@ struct SessionHistoryParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SendSessionParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     session_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     client_message_id: String,
     text: String,
 }
@@ -143,6 +184,7 @@ struct SendSessionParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MarkReadParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
     session_id: String,
     through_sequence: i64,
 }
@@ -219,7 +261,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let paths = prepare_directories()?;
     init_logging(&paths.logs);
     let database_path = paths.data.join("todoagent.sqlite3");
+    let attachments_path = paths.data.join("Attachments");
+    store::prepare_database_files(&database_path, &attachments_path)?;
+    secure_directory(&attachments_path)?;
     let store = StoreWorker::open(&database_path)?;
+    let recovery_attachments = attachments_path.clone();
+    store
+        .call(move |store| store.reconcile_task_attachment_files(&recovery_attachments))
+        .await?;
     fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600))?;
     let (writer_tx, writer_rx) = sync_channel::<Value>(512);
     let writer_thread = std::thread::spawn(move || -> io::Result<()> {
@@ -250,6 +299,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         authorized_directories: Arc::new(Mutex::new(HashSet::new())),
         gemini_key,
         assistant,
+        data_directory: Arc::new(paths.data),
     };
     engine.send(&protocol::handshake()).await;
 
@@ -322,21 +372,31 @@ impl Engine {
             }
             "task.create" => {
                 let params: CreateTaskParams = parse(&request.params)?;
-                validate_text(&params.title, 500, "title")?;
-                let task = self
+                let snapshot = self
                     .store
                     .call(move |store| {
                         store.create_task(
                             &params.title,
                             &params.note,
                             params.list_id.as_deref(),
+                            params.execution_date.as_deref(),
                             params.due_date.as_deref(),
-                        )
+                        )?;
+                        store.bootstrap()
                     })
                     .await?;
-                let snapshot = self.store.call(|store| store.bootstrap()).await?;
-                self.emit("task.changed", snapshot).await;
-                to_value(task)
+                self.publish_task_snapshot(snapshot).await
+            }
+            "task.update" => {
+                let params: UpdateTaskParams = parse(&request.params)?;
+                let snapshot = self
+                    .store
+                    .call(move |store| {
+                        store.update_task(&params.task_id, &params.patch)?;
+                        store.bootstrap()
+                    })
+                    .await?;
+                self.publish_task_snapshot(snapshot).await
             }
             "task.complete" | "task.reopen" => {
                 let params: TaskIDParams = parse(&request.params)?;
@@ -346,26 +406,48 @@ impl Engine {
                     models::TaskStatus::Open
                 };
                 let task_id = params.task_id;
-                let task = self
+                let snapshot = self
                     .store
-                    .call(move |store| store.set_task_status(&task_id, status))
+                    .call(move |store| {
+                        store.set_task_status(&task_id, status)?;
+                        store.bootstrap()
+                    })
                     .await?;
-                let snapshot = self.store.call(|store| store.bootstrap()).await?;
-                self.emit("task.changed", snapshot).await;
-                to_value(task)
+                self.publish_task_snapshot(snapshot).await
+            }
+            "task.create_list" => {
+                let params: TaskIDParams = parse(&request.params)?;
+                let task_id = params.task_id;
+                let snapshot = self
+                    .store
+                    .call(move |store| {
+                        store.create_list_from_task(&task_id)?;
+                        store.bootstrap()
+                    })
+                    .await?;
+                self.publish_task_snapshot(snapshot).await
+            }
+            "task.delete" => {
+                let params: TaskIDParams = parse(&request.params)?;
+                let snapshot = self.delete_task(params.task_id).await?;
+                self.publish_task_snapshot(snapshot).await
+            }
+            "task.attachment.add" => {
+                let params: AddTaskAttachmentsParams = parse(&request.params)?;
+                let snapshot = self.add_task_attachments(params).await?;
+                self.publish_task_snapshot(snapshot).await
+            }
+            "task.attachment.remove" => {
+                let params: RemoveTaskAttachmentParams = parse(&request.params)?;
+                let snapshot = self.remove_task_attachment(params).await?;
+                self.publish_task_snapshot(snapshot).await
             }
             "runtime.list" => to_value(self.store.call(|store| store.runtimes()).await?),
             "runtime.detect" => {
                 let candidates = runtime::detect_all();
                 let persisted = self
                     .store
-                    .call(move |store| {
-                        let mut persisted = Vec::with_capacity(candidates.len());
-                        for runtime in &candidates {
-                            persisted.push(store.save_detected_runtime(runtime)?);
-                        }
-                        Ok(persisted)
-                    })
+                    .call(move |store| store.save_detected_runtimes(&candidates))
                     .await?;
                 self.emit("runtime.changed", &persisted).await;
                 to_value(persisted)
@@ -467,43 +549,34 @@ impl Engine {
                 {
                     return Err(EngineError::Conflict("workspace_not_authorized"));
                 }
-                let runtime = self.ready_runtime(kind).await?;
-                let executable = runtime
-                    .resolved_path
-                    .or(runtime.launch_path)
-                    .ok_or(EngineError::Runtime("runtime_missing"))?;
-                let task_id = params.task_id.clone();
-                let task = self
-                    .store
-                    .call(move |store| store.task(&task_id)?.ok_or(StoreError::NotFound))
-                    .await?;
-                let prompt = if task.note.trim().is_empty() {
-                    task.title
-                } else {
-                    format!("{}\n\n{}", task.title, task.note)
-                };
                 let working_directory = directory.display().to_string();
-                let queued = self
+                let task_id = params.task_id;
+                let prepare_task_id = task_id.clone();
+                let prepare_directory = working_directory.clone();
+                let replayed = self
                     .store
                     .call(move |store| {
-                        store.create_session(
-                            &params.task_id,
-                            kind,
-                            &working_directory,
-                            &params.client_message_id,
-                            &prompt,
-                        )
+                        store.prepare_session_create(&prepare_task_id, kind, &prepare_directory)
                     })
                     .await?;
-                let queued_session_id = queued.session.id.clone();
+                let session = if let Some(session) = replayed {
+                    session
+                } else {
+                    let runtime = self.ready_runtime(kind).await?;
+                    let _executable = runtime
+                        .resolved_path
+                        .or(runtime.launch_path)
+                        .ok_or(EngineError::Runtime("runtime_missing"))?;
+                    self.store
+                        .call(move |store| store.create_session(&task_id, kind, &working_directory))
+                        .await?
+                };
+                let session_id = session.id.clone();
                 let bundle = self
                     .store
-                    .call(move |store| store.session_bundle(&queued_session_id, 0, 500))
+                    .call(move |store| store.session_bundle(&session_id, 0, 500))
                     .await?;
                 self.emit("session.created", &bundle).await;
-                if queued.is_new {
-                    self.schedule(queued, executable).await;
-                }
                 to_value(bundle)
             }
             "session.get" => {
@@ -1086,6 +1159,196 @@ impl Engine {
         remove_matching_cli_turn(&mut turns, session_id, turn_id)
     }
 
+    async fn publish_task_snapshot(
+        &self,
+        snapshot: models::Bootstrap,
+    ) -> Result<Value, EngineError> {
+        let result = to_value(&snapshot)?;
+        self.emit("task.changed", &snapshot).await;
+        Ok(result)
+    }
+
+    async fn add_task_attachments(
+        &self,
+        params: AddTaskAttachmentsParams,
+    ) -> Result<models::Bootstrap, EngineError> {
+        let task_id = params.task_id;
+        let source_paths = params.source_paths;
+        let client_mutation_id = params.client_mutation_id;
+        let prepare_task_id = task_id.clone();
+        let prepare_source_paths = source_paths.clone();
+        let prepare_mutation_id = client_mutation_id.clone();
+        let replay_snapshot = self
+            .store
+            .call(move |store| {
+                if store.prepare_add_task_attachment_mutation(
+                    &prepare_task_id,
+                    &prepare_mutation_id,
+                    &prepare_source_paths,
+                )? {
+                    Ok(Some(store.bootstrap()?))
+                } else {
+                    Ok(None)
+                }
+            })
+            .await?;
+        if let Some(snapshot) = replay_snapshot {
+            return Ok(snapshot);
+        }
+
+        let staging_directory = self.data_directory.as_ref().clone();
+        let staging_task_id = task_id.clone();
+        let staging_source_paths = source_paths.clone();
+        let (staged, managed_paths) = tokio::task::spawn_blocking(move || {
+            stage_task_attachment_batch(&staging_directory, &staging_task_id, &staging_source_paths)
+        })
+        .await
+        .map_err(|error| {
+            EngineError::Io(io::Error::other(format!(
+                "task attachment staging worker failed: {error}"
+            )))
+        })??;
+
+        let outcome = match self
+            .store
+            .call(move |store| {
+                store.add_task_attachments_idempotent(
+                    &task_id,
+                    &client_mutation_id,
+                    &source_paths,
+                    &staged,
+                )
+            })
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                cleanup_files(&managed_paths);
+                return Err(error.into());
+            }
+        };
+        if outcome == store::AttachmentMutationOutcome::Replayed {
+            cleanup_files(&managed_paths);
+        }
+        Ok(self.store.call(|store| store.bootstrap()).await?)
+    }
+
+    async fn remove_task_attachment(
+        &self,
+        params: RemoveTaskAttachmentParams,
+    ) -> Result<models::Bootstrap, EngineError> {
+        let task_id = params.task_id;
+        let attachment_id = params.attachment_id;
+        let client_mutation_id = params.client_mutation_id;
+        let prepare_task_id = task_id.clone();
+        let prepare_attachment_id = attachment_id.clone();
+        let prepare_mutation_id = client_mutation_id.clone();
+        let preparation = self
+            .store
+            .call(move |store| {
+                store.prepare_remove_task_attachment_mutation(
+                    &prepare_task_id,
+                    &prepare_attachment_id,
+                    &prepare_mutation_id,
+                )
+            })
+            .await?;
+        let attachment = match preparation {
+            store::RemoveTaskAttachmentPreparation::Pending(attachment) => attachment,
+            store::RemoveTaskAttachmentPreparation::Replayed => {
+                return Ok(self.store.call(|store| store.bootstrap()).await?);
+            }
+        };
+        let managed_path =
+            managed_attachment_path(&self.data_directory, &attachment.relative_path)?;
+        let quarantine = self
+            .data_directory
+            .join("Attachments")
+            .join(format!(".removing-{}", attachment.id));
+        let moved = if managed_path.exists() {
+            fs::rename(&managed_path, &quarantine)?;
+            true
+        } else {
+            false
+        };
+
+        if let Err(error) = self
+            .store
+            .call(move |store| {
+                store.remove_task_attachment_idempotent(
+                    &task_id,
+                    &attachment_id,
+                    &client_mutation_id,
+                )
+            })
+            .await
+        {
+            if moved {
+                let _ = fs::rename(&quarantine, &managed_path);
+            }
+            return Err(error.into());
+        }
+        if moved {
+            if let Err(error) = fs::remove_file(&quarantine) {
+                tracing::warn!("failed to remove detached managed attachment: {error}");
+            }
+        }
+        Ok(self.store.call(|store| store.bootstrap()).await?)
+    }
+
+    async fn delete_task(&self, task_id: String) -> Result<models::Bootstrap, EngineError> {
+        let prepare_task_id = task_id.clone();
+        let attachments = self
+            .store
+            .call(move |store| store.prepare_delete_task(&prepare_task_id))
+            .await?;
+        let mut final_paths = Vec::with_capacity(attachments.len());
+        let mut quarantine_paths = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let final_path =
+                managed_attachment_path(&self.data_directory, attachment.relative_path.as_str())?;
+            let quarantine = self
+                .data_directory
+                .join("Attachments")
+                .join(format!(".removing-{}", attachment.id));
+            let prepared = match prepare_managed_attachment_deletion(&final_path, &quarantine) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    cleanup_files(&quarantine_paths);
+                    return Err(error);
+                }
+            };
+            if let Some(path) = prepared.0 {
+                final_paths.push(path);
+            }
+            if let Some(path) = prepared.1 {
+                quarantine_paths.push(path);
+            }
+        }
+
+        let delete_task_id = task_id.clone();
+        if let Err(error) = self
+            .store
+            .call(move |store| store.delete_task(&delete_task_id))
+            .await
+        {
+            // Every final path still exists because preparation used hard links,
+            // so a database failure cannot leave attachment metadata dangling.
+            cleanup_files(&quarantine_paths);
+            return Err(error.into());
+        }
+        for path in final_paths.iter().chain(quarantine_paths.iter()) {
+            if let Err(error) = fs::remove_file(path)
+                && error.kind() != io::ErrorKind::NotFound
+            {
+                // The DB no longer references the file. Startup reconciliation
+                // will safely remove any final or quarantine orphan left behind.
+                tracing::warn!(path = %path.display(), "failed to clean deleted task attachment: {error}");
+            }
+        }
+        Ok(self.store.call(|store| store.bootstrap()).await?)
+    }
+
     async fn shutdown(&self) {
         self.assistant.shutdown().await;
         *self.gemini_key.lock().await = None;
@@ -1111,6 +1374,275 @@ impl Engine {
             let _ = self.writer.send(value);
         }
     }
+}
+
+fn stage_task_attachment_batch(
+    data_directory: &Path,
+    task_id: &str,
+    source_paths: &[String],
+) -> Result<(Vec<TaskAttachment>, Vec<PathBuf>), EngineError> {
+    let mut staged = Vec::with_capacity(source_paths.len());
+    let mut managed_paths = Vec::with_capacity(source_paths.len());
+    for source in source_paths {
+        match stage_task_attachment(data_directory, task_id, Path::new(source)) {
+            Ok((attachment, managed_path)) => {
+                staged.push(attachment);
+                managed_paths.push(managed_path);
+            }
+            Err(error) => {
+                cleanup_files(&managed_paths);
+                return Err(error);
+            }
+        }
+    }
+    Ok((staged, managed_paths))
+}
+
+fn stage_task_attachment(
+    data_directory: &Path,
+    task_id: &str,
+    source: &Path,
+) -> Result<(TaskAttachment, PathBuf), EngineError> {
+    secure_directory(data_directory)?;
+    secure_directory(&data_directory.join("Attachments"))?;
+    if !source.is_absolute() {
+        return Err(EngineError::Invalid(
+            "task attachment source paths must be absolute".to_owned(),
+        ));
+    }
+    let source_file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(source)
+    {
+        Ok(file) => file,
+        Err(error) if error.raw_os_error() == Some(nix::libc::ELOOP) => {
+            return Err(EngineError::Invalid(
+                "task attachments must not be symbolic links".to_owned(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = source_file.metadata()?;
+    if !metadata.is_file() {
+        return Err(EngineError::Invalid(
+            "task attachments must be regular files".to_owned(),
+        ));
+    }
+    if metadata.len() > MAX_TASK_ATTACHMENT_BYTES {
+        return Err(EngineError::Invalid(
+            "task attachment exceeds the 100 MiB limit".to_owned(),
+        ));
+    }
+    let original_name = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| EngineError::Invalid("attachment name is invalid".to_owned()))?
+        .to_owned();
+    let id = uuid::Uuid::new_v4().to_string();
+    let safe_extension = source
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .filter(|extension| {
+            !extension.is_empty()
+                && extension.len() <= 16
+                && extension
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric())
+        })
+        .map(str::to_ascii_lowercase);
+    let managed_name = safe_extension
+        .as_deref()
+        .map_or_else(|| id.clone(), |extension| format!("{id}.{extension}"));
+    let relative_path = format!("Attachments/{managed_name}");
+    let managed_path = managed_attachment_path(data_directory, &relative_path)?;
+    let staging_path = data_directory
+        .join("Attachments")
+        .join(format!(".staging-{id}"));
+    let mut staging_file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&staging_path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            let _ = fs::remove_file(&staging_path);
+            return Err(error.into());
+        }
+    };
+    let copied = match io::copy(
+        &mut source_file.take(MAX_TASK_ATTACHMENT_BYTES + 1),
+        &mut staging_file,
+    ) {
+        Ok(copied) => copied,
+        Err(error) => {
+            let _ = fs::remove_file(&staging_path);
+            return Err(error.into());
+        }
+    };
+    if copied > MAX_TASK_ATTACHMENT_BYTES || copied != metadata.len() {
+        drop(staging_file);
+        let _ = fs::remove_file(&staging_path);
+        return Err(EngineError::Invalid(
+            "task attachment changed while it was copied".to_owned(),
+        ));
+    }
+    if let Err(error) = staging_file.sync_all() {
+        drop(staging_file);
+        let _ = fs::remove_file(&staging_path);
+        return Err(error.into());
+    }
+    drop(staging_file);
+    if let Err(error) = fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o600)) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error.into());
+    }
+    if let Err(error) = fs::rename(&staging_path, &managed_path) {
+        let _ = fs::remove_file(&staging_path);
+        return Err(error.into());
+    }
+    Ok((
+        TaskAttachment {
+            id,
+            task_id: task_id.to_owned(),
+            original_name,
+            size_bytes: i64::try_from(metadata.len())
+                .map_err(|_| EngineError::Invalid("task attachment size is invalid".to_owned()))?,
+            mime_type: mime_type_for_path(source).to_owned(),
+            relative_path,
+            created_at: chrono::Utc::now().to_rfc3339(),
+        },
+        managed_path,
+    ))
+}
+
+fn managed_attachment_path(data_directory: &Path, relative: &str) -> Result<PathBuf, EngineError> {
+    let relative_path = Path::new(relative);
+    let mut components = relative_path.components();
+    let valid = matches!(components.next(), Some(std::path::Component::Normal(name)) if name == "Attachments")
+        && matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none();
+    if !valid {
+        return Err(EngineError::Invalid(
+            "managed attachment path is invalid".to_owned(),
+        ));
+    }
+    Ok(data_directory.join(relative_path))
+}
+
+fn mime_type_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("txt") => "text/plain",
+        Some("md" | "markdown") => "text/markdown",
+        Some("json") => "application/json",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("csv") => "text/csv",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+fn cleanup_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Prepares one managed attachment for a cascading task delete without ever
+/// removing the path SQLite currently references. A previous failed cleanup may
+/// leave the quarantine name behind; regular final files replace that stale name
+/// with a fresh hard link, while a quarantine-only regular file is reused and
+/// linked back to the final path before proceeding.
+fn prepare_managed_attachment_deletion(
+    final_path: &Path,
+    quarantine: &Path,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), EngineError> {
+    let final_metadata = match fs::symlink_metadata(final_path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let quarantine_metadata = match fs::symlink_metadata(quarantine) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    if final_metadata.is_none()
+        && quarantine_metadata
+            .as_ref()
+            .is_some_and(fs::Metadata::is_file)
+    {
+        fs::hard_link(quarantine, final_path)?;
+        return Ok((Some(final_path.to_owned()), Some(quarantine.to_owned())));
+    }
+
+    if final_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.file_type().is_symlink())
+    {
+        if quarantine_metadata
+            .as_ref()
+            .is_some_and(fs::Metadata::is_file)
+        {
+            return Err(EngineError::Invalid(
+                "managed task attachment recovery is required".to_owned(),
+            ));
+        }
+        if let Some(metadata) = quarantine_metadata {
+            if metadata.file_type().is_symlink() {
+                fs::remove_file(quarantine)?;
+            } else {
+                return Err(EngineError::Invalid(
+                    "managed task attachment quarantine must be a file".to_owned(),
+                ));
+            }
+        }
+        // The link itself is untrusted and is removed only after the database
+        // commits; its external target is never opened or followed.
+        return Ok((Some(final_path.to_owned()), None));
+    }
+
+    let Some(final_metadata) = final_metadata else {
+        if let Some(metadata) = quarantine_metadata {
+            if metadata.file_type().is_symlink() {
+                fs::remove_file(quarantine)?;
+            } else {
+                return Err(EngineError::Invalid(
+                    "managed task attachment quarantine must be a file".to_owned(),
+                ));
+            }
+        }
+        return Ok((None, None));
+    };
+    if !final_metadata.is_file() {
+        return Err(EngineError::Invalid(
+            "managed task attachment must be a regular file".to_owned(),
+        ));
+    }
+    if let Some(metadata) = quarantine_metadata {
+        if metadata.is_file() || metadata.file_type().is_symlink() {
+            fs::remove_file(quarantine)?;
+        } else {
+            return Err(EngineError::Invalid(
+                "managed task attachment quarantine must be a file".to_owned(),
+            ));
+        }
+    }
+    fs::hard_link(final_path, quarantine)?;
+    Ok((Some(final_path.to_owned()), Some(quarantine.to_owned())))
 }
 
 fn remove_matching_cli_turn(
@@ -1206,6 +1738,29 @@ fn parse<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, EngineError> 
     serde_json::from_value(value.clone()).map_err(|error| EngineError::Invalid(error.to_string()))
 }
 
+fn deserialize_canonical_uuid<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    uuid::Uuid::parse_str(&value)
+        .map(|value| value.to_string())
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_optional_canonical_uuid<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)?
+        .map(|value| {
+            uuid::Uuid::parse_str(&value)
+                .map(|value| value.to_string())
+                .map_err(serde::de::Error::custom)
+        })
+        .transpose()
+}
+
 fn validate_text(value: &str, maximum: usize, name: &str) -> Result<(), EngineError> {
     if value.trim().is_empty() || value.chars().count() > maximum {
         return Err(EngineError::Invalid(format!(
@@ -1262,7 +1817,17 @@ fn prepare_directories() -> io::Result<Paths> {
 
 fn secure_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_DIRECTORY | nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)?;
+    if !directory.metadata()?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "private data root must be a real directory",
+        ));
+    }
+    directory.set_permissions(fs::Permissions::from_mode(0o700))
 }
 
 fn init_logging(logs: &Path) {
@@ -1276,6 +1841,7 @@ fn init_logging(logs: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
     use uuid::Uuid;
 
     fn test_runtime(kind: RuntimeKind, status: &str) -> models::Runtime {
@@ -1301,6 +1867,7 @@ mod tests {
     fn test_engine(
         store: StoreWorker,
         concurrency: usize,
+        data_directory: PathBuf,
     ) -> (Engine, std::sync::mpsc::Receiver<Value>) {
         let (writer, receiver) = sync_channel(512);
         let gemini_key = Arc::new(Mutex::new(None));
@@ -1318,6 +1885,7 @@ mod tests {
                 authorized_directories: Arc::new(Mutex::new(HashSet::new())),
                 gemini_key,
                 assistant,
+                data_directory: Arc::new(data_directory),
             },
             receiver,
         )
@@ -1329,17 +1897,388 @@ mod tests {
     }
 
     #[test]
+    fn task_attachment_staging_copies_uniquely_and_rejects_unsafe_sources() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let first_parent = directory.path().join("first");
+        let second_parent = directory.path().join("second");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        fs::create_dir_all(&first_parent).unwrap();
+        fs::create_dir_all(&second_parent).unwrap();
+        let first = first_parent.join("brief.PDF");
+        let second = second_parent.join("brief.PDF");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&second, b"second").unwrap();
+
+        let (first_attachment, first_managed) =
+            stage_task_attachment(&data, "task-1", &first).unwrap();
+        let (second_attachment, second_managed) =
+            stage_task_attachment(&data, "task-1", &second).unwrap();
+
+        assert_ne!(
+            first_attachment.relative_path,
+            second_attachment.relative_path
+        );
+        assert!(first_attachment.relative_path.ends_with(".pdf"));
+        assert_eq!(fs::read(first_managed).unwrap(), b"first");
+        assert_eq!(fs::read(second_managed).unwrap(), b"second");
+        assert_eq!(first_attachment.original_name, "brief.PDF");
+        assert_eq!(first_attachment.mime_type, "application/pdf");
+
+        let relative_error = stage_task_attachment(&data, "task-1", Path::new("brief.PDF"));
+        assert!(matches!(relative_error, Err(EngineError::Invalid(_))));
+        let directory_error = stage_task_attachment(&data, "task-1", &first_parent);
+        assert!(matches!(directory_error, Err(EngineError::Invalid(_))));
+        let link = directory.path().join("brief-link.pdf");
+        symlink(&first, &link).unwrap();
+        let link_error = stage_task_attachment(&data, "task-1", &link);
+        assert!(matches!(link_error, Err(EngineError::Invalid(_))));
+
+        let oversized = directory.path().join("oversized.bin");
+        let file = fs::File::create(&oversized).unwrap();
+        file.set_len(MAX_TASK_ATTACHMENT_BYTES + 1).unwrap();
+        let size_error = stage_task_attachment(&data, "task-1", &oversized);
+        assert!(matches!(size_error, Err(EngineError::Invalid(_))));
+        assert!(
+            fs::read_dir(data.join("Attachments"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".staging-"))
+        );
+    }
+
+    #[test]
+    fn private_data_and_attachment_roots_reject_symlinks_without_touching_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = directory.path().join("external");
+        fs::create_dir_all(&external).unwrap();
+        let sentinel = external.join("sentinel.txt");
+        fs::write(&sentinel, b"keep").unwrap();
+        let data_link = directory.path().join("data-link");
+        symlink(&external, &data_link).unwrap();
+
+        assert!(secure_directory(&data_link).is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        symlink(&external, data.join("Attachments")).unwrap();
+        let source = directory.path().join("source.txt");
+        fs::write(&source, b"source").unwrap();
+
+        let result = stage_task_attachment(&data, &Uuid::new_v4().to_string(), &source);
+        assert!(result.is_err());
+        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
+        assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attachment_batch_rolls_back_files_and_rows_when_a_later_source_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| store.create_task("批量附件", "", None, None, None))
+            .await
+            .unwrap();
+        let (engine, _receiver) = test_engine(worker.clone(), 0, data.clone());
+        let first = directory.path().join("first.txt");
+        fs::write(&first, b"first").unwrap();
+        let missing = directory.path().join("missing.txt");
+
+        let result = engine
+            .add_task_attachments(AddTaskAttachmentsParams {
+                task_id: task.id,
+                source_paths: vec![
+                    first.to_string_lossy().into_owned(),
+                    missing.to_string_lossy().into_owned(),
+                ],
+                client_mutation_id: Uuid::new_v4().to_string(),
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            worker
+                .call(|store| store.bootstrap())
+                .await
+                .unwrap()
+                .task_attachments
+                .is_empty()
+        );
+        assert_eq!(fs::read_dir(data.join("Attachments")).unwrap().count(), 0);
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attachment_ipc_replays_committed_mutations_without_duplicate_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| store.create_task("附件重放", "", None, None, None))
+            .await
+            .unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data.clone());
+        let source = directory.path().join("retry.txt");
+        fs::write(&source, b"first copy").unwrap();
+        let source_path = source.to_string_lossy().into_owned();
+        let add_mutation_id = Uuid::new_v4().to_string();
+        let add_params = json!({
+            "taskId":task.id.to_uppercase(),
+            "sourcePaths":[source_path],
+            "clientMutationId":add_mutation_id.to_uppercase(),
+        });
+
+        let first_add = engine
+            .handle(Request {
+                id: "attachment-add-first".to_owned(),
+                method: "task.attachment.add".to_owned(),
+                params: add_params.clone(),
+            })
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap()["data"],
+            first_add
+        );
+        let first_revision = first_add["revision"].as_i64().unwrap();
+        let attachment_id = first_add["taskAttachments"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let relative_path = first_add["taskAttachments"][0]["relativePath"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        fs::remove_file(&source).unwrap();
+
+        worker
+            .call(|store| store.create_task("推进快照", "", None, None, None))
+            .await
+            .unwrap();
+        let replayed_add = engine
+            .handle(Request {
+                id: "attachment-add-replay".to_owned(),
+                method: "task.attachment.add".to_owned(),
+                params: add_params.clone(),
+            })
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap()["data"],
+            replayed_add
+        );
+        assert!(replayed_add["revision"].as_i64().unwrap() > first_revision);
+        assert_eq!(replayed_add["taskAttachments"].as_array().unwrap().len(), 1);
+        assert!(data.join(&relative_path).exists());
+        assert_eq!(fs::read_dir(data.join("Attachments")).unwrap().count(), 1);
+
+        let conflicting_add = engine
+            .handle(Request {
+                id: "attachment-add-conflict".to_owned(),
+                method: "task.attachment.add".to_owned(),
+                params: json!({
+                    "taskId":task.id,
+                    "sourcePaths":[directory.path().join("different.txt")],
+                    "clientMutationId":add_mutation_id,
+                }),
+            })
+            .await;
+        assert_eq!(
+            conflicting_add.error.unwrap().code,
+            "attachment_mutation_conflict"
+        );
+
+        let remove_mutation_id = Uuid::new_v4().to_string();
+        let remove_params = json!({
+            "taskId":task.id,
+            "attachmentId":attachment_id,
+            "clientMutationId":remove_mutation_id.to_uppercase(),
+        });
+        let first_remove = engine
+            .handle(Request {
+                id: "attachment-remove-first".to_owned(),
+                method: "task.attachment.remove".to_owned(),
+                params: remove_params.clone(),
+            })
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap()["data"],
+            first_remove
+        );
+        let remove_revision = first_remove["revision"].as_i64().unwrap();
+        assert!(!data.join(&relative_path).exists());
+
+        let replayed_remove = engine
+            .handle(Request {
+                id: "attachment-remove-replay".to_owned(),
+                method: "task.attachment.remove".to_owned(),
+                params: remove_params.clone(),
+            })
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap()["data"],
+            replayed_remove
+        );
+        assert_eq!(replayed_remove["revision"], remove_revision);
+
+        let new_key_missing = engine
+            .handle(Request {
+                id: "attachment-remove-new-key".to_owned(),
+                method: "task.attachment.remove".to_owned(),
+                params: json!({
+                    "taskId":task.id,
+                    "attachmentId":attachment_id,
+                    "clientMutationId":Uuid::new_v4().to_string(),
+                }),
+            })
+            .await;
+        assert_eq!(new_key_missing.error.unwrap().code, "not_found");
+
+        let missing_key = engine
+            .handle(Request {
+                id: "attachment-add-missing-key".to_owned(),
+                method: "task.attachment.add".to_owned(),
+                params: json!({"taskId":task.id,"sourcePaths":["/tmp/missing"]}),
+            })
+            .await;
+        assert_eq!(missing_key.error.unwrap().code, "invalid_params");
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attachment_batch_rolls_back_files_when_database_transaction_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let database = data.join("todoagent.sqlite3");
+        let worker = StoreWorker::open(&database).unwrap();
+        let task = worker
+            .call(|store| store.create_task("数据库回滚", "", None, None, None))
+            .await
+            .unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_bad_attachment
+                 BEFORE INSERT ON task_attachment
+                 WHEN NEW.original_name = 'bad.txt'
+                 BEGIN SELECT RAISE(ABORT, 'injected attachment failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+        let (engine, _receiver) = test_engine(worker.clone(), 0, data.clone());
+        let first = directory.path().join("first.txt");
+        let bad = directory.path().join("bad.txt");
+        fs::write(&first, b"first").unwrap();
+        fs::write(&bad, b"bad").unwrap();
+
+        let result = engine
+            .add_task_attachments(AddTaskAttachmentsParams {
+                task_id: task.id,
+                source_paths: vec![
+                    first.to_string_lossy().into_owned(),
+                    bad.to_string_lossy().into_owned(),
+                ],
+                client_mutation_id: Uuid::new_v4().to_string(),
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert!(
+            worker
+                .call(|store| store.bootstrap())
+                .await
+                .unwrap()
+                .task_attachments
+                .is_empty()
+        );
+        assert_eq!(fs::read_dir(data.join("Attachments")).unwrap().count(), 0);
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn attachment_staging_does_not_block_the_async_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| store.create_task("异步附件", "", None, None, None))
+            .await
+            .unwrap();
+        let (engine, _receiver) = test_engine(worker.clone(), 0, data);
+        let fifo = directory.path().join("blocked-source");
+        nix::unistd::mkfifo(
+            &fifo,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .unwrap();
+        let writer_fifo = fifo.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(1));
+            fs::OpenOptions::new()
+                .write(true)
+                .open(writer_fifo)
+                .unwrap()
+        });
+        let staging_engine = engine.clone();
+        let staging = tokio::spawn(async move {
+            staging_engine
+                .add_task_attachments(AddTaskAttachmentsParams {
+                    task_id: task.id,
+                    source_paths: vec![fifo.to_string_lossy().into_owned()],
+                    client_mutation_id: Uuid::new_v4().to_string(),
+                })
+                .await
+        });
+        let started = std::time::Instant::now();
+
+        sleep(Duration::from_millis(50)).await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "attachment copy blocked the current-thread Tokio runtime"
+        );
+        assert!(staging.await.unwrap().is_err());
+        drop(writer.join().unwrap());
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[test]
     fn client_message_ids_are_uuid_shaped() {
         assert!(Uuid::parse_str(&Uuid::new_v4().to_string()).is_ok());
     }
 
     #[test]
     fn session_lookup_requires_protocol_camel_case_ids() {
-        let task: SessionLookupParams = parse(&json!({"taskId":"task-1"})).unwrap();
-        assert_eq!(task.task_id.as_deref(), Some("task-1"));
+        let task_id = Uuid::new_v4().to_string();
+        let task: SessionLookupParams = parse(&json!({"taskId":task_id.to_uppercase()})).unwrap();
+        assert_eq!(task.task_id.as_deref(), Some(task_id.as_str()));
         assert!(task.session_id.is_none());
 
-        let error = parse::<SessionLookupParams>(&json!({"taskID":"task-1"})).unwrap_err();
+        let error =
+            parse::<SessionLookupParams>(&json!({"taskID":task_id.to_uppercase()})).unwrap_err();
         assert!(error.to_string().contains("unknown field `taskID`"));
     }
 
@@ -1369,11 +2308,262 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn task_mutations_return_and_emit_the_same_authoritative_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data.clone());
+        let list = worker
+            .call(|store| store.create_list("大写 UUID", "blue", None))
+            .await
+            .unwrap();
+
+        let created = engine
+            .handle(Request {
+                id: "create-task".to_owned(),
+                method: "task.create".to_owned(),
+                params: json!({
+                    "title":"八月十日执行",
+                    "listId":list.id.to_uppercase(),
+                    "executionDate":"2026-08-10",
+                    "dueDate":"2026-08-12"
+                }),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "task.changed");
+        assert_eq!(event["data"], created);
+        assert_eq!(created["tasks"][0]["executionDate"], "2026-08-10");
+        assert_eq!(created["tasks"][0]["dueDate"], "2026-08-12");
+        assert_eq!(created["tasks"][0]["listId"], list.id);
+        let task_id = created["tasks"][0]["id"].as_str().unwrap().to_owned();
+        let uppercase_task_id = task_id.to_uppercase();
+
+        let updated = engine
+            .handle(Request {
+                id: "update-task".to_owned(),
+                method: "task.update".to_owned(),
+                params: json!({
+                    "taskId":uppercase_task_id.clone(),
+                    "patch":{"executionDate":"2026-08-11","dueDate":null}
+                }),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["data"], updated);
+        assert_eq!(updated["tasks"][0]["executionDate"], "2026-08-11");
+        assert!(updated["tasks"][0]["dueDate"].is_null());
+
+        let completed = engine
+            .handle(Request {
+                id: "complete-task".to_owned(),
+                method: "task.complete".to_owned(),
+                params: json!({"taskId":uppercase_task_id.clone()}),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["data"], completed);
+        assert_eq!(completed["tasks"][0]["status"], "completed");
+
+        let reopened = engine
+            .handle(Request {
+                id: "reopen-task".to_owned(),
+                method: "task.reopen".to_owned(),
+                params: json!({"taskId":uppercase_task_id.clone()}),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["data"], reopened);
+        assert_eq!(reopened["tasks"][0]["status"], "open");
+
+        let source = directory.path().join("brief.txt");
+        fs::write(&source, b"memo").unwrap();
+        let with_attachment = engine
+            .handle(Request {
+                id: "add-attachment".to_owned(),
+                method: "task.attachment.add".to_owned(),
+                params: json!({
+                    "taskId":uppercase_task_id.clone(),
+                    "sourcePaths":[source],
+                    "clientMutationId":Uuid::new_v4().to_string().to_uppercase()
+                }),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["data"], with_attachment);
+        let attachment = &with_attachment["taskAttachments"][0];
+        let relative_path = attachment["relativePath"].as_str().unwrap();
+        assert!(relative_path.starts_with("Attachments/"));
+        assert!(data.join(relative_path).exists());
+        let attachment_id = attachment["id"].as_str().unwrap().to_owned();
+
+        let removed = engine
+            .handle(Request {
+                id: "remove-attachment".to_owned(),
+                method: "task.attachment.remove".to_owned(),
+                params: json!({
+                    "taskId":uppercase_task_id,
+                    "attachmentId":attachment_id.to_uppercase(),
+                    "clientMutationId":Uuid::new_v4().to_string().to_uppercase()
+                }),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["data"], removed);
+        assert!(removed["taskAttachments"].as_array().unwrap().is_empty());
+        assert!(source.exists());
+        assert!(!data.join(relative_path).exists());
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_create_list_and_delete_publish_snapshots_and_clean_managed_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data.clone());
+        let task = worker
+            .call(|store| store.create_task("右键任务", "", None, None, None))
+            .await
+            .unwrap();
+        let source = directory.path().join("original.txt");
+        fs::write(&source, b"original").unwrap();
+        let with_attachment = engine
+            .handle(Request {
+                id: "add-before-delete".to_owned(),
+                method: "task.attachment.add".to_owned(),
+                params: json!({
+                    "taskId":task.id.to_uppercase(),
+                    "sourcePaths":[source],
+                    "clientMutationId":Uuid::new_v4().to_string()
+                }),
+            })
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap()["data"],
+            with_attachment
+        );
+        let managed_relative = with_attachment["taskAttachments"][0]["relativePath"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let managed_path = data.join(&managed_relative);
+        assert!(managed_path.exists());
+        let attachment_id = with_attachment["taskAttachments"][0]["id"]
+            .as_str()
+            .unwrap();
+        let stale_quarantine = data
+            .join("Attachments")
+            .join(format!(".removing-{attachment_id}"));
+        fs::hard_link(&managed_path, &stale_quarantine).unwrap();
+        assert!(stale_quarantine.exists());
+
+        let with_list = engine
+            .handle(Request {
+                id: "create-list-from-task".to_owned(),
+                method: "task.create_list".to_owned(),
+                params: json!({"taskId":task.id.to_uppercase()}),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "task.changed");
+        assert_eq!(event["data"], with_list);
+        assert_eq!(with_list["lists"][0]["name"], "右键任务");
+        assert_eq!(with_list["lists"][0]["color"], "blue");
+        assert_eq!(with_list["tasks"][0]["listId"], with_list["lists"][0]["id"]);
+
+        let deleted = engine
+            .handle(Request {
+                id: "delete-task".to_owned(),
+                method: "task.delete".to_owned(),
+                params: json!({"taskId":task.id.to_uppercase()}),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "task.changed");
+        assert_eq!(event["data"], deleted);
+        assert!(deleted["tasks"].as_array().unwrap().is_empty());
+        assert!(deleted["taskAttachments"].as_array().unwrap().is_empty());
+        assert!(source.exists(), "deletion must preserve the source file");
+        assert!(!managed_path.exists());
+        assert!(!stale_quarantine.exists());
+        assert_eq!(fs::read_dir(data.join("Attachments")).unwrap().count(), 0);
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn task_delete_reports_active_session_conflict_without_emitting_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| store.create_task("执行中", "", None, None, None))
+            .await
+            .unwrap();
+        let task_id = task.id.clone();
+        worker
+            .call(move |store| {
+                let session = store.create_session(&task_id, RuntimeKind::Codex, "/tmp")?;
+                store.send_message(&session.id, &Uuid::new_v4().to_string(), "执行中")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+
+        let response = engine
+            .handle(Request {
+                id: "delete-active".to_owned(),
+                method: "task.delete".to_owned(),
+                params: json!({"taskId":task.id.to_uppercase()}),
+            })
+            .await;
+
+        assert!(response.result.is_none());
+        assert_eq!(response.error.unwrap().code, "task_session_active");
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            worker
+                .call(move |store| Ok(store.task(&task.id)?.is_some()))
+                .await
+                .unwrap()
+        );
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn session_create_checks_executable_before_persisting_the_session() {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("session-create.sqlite3")).unwrap();
         let task_id = worker
-            .call(|store| Ok(store.create_task("任务", "", None, None)?.id))
+            .call(|store| Ok(store.create_task("任务", "", None, None, None)?.id))
             .await
             .unwrap();
         let mut pathless = test_runtime(RuntimeKind::Codex, "ready");
@@ -1383,7 +2573,7 @@ mod tests {
             .call(move |store| store.save_runtime(&pathless))
             .await
             .unwrap();
-        let (engine, _receiver) = test_engine(worker.clone(), 0);
+        let (engine, _receiver) = test_engine(worker.clone(), 0, directory.path().to_owned());
         let workspace = fs::canonicalize(directory.path()).unwrap();
         engine
             .authorized_directories
@@ -1399,7 +2589,6 @@ mod tests {
                     "taskId": task_id,
                     "runtimeKind": "codex",
                     "workingDirectory": workspace.display().to_string(),
-                    "clientMessageId": Uuid::new_v4().to_string(),
                 }),
             })
             .await
@@ -1416,35 +2605,117 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn session_create_returns_an_empty_idle_bundle_and_replays_without_scheduling() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(data.join("Attachments")).unwrap();
+        fs::create_dir_all(&workspace).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| {
+                store.create_task(
+                    "任务标题",
+                    "任务备注",
+                    None,
+                    Some("2026-08-10"),
+                    Some("2026-08-12"),
+                )
+            })
+            .await
+            .unwrap();
+        let ready = test_runtime(RuntimeKind::Codex, "ready");
+        worker
+            .call(move |store| store.save_runtime(&ready))
+            .await
+            .unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        let workspace = fs::canonicalize(workspace).unwrap();
+        engine
+            .authorized_directories
+            .lock()
+            .await
+            .insert(workspace.clone());
+        let params = json!({
+            "taskId":task.id.to_uppercase(),
+            "runtimeKind":"codex",
+            "workingDirectory":workspace.display().to_string(),
+        });
+
+        let first = engine
+            .handle(Request {
+                id: "session-create-first".to_owned(),
+                method: "session.create".to_owned(),
+                params: params.clone(),
+            })
+            .await
+            .result
+            .unwrap();
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "session.created");
+        assert_eq!(event["data"], first);
+        assert_eq!(first["session"]["state"], "idle");
+        assert!(first["messages"].as_array().unwrap().is_empty());
+        assert!(first["activeTurn"].is_null());
+        assert!(engine.turns.lock().await.is_empty());
+        let session_id = first["session"]["id"].as_str().unwrap().to_owned();
+        let revision = worker.call(|store| store.revision()).await.unwrap();
+        let turn_count = worker
+            .call({
+                let session_id = session_id.clone();
+                move |store| store.session_turn_count(&session_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(turn_count, 0);
+
+        let unavailable = test_runtime(RuntimeKind::Codex, "auth_required");
+        worker
+            .call(move |store| store.save_runtime(&unavailable))
+            .await
+            .unwrap();
+        let replay_revision = worker.call(|store| store.revision()).await.unwrap();
+        let replayed = engine
+            .handle(Request {
+                id: "session-create-replay".to_owned(),
+                method: "session.create".to_owned(),
+                params,
+            })
+            .await
+            .result
+            .unwrap();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(1)).unwrap()["data"],
+            replayed
+        );
+        assert_eq!(replayed["session"]["id"], session_id);
+        assert!(replayed["messages"].as_array().unwrap().is_empty());
+        assert!(replayed["activeTurn"].is_null());
+        assert!(replay_revision > revision);
+        assert_eq!(
+            worker.call(|store| store.revision()).await.unwrap(),
+            replay_revision
+        );
+        assert!(engine.turns.lock().await.is_empty());
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn session_send_checks_runtime_before_queue_and_keeps_retries_idempotent() {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("session-send.sqlite3")).unwrap();
         let session_id = worker
             .call(|store| {
-                let task = store.create_task("任务", "", None, None)?;
-                let initial = store.create_session(
-                    &task.id,
-                    RuntimeKind::Codex,
-                    "/tmp",
-                    &Uuid::new_v4().to_string(),
-                    "任务",
-                )?;
-                store.mark_turn_running(&initial.turn.id)?;
-                store.finish_turn(
-                    &initial.turn.id,
-                    TurnStatus::Completed,
-                    Some(0),
-                    Some("完成"),
-                    Some("provider-session"),
-                    None,
-                    None,
-                    None,
-                )?;
-                Ok(initial.session.id)
+                let task = store.create_task("任务", "", None, None, None)?;
+                Ok(store
+                    .create_session(&task.id, RuntimeKind::Codex, "/tmp")?
+                    .id)
             })
             .await
             .unwrap();
-        let (engine, _receiver) = test_engine(worker.clone(), 0);
+        let (engine, _receiver) = test_engine(worker.clone(), 0, directory.path().to_owned());
         let initial_turn_count = worker
             .call({
                 let session_id = session_id.clone();
@@ -1505,7 +2776,7 @@ mod tests {
             .await
             .unwrap();
         assert!(unchanged_bundle.active_turn.is_none());
-        assert_eq!(unchanged_bundle.messages.len(), 1);
+        assert!(unchanged_bundle.messages.is_empty());
 
         let ready = test_runtime(RuntimeKind::Codex, "ready");
         worker
@@ -1521,6 +2792,7 @@ mod tests {
         let (queued, executable) = engine.prepare_session_send(params).await.unwrap();
         assert!(queued.is_new);
         assert_eq!(queued.turn.status, TurnStatus::Queued);
+        assert_eq!(queued.prompt, "正常发送");
         assert_eq!(executable.as_deref(), Some("/usr/bin/true"));
         let queued_turn_count = worker
             .call({

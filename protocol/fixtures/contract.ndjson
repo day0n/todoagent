@@ -1,6 +1,13 @@
-{"event":"engine.ready","data":{"protocolVersion":2,"engineVersion":"0.1.0","capabilities":["app.bootstrap","session.send"],"runtimes":["codex","claude","cursor","kiro"]}}
+{"event":"engine.ready","data":{"protocolVersion":3,"engineVersion":"0.1.0","capabilities":["app.bootstrap","task.create","task.update","task.create_list","task.delete","task.attachment.add","task.attachment.remove","session.send"],"runtimes":["codex","claude","cursor","kiro"]}}
 {"id":"bootstrap-1","method":"app.bootstrap","params":{}}
-{"id":"bootstrap-1","result":{"revision":0,"lists":[],"tasks":[],"runtimes":[],"sessions":[]}}
+{"id":"bootstrap-1","result":{"revision":0,"lists":[],"tasks":[],"taskAttachments":[],"runtimes":[],"sessions":[]}}
+{"id":"task-create-1","method":"task.create","params":{"title":"测试时间","note":"","executionDate":"2026-08-10","dueDate":"2026-08-12"}}
+{"id":"task-update-1","method":"task.update","params":{"taskId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101","patch":{"executionDate":"2026-08-11","dueDate":null}}}
+{"id":"task-create-list-1","method":"task.create_list","params":{"taskId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101"}}
+{"id":"task-delete-1","method":"task.delete","params":{"taskId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101"}}
+{"id":"attachment-add-1","method":"task.attachment.add","params":{"taskId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101","sourcePaths":["/tmp/brief.pdf"],"clientMutationId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC103"}}
+{"id":"attachment-remove-1","method":"task.attachment.remove","params":{"taskId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101","attachmentId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC102","clientMutationId":"ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC104"}}
+{"event":"task.changed","data":{"revision":2,"lists":[],"tasks":[{"id":"abcdefab-cdef-4abc-8def-abcdefabc101","listId":null,"title":"测试时间","note":"","status":"open","executionDate":"2026-08-11","dueDate":null,"completedAt":null,"createdAt":"2026-08-09T00:00:00Z","updatedAt":"2026-08-09T00:00:01Z"}],"taskAttachments":[{"id":"abcdefab-cdef-4abc-8def-abcdefabc102","taskId":"abcdefab-cdef-4abc-8def-abcdefabc101","originalName":"brief.pdf","sizeBytes":42,"mimeType":"application/pdf","relativePath":"Attachments/abcdefab-cdef-4abc-8def-abcdefabc102.pdf","createdAt":"2026-08-09T00:00:01Z"}],"runtimes":[],"sessions":[]}}
 {"id":"missing-1","error":{"code":"not_found","message":"requested record does not exist"}}
 {"id":"assistant-list-1","method":"assistant.session.list","params":{"includeArchived":false}}
 {"id":"assistant-list-1","result":{"sessions":[{"id":"00000000-0000-4000-8000-000000000201","title":"原生助手","archived":false,"createdAt":"2026-08-09T00:00:00Z","updatedAt":"2026-08-09T00:00:00Z","lastSequence":0,"isRunning":false}]}}

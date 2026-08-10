@@ -11,6 +11,12 @@ CREATE TABLE IF NOT EXISTS app_revision (
 );
 INSERT OR IGNORE INTO app_revision(singleton, revision) VALUES(1, 0);
 
+CREATE TABLE IF NOT EXISTS task_data_revision (
+  singleton   INTEGER PRIMARY KEY CHECK(singleton = 1),
+  revision    INTEGER NOT NULL CHECK(revision >= 0)
+);
+INSERT OR IGNORE INTO task_data_revision(singleton, revision) VALUES(1, 0);
+
 CREATE TABLE IF NOT EXISTS list (
   id               TEXT PRIMARY KEY,
   name             TEXT NOT NULL,
@@ -27,10 +33,46 @@ CREATE TABLE IF NOT EXISTS task (
   title         TEXT NOT NULL,
   note          TEXT NOT NULL DEFAULT '',
   status        TEXT NOT NULL CHECK(status IN ('open','completed')),
-  due_date      TEXT,
+  execution_date TEXT CHECK(
+    execution_date IS NULL OR
+    (length(execution_date) = 10 AND
+     execution_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND
+     substr(execution_date, 1, 4) BETWEEN '0001' AND '9999')
+  ),
+  due_date      TEXT CHECK(
+    due_date IS NULL OR
+    (length(due_date) = 10 AND
+     due_date GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' AND
+     substr(due_date, 1, 4) BETWEEN '0001' AND '9999')
+  ),
   completed_at  TEXT,
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_attachment (
+  id             TEXT PRIMARY KEY,
+  task_id        TEXT NOT NULL REFERENCES task(id) ON DELETE CASCADE,
+  original_name  TEXT NOT NULL CHECK(original_name NOT IN ('', '.', '..') AND instr(original_name, '/') = 0),
+  size_bytes     INTEGER NOT NULL CHECK(size_bytes BETWEEN 0 AND 104857600),
+  mime_type      TEXT NOT NULL CHECK(mime_type <> ''),
+  relative_path  TEXT NOT NULL UNIQUE CHECK(
+    relative_path GLOB 'Attachments/*' AND
+    instr(substr(relative_path, 13), '/') = 0
+  ),
+  created_at     TEXT NOT NULL
+);
+
+-- Durable receipts make attachment mutations safe to retry after the caller
+-- loses the response. The canonical request fingerprint prevents a UUID from
+-- being reused for a different operation or target.
+CREATE TABLE IF NOT EXISTS task_attachment_mutation (
+  client_mutation_id          TEXT PRIMARY KEY,
+  operation                   TEXT NOT NULL CHECK(operation IN ('add','remove')),
+  task_id                     TEXT NOT NULL,
+  request_fingerprint         TEXT NOT NULL,
+  result_attachment_ids_json  TEXT NOT NULL,
+  created_at                  TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS runtime (
@@ -224,6 +266,9 @@ CREATE TABLE IF NOT EXISTS app_setting (
 
 CREATE INDEX IF NOT EXISTS idx_task_status ON task(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_task_list ON task(list_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_execution_date ON task(execution_date, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_due_date ON task(due_date, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_task_attachment_task ON task_attachment(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_session_task ON task_session(task_id);
 CREATE INDEX IF NOT EXISTS idx_turn_session ON session_turn(session_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_message_session ON session_message(session_id, sequence);

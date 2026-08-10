@@ -1,60 +1,64 @@
-import Foundation
+import AppKit
+import SwiftUI
 import Testing
 @testable import TodoAgentApp
 
 @Suite("Today menu bar projection")
 struct TodayMenuBarViewTests {
-    @Test("only incomplete tasks due on the local calendar day are shown")
-    func filtersTodayOpenTasks() throws {
+    @Test("execution date selects all of today's tasks and keeps completed items")
+    func filtersExecutionDayAndKeepsCompletedTasks() throws {
         let calendar = shanghaiCalendar()
         let now = try date(2026, 8, 9, 12, 0, calendar: calendar)
-        let today = task(
+        let today = LocalDay(now, calendar: calendar)
+        let tomorrow = try #require(today.advanced(by: 1, calendar: calendar))
+        let openToday = task(
             id: "00000000-0000-4000-8000-000000000601",
             title: "今天完成",
             status: .open,
-            dueDate: try date(2026, 8, 9, 23, 59, calendar: calendar)
+            executionDate: today
         )
         let completedToday = task(
             id: "00000000-0000-4000-8000-000000000602",
             title: "已完成",
             status: .completed,
-            dueDate: try date(2026, 8, 9, 8, 0, calendar: calendar)
+            executionDate: today
         )
-        let tomorrow = task(
+        let tomorrowTask = task(
             id: "00000000-0000-4000-8000-000000000603",
             title: "明天处理",
             status: .open,
-            dueDate: try date(2026, 8, 10, 0, 0, calendar: calendar)
+            executionDate: tomorrow
         )
-        let unscheduled = task(
+        let dueOnly = task(
             id: "00000000-0000-4000-8000-000000000604",
-            title: "没有日期",
+            title: "仅截止日期",
             status: .open,
-            dueDate: nil
+            executionDate: nil,
+            dueDate: today
         )
 
         let projection = TodayMenuBarProjection(
-            tasks: [today, completedToday, tomorrow, unscheduled],
+            tasks: [completedToday, tomorrowTask, openToday, dueOnly],
             now: now,
             calendar: calendar
         )
 
-        #expect(projection.tasks.map(\.id) == [today.id])
-        #expect(projection.tasks.allSatisfy { $0.status == .open })
+        #expect(projection.tasks.map(\.id) == [openToday.id, completedToday.id])
     }
 
-    @Test("an empty or non-today task set produces the menu empty state")
+    @Test("an empty or non-today execution set produces no rows")
     func emptyProjection() throws {
         let calendar = shanghaiCalendar()
         let now = try date(2026, 8, 9, 12, 0, calendar: calendar)
-        let task = task(
+        let yesterday = LocalDay(try date(2026, 8, 8, 23, 59, calendar: calendar), calendar: calendar)
+        let oldTask = task(
             id: "00000000-0000-4000-8000-000000000605",
             title: "昨天的任务",
             status: .open,
-            dueDate: try date(2026, 8, 8, 23, 59, calendar: calendar)
+            executionDate: yesterday
         )
 
-        let projection = TodayMenuBarProjection(tasks: [task], now: now, calendar: calendar)
+        let projection = TodayMenuBarProjection(tasks: [oldTask], now: now, calendar: calendar)
 
         #expect(projection.tasks.isEmpty)
     }
@@ -63,23 +67,19 @@ struct TodayMenuBarViewTests {
     func respectsLocalCalendarTimeZone() throws {
         let calendar = shanghaiCalendar()
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-09T00:30:00Z"))
-        let sameShanghaiDay = try #require(
-            ISO8601DateFormatter().date(from: "2026-08-09T15:59:00Z")
-        )
-        let nextShanghaiDay = try #require(
-            ISO8601DateFormatter().date(from: "2026-08-09T16:00:00Z")
-        )
+        let shanghaiToday = LocalDay(now, calendar: calendar)
+        let nextShanghaiDay = try #require(shanghaiToday.advanced(by: 1, calendar: calendar))
         let sameDayTask = task(
             id: "00000000-0000-4000-8000-000000000606",
             title: "上海当天",
             status: .open,
-            dueDate: sameShanghaiDay
+            executionDate: shanghaiToday
         )
         let nextDayTask = task(
             id: "00000000-0000-4000-8000-000000000607",
             title: "上海次日",
             status: .open,
-            dueDate: nextShanghaiDay
+            executionDate: nextShanghaiDay
         )
 
         let projection = TodayMenuBarProjection(
@@ -89,6 +89,53 @@ struct TodayMenuBarViewTests {
         )
 
         #expect(projection.tasks.map(\.id) == [sameDayTask.id])
+    }
+
+    @MainActor
+    @Test("real SwiftUI task list has nonzero hosted height")
+    func hostedTaskListDoesNotCollapse() {
+        let visibleTask = task(
+            id: "00000000-0000-4000-8000-000000000608",
+            title: "菜单栏可见任务",
+            status: .open,
+            executionDate: .today()
+        )
+        let host = NSHostingView(rootView: TodayMenuTaskList(tasks: [visibleTask]))
+        host.frame = NSRect(x: 0, y: 0, width: 312, height: 300)
+        let window = NSWindow(
+            contentRect: host.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        window.layoutIfNeeded()
+        host.layoutSubtreeIfNeeded()
+        host.displayIfNeeded()
+        let renderedWithTitle = renderedPNG(of: host)
+
+        var blankTask = visibleTask
+        blankTask.title = ""
+        let blankHost = NSHostingView(rootView: TodayMenuTaskList(tasks: [blankTask]))
+        blankHost.frame = host.frame
+        let blankWindow = NSWindow(
+            contentRect: blankHost.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        blankWindow.contentView = blankHost
+        blankWindow.layoutIfNeeded()
+        blankHost.layoutSubtreeIfNeeded()
+        blankHost.displayIfNeeded()
+        let renderedWithoutTitle = renderedPNG(of: blankHost)
+
+        #expect(TodayMenuBarTaskAreaMetrics.height(taskCount: 1) > 0)
+        #expect(host.fittingSize.height > 0)
+        #expect(renderedWithTitle != nil)
+        #expect(renderedWithTitle != renderedWithoutTitle)
+        window.orderOut(nil)
+        blankWindow.orderOut(nil)
     }
 
     private func shanghaiCalendar() -> Calendar {
@@ -122,7 +169,8 @@ struct TodayMenuBarViewTests {
         id: String,
         title: String,
         status: TaskStatus,
-        dueDate: Date?
+        executionDate: LocalDay?,
+        dueDate: LocalDay? = nil
     ) -> TaskItem {
         TaskItem(
             id: UUID(uuidString: id)!,
@@ -130,10 +178,20 @@ struct TodayMenuBarViewTests {
             title: title,
             note: "",
             status: status,
+            executionDate: executionDate,
             dueDate: dueDate,
             completedAt: status == .completed ? "2026-08-09T00:00:00Z" : nil,
             createdAt: .distantPast,
             updatedAt: "2026-08-09T00:00:00Z"
         )
+    }
+
+    @MainActor
+    private func renderedPNG(of view: NSView) -> Data? {
+        guard let representation = view.bitmapImageRepForCachingDisplay(in: view.bounds) else {
+            return nil
+        }
+        view.cacheDisplay(in: view.bounds, to: representation)
+        return representation.representation(using: .png, properties: [:])
     }
 }

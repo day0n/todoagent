@@ -170,8 +170,7 @@ private struct RuntimeSettingsPane: View {
     private func runtimeRow(_ kind: RuntimeKind) -> some View {
         let info = state.runtime(kind)
         return HStack(alignment: .top, spacing: 12) {
-            Image(systemName: runtimeSymbol(kind))
-                .font(.title3)
+            RuntimeIconView(kind: kind, fallbackSymbol: runtimeSymbol(kind))
                 .frame(width: 28, height: 28)
                 .foregroundStyle(statusColor(info?.status))
                 .background(statusColor(info?.status).opacity(0.1), in: .rect(cornerRadius: 7))
@@ -358,6 +357,10 @@ final class GeminiAPIKeyEditorState {
         !draftKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    var visibilitySystemImage: String {
+        isRevealed ? "eye" : "eye.slash"
+    }
+
     func updateFieldText(_ value: String) {
         draftKey = value
         // Once the user edits, the field represents a replacement draft. Do
@@ -438,7 +441,7 @@ private struct ModelSettingsPane: View {
                         apiKeyField
 
                         Button(action: toggleKeyVisibility) {
-                            Image(systemName: keyEditor.isRevealed ? "eye.slash" : "eye")
+                            Image(systemName: keyEditor.visibilitySystemImage)
                                 .frame(width: 24, height: 24)
                                 .contentShape(.rect)
                         }
@@ -520,7 +523,7 @@ private struct ModelSettingsPane: View {
 
     @ViewBuilder
     private var apiKeyField: some View {
-        let prompt = Text(hasSavedKey ? "已保存，输入新 Key 可替换" : "输入 Gemini API Key")
+        let prompt = Text(hasSavedKey ? "••••••••••••" : "输入 Gemini API Key")
         if keyEditor.isRevealed {
             TextField("API Key", text: apiKeyText, prompt: prompt)
                 .textFieldStyle(.plain)
@@ -726,7 +729,7 @@ private struct AboutSettingsPane: View {
             }
             Section("架构") {
                 LabeledContent("界面", value: "SwiftUI + AppKit")
-                LabeledContent("Engine", value: "Rust sidecar · IPC v2")
+                LabeledContent("Engine", value: "Rust sidecar · IPC v3")
                 LabeledContent("系统", value: "macOS 26+")
             }
         }

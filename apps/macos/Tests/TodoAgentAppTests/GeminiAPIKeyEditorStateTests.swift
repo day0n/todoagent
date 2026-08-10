@@ -13,6 +13,7 @@ struct GeminiAPIKeyEditorStateTests {
         }
 
         #expect(state.isRevealed == false)
+        #expect(state.visibilitySystemImage == "eye.slash")
         #expect(state.fieldText.isEmpty)
         #expect(state.draftKey.isEmpty)
         #expect(state.hasDraftKey == false)
@@ -30,6 +31,7 @@ struct GeminiAPIKeyEditorStateTests {
         try state.toggleVisibility()
 
         #expect(state.isRevealed)
+        #expect(state.visibilitySystemImage == "eye")
         #expect(state.fieldText.isEmpty == false)
         #expect(state.draftKey.isEmpty)
         #expect(state.hasDraftKey == false)
@@ -38,6 +40,7 @@ struct GeminiAPIKeyEditorStateTests {
         try state.toggleVisibility()
 
         #expect(state.isRevealed == false)
+        #expect(state.visibilitySystemImage == "eye.slash")
         #expect(state.fieldText.isEmpty)
         #expect(state.draftKey.isEmpty)
         #expect(state.hasDraftKey == false)

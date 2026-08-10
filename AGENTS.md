@@ -3,9 +3,13 @@
 ## Branches and product scope
 
 - `master` is the canonical native macOS product branch.
+- Perform all normal development, fixes, tests, and local preview work directly
+  on `master` in this checkout.
+- Do not create or switch to `feature/...`, `fix/...`, `codex/...`, or other
+  development branches unless the user explicitly requests a separate branch.
 - `legacy/web` preserves the former Web and Node.js implementation.
-- Name new branches for their purpose, such as `feature/...`, `fix/...`, or
-  `legacy/...`. Do not use a `codex/` prefix.
+- If the user explicitly requests a branch, name it for its purpose and never
+  use a `codex/` prefix.
 - Keep the legacy source available for compatibility fixtures and reference
   unless a separate cleanup task explicitly removes it.
 

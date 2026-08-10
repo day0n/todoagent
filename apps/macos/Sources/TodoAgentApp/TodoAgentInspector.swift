@@ -3,35 +3,69 @@ import SwiftUI
 
 struct TodoAgentInspector: View {
     let state: AppState
-    private let onClose: () -> Void
 
     @AppStorage("geminiModel") private var model = "gemini-3.6-flash"
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var draft = ""
     @State private var pendingAttachments: [AssistantTextAttachment] = []
     @State private var attachmentError: String?
+    @State private var sessionSwitcherPresented = false
     @State private var renamingSession: AssistantSessionDescriptor?
     @State private var pendingArchive: AssistantSessionDescriptor?
     @FocusState private var composerFocused: Bool
 
     private var assistant: AssistantViewState { state.assistant }
 
-    init(
-        state: AppState,
-        onClose: @escaping () -> Void = {}
-    ) {
+    init(state: AppState) {
         self.state = state
-        self.onClose = onClose
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            if let error = assistant.errorMessage {
-                AssistantErrorBanner(message: error) { assistant.clearError() }
+        ZStack(alignment: .top) {
+            VStack(spacing: 0) {
+                TodoAgentToolbar(
+                    state: state,
+                    sessionSwitcherPresented: $sessionSwitcherPresented
+                ) {
+                    state.inspectorPresented = false
+                }
+
+                Divider()
+
+                if let error = assistant.errorMessage {
+                    AssistantErrorBanner(message: error) { assistant.clearError() }
+                }
+                content
             }
-            content
+
+            if sessionSwitcherPresented {
+                Color.black.opacity(0.001)
+                    .contentShape(.rect)
+                    .padding(.top, TodoAgentToolbar.height)
+                    .onTapGesture { sessionSwitcherPresented = false }
+                    .accessibilityHidden(true)
+
+                AssistantSessionSwitcherPanel(
+                    sessions: assistant.activeSessions,
+                    selectedSessionID: assistant.selectedSessionID,
+                    selectedSessionRunning: assistant.isSelectedSessionRunning,
+                    selectionDisabled: assistant.isManagingSession,
+                    onSelect: selectSession,
+                    onRename: beginRenamingSelectedSession,
+                    onArchive: beginArchivingSelectedSession
+                )
+                .padding(.horizontal, 10)
+                .padding(.top, TodoAgentToolbar.height + 7)
+                .transition(.move(edge: .top).combined(with: .opacity))
+                .zIndex(2)
+            }
         }
         .background(TodoAgentUI.canvasBackground)
+        .onChange(of: assistant.selectedSessionID) {
+            sessionSwitcherPresented = false
+            pendingAttachments = []
+            attachmentError = nil
+        }
         .sheet(item: $renamingSession) { session in
             RenameAssistantSessionSheet(session: session, assistant: assistant)
         }
@@ -47,111 +81,30 @@ struct TodoAgentInspector: View {
         } message: {
             Text("会话会从列表中隐藏，已有任务和清单不会被删除。")
         }
-        .onChange(of: assistant.selectedSessionID) {
-            pendingAttachments = []
-            attachmentError = nil
-        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: sessionSwitcherPresented)
         .accessibilityIdentifier("todoagent.inspector")
     }
 
-    private var header: some View {
-        HStack(spacing: 8) {
-            AssistantAvatar(statusColor: statusColor)
-            sessionPicker
-
-            Spacer()
-
-            Button("新建会话", systemImage: "plus.bubble") {
-                Task { _ = await assistant.createSession() }
-            }
-            .labelStyle(.iconOnly)
-            .buttonStyle(AssistantToolbarButtonStyle())
-            .disabled(!assistant.canUseAssistant || assistant.isManagingSession)
-            .help("新建 TodoAgent 对话")
-            .accessibilityIdentifier("assistant.new-session")
-
-            sessionActions
-
-            Button("设置", systemImage: "gearshape") {
-                SettingsWindowController.show(tab: .model)
-            }
-            .labelStyle(.iconOnly)
-            .buttonStyle(AssistantToolbarButtonStyle())
-            .help("TodoAgent 设置")
-            .accessibilityIdentifier("assistant.settings")
-
-            Button("收起 TodoAgent", systemImage: "chevron.right") {
-                onClose()
-            }
-            .labelStyle(.iconOnly)
-            .buttonStyle(AssistantToolbarButtonStyle())
-            .help("收起 TodoAgent")
-            .accessibilityIdentifier("assistant.collapse")
-        }
-        .padding(.horizontal, TodoAgentUI.sectionSpacing)
-        .frame(minHeight: 52)
-        .background(TodoAgentUI.surfaceBackground)
-        .overlay(alignment: .bottom) {
-            Rectangle()
-                .fill(TodoAgentUI.hairline)
-                .frame(height: 1)
-        }
+    private func selectSession(_ sessionID: String) {
+        sessionSwitcherPresented = false
+        Task { await assistant.selectSession(sessionID) }
     }
 
-    private var sessionPicker: some View {
-        Menu {
-            ForEach(assistant.activeSessions) { session in
-                Button {
-                    Task { await assistant.selectSession(session.id) }
-                } label: {
-                    if session.id == assistant.selectedSessionID {
-                        Label(session.displayTitle, systemImage: "checkmark")
-                    } else {
-                        Text(session.displayTitle)
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 7) {
-                Text(assistant.selectedSession?.displayTitle ?? "新建 AI 对话")
-                    .font(.headline)
-                    .foregroundStyle(TodoAgentUI.primaryText)
-                    .lineLimit(1)
-                Image(systemName: "chevron.down")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(TodoAgentUI.secondaryText)
-                    .accessibilityHidden(true)
-            }
-            .frame(maxWidth: 220, alignment: .leading)
-            .contentShape(.rect)
-        }
-        .menuStyle(.borderlessButton)
-        .disabled(assistant.activeSessions.isEmpty || assistant.isManagingSession)
-        .help("TodoAgent · \(statusLabel)")
-        .accessibilityValue(statusLabel)
-        .accessibilityIdentifier("assistant.session-picker")
+    private func beginRenamingSelectedSession() {
+        sessionSwitcherPresented = false
+        renamingSession = assistant.selectedSession
     }
 
-    private var sessionActions: some View {
-        Menu {
-            Button("重命名…", systemImage: "pencil") {
-                renamingSession = assistant.selectedSession
-            }
-            .disabled(assistant.selectedSession == nil)
+    private func beginArchivingSelectedSession() {
+        sessionSwitcherPresented = false
+        pendingArchive = assistant.selectedSession
+    }
 
-            Button("归档", systemImage: "archivebox", role: .destructive) {
-                pendingArchive = assistant.selectedSession
-            }
-            .disabled(assistant.selectedSession == nil || assistant.isSelectedSessionRunning)
-        } label: {
-            Image(systemName: "ellipsis")
-                .frame(width: 28, height: 28)
-                .contentShape(.rect(cornerRadius: 7))
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .accessibilityLabel("会话操作")
-        .accessibilityIdentifier("assistant.session-actions")
+    private var archivePresented: Binding<Bool> {
+        Binding(
+            get: { pendingArchive != nil },
+            set: { if !$0 { pendingArchive = nil } }
+        )
     }
 
     @ViewBuilder
@@ -176,7 +129,13 @@ struct TodoAgentInspector: View {
             } else if assistant.status?.available != true {
                 unavailableAssistant
             } else if assistant.activeSessions.isEmpty {
-                emptySessions
+                if assistant.isManagingSession {
+                    ProgressView("正在准备默认会话…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .accessibilityIdentifier("assistant.default-session-loading")
+                } else {
+                    emptySessions
+                }
             } else if assistant.selectedSession == nil {
                 ContentUnavailableView("选择一个会话", systemImage: "bubble.left.and.bubble.right")
             } else {
@@ -213,11 +172,13 @@ struct TodoAgentInspector: View {
 
     private var emptySessions: some View {
         ContentUnavailableView {
-            Label("还没有会话", systemImage: "bubble.left")
+            Label("无法开始会话", systemImage: "exclamationmark.bubble")
         } description: {
-            Text("创建一个独立会话，让 TodoAgent 帮你创建和整理任务。")
+            Text("默认会话没有创建成功。你的任务数据不受影响，可以直接重试。")
         } actions: {
-            Button("新建会话") { Task { _ = await assistant.createSession() } }
+            Button("重试创建默认会话") {
+                Task { _ = await assistant.ensureDefaultSession() }
+            }
                 .buttonStyle(.borderedProminent)
                 .disabled(assistant.isManagingSession)
         }
@@ -236,22 +197,26 @@ struct TodoAgentInspector: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: TodoAgentUI.standardSpacing) {
-                    if assistant.isLoadingHistory, assistant.selectedMessages.isEmpty {
-                        ProgressView("正在载入历史…")
+                    if assistant.isLoadingHistory, assistant.selectedTimelineItems.isEmpty {
+                        Text("正在载入历史…")
+                            .font(.caption)
+                            .foregroundStyle(TodoAgentUI.secondaryText)
                             .padding(.vertical, 30)
-                    } else if assistant.selectedMessages.isEmpty, assistant.selectedDraft == nil {
-                        AssistantConversationEmptyState()
+                    } else if assistant.selectedTimelineItems.isEmpty, assistant.selectedDraft == nil {
+                        AssistantConversationEmptyState { suggestion in
+                            draft = suggestion
+                            composerFocused = true
+                        }
                             .padding(.vertical, 32)
                     }
 
-                    ForEach(assistant.selectedMessages) { message in
-                        AssistantMessageRow(message: message, state: state)
-                            .id(message.id)
-                    }
-
-                    ForEach(assistant.selectedTools) { tool in
-                        AssistantToolRow(tool: tool, state: state)
-                            .id("tool-\(tool.id)")
+                    ForEach(assistant.selectedTimelineItems) { item in
+                        switch item {
+                        case let .message(message):
+                            AssistantMessageRow(message: message, state: state)
+                        case let .tool(tool):
+                            AssistantToolRow(tool: tool, state: state)
+                        }
                     }
 
                     if let draft = assistant.selectedDraft, !draft.body.isEmpty {
@@ -280,6 +245,9 @@ struct TodoAgentInspector: View {
             }
             .background(TodoAgentUI.canvasBackground)
             .onChange(of: assistant.selectedMessages.last?.id) {
+                scrollToBottom(proxy)
+            }
+            .onChange(of: assistant.selectedTimelineItems.last?.id) {
                 scrollToBottom(proxy)
             }
             .onChange(of: assistant.selectedDraft?.body) {
@@ -407,28 +375,6 @@ struct TodoAgentInspector: View {
         return .preparing
     }
 
-    private var statusLabel: String {
-        if assistant.loadState == .loading { return "正在连接" }
-        guard let status = assistant.status else { return "未连接" }
-        if !status.configured { return "未配置" }
-        if !status.available { return "不可用" }
-        return assistant.isSelectedSessionRunning ? "正在回复" : "已连接"
-    }
-
-    private var statusColor: Color {
-        guard let status = assistant.status else { return .secondary }
-        if !status.configured { return .orange }
-        if !status.available { return .red }
-        return .green
-    }
-
-    private var archivePresented: Binding<Bool> {
-        Binding(
-            get: { pendingArchive != nil },
-            set: { if !$0 { pendingArchive = nil } }
-        )
-    }
-
     private func submit() {
         let value = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canSubmit else { return }
@@ -469,6 +415,207 @@ struct TodoAgentInspector: View {
     }
 }
 
+/// Compact controls owned by the assistant pane. Keeping them inside the pane
+/// lets the conversation switcher expand below this row instead of allowing a
+/// native menu to cover the window toolbar.
+struct TodoAgentToolbar: View {
+    static let height: CGFloat = 46
+
+    let state: AppState
+    @Binding var sessionSwitcherPresented: Bool
+    let onClose: () -> Void
+
+    private var assistant: AssistantViewState { state.assistant }
+
+    var body: some View {
+        HStack(spacing: 6) {
+            sessionPicker
+
+            Button("开始新对话", systemImage: "plus.bubble") {
+                Task { _ = await assistant.createSession() }
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(AssistantToolbarButtonStyle())
+            .disabled(!assistant.canUseAssistant || assistant.isManagingSession)
+            .help("开始新对话")
+            .accessibilityIdentifier("assistant.new-session")
+
+            Button("隐藏对话", systemImage: "chevron.right") {
+                onClose()
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(AssistantToolbarButtonStyle())
+            .help("隐藏对话")
+            .accessibilityIdentifier("assistant.collapse")
+        }
+        .padding(.horizontal, 10)
+        .frame(height: Self.height)
+        .background(TodoAgentUI.canvasBackground)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("assistant.window-toolbar")
+    }
+
+    private var sessionPicker: some View {
+        Button {
+            sessionSwitcherPresented.toggle()
+        } label: {
+            HStack(spacing: 6) {
+                Text(assistant.selectedSession?.displayTitle ?? "新建 AI 对话")
+                    .font(.headline)
+                    .foregroundStyle(TodoAgentUI.primaryText)
+                    .lineLimit(1)
+                Image(systemName: sessionSwitcherPresented ? "chevron.up" : "chevron.down")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(TodoAgentUI.secondaryText)
+                    .accessibilityHidden(true)
+            }
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+            .background(
+                sessionSwitcherPresented ? TodoAgentUI.selectionBackground : .clear,
+                in: .rect(cornerRadius: 8)
+            )
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .disabled(assistant.activeSessions.isEmpty || assistant.isManagingSession)
+        .help("切换对话 · \(statusLabel)")
+        .accessibilityValue("\(statusLabel)，\(sessionSwitcherPresented ? "已展开" : "已折叠")")
+        .accessibilityIdentifier("assistant.session-picker")
+    }
+
+    private var statusLabel: String {
+        if assistant.loadState == .loading { return "正在连接" }
+        guard let status = assistant.status else { return "未连接" }
+        if !status.configured { return "未配置" }
+        if !status.available { return "不可用" }
+        return assistant.isSelectedSessionRunning ? "正在回复" : "已连接"
+    }
+}
+
+struct AssistantSessionSwitcherPanel: View {
+    let sessions: [AssistantSessionDescriptor]
+    let selectedSessionID: String?
+    let selectedSessionRunning: Bool
+    let selectionDisabled: Bool
+    let onSelect: (String) -> Void
+    let onRename: () -> Void
+    let onArchive: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("对话")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(TodoAgentUI.secondaryText)
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+                .padding(.bottom, 5)
+
+            ScrollView {
+                LazyVStack(spacing: 3) {
+                    ForEach(sessions) { session in
+                        sessionRow(session)
+                    }
+                }
+                .padding(.horizontal, 6)
+            }
+            .scrollIndicators(.visible)
+            .frame(height: sessionListHeight)
+
+            if selectedSessionID != nil {
+                Divider()
+                    .padding(.horizontal, 10)
+                    .padding(.top, 7)
+
+                HStack(spacing: 8) {
+                    Button("重命名", systemImage: "pencil", action: onRename)
+                        .buttonStyle(AssistantSwitcherActionButtonStyle())
+
+                    Spacer(minLength: 0)
+
+                    Button("归档", systemImage: "archivebox", role: .destructive, action: onArchive)
+                        .buttonStyle(AssistantSwitcherActionButtonStyle(isDestructive: true))
+                        .disabled(selectedSessionRunning)
+                }
+                .padding(8)
+                .disabled(selectionDisabled)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .background(TodoAgentUI.surfaceBackground, in: .rect(cornerRadius: TodoAgentUI.panelRadius))
+        .overlay {
+            RoundedRectangle(cornerRadius: TodoAgentUI.panelRadius)
+                .stroke(TodoAgentUI.hairline, lineWidth: 1)
+        }
+        .shadow(color: TodoAgentUI.shadowColor, radius: 16, y: 8)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("assistant.session-switcher")
+    }
+
+    private func sessionRow(_ session: AssistantSessionDescriptor) -> some View {
+        let isSelected = session.id == selectedSessionID
+
+        return Button {
+            onSelect(session.id)
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: isSelected ? "checkmark" : "circle")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(isSelected ? TodoAgentUI.primaryText : .clear)
+                    .frame(width: 14)
+                    .accessibilityHidden(true)
+
+                Text(session.displayTitle)
+                    .font(.body)
+                    .foregroundStyle(TodoAgentUI.primaryText)
+                    .lineLimit(1)
+
+                Spacer(minLength: 8)
+
+                if session.isRunning {
+                    Image(systemName: "circle.fill")
+                        .font(.system(size: 7))
+                        .foregroundStyle(.green)
+                        .accessibilityLabel("正在回复")
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+            .background(
+                isSelected ? TodoAgentUI.selectionBackground : .clear,
+                in: .rect(cornerRadius: 8)
+            )
+            .contentShape(.rect(cornerRadius: 8))
+        }
+        .buttonStyle(.plain)
+        .disabled(selectionDisabled)
+        .accessibilityValue(isSelected ? "当前对话" : "")
+        .accessibilityIdentifier("assistant.session-row.\(session.id)")
+    }
+
+    private var sessionListHeight: CGFloat {
+        min(max(CGFloat(sessions.count) * 39, 39), 234)
+    }
+}
+
+private struct AssistantSwitcherActionButtonStyle: ButtonStyle {
+    var isDestructive = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.caption.weight(.medium))
+            .foregroundStyle(isDestructive ? Color.red : TodoAgentUI.secondaryText)
+            .padding(.horizontal, 8)
+            .frame(height: 28)
+            .background(
+                configuration.isPressed ? TodoAgentUI.selectionBackground : .clear,
+                in: .rect(cornerRadius: 7)
+            )
+            .contentShape(.rect(cornerRadius: 7))
+    }
+}
+
 private struct AssistantErrorBanner: View {
     let message: String
     let dismiss: () -> Void
@@ -498,12 +645,27 @@ private struct AssistantErrorBanner: View {
 }
 
 private struct AssistantConversationEmptyState: View {
+    private struct Suggestion: Identifiable {
+        let title: String
+        let prompt: String
+
+        var id: String { title }
+    }
+
+    let selectSuggestion: (String) -> Void
+
+    private let suggestions = [
+        Suggestion(title: "整理今天的任务", prompt: "把今天要执行的任务按优先级整理一下"),
+        Suggestion(title: "检查逾期事项", prompt: "帮我找出所有未完成且已经逾期的任务"),
+        Suggestion(title: "规划接下来四天", prompt: "根据现有任务规划接下来四天的执行安排"),
+    ]
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 16) {
             Image(systemName: "sparkles")
-                .font(.title2)
+                .font(.title2.weight(.semibold))
                 .foregroundStyle(TodoAgentUI.primaryText)
-                .frame(width: 44, height: 44)
+                .frame(width: 48, height: 48)
                 .background(TodoAgentUI.surfaceBackground, in: .circle)
                 .overlay {
                     Circle().stroke(TodoAgentUI.hairline, lineWidth: 1)
@@ -515,15 +677,33 @@ private struct AssistantConversationEmptyState: View {
                 .font(.title3.bold())
                 .foregroundStyle(TodoAgentUI.primaryText)
 
-            Text("TodoAgent 可以创建与更新任务、查找相关事项，并整理当前清单。")
-                .font(.callout)
-                .foregroundStyle(TodoAgentUI.secondaryText)
-                .fixedSize(horizontal: false, vertical: true)
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(suggestions) { suggestion in
+                    Button {
+                        selectSuggestion(suggestion.prompt)
+                    } label: {
+                        Label(suggestion.title, systemImage: suggestionIcon(for: suggestion.title))
+                            .font(.callout)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 6)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(TodoAgentUI.primaryText)
+                    .accessibilityHint("把建议填入输入框，不会自动发送")
+                }
+            }
         }
-        .frame(maxWidth: 320, alignment: .leading)
+        .frame(maxWidth: 360, alignment: .leading)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(24)
-        .accessibilityElement(children: .combine)
+    }
+
+    private func suggestionIcon(for title: String) -> String {
+        switch title {
+        case "整理今天的任务": "list.bullet"
+        case "检查逾期事项": "calendar.badge.exclamationmark"
+        default: "calendar.badge.clock"
+        }
     }
 }
 
@@ -567,28 +747,6 @@ private struct AssistantComposerCircleButtonStyle: ButtonStyle {
                 in: .circle
             )
             .contentShape(.circle)
-    }
-}
-
-private struct AssistantAvatar: View {
-    let statusColor: Color
-
-    var body: some View {
-        Image(systemName: "sparkles")
-            .font(.callout.weight(.semibold))
-            .foregroundStyle(TodoAgentUI.primaryText)
-            .frame(width: 30, height: 30)
-            .background(TodoAgentUI.selectionBackground, in: .circle)
-            .overlay {
-                Circle().stroke(TodoAgentUI.hairline, lineWidth: 1)
-            }
-            .overlay(alignment: .bottomTrailing) {
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 8, height: 8)
-                    .overlay { Circle().stroke(TodoAgentUI.surfaceBackground, lineWidth: 2) }
-            }
-            .accessibilityHidden(true)
     }
 }
 
@@ -769,8 +927,11 @@ private struct AssistantProcessingRow: View {
     let phase: AssistantProcessingPhase
 
     var body: some View {
-        HStack(spacing: 9) {
-            AssistantOrbitGlyph()
+        HStack(spacing: 7) {
+            Image(systemName: "ellipsis")
+                .font(.caption.bold())
+                .foregroundStyle(TodoAgentUI.secondaryText)
+                .accessibilityHidden(true)
             Text(phase.label)
                 .font(.caption)
                 .foregroundStyle(TodoAgentUI.secondaryText)
@@ -782,61 +943,24 @@ private struct AssistantProcessingRow: View {
     }
 }
 
-private struct AssistantOrbitGlyph: View {
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var rotation = 0.0
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .trim(from: 0.08, to: 0.72)
-                .stroke(TodoAgentUI.primaryText, style: .init(lineWidth: 1.6, lineCap: .round))
-                .rotationEffect(.degrees(rotation))
-
-            Circle()
-                .trim(from: 0.18, to: 0.82)
-                .stroke(TodoAgentUI.secondaryText, style: .init(lineWidth: 1.4, lineCap: .round))
-                .frame(width: 10, height: 10)
-                .rotationEffect(.degrees(-rotation * 1.35))
-        }
-        .frame(width: 18, height: 18)
-        .accessibilityHidden(true)
-        .onAppear(perform: updateAnimation)
-        .onChange(of: reduceMotion) { updateAnimation() }
-    }
-
-    private func updateAnimation() {
-        if reduceMotion {
-            withAnimation(.none) { rotation = 0 }
-        } else {
-            rotation = 0
-            withAnimation(.linear(duration: 1.15).repeatForever(autoreverses: false)) {
-                rotation = 360
-            }
-        }
-    }
-}
-
 private struct AssistantToolRow: View {
     let tool: AssistantToolActivity
     let state: AppState
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 7) {
-                if tool.state == .running {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: tool.state == .failed ? "xmark.circle.fill" : "checkmark.circle.fill")
-                        .foregroundStyle(tool.state == .failed ? .red : .green)
-                }
+                Image(systemName: stateIcon)
+                    .foregroundStyle(stateColor)
+                    .accessibilityHidden(true)
                 Text(tool.name)
-                    .font(.caption.bold())
+                    .font(.caption.weight(.semibold))
+                    .fontDesign(.monospaced)
                     .lineLimit(1)
                 Spacer()
-                Text(tool.state == .running ? "处理中" : tool.state == .failed ? "失败" : "完成")
+                Text(stateTitle)
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(tool.state == .failed ? Color.red : TodoAgentUI.secondaryText)
             }
 
             if !tool.taskReferences.isEmpty {
@@ -847,14 +971,36 @@ private struct AssistantToolRow: View {
                 }
             }
         }
-        .padding(9)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 7)
         .foregroundStyle(TodoAgentUI.primaryText)
-        .background(TodoAgentUI.surfaceBackground, in: .rect(cornerRadius: 9))
-        .overlay {
-            RoundedRectangle(cornerRadius: 9)
-                .stroke(TodoAgentUI.hairline, lineWidth: 1)
-        }
+        .background(TodoAgentUI.selectionBackground.opacity(0.55), in: .rect(cornerRadius: 8))
         .accessibilityElement(children: .combine)
+        .accessibilityLabel("工具 \(tool.name)，\(stateTitle)")
+    }
+
+    private var stateIcon: String {
+        switch tool.state {
+        case .running: "ellipsis.circle"
+        case .completed: "checkmark.circle.fill"
+        case .failed: "xmark.circle.fill"
+        }
+    }
+
+    private var stateColor: Color {
+        switch tool.state {
+        case .running: TodoAgentUI.secondaryText
+        case .completed: .green
+        case .failed: .red
+        }
+    }
+
+    private var stateTitle: String {
+        switch tool.state {
+        case .running: "处理中"
+        case .completed: "完成"
+        case .failed: "失败"
+        }
     }
 }
 

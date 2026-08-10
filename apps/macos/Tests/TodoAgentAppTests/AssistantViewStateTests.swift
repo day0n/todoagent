@@ -170,6 +170,96 @@ struct AssistantViewStateTests {
         #expect(state.selectedTools.first?.taskReferences == [taskID])
     }
 
+    @Test("tool activity stays inside its turn instead of collecting below the transcript")
+    func conversationTimelineInterleavesToolsByTurn() async {
+        let session = sessionDescriptor(lastSequence: 4)
+        let messages = [
+            AssistantMessage(
+                id: "message-user-1",
+                sessionID: session.id,
+                turnID: "turn-1",
+                sequence: 1,
+                role: .user,
+                body: "先创建任务"
+            ),
+            AssistantMessage(
+                id: "message-agent-1",
+                sessionID: session.id,
+                turnID: "turn-1",
+                sequence: 2,
+                role: .todoAgent,
+                body: "已创建"
+            ),
+            AssistantMessage(
+                id: "message-user-2",
+                sessionID: session.id,
+                turnID: "turn-2",
+                sequence: 3,
+                role: .user,
+                body: "再查询任务"
+            ),
+            AssistantMessage(
+                id: "message-agent-2",
+                sessionID: session.id,
+                turnID: "turn-2",
+                sequence: 4,
+                role: .todoAgent,
+                body: "查询完成"
+            ),
+        ]
+        // Deliberately use call IDs whose alphabetical order is the opposite
+        // of the Engine history order. The timeline must preserve occurrence
+        // order and place each tool before that turn's final reply.
+        let tools = [
+            AssistantPersistedTool(
+                id: "tool-1",
+                sessionID: session.id,
+                turnID: "turn-1",
+                callID: "z-first",
+                toolName: "create_tasks",
+                taskRefsJSON: nil,
+                isError: false,
+                status: "completed"
+            ),
+            AssistantPersistedTool(
+                id: "tool-2",
+                sessionID: session.id,
+                turnID: "turn-1",
+                callID: "a-second",
+                toolName: "find_related",
+                taskRefsJSON: nil,
+                isError: false,
+                status: "completed"
+            ),
+            AssistantPersistedTool(
+                id: "tool-3",
+                sessionID: session.id,
+                turnID: "turn-2",
+                callID: "m-third",
+                toolName: "list_state",
+                taskRefsJSON: nil,
+                isError: false,
+                status: "completed"
+            ),
+        ]
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, messages: messages, tools: tools),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+
+        await state.load()
+
+        #expect(state.selectedTimelineItems.map(\.id) == [
+            "message-message-user-1",
+            "tool-z-first",
+            "tool-a-second",
+            "message-message-agent-1",
+            "message-message-user-2",
+            "tool-m-third",
+            "message-message-agent-2",
+        ])
+    }
+
     @Test("turn completion reconciles a dropped tool event from SQLite")
     func droppedToolEventReconciles() async throws {
         let taskID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000302"))
@@ -381,6 +471,54 @@ struct AssistantViewStateTests {
         #expect(state.selectedSessionID != session.id)
     }
 
+    @Test("an open requested before loading creates one default conversation when ready")
+    func deferredDefaultSessionCreation() async throws {
+        let repository = AssistantTestRepository()
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+
+        #expect(await state.ensureDefaultSession() == false)
+        await state.load()
+
+        let sessions = try await repository.assistantSessions(includeArchived: false)
+        let session = try #require(sessions.first)
+        #expect(sessions.count == 1)
+        #expect(state.selectedSessionID == session.id)
+
+        #expect(await state.ensureDefaultSession())
+        #expect(try await repository.assistantSessions(includeArchived: false).count == 1)
+    }
+
+    @Test("opening with an existing conversation selects it without creating another")
+    func existingSessionIsTheDefault() async throws {
+        let existing = sessionDescriptor(id: "existing-session")
+        let repository = AssistantTestRepository(bundles: [
+            existing.id: AssistantSessionBundle(session: existing),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        #expect(await state.ensureDefaultSession())
+
+        let sessions = try await repository.assistantSessions(includeArchived: false)
+        #expect(sessions.count == 1)
+        #expect(state.selectedSessionID == existing.id)
+    }
+
+    @Test("a failed default conversation stays retryable")
+    func failedDefaultSessionCanRetry() async throws {
+        let repository = AssistantTestRepository(createSessionFailuresRemaining: 1)
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        #expect(await state.ensureDefaultSession() == false)
+        #expect(state.errorMessage != nil)
+        #expect(try await repository.assistantSessions(includeArchived: false).isEmpty)
+
+        #expect(await state.ensureDefaultSession())
+        #expect(state.errorMessage == nil)
+        #expect(try await repository.assistantSessions(includeArchived: false).count == 1)
+    }
+
     @Test("engine.ready restores the in-memory key and reloads assistant state")
     func engineReadyRestoresKey() async throws {
         let session = sessionDescriptor()
@@ -535,6 +673,7 @@ actor AssistantTestRepository: AppRepository {
     private var sentAttachments: [AssistantTextAttachment] = []
     private var loadCallCount = 0
     private var sendFailuresRemaining: Int
+    private var createSessionFailuresRemaining: Int
     private let persistFailedSend: Bool
     private let historyPageSize: Int
     private var shouldSuspendLoad: Bool
@@ -545,12 +684,14 @@ actor AssistantTestRepository: AppRepository {
         bundles: [String: AssistantSessionBundle] = [:],
         historyPageSize: Int = .max,
         sendFailuresRemaining: Int = 0,
+        createSessionFailuresRemaining: Int = 0,
         persistFailedSend: Bool = false,
         suspendLoad: Bool = false
     ) {
         self.bundles = bundles
         self.historyPageSize = historyPageSize
         self.sendFailuresRemaining = sendFailuresRemaining
+        self.createSessionFailuresRemaining = createSessionFailuresRemaining
         self.persistFailedSend = persistFailedSend
         shouldSuspendLoad = suspendLoad
     }
@@ -573,7 +714,13 @@ actor AssistantTestRepository: AppRepository {
         continuation.finish()
         return stream
     }
-    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot { snapshot }
+    func createList(name: String, color: String) async throws -> AppSnapshot { snapshot }
+    func createTask(title: String, note: String, listID: UUID?, executionDate: LocalDay?, dueDate: LocalDay?) async throws -> AppSnapshot { snapshot }
+    func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot { snapshot }
+    func deleteTask(taskID: UUID) async throws -> AppSnapshot { snapshot }
+    func createListFromTask(taskID: UUID) async throws -> AppSnapshot { snapshot }
+    func addTaskAttachments(taskID: UUID, sourcePaths: [String], clientMutationID: UUID) async throws -> AppSnapshot { snapshot }
+    func removeTaskAttachment(taskID: UUID, attachmentID: UUID, clientMutationID: UUID) async throws -> AppSnapshot { snapshot }
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot { snapshot }
     func detectRuntimes() async throws -> AppSnapshot { snapshot }
     func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot { snapshot }
@@ -598,6 +745,10 @@ actor AssistantTestRepository: AppRepository {
     }
 
     func createAssistantSession(title: String?) async throws -> AssistantSessionBundle {
+        if createSessionFailuresRemaining > 0 {
+            createSessionFailuresRemaining -= 1
+            throw AppRepositoryError.runtimeUnavailable
+        }
         let session = AssistantSessionDescriptor(id: UUID().uuidString, title: title ?? "")
         let bundle = AssistantSessionBundle(session: session)
         bundles[session.id] = bundle

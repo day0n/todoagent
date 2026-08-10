@@ -11,7 +11,8 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "TodoAgentApp",
-            path: "Sources/TodoAgentApp"
+            path: "Sources/TodoAgentApp",
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "TodoAgentAppTests",

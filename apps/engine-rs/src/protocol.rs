@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -77,8 +77,13 @@ pub fn handshake() -> Event<Handshake> {
                 "app.sync",
                 "list.create",
                 "task.create",
+                "task.update",
                 "task.complete",
                 "task.reopen",
+                "task.create_list",
+                "task.delete",
+                "task.attachment.add",
+                "task.attachment.remove",
                 "runtime.list",
                 "runtime.detect",
                 "runtime.verify",
@@ -122,10 +127,13 @@ mod tests {
     }
 
     #[test]
-    fn handshake_is_v2_and_lists_four_runtimes() {
+    fn handshake_is_v3_and_lists_four_runtimes() {
         let value = serde_json::to_value(handshake()).unwrap();
-        assert_eq!(value["data"]["protocolVersion"], 2);
+        assert_eq!(value["data"]["protocolVersion"], 3);
         assert_eq!(value["data"]["runtimes"].as_array().unwrap().len(), 4);
+        let capabilities = value["data"]["capabilities"].as_array().unwrap();
+        assert!(capabilities.contains(&Value::String("task.create_list".to_owned())));
+        assert!(capabilities.contains(&Value::String("task.delete".to_owned())));
     }
 
     #[test]
@@ -136,9 +144,35 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(values.len(), 15);
+        assert_eq!(values.len(), 22);
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("assistant.send")
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("event").and_then(Value::as_str) == Some("task.changed")
+                && value["data"]["tasks"][0]["executionDate"] == "2026-08-11"
+                && value["data"]["taskAttachments"][0]["relativePath"]
+                    == "Attachments/abcdefab-cdef-4abc-8def-abcdefabc102.pdf"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("task.update")
+                && value["params"]["taskId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("task.create_list")
+                && value["params"]["taskId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("task.delete")
+                && value["params"]["taskId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("task.attachment.add")
+                && value["params"]["clientMutationId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC103"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("task.attachment.remove")
+                && value["params"]["clientMutationId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC104"
         }));
         assert!(values.iter().any(|value| {
             value.get("event").and_then(Value::as_str) == Some("assistant.message.delta")

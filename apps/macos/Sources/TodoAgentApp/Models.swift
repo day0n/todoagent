@@ -1,5 +1,119 @@
 import Foundation
 
+extension Calendar {
+    /// TodoAgent stores civil dates as Gregorian `YYYY-MM-DD` values while
+    /// still following the user's live system time zone. Never inherit the
+    /// user's preferred calendar identifier (for example Buddhist or Japanese)
+    /// for persistence or schedule projection.
+    static var todoAgentLocal: Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.locale = .autoupdatingCurrent
+        calendar.timeZone = .autoupdatingCurrent
+        return calendar
+    }
+}
+
+/// A calendar day without a time, time zone, or daylight-saving offset.
+///
+/// TodoAgent's task scheduling contract deliberately transports days as
+/// `YYYY-MM-DD`. Keeping that value intact prevents a task from moving to an
+/// adjacent column when the current time zone changes.
+struct LocalDay: RawRepresentable, Codable, Hashable, Comparable, Sendable, CustomStringConvertible {
+    let year: Int
+    let month: Int
+    let day: Int
+
+    init?(rawValue: String) {
+        let pieces = rawValue.split(separator: "-", omittingEmptySubsequences: false)
+        guard
+            pieces.count == 3,
+            pieces[0].count == 4,
+            pieces[1].count == 2,
+            pieces[2].count == 2,
+            let year = Int(pieces[0]),
+            let month = Int(pieces[1]),
+            let day = Int(pieces[2]),
+            (1 ... 9999).contains(year),
+            (1 ... 12).contains(month),
+            (1 ... 31).contains(day)
+        else { return nil }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let components = DateComponents(
+            calendar: calendar,
+            timeZone: calendar.timeZone,
+            year: year,
+            month: month,
+            day: day
+        )
+        guard
+            let date = calendar.date(from: components),
+            calendar.dateComponents([.year, .month, .day], from: date) ==
+                DateComponents(year: year, month: month, day: day)
+        else { return nil }
+
+        self.year = year
+        self.month = month
+        self.day = day
+    }
+
+    init(_ date: Date, calendar: Calendar = .todoAgentLocal) {
+        let components = calendar.dateComponents([.year, .month, .day], from: date)
+        year = components.year ?? 1
+        month = components.month ?? 1
+        day = components.day ?? 1
+    }
+
+    init(date: Date, calendar: Calendar = .todoAgentLocal) {
+        self.init(date, calendar: calendar)
+    }
+
+    var rawValue: String {
+        String(format: "%04d-%02d-%02d", year, month, day)
+    }
+
+    var description: String { rawValue }
+
+    func date(in calendar: Calendar = .todoAgentLocal) -> Date? {
+        calendar.date(from: DateComponents(year: year, month: month, day: day))
+            .map(calendar.startOfDay(for:))
+    }
+
+    func advanced(by days: Int, calendar: Calendar = .todoAgentLocal) -> LocalDay? {
+        guard
+            let date = date(in: calendar),
+            let advanced = calendar.date(byAdding: .day, value: days, to: date)
+        else { return nil }
+        return LocalDay(advanced, calendar: calendar)
+    }
+
+    static func today(now: Date = .now, calendar: Calendar = .todoAgentLocal) -> LocalDay {
+        LocalDay(now, calendar: calendar)
+    }
+
+    static func < (lhs: LocalDay, rhs: LocalDay) -> Bool {
+        (lhs.year, lhs.month, lhs.day) < (rhs.year, rhs.month, rhs.day)
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let value = try container.decode(String.self)
+        guard let day = LocalDay(rawValue: value) else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Expected a real local day in YYYY-MM-DD format."
+            )
+        }
+        self = day
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(rawValue)
+    }
+}
+
 enum TaskStatus: String, Codable, CaseIterable, Sendable {
     case open
     case completed
@@ -388,6 +502,28 @@ struct AssistantToolActivity: Identifiable, Equatable, Sendable {
     var taskReferences: [UUID]
 }
 
+/// One stable row in the TodoAgent conversation. Messages and tool activity
+/// share a turn ID, so the UI can keep every tool beside the user request that
+/// caused it instead of rendering a second tool list at the end of the chat.
+enum AssistantConversationTimelineItem: Identifiable, Equatable, Sendable {
+    case message(AssistantMessage)
+    case tool(AssistantToolActivity)
+
+    var id: String {
+        switch self {
+        case let .message(message): "message-\(message.id)"
+        case let .tool(tool): "tool-\(tool.toolCallID)"
+        }
+    }
+
+    var turnID: String? {
+        switch self {
+        case let .message(message): message.turnID
+        case let .tool(tool): tool.turnID
+        }
+    }
+}
+
 enum AssistantLoadState: Equatable, Sendable { case idle, loading, loaded, failed(String) }
 
 // MARK: Assistant request/response payloads
@@ -653,11 +789,9 @@ struct SessionBundle: Codable, Equatable, Sendable {
 enum AppLoadState: Equatable, Sendable { case loading, loaded, failed(String) }
 
 enum AppSheet: Identifiable, Equatable, Sendable {
-    case newTask
     case taskSession(UUID)
     var id: String {
         switch self {
-        case .newTask: "new-task"
         case let .taskSession(id): "task-session-\(id)"
         }
     }
@@ -669,10 +803,294 @@ struct TaskItem: Identifiable, Codable, Hashable, Sendable {
     var title: String
     var note: String
     var status: TaskStatus
-    var dueDate: Date?
+    var executionDate: LocalDay?
+    var dueDate: LocalDay?
+    var attachments: [TaskAttachment]
     var completedAt: String?
     let createdAt: Date
     var updatedAt: String
+
+    init(
+        id: UUID,
+        listID: UUID?,
+        title: String,
+        note: String,
+        status: TaskStatus,
+        executionDate: LocalDay? = nil,
+        dueDate: LocalDay? = nil,
+        attachments: [TaskAttachment] = [],
+        completedAt: String?,
+        createdAt: Date,
+        updatedAt: String
+    ) {
+        self.id = id
+        self.listID = listID
+        self.title = title
+        self.note = note
+        self.status = status
+        self.executionDate = executionDate
+        self.dueDate = dueDate
+        self.attachments = attachments
+        self.completedAt = completedAt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case listID = "listId"
+        case title, note, status, executionDate, dueDate, completedAt, createdAt, updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(UUID.self, forKey: .id)
+        listID = try values.decodeIfPresent(UUID.self, forKey: .listID)
+        title = try values.decode(String.self, forKey: .title)
+        note = try values.decodeIfPresent(String.self, forKey: .note) ?? ""
+        status = try values.decode(TaskStatus.self, forKey: .status)
+        executionDate = try values.decodeIfPresent(LocalDay.self, forKey: .executionDate)
+        dueDate = try values.decodeIfPresent(LocalDay.self, forKey: .dueDate)
+        attachments = []
+        completedAt = try values.decodeIfPresent(String.self, forKey: .completedAt)
+        createdAt = try values.decode(Date.self, forKey: .createdAt)
+        updatedAt = try values.decode(String.self, forKey: .updatedAt)
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encodeIfPresent(listID, forKey: .listID)
+        try values.encode(title, forKey: .title)
+        try values.encode(note, forKey: .note)
+        try values.encode(status, forKey: .status)
+        try values.encodeIfPresent(executionDate, forKey: .executionDate)
+        try values.encodeIfPresent(dueDate, forKey: .dueDate)
+        try values.encodeIfPresent(completedAt, forKey: .completedAt)
+        try values.encode(createdAt, forKey: .createdAt)
+        try values.encode(updatedAt, forKey: .updatedAt)
+    }
+
+    func isDueDateOverdue(on today: LocalDay = .today()) -> Bool {
+        status == .open && dueDate.map { $0 < today } == true
+    }
+
+    func isExecutionDateOverdue(on today: LocalDay = .today()) -> Bool {
+        status == .open && executionDate.map { $0 < today } == true
+    }
+
+    /// A task needs overdue attention when either of its explicit schedule
+    /// dates has passed while it remains open. The two dates keep their domain
+    /// meanings; this only unifies their user-facing warning state.
+    func isOverdue(on today: LocalDay = .today()) -> Bool {
+        isDueDateOverdue(on: today) || isExecutionDateOverdue(on: today)
+    }
+
+    func cardDatePresentation(on today: LocalDay = .today()) -> TaskCardDatePresentation? {
+        let candidates = [
+            dueDate.map {
+                TaskCardDatePresentation(
+                    kind: .due,
+                    day: $0,
+                    isOverdue: isDueDateOverdue(on: today)
+                )
+            },
+            executionDate.map {
+                TaskCardDatePresentation(
+                    kind: .execution,
+                    day: $0,
+                    isOverdue: isExecutionDateOverdue(on: today)
+                )
+            },
+        ].compactMap { $0 }
+
+        return candidates.first(where: \.isOverdue) ?? candidates.first
+    }
+}
+
+enum TaskCardDateKind: String, Equatable, Sendable {
+    case execution
+    case due
+}
+
+struct TaskCardDatePresentation: Equatable, Sendable {
+    let kind: TaskCardDateKind
+    let day: LocalDay
+    let isOverdue: Bool
+}
+
+struct TaskAttachment: Identifiable, Codable, Hashable, Sendable {
+    let id: UUID
+    let taskID: UUID
+    let originalName: String
+    let sizeBytes: Int64
+    let mimeType: String
+    let relativePath: String
+    let createdAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case taskID = "taskId"
+        case originalName, sizeBytes, mimeType, relativePath, createdAt
+    }
+
+    /// Resolves the Engine-managed copy from the same data root selection used
+    /// by the Rust process. Attachment metadata is intentionally restricted to
+    /// exactly `Attachments/<safe leaf>` before it becomes a local file URL.
+    func managedURL(
+        fileManager: FileManager = .default,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        let components = relativePath.split(
+            separator: "/",
+            omittingEmptySubsequences: false
+        )
+        guard
+            components.count == 2,
+            components[0] == "Attachments"
+        else { return nil }
+
+        let leaf = String(components[1])
+        guard !leaf.isEmpty, leaf != ".", leaf != "..", !leaf.contains("\0") else {
+            return nil
+        }
+
+        let root: URL
+        if let configuredRoot = environment["TODOAGENT_NATIVE_DATA_DIR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !configuredRoot.isEmpty {
+            root = URL(fileURLWithPath: configuredRoot, isDirectory: true).standardizedFileURL
+        } else {
+            guard let applicationSupport = fileManager.urls(
+                for: .applicationSupportDirectory,
+                in: .userDomainMask
+            ).first else { return nil }
+            root = applicationSupport
+                .appendingPathComponent("TodoAgent", isDirectory: true)
+                .standardizedFileURL
+        }
+
+        let attachmentsRoot = root
+            .appendingPathComponent("Attachments", isDirectory: true)
+            .standardizedFileURL
+        let candidate = attachmentsRoot
+            .appendingPathComponent(leaf, isDirectory: false)
+            .standardizedFileURL
+        guard candidate.deletingLastPathComponent() == attachmentsRoot else { return nil }
+        return candidate
+    }
+}
+
+extension TaskItem {
+    mutating func apply(_ patch: TaskPatch) {
+        if let title = patch.title { self.title = title }
+        if let note = patch.note { self.note = note }
+        if let status = patch.status {
+            self.status = status
+            completedAt = status == .completed
+                ? completedAt ?? ISO8601DateFormatter().string(from: .now)
+                : nil
+        }
+        switch patch.listID {
+        case .unchanged: break
+        case let .set(value): listID = value
+        case .clear: listID = nil
+        }
+        switch patch.executionDate {
+        case .unchanged: break
+        case let .set(value): executionDate = value
+        case .clear: executionDate = nil
+        }
+        switch patch.dueDate {
+        case .unchanged: break
+        case let .set(value): dueDate = value
+        case .clear: dueDate = nil
+        }
+    }
+}
+
+enum TaskPatchField<Value: Equatable & Sendable>: Equatable, Sendable {
+    case unchanged
+    case set(Value)
+    case clear
+}
+
+/// A tri-state task patch. `.unchanged` omits a key from JSON while `.clear`
+/// emits an explicit `null`; this distinction is part of IPC v3.
+struct TaskPatch: Encodable, Equatable, Sendable {
+    var title: String?
+    var note: String?
+    var status: TaskStatus?
+    var listID: TaskPatchField<UUID>
+    var executionDate: TaskPatchField<LocalDay>
+    var dueDate: TaskPatchField<LocalDay>
+
+    init(
+        title: String? = nil,
+        note: String? = nil,
+        status: TaskStatus? = nil,
+        listID: TaskPatchField<UUID> = .unchanged,
+        executionDate: TaskPatchField<LocalDay> = .unchanged,
+        dueDate: TaskPatchField<LocalDay> = .unchanged
+    ) {
+        self.title = title
+        self.note = note
+        self.status = status
+        self.listID = listID
+        self.executionDate = executionDate
+        self.dueDate = dueDate
+    }
+
+    var isEmpty: Bool {
+        title == nil && note == nil && status == nil && listID == .unchanged &&
+            executionDate == .unchanged && dueDate == .unchanged
+    }
+
+    func merging(_ newer: TaskPatch) -> TaskPatch {
+        TaskPatch(
+            title: newer.title ?? title,
+            note: newer.note ?? note,
+            status: newer.status ?? status,
+            listID: newer.listID == .unchanged ? listID : newer.listID,
+            executionDate: newer.executionDate == .unchanged ? executionDate : newer.executionDate,
+            dueDate: newer.dueDate == .unchanged ? dueDate : newer.dueDate
+        )
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case title, note, status
+        case listID = "listId"
+        case executionDate, dueDate
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encodeIfPresent(title, forKey: .title)
+        try values.encodeIfPresent(note, forKey: .note)
+        try values.encodeIfPresent(status, forKey: .status)
+        try Self.encode(listID, forKey: .listID, into: &values)
+        try Self.encode(executionDate, forKey: .executionDate, into: &values)
+        try Self.encode(dueDate, forKey: .dueDate, into: &values)
+    }
+
+    private static func encode<Value: Encodable & Equatable & Sendable>(
+        _ field: TaskPatchField<Value>,
+        forKey key: CodingKeys,
+        into values: inout KeyedEncodingContainer<CodingKeys>
+    ) throws {
+        switch field {
+        case .unchanged: break
+        case let .set(value): try values.encode(value, forKey: key)
+        case .clear: try values.encodeNil(forKey: key)
+        }
+    }
+}
+
+enum TaskSaveState: Equatable, Sendable {
+    case idle
+    case debouncing
+    case saving
+    case failed(String)
 }
 
 struct TodoList: Identifiable, Codable, Hashable, Sendable {
@@ -713,4 +1131,20 @@ struct AppSnapshot: Codable, Equatable, Sendable {
     var messages: [ChatMessage]
 }
 
-enum BoardBucket: String, CaseIterable, Identifiable, Sendable { case today, tomorrow, dayAfter, later; var id: Self { self } }
+struct TimelineDay: Identifiable, Equatable, Sendable {
+    let day: LocalDay
+    let tasks: [TaskItem]
+
+    var id: LocalDay { day }
+    var completedCount: Int { tasks.count(where: { $0.status == .completed }) }
+    var totalCount: Int { tasks.count }
+    var progress: Double {
+        guard totalCount > 0 else { return 0 }
+        return Double(completedCount) / Double(totalCount)
+    }
+}
+
+enum BoardBucket: String, CaseIterable, Identifiable, Sendable {
+    case today, tomorrow, dayAfter, threeDaysAfter
+    var id: Self { self }
+}

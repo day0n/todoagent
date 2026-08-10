@@ -13,7 +13,7 @@ struct EngineClientTests {
             try EngineWireMessage.decode(Data($0.utf8))
         }
 
-        try #require(messages.count == 15)
+        try #require(messages.count == 22)
 
         guard case let .event(ready) = messages[0] else {
             Issue.record("The first contract line must be engine.ready.")
@@ -23,7 +23,7 @@ struct EngineClientTests {
         let handshake = try #require(
             JSONSerialization.jsonObject(with: ready.data) as? [String: Any]
         )
-        #expect(handshake["protocolVersion"] as? Int == 2)
+        #expect(handshake["protocolVersion"] as? Int == 3)
         #expect(handshake["engineVersion"] as? String == "0.1.0")
 
         guard case let .request(id, method, params) = messages[1] else {
@@ -44,9 +44,66 @@ struct EngineClientTests {
         )
         #expect((snapshot["lists"] as? [Any])?.isEmpty == true)
         #expect((snapshot["tasks"] as? [Any])?.isEmpty == true)
+        #expect((snapshot["taskAttachments"] as? [Any])?.isEmpty == true)
 
-        guard case let .failure(errorID, code, message, details) = messages[3] else {
-            Issue.record("The fourth contract line must be an error response.")
+        guard case let .request(_, createMethod, createParams) = messages[3] else {
+            Issue.record("The fourth contract line must create a task.")
+            return
+        }
+        #expect(createMethod == "task.create")
+        let createObject = try #require(
+            JSONSerialization.jsonObject(with: createParams) as? [String: Any]
+        )
+        #expect(createObject["executionDate"] as? String == "2026-08-10")
+        #expect(createObject["dueDate"] as? String == "2026-08-12")
+
+        guard case let .request(_, updateMethod, updateParams) = messages[4] else {
+            Issue.record("The fifth contract line must update a task.")
+            return
+        }
+        #expect(updateMethod == "task.update")
+        let updateObject = try #require(
+            JSONSerialization.jsonObject(with: updateParams) as? [String: Any]
+        )
+        let fixturePatch = try #require(updateObject["patch"] as? [String: Any])
+        #expect(fixturePatch["executionDate"] as? String == "2026-08-11")
+        #expect(fixturePatch.keys.contains("dueDate"))
+        #expect(fixturePatch["dueDate"] is NSNull)
+
+        guard case let .request(_, createListMethod, createListParams) = messages[5] else {
+            Issue.record("The sixth contract line must create a list from a task.")
+            return
+        }
+        #expect(createListMethod == "task.create_list")
+        let createListObject = try #require(
+            JSONSerialization.jsonObject(with: createListParams) as? [String: Any]
+        )
+        #expect(createListObject["taskId"] as? String == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101")
+
+        guard case let .request(_, deleteMethod, deleteParams) = messages[6] else {
+            Issue.record("The seventh contract line must delete a task.")
+            return
+        }
+        #expect(deleteMethod == "task.delete")
+        let deleteObject = try #require(
+            JSONSerialization.jsonObject(with: deleteParams) as? [String: Any]
+        )
+        #expect(deleteObject["taskId"] as? String == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101")
+
+        guard case let .event(taskChanged) = messages[9] else {
+            Issue.record("The tenth contract line must be task.changed.")
+            return
+        }
+        let changedSnapshot = try JSONDecoder().decode(
+            EngineBootstrap.self,
+            from: taskChanged.data
+        )
+        #expect(changedSnapshot.revision == 2)
+        #expect(changedSnapshot.tasks.first?.executionDate?.rawValue == "2026-08-11")
+        #expect(changedSnapshot.taskAttachments.first?.originalName == "brief.pdf")
+
+        guard case let .failure(errorID, code, message, details) = messages[10] else {
+            Issue.record("The eleventh contract line must be an error response.")
             return
         }
         #expect(errorID == "missing-1")
@@ -54,7 +111,7 @@ struct EngineClientTests {
         #expect(message == "requested record does not exist")
         #expect(details == nil)
 
-        guard case let .response(listResponseID, listResult) = messages[5] else {
+        guard case let .response(listResponseID, listResult) = messages[12] else {
             Issue.record("The assistant list fixture must include its response.")
             return
         }
@@ -63,7 +120,7 @@ struct EngineClientTests {
         #expect(listed.sessions.first?.displayTitle == "原生助手")
         #expect(listed.sessions.first?.isRunning == false)
 
-        guard case let .request(sendID, sendMethod, sendParams) = messages[6] else {
+        guard case let .request(sendID, sendMethod, sendParams) = messages[13] else {
             Issue.record("The assistant send fixture must be a request.")
             return
         }
@@ -76,8 +133,8 @@ struct EngineClientTests {
         #expect(sendObject["clientMessageId"] as? String == "00000000-0000-4000-8000-000000000202")
         #expect(sendObject["model"] as? String == "gemini-3.6-flash")
 
-        guard case let .event(deltaEvent) = messages[8] else {
-            Issue.record("The ninth contract line must be an assistant delta event.")
+        guard case let .event(deltaEvent) = messages[15] else {
+            Issue.record("The sixteenth contract line must be an assistant delta event.")
             return
         }
         #expect(deltaEvent.name == "assistant.message.delta")
@@ -86,8 +143,8 @@ struct EngineClientTests {
         #expect(delta.attempt == 1)
         #expect(delta.delta == "已经创建")
 
-        guard case let .event(appendedEvent) = messages[11] else {
-            Issue.record("The twelfth contract line must be an appended assistant message.")
+        guard case let .event(appendedEvent) = messages[18] else {
+            Issue.record("The nineteenth contract line must be an appended assistant message.")
             return
         }
         #expect(appendedEvent.name == "assistant.message.appended")
@@ -100,7 +157,7 @@ struct EngineClientTests {
         let referencedTaskID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000101"))
         #expect(appended.message.taskReferences == [referencedTaskID])
 
-        guard case let .response(historyResponseID, historyResult) = messages[14] else {
+        guard case let .response(historyResponseID, historyResult) = messages[21] else {
             Issue.record("The final contract line must be an assistant history response.")
             return
         }
@@ -140,25 +197,84 @@ struct EngineClientTests {
         #expect(sessionObject["taskId"] == nil)
 
         let createTask = try object(
-            CreateTaskRequest(title: "任务", note: "", listID: taskID, dueDate: nil)
+            CreateTaskRequest(
+                title: "任务",
+                note: "",
+                listID: taskID,
+                executionDate: LocalDay(rawValue: "2026-08-10"),
+                dueDate: nil
+            )
         )
         #expect(createTask["listId"] as? String == taskID.uuidString)
         #expect(createTask["listID"] == nil)
+        #expect(createTask["executionDate"] as? String == "2026-08-10")
+
+        let patchObject = try object(
+            UpdateTaskRequest(
+                taskID: taskID,
+                patch: TaskPatch(
+                    title: "修改",
+                    executionDate: .unchanged,
+                    dueDate: .clear
+                )
+            )
+        )
+        let encodedPatch = try #require(patchObject["patch"] as? [String: Any])
+        #expect(encodedPatch["title"] as? String == "修改")
+        #expect(encodedPatch.keys.contains("executionDate") == false)
+        #expect(encodedPatch.keys.contains("dueDate"))
+        #expect(encodedPatch["dueDate"] is NSNull)
+
+        let createList = try object(
+            CreateListRequest(name: "工作", color: "blue", repositoryPath: nil)
+        )
+        #expect(createList["name"] as? String == "工作")
+        #expect(createList["color"] as? String == "blue")
+        #expect(createList["repositoryPath"] == nil)
 
         let taskStatus = try object(TaskIDRequest(taskID: taskID))
         #expect(taskStatus["taskId"] as? String == taskID.uuidString)
         #expect(taskStatus["taskID"] == nil)
 
+        let deleteTask = try object(DeleteTaskRequest(taskID: taskID))
+        #expect(deleteTask["taskId"] as? String == taskID.uuidString)
+        #expect(deleteTask["taskID"] == nil)
+
+        let createListFromTask = try object(CreateListFromTaskRequest(taskID: taskID))
+        #expect(createListFromTask["taskId"] as? String == taskID.uuidString)
+        #expect(createListFromTask["taskID"] == nil)
+
+        let addAttachments = try object(
+            AddTaskAttachmentsRequest(
+                taskID: taskID,
+                sourcePaths: ["/tmp/report.pdf"],
+                clientMutationID: clientMessageID
+            )
+        )
+        #expect(addAttachments["taskId"] as? String == taskID.uuidString)
+        #expect(addAttachments["clientMutationId"] as? String == clientMessageID.uuidString)
+        #expect(addAttachments["clientMutationID"] == nil)
+
+        let removeAttachment = try object(
+            RemoveTaskAttachmentRequest(
+                taskID: taskID,
+                attachmentID: clientMessageID,
+                clientMutationID: taskID
+            )
+        )
+        #expect(removeAttachment["attachmentId"] as? String == clientMessageID.uuidString)
+        #expect(removeAttachment["clientMutationId"] as? String == taskID.uuidString)
+        #expect(removeAttachment["attachmentID"] == nil)
+
         let createSession = try object(
             CreateSessionRequest(
                 taskID: taskID,
                 runtimeKind: .codex,
-                workingDirectory: "/tmp/project",
-                clientMessageID: clientMessageID
+                workingDirectory: "/tmp/project"
             )
         )
         #expect(createSession["taskId"] as? String == taskID.uuidString)
-        #expect(createSession["clientMessageId"] as? String == clientMessageID.uuidString)
+        #expect(createSession["clientMessageId"] == nil)
         #expect(createSession["taskID"] == nil)
         #expect(createSession["clientMessageID"] == nil)
 
@@ -273,7 +389,7 @@ struct EngineClientTests {
         }
     }
 
-    @Test("Repository load keeps persisted runtimes and verify uses its extended timeout")
+    @Test("Repository uses dedicated timeouts for runtime verification and attachment copies")
     func repositoryRuntimeLifecycle() async throws {
         let fake = try makeRuntimeRepositoryFakeEngine()
         defer { try? FileManager.default.removeItem(at: fake.directory) }
@@ -302,8 +418,17 @@ struct EngineClientTests {
             #expect(verified.runtimes.first?.status == .ready)
             #expect(verified.runtimes.first?.verifiedAt == "2026-08-09T00:02:00Z")
 
+            // Copying a full attachment batch can legitimately exceed the
+            // generic request timeout, just like CLI verification.
+            _ = try await repository.addTaskAttachments(
+                taskID: UUID(),
+                sourcePaths: ["/tmp/large-attachment.bin"],
+                clientMutationID: UUID()
+            )
+
             let allRequests = try String(contentsOf: fake.requestLog, encoding: .utf8)
             #expect(allRequests.contains(#""method":"runtime.verify""#))
+            #expect(allRequests.contains(#""method":"task.attachment.add""#))
             #expect(allRequests.contains(#""method":"app.sync""#))
             await repository.shutdown()
         } catch {
@@ -364,7 +489,7 @@ struct EngineClientTests {
             try await client.start()
             Issue.record("The first handshake should have been rejected.")
         } catch let error as EngineClientError {
-            #expect(error == .protocolMismatch(expected: 2, received: 999))
+            #expect(error == .protocolMismatch(expected: 3, received: 999))
         }
 
         do {
@@ -457,7 +582,7 @@ struct EngineClientTests {
 
         var script = #"""
         #!/bin/zsh
-        protocol_version=2
+        protocol_version=3
         __FIRST_LAUNCH_BLOCK__
         printf '{"event":"engine.ready","data":{"protocolVersion":%s,"engineVersion":"fake-1.0.0","capabilities":["engine.shutdown"]}}\n' "$protocol_version"
 
@@ -496,10 +621,10 @@ struct EngineClientTests {
         #!/bin/zsh
         request_log="$0.requests.ndjson"
         : > "$request_log"
-        printf '{"event":"engine.ready","data":{"protocolVersion":2,"engineVersion":"fake-runtime-1.0.0","capabilities":["engine.shutdown"]}}\n'
+        printf '{"event":"engine.ready","data":{"protocolVersion":3,"engineVersion":"fake-runtime-1.0.0","capabilities":["engine.shutdown"]}}\n'
 
         runtime='{"kind":"codex","launchPath":"/usr/local/bin/codex","resolvedPath":"/opt/codex/bin/codex","version":"codex-cli 1.2.3","status":"ready","authStatus":"authenticated","capabilities":{},"providerEngine":null,"detectedAt":"2026-08-09T00:01:00Z","verifiedAt":"2026-08-09T00:02:00Z","verifyError":null}'
-        verified_bootstrap='{"revision":0,"lists":[],"tasks":[],"runtimes":['"$runtime"'],"sessions":[]}'
+        verified_bootstrap='{"revision":0,"lists":[],"tasks":[],"taskAttachments":[],"runtimes":['"$runtime"'],"sessions":[]}'
 
         while IFS= read -r line; do
           printf '%s\n' "$line" >> "$request_log"
@@ -515,6 +640,11 @@ struct EngineClientTests {
           if [[ "$line" == *'"method":"runtime.verify"'* ]]; then
             /bin/sleep 0.35
             printf '{"id":"%s","result":%s}\n' "$request_id" "$runtime"
+            continue
+          fi
+          if [[ "$line" == *'"method":"task.attachment.add"'* ]]; then
+            /bin/sleep 0.35
+            printf '{"id":"%s","result":%s}\n' "$request_id" "$verified_bootstrap"
             continue
           fi
           if [[ "$line" == *'"method":"app.sync"'* ]]; then

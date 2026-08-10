@@ -5,8 +5,37 @@ import Observation
 @MainActor
 @Observable
 final class AppState {
+    private struct ActiveTaskFlush {
+        let token: UUID
+        let task: Task<Bool, Never>
+    }
+
+    private enum TaskAttachmentMutation: Sendable {
+        case add(sourcePaths: [String], clientMutationID: UUID)
+        case remove(attachmentID: UUID, clientMutationID: UUID)
+    }
+
+    private enum FailedTaskCommand {
+        case createList(previousListIDs: Set<UUID>, recoveryOnly: Bool)
+        case delete(recoveryOnly: Bool)
+
+        var recoveryOnly: Bool {
+            switch self {
+            case let .createList(_, recoveryOnly), let .delete(recoveryOnly):
+                recoveryOnly
+            }
+        }
+    }
+
+    private struct ActiveEngineRecovery {
+        let token: UUID
+        let task: Task<Void, Never>
+    }
+
     private let repository: any AppRepository
+    private let calendar: Calendar
     private var projection = TaskProjection.empty
+    private var hasAppliedSnapshot = false
     private var eventTask: Task<Void, Never>?
     private var eventGeneration: UInt64 = 0
     private var loadTask: Task<Void, Never>?
@@ -15,43 +44,71 @@ final class AppState {
     private var sessionLoadTask: Task<Void, Never>?
     private var sessionLoadGeneration: UInt64 = 0
     private var bundles: [UUID: SessionBundle] = [:]
+    private var pendingTaskPatches: [UUID: TaskPatch] = [:]
+    private var inFlightTaskPatches: [UUID: TaskPatch] = [:]
+    private var pendingTaskAttachmentMutations: [UUID: [TaskAttachmentMutation]] = [:]
+    private var taskDebounceTasks: [UUID: Task<Void, Never>] = [:]
+    private var activeTaskFlushes: [UUID: ActiveTaskFlush] = [:]
+    private var activeTaskCommands: Set<UUID> = []
+    private var activeTaskCommandWaiters: [CheckedContinuation<Void, Never>] = []
+    private var failedTaskCommands: [UUID: FailedTaskCommand] = [:]
+    private var activeEngineRecovery: ActiveEngineRecovery?
+    private var localDayRefreshTask: Task<Void, Never>?
+    private var calendarObservers: [NSObjectProtocol] = []
+    private var workspaceCalendarObserver: NSObjectProtocol?
 
+    private(set) var revision: Int64 = 0
     private(set) var lists: [TodoList] = []
     private(set) var tasks: [TaskItem] = []
     private(set) var messages: [ChatMessage] = []
     private(set) var runtimes: [RuntimeInfo] = []
     private(set) var sessions: [TaskSessionDescriptor] = []
     private(set) var loadingSessionTaskID: UUID?
-    private(set) var pendingNewTaskListID: UUID?
     private(set) var taskSessionErrorMessage: String?
+    private(set) var taskSaveStates: [UUID: TaskSaveState] = [:]
     let assistant: AssistantViewState
 
     var selection: SidebarSelection? = .smart(.timeline)
-    var selectedDate = Calendar.current.startOfDay(for: .now)
+    var selectedDay: LocalDay
+    private(set) var currentDay: LocalDay
+    var selectedDate: Date {
+        get { selectedDay.date(in: calendar) ?? .now }
+        set { selectedDay = LocalDay(newValue, calendar: calendar) }
+    }
     var inspectorPresented: Bool
     var presentedSheet: AppSheet?
     var loadState: AppLoadState = .loading
     var errorMessage: String?
+    private(set) var isPreparingToTerminate = false
 
-    init(repository: any AppRepository, inspectorPresented: Bool = false) {
+    init(
+        repository: any AppRepository,
+        inspectorPresented: Bool = false,
+        now: Date = .now,
+        calendar: Calendar = .todoAgentLocal
+    ) {
         self.repository = repository
+        self.calendar = calendar
         self.inspectorPresented = inspectorPresented
+        let today = LocalDay(now, calendar: calendar)
+        selectedDay = today
+        currentDay = today
         assistant = AssistantViewState(repository: repository)
+        installCalendarObservers()
     }
 
-    func openAssistant() {
+    @discardableResult
+    func openAssistant() async -> Bool {
         inspectorPresented = true
+        return await assistant.ensureDefaultSession()
     }
 
-    func toggleAssistant() {
-        inspectorPresented.toggle()
-    }
-
-    /// Captures the destination list when the creation surface opens. The
-    /// sheet uses this stable value even if navigation changes before save.
-    func presentNewTask() {
-        pendingNewTaskListID = if case let .list(id) = selection { id } else { nil }
-        presentedSheet = .newTask
+    func toggleAssistant() async {
+        if inspectorPresented {
+            inspectorPresented = false
+        } else {
+            await openAssistant()
+        }
     }
 
     /// Opens the native assistant surface first, then creates a session only
@@ -67,6 +124,7 @@ final class AppState {
     func load() async {
         if hasLoaded {
             startEventsIfNeeded()
+            scheduleLocalDayRefresh()
             assistant.resumeEventsIfNeeded()
             return
         }
@@ -95,10 +153,14 @@ final class AppState {
             guard loadGeneration == generation else { return }
             apply(snapshot)
             startEventsIfNeeded()
+            scheduleLocalDayRefresh()
             await assistant.load()
             guard loadGeneration == generation else { return }
             hasLoaded = true
             loadState = .loaded
+            if inspectorPresented {
+                _ = await assistant.ensureDefaultSession()
+            }
         } catch is CancellationError {
             return
         } catch {
@@ -107,36 +169,387 @@ final class AppState {
         }
     }
 
-    func shutdown() async {
+    /// Flushes every pending task draft before stopping the Engine. Returning
+    /// `false` tells AppKit to cancel termination; pending patches and their
+    /// visible failure state remain intact so the user can retry.
+    @discardableResult
+    func shutdown() async -> Bool {
+        isPreparingToTerminate = true
+        guard await flushAllTaskEditsForShutdown() else {
+            isPreparingToTerminate = false
+            errorMessage = "还有任务修改未能保存。已取消退出，修改仍保留在当前界面，请重试保存。"
+            return false
+        }
+        await waitForActiveTaskCommands()
+
         loadGeneration &+= 1
         loadTask?.cancel()
         loadTask = nil
         eventGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
+        activeEngineRecovery?.task.cancel()
+        activeEngineRecovery = nil
         sessionLoadGeneration &+= 1
         sessionLoadTask?.cancel()
         sessionLoadTask = nil
         loadingSessionTaskID = nil
+        localDayRefreshTask?.cancel()
+        localDayRefreshTask = nil
+        for task in taskDebounceTasks.values { task.cancel() }
+        taskDebounceTasks.removeAll()
+        // All active task flushes were awaited above. Do not cancel an Engine
+        // mutation after it may already have reached durable storage.
+        activeTaskFlushes.removeAll()
+        inFlightTaskPatches.removeAll()
+        pendingTaskAttachmentMutations.removeAll()
         assistant.shutdown()
         await repository.shutdown()
         hasLoaded = false
+        return true
+    }
+
+    private func flushAllTaskEditsForShutdown() async -> Bool {
+        while true {
+            let taskIDs = Set(pendingTaskPatches.keys)
+                .union(pendingTaskAttachmentMutations.keys)
+                .union(activeTaskFlushes.keys)
+            guard !taskIDs.isEmpty else { return inFlightTaskPatches.isEmpty }
+
+            for taskID in taskIDs.sorted(by: { $0.uuidString < $1.uuidString }) {
+                guard await flushTaskEdits(taskID: taskID) else { return false }
+            }
+
+            // A newer edit may have arrived while an earlier Engine mutation
+            // was in flight. Loop until the MainActor has no pending draft.
+            if pendingTaskPatches.isEmpty,
+               pendingTaskAttachmentMutations.isEmpty,
+               activeTaskFlushes.isEmpty,
+               inFlightTaskPatches.isEmpty {
+                return true
+            }
+        }
     }
 
     @discardableResult
-    func createTask(title: String, note: String = "", dueDate: Date?) async -> Bool {
+    func createList(name: String, color: String = "blue") async -> Bool {
+        let normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard normalizedName.isEmpty == false else { return false }
+
+        let previousIDs = Set(lists.map(\.id))
+        let created = await update {
+            try await repository.createList(name: normalizedName, color: color)
+        }
+        guard created else { return false }
+        if let newList = lists.first(where: { previousIDs.contains($0.id) == false }) {
+            selection = .list(newList.id)
+        }
+        return true
+    }
+
+    /// Creates a list named after the task and moves that task into it as one
+    /// atomic Engine mutation. If the Engine committed but its response was
+    /// lost, the authoritative snapshot identifies the newly created list.
+    @discardableResult
+    func createListFromTask(taskID: UUID) async -> Bool {
+        guard
+            !isPreparingToTerminate,
+            task(id: taskID) != nil,
+            failedTaskCommands[taskID]?.recoveryOnly != true,
+            activeTaskCommands.insert(taskID).inserted
+        else {
+            return false
+        }
+        defer { finishTaskCommand(taskID: taskID) }
+        clearRetriableTaskCommandFailure(taskID: taskID)
+
+        guard await flushTaskEdits(taskID: taskID) else { return false }
+        let previousListIDs = Set(lists.map(\.id))
+        taskSaveStates[taskID] = .saving
+
+        do {
+            let snapshot = try await repository.createListFromTask(taskID: taskID)
+            apply(snapshot, acceptingEqualMutationRevision: true)
+        } catch {
+            let isAmbiguous = isAmbiguousTaskCommandError(error)
+            if isAmbiguous,
+               await recoverCreatedListFromTask(
+                    taskID: taskID,
+                    previousListIDs: previousListIDs
+               ) {
+                // The Engine committed before its response was lost.
+            } else {
+                failedTaskCommands[taskID] = .createList(
+                    previousListIDs: previousListIDs,
+                    recoveryOnly: isAmbiguous
+                )
+                taskSaveStates[taskID] = .failed(error.localizedDescription)
+                errorMessage = error.localizedDescription
+                return false
+            }
+        }
+
+        failedTaskCommands[taskID] = nil
+        taskSaveStates[taskID] = .idle
+        errorMessage = nil
+        if let listID = task(id: taskID)?.listID,
+           previousListIDs.contains(listID) == false,
+           lists.contains(where: { $0.id == listID }) {
+            selection = .list(listID)
+        }
+        return true
+    }
+
+    /// Deletes only after explicit UI confirmation. No optimistic removal is
+    /// performed: the card stays visible until an authoritative snapshot says
+    /// the task is gone. Active task Sessions may be rejected by the Engine.
+    @discardableResult
+    func deleteTask(taskID: UUID) async -> Bool {
+        guard
+            !isPreparingToTerminate,
+            task(id: taskID) != nil,
+            failedTaskCommands[taskID]?.recoveryOnly != true,
+            activeTaskCommands.insert(taskID).inserted
+        else {
+            return false
+        }
+        defer { finishTaskCommand(taskID: taskID) }
+        clearRetriableTaskCommandFailure(taskID: taskID)
+
+        guard await flushTaskEdits(taskID: taskID) else { return false }
+        taskSaveStates[taskID] = .saving
+
+        do {
+            let snapshot = try await repository.deleteTask(taskID: taskID)
+            apply(snapshot, acceptingEqualMutationRevision: true)
+        } catch {
+            let isAmbiguous = isAmbiguousTaskCommandError(error)
+            if isAmbiguous, await recoverDeletedTask(taskID: taskID) {
+                // The Engine committed before its response was lost.
+            } else {
+                let message = deleteTaskErrorMessage(error)
+                failedTaskCommands[taskID] = .delete(recoveryOnly: isAmbiguous)
+                taskSaveStates[taskID] = .failed(message)
+                errorMessage = message
+                return false
+            }
+        }
+
+        guard task(id: taskID) == nil else {
+            let message = "删除任务后返回的数据仍包含该任务，请重试。"
+            taskSaveStates[taskID] = .failed(message)
+            errorMessage = message
+            return false
+        }
+        cleanUpDeletedTask(taskID: taskID)
+        errorMessage = nil
+        return true
+    }
+
+    func isTaskCommandInFlight(taskID: UUID) -> Bool {
+        activeTaskCommands.contains(taskID)
+            || failedTaskCommands[taskID]?.recoveryOnly == true
+    }
+
+    private func waitForActiveTaskCommands() async {
+        guard activeTaskCommands.isEmpty == false else { return }
+        await withCheckedContinuation { continuation in
+            if activeTaskCommands.isEmpty {
+                continuation.resume()
+            } else {
+                activeTaskCommandWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func finishTaskCommand(taskID: UUID) {
+        activeTaskCommands.remove(taskID)
+        guard activeTaskCommands.isEmpty else { return }
+        let waiters = activeTaskCommandWaiters
+        activeTaskCommandWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    @discardableResult
+    func createTask(
+        title: String,
+        note: String = "",
+        executionDate: LocalDay? = nil,
+        dueDate: LocalDay? = nil
+    ) async -> Bool {
         let listID: UUID? = if case let .list(id) = selection { id } else { nil }
-        return await createTask(title: title, note: note, listID: listID, dueDate: dueDate)
+        return await createTask(
+            title: title,
+            note: note,
+            listID: listID,
+            executionDate: executionDate,
+            dueDate: dueDate
+        )
     }
 
     @discardableResult
-    func createTask(title: String, note: String = "", listID: UUID?, dueDate: Date?) async -> Bool {
-        return await update { try await repository.createTask(title: title, note: note, listID: listID, dueDate: dueDate) }
+    func createTask(
+        title: String,
+        note: String = "",
+        listID: UUID?,
+        executionDate: LocalDay? = nil,
+        dueDate: LocalDay? = nil
+    ) async -> Bool {
+        let normalizedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalizedTitle.isEmpty, normalizedTitle.count <= 500, note.count <= 4_000 else {
+            errorMessage = normalizedTitle.isEmpty
+                ? "任务标题不能为空。"
+                : normalizedTitle.count > 500 ? "任务标题不能超过 500 个字符。" : "任务备注不能超过 4000 个字符。"
+            return false
+        }
+        return await update {
+            try await repository.createTask(
+                title: normalizedTitle,
+                note: note,
+                listID: listID,
+                executionDate: executionDate,
+                dueDate: dueDate
+            )
+        }
     }
 
     @discardableResult
     func setCompleted(_ task: TaskItem, completed: Bool) async -> Bool {
-        await update { try await repository.setCompleted(taskID: task.id, completed: completed) }
+        await updateTask(
+            taskID: task.id,
+            patch: TaskPatch(status: completed ? .completed : .open)
+        )
+    }
+
+    /// Preserves event order for immediate detail edits. The patch is merged
+    /// and projected synchronously on MainActor before one per-task drain is
+    /// registered, so consecutive DatePicker/Toggle callbacks cannot race as
+    /// independent fire-and-forget tasks.
+    func enqueueImmediateTaskUpdate(taskID: UUID, patch: TaskPatch) {
+        guard isTaskCommandInFlight(taskID: taskID) == false else { return }
+        guard let patch = changedTaskPatch(taskID: taskID, patch: patch) else { return }
+        queueTaskPatch(taskID: taskID, patch: patch)
+        beginImmediateTaskFlush(taskID: taskID)
+    }
+
+    /// Queues a title/note patch for the 400 ms autosave window. The draft is
+    /// projected immediately and remains visible if persistence fails.
+    func scheduleTaskUpdate(taskID: UUID, patch: TaskPatch) {
+        guard isTaskCommandInFlight(taskID: taskID) == false else { return }
+        guard let patch = changedTaskPatch(taskID: taskID, patch: patch) else { return }
+        queueTaskPatch(taskID: taskID, patch: patch)
+        taskSaveStates[taskID] = activeTaskFlushes[taskID] == nil ? .debouncing : .saving
+        taskDebounceTasks[taskID]?.cancel()
+        taskDebounceTasks[taskID] = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .milliseconds(400))
+            } catch { return }
+            guard !Task.isCancelled else { return }
+            _ = await self?.flushTaskEdits(taskID: taskID)
+        }
+    }
+
+    /// Applies a patch immediately or enters the title/note debounce window.
+    /// Date/status UI should pass the default `debounce: false`.
+    @discardableResult
+    func updateTask(
+        taskID: UUID,
+        patch: TaskPatch,
+        debounce: Bool = false
+    ) async -> Bool {
+        guard isTaskCommandInFlight(taskID: taskID) == false else { return false }
+        guard task(id: taskID) != nil else {
+            taskSaveStates[taskID] = .failed("找不到这个任务。")
+            return false
+        }
+        guard let patch = changedTaskPatch(taskID: taskID, patch: patch) else { return true }
+        if debounce {
+            scheduleTaskUpdate(taskID: taskID, patch: patch)
+            return true
+        }
+        queueTaskPatch(taskID: taskID, patch: patch)
+        return await flushTaskEdits(taskID: taskID)
+    }
+
+    @discardableResult
+    func flushTaskEdits(taskID: UUID) async -> Bool {
+        taskDebounceTasks[taskID]?.cancel()
+        taskDebounceTasks[taskID] = nil
+
+        while true {
+            if let active = activeTaskFlushes[taskID] {
+                guard await active.task.value else { return false }
+                continue
+            }
+
+            if let flush = startTaskFlushIfNeeded(taskID: taskID) {
+                guard await flush.value else { return false }
+                continue
+            }
+
+            if case .failed = taskSaveStates[taskID] { return false }
+            taskSaveStates[taskID] = .idle
+            return true
+        }
+    }
+
+    @discardableResult
+    func retryTaskEdits(taskID: UUID) async -> Bool {
+        if let command = failedTaskCommands.removeValue(forKey: taskID) {
+            taskSaveStates[taskID] = .idle
+            return await retryTaskCommand(command, taskID: taskID)
+        }
+        guard hasPendingTaskMutations(taskID: taskID) else {
+            taskSaveStates[taskID] = .idle
+            return true
+        }
+        return await flushTaskEdits(taskID: taskID)
+    }
+
+    func taskSaveState(taskID: UUID) -> TaskSaveState {
+        taskSaveStates[taskID, default: .idle]
+    }
+
+    func enqueueTaskAttachmentAdd(taskID: UUID, sourcePaths: [String]) {
+        guard sourcePaths.isEmpty == false else { return }
+        enqueueTaskAttachmentMutation(
+            taskID: taskID,
+            mutation: .add(
+                sourcePaths: sourcePaths,
+                clientMutationID: UUID()
+            )
+        )
+    }
+
+    func enqueueTaskAttachmentRemoval(taskID: UUID, attachmentID: UUID) {
+        enqueueTaskAttachmentMutation(
+            taskID: taskID,
+            mutation: .remove(
+                attachmentID: attachmentID,
+                clientMutationID: UUID()
+            )
+        )
+    }
+
+    @discardableResult
+    func addTaskAttachments(taskID: UUID, sourcePaths: [String]) async -> Bool {
+        guard sourcePaths.isEmpty == false else { return false }
+        enqueueTaskAttachmentAdd(taskID: taskID, sourcePaths: sourcePaths)
+        return await flushTaskEdits(taskID: taskID)
+    }
+
+    @discardableResult
+    func removeTaskAttachment(taskID: UUID, attachmentID: UUID) async -> Bool {
+        enqueueTaskAttachmentRemoval(taskID: taskID, attachmentID: attachmentID)
+        return await flushTaskEdits(taskID: taskID)
+    }
+
+    func taskAttachments(taskID: UUID) -> [TaskAttachment] {
+        task(id: taskID)?.attachments ?? []
+    }
+
+    func attachmentURL(_ attachment: TaskAttachment) -> URL? {
+        attachment.managedURL()
     }
 
     func openTask(_ task: TaskItem) {
@@ -157,6 +570,24 @@ final class AppState {
     }
 
     func dismissTaskSession(taskID: UUID) {
+        if hasPendingTaskMutations(taskID: taskID) == false,
+           activeTaskFlushes[taskID] == nil {
+            finishDismissingTaskSession(taskID: taskID)
+            return
+        }
+        Task { @MainActor [weak self] in
+            _ = await self?.flushAndDismissTaskSession(taskID: taskID)
+        }
+    }
+
+    @discardableResult
+    func flushAndDismissTaskSession(taskID: UUID) async -> Bool {
+        guard await flushTaskEdits(taskID: taskID) else { return false }
+        finishDismissingTaskSession(taskID: taskID)
+        return true
+    }
+
+    private func finishDismissingTaskSession(taskID: UUID) {
         if presentedSheet == .taskSession(taskID) {
             presentedSheet = nil
         }
@@ -231,6 +662,10 @@ final class AppState {
     @discardableResult
     func startSession(_ task: TaskItem, runtime: RuntimeKind, workspace: String) async -> Bool {
         taskSessionErrorMessage = nil
+        guard await flushTaskEdits(taskID: task.id) else {
+            taskSessionErrorMessage = "任务修改尚未保存，请重试后再启动 Session。"
+            return false
+        }
         let directory = workspace.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !directory.isEmpty else { taskSessionErrorMessage = "请选择 Agent 执行目录。"; return false }
         guard runtimes.first(where: { $0.kind == runtime })?.isSelectable == true else {
@@ -307,7 +742,22 @@ final class AppState {
     func count(for view: SmartView) -> Int { projection.count(for: view, sessions: sessions) }
     func activeCount(forList id: UUID) -> Int { projection.activeCount(forList: id) }
     func task(id: UUID) -> TaskItem? { projection.task(id: id) }
-    func timelineBuckets() -> [BoardBucket: [TaskItem]] { projection.timelineBuckets(selectedDate: selectedDate) }
+    func tasks(executingOn day: LocalDay) -> [TaskItem] { projection.tasks(executingOn: day) }
+    func todayTasks() -> [TaskItem] { projection.todayTasks() }
+    func timelineDays() -> [TimelineDay] {
+        projection.timelineDays(startingAt: selectedDay, calendar: calendar)
+    }
+    func shiftSelectedDay(by days: Int) {
+        if let day = selectedDay.advanced(by: days, calendar: calendar) {
+            selectedDay = day
+        }
+    }
+    func selectToday() { selectedDay = currentDay }
+    func timelineBuckets() -> [BoardBucket: [TaskItem]] {
+        projection.timelineBuckets(selectedDay: selectedDay, calendar: calendar)
+    }
+    func isOverdue(_ task: TaskItem) -> Bool { projection.isOverdue(task) }
+    var readyRuntimeCount: Int { runtimes.count(where: \.isSelectable) }
     func visibleTasks() -> [TaskItem] {
         guard let selection else { return tasks }
         switch selection {
@@ -344,9 +794,11 @@ final class AppState {
         }
     }
 
-    private func consume(_ event: EngineEvent) async {
-        if event.name.hasPrefix("assistant.") || event.name == "engine.ready" {
+    func consume(_ event: EngineEvent) async {
+        if event.name.hasPrefix("assistant.") {
             return
+        } else if event.name == "engine.ready" {
+            recoverSnapshotAfterEngineReadyIfNeeded()
         } else if event.name.hasPrefix("session.") {
             if let bundle = try? JSONDecoder.engineDecoder.decode(SessionBundle.self, from: event.data) {
                 merge(bundle, taskID: bundle.session.taskID)
@@ -365,9 +817,43 @@ final class AppState {
                     await refreshSession(taskID: session.taskID)
                 }
             }
-        } else if event.name == "task.changed" || event.name == "runtime.changed" {
+        } else if event.name == "task.changed" {
+            if let payload = try? JSONDecoder.engineDecoder.decode(
+                EngineBootstrap.self,
+                from: event.data
+            ) {
+                apply(EngineRepository.mapSnapshot(payload, messages: messages))
+            }
+        } else if event.name == "runtime.changed" {
             _ = await update { try await repository.sync() }
         }
+    }
+
+    /// `load()` subscribes after the startup handshake, so every ready observed
+    /// on this stream represents a restarted sidecar. One coalesced sync repairs
+    /// any mutation whose durable response/event was lost with that process.
+    private func recoverSnapshotAfterEngineReadyIfNeeded() {
+        guard hasAppliedSnapshot, activeEngineRecovery == nil else { return }
+
+        let token = UUID()
+        let recovery = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let snapshot = try await self.repository.sync()
+                self.apply(snapshot)
+            } catch is CancellationError {
+                // App shutdown or a superseding lifecycle ends recovery.
+            } catch {
+                self.errorMessage = error.localizedDescription
+            }
+            self.finishEngineRecovery(token: token)
+        }
+        activeEngineRecovery = ActiveEngineRecovery(token: token, task: recovery)
+    }
+
+    private func finishEngineRecovery(token: UUID) {
+        guard activeEngineRecovery?.token == token else { return }
+        activeEngineRecovery = nil
     }
 
     private func merge(_ incoming: SessionBundle, taskID: UUID) {
@@ -386,13 +872,448 @@ final class AppState {
         catch { errorMessage = error.localizedDescription; return false }
     }
 
-    private func apply(_ snapshot: AppSnapshot) {
+    private func recoverCreatedListFromTask(
+        taskID: UUID,
+        previousListIDs: Set<UUID>
+    ) async -> Bool {
+        do {
+            apply(try await repository.sync())
+            guard
+                let listID = task(id: taskID)?.listID,
+                previousListIDs.contains(listID) == false,
+                lists.contains(where: { $0.id == listID })
+            else { return false }
+            selection = .list(listID)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func recoverDeletedTask(taskID: UUID) async -> Bool {
+        do {
+            apply(try await repository.sync())
+            return task(id: taskID) == nil
+        } catch {
+            return false
+        }
+    }
+
+    private func isAmbiguousTaskCommandError(_ error: any Error) -> Bool {
+        if error is CancellationError { return true }
+        guard let error = error as? EngineClientError else { return false }
+        return switch error {
+        case .notRunning, .invalidMessage, .timedOut, .processExited:
+            true
+        case .executableMissing, .alreadyStarted, .launchFailed, .protocolMismatch,
+             .requestFailed:
+            false
+        }
+    }
+
+    private func deleteTaskErrorMessage(_ error: any Error) -> String {
+        if let engineError = error as? EngineClientError,
+           case let .requestFailed(code, _) = engineError,
+           code == "task_session_active" {
+            return "任务的本地 Session 正在运行，请先停止本轮再删除。"
+        }
+        return error.localizedDescription
+    }
+
+    private func cleanUpDeletedTask(taskID: UUID) {
+        taskDebounceTasks[taskID]?.cancel()
+        taskDebounceTasks[taskID] = nil
+        pendingTaskPatches[taskID] = nil
+        inFlightTaskPatches[taskID] = nil
+        pendingTaskAttachmentMutations[taskID] = nil
+        activeTaskFlushes[taskID] = nil
+        taskSaveStates[taskID] = nil
+        failedTaskCommands[taskID] = nil
+        bundles[taskID] = nil
+        if presentedSheet == .taskSession(taskID) {
+            finishDismissingTaskSession(taskID: taskID)
+        }
+    }
+
+    private func clearRetriableTaskCommandFailure(taskID: UUID) {
+        guard failedTaskCommands[taskID]?.recoveryOnly == false else { return }
+        failedTaskCommands[taskID] = nil
+        if hasPendingTaskMutations(taskID: taskID) == false {
+            taskSaveStates[taskID] = .idle
+        }
+    }
+
+    private func retryTaskCommand(
+        _ command: FailedTaskCommand,
+        taskID: UUID
+    ) async -> Bool {
+        guard command.recoveryOnly else {
+            switch command {
+            case .createList:
+                return await createListFromTask(taskID: taskID)
+            case .delete:
+                return await deleteTask(taskID: taskID)
+            }
+        }
+
+        guard activeTaskCommands.insert(taskID).inserted else { return false }
+        defer { finishTaskCommand(taskID: taskID) }
+        taskSaveStates[taskID] = .saving
+
+        let recovered: Bool
+        switch command {
+        case let .createList(previousListIDs, _):
+            recovered = await recoverCreatedListFromTask(
+                taskID: taskID,
+                previousListIDs: previousListIDs
+            )
+        case .delete:
+            recovered = await recoverDeletedTask(taskID: taskID)
+        }
+
+        guard recovered else {
+            let message = "任务操作结果尚未确认。请恢复 Engine 后重试确认，系统不会重复执行。"
+            failedTaskCommands[taskID] = command
+            taskSaveStates[taskID] = .failed(message)
+            errorMessage = message
+            return false
+        }
+
+        switch command {
+        case .createList:
+            taskSaveStates[taskID] = .idle
+        case .delete:
+            cleanUpDeletedTask(taskID: taskID)
+        }
+        errorMessage = nil
+        return true
+    }
+
+    private func apply(
+        _ snapshot: AppSnapshot,
+        acceptingEqualMutationRevision: Bool = false
+    ) {
+        guard
+            !hasAppliedSnapshot
+                || snapshot.revision > revision
+                || (acceptingEqualMutationRevision && snapshot.revision == revision)
+        else { return }
+        hasAppliedSnapshot = true
+        revision = snapshot.revision
         lists = snapshot.lists
         tasks = snapshot.tasks
         runtimes = snapshot.runtimes
         sessions = snapshot.sessions
         messages = snapshot.messages
-        projection = TaskProjection(tasks: snapshot.tasks)
+        reapplyTaskDrafts()
+        rebuildProjection()
+    }
+
+    private func queueTaskPatch(taskID: UUID, patch: TaskPatch) {
+        guard tasks.contains(where: { $0.id == taskID }) else {
+            taskSaveStates[taskID] = .failed("找不到这个任务。")
+            return
+        }
+        pendingTaskPatches[taskID] = pendingTaskPatches[taskID]?.merging(patch) ?? patch
+        applyDraft(patch, to: taskID)
+    }
+
+    private func changedTaskPatch(taskID: UUID, patch: TaskPatch) -> TaskPatch? {
+        guard let task = task(id: taskID) else {
+            taskSaveStates[taskID] = .failed("找不到这个任务。")
+            return nil
+        }
+
+        var changed = patch
+        if changed.title == task.title { changed.title = nil }
+        if changed.note == task.note { changed.note = nil }
+        if changed.status == task.status { changed.status = nil }
+        changed.listID = changedField(changed.listID, current: task.listID)
+        changed.executionDate = changedField(
+            changed.executionDate,
+            current: task.executionDate
+        )
+        changed.dueDate = changedField(changed.dueDate, current: task.dueDate)
+        return changed.isEmpty ? nil : changed
+    }
+
+    private func changedField<Value: Equatable & Sendable>(
+        _ field: TaskPatchField<Value>,
+        current: Value?
+    ) -> TaskPatchField<Value> {
+        switch field {
+        case .unchanged:
+            .unchanged
+        case let .set(value):
+            current == value ? .unchanged : .set(value)
+        case .clear:
+            current == nil ? .unchanged : .clear
+        }
+    }
+
+    private func beginImmediateTaskFlush(taskID: UUID) {
+        taskDebounceTasks[taskID]?.cancel()
+        taskDebounceTasks[taskID] = nil
+        taskSaveStates[taskID] = .saving
+        _ = startTaskFlushIfNeeded(taskID: taskID)
+    }
+
+    private func enqueueTaskAttachmentMutation(
+        taskID: UUID,
+        mutation: TaskAttachmentMutation
+    ) {
+        guard task(id: taskID) != nil else {
+            taskSaveStates[taskID] = .failed("找不到这个任务。")
+            return
+        }
+        pendingTaskAttachmentMutations[taskID, default: []].append(mutation)
+        beginImmediateTaskFlush(taskID: taskID)
+    }
+
+    private func hasPendingTaskMutations(taskID: UUID) -> Bool {
+        pendingTaskPatches[taskID] != nil
+            || pendingTaskAttachmentMutations[taskID]?.isEmpty == false
+    }
+
+    private func startTaskFlushIfNeeded(taskID: UUID) -> Task<Bool, Never>? {
+        if let active = activeTaskFlushes[taskID] { return active.task }
+        guard hasPendingTaskMutations(taskID: taskID) else { return nil }
+
+        let token = UUID()
+        let flush = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            let succeeded = await self.drainTaskMutations(taskID: taskID)
+            self.finishTaskFlush(taskID: taskID, token: token)
+            return succeeded
+        }
+        // This method is synchronous on MainActor, so the handle is registered
+        // before the new task can begin and a second UI callback can enqueue.
+        activeTaskFlushes[taskID] = ActiveTaskFlush(token: token, task: flush)
+        return flush
+    }
+
+    /// One task owns one drain loop for patches and attachment mutations. New
+    /// work queued while the Engine is suspended is consumed by that same loop
+    /// before close, Session start, or app termination is allowed to continue.
+    private func drainTaskMutations(taskID: UUID) async -> Bool {
+        while true {
+            if let patch = pendingTaskPatches.removeValue(forKey: taskID) {
+                taskSaveStates[taskID] = .saving
+                inFlightTaskPatches[taskID] = patch
+                do {
+                    let snapshot = try await repository.updateTask(taskID: taskID, patch: patch)
+                    // The response is authoritative for normalization. A
+                    // matching task.changed may have arrived first, so accept
+                    // this response at the same (never lower) revision once.
+                    inFlightTaskPatches[taskID] = nil
+                    apply(snapshot, acceptingEqualMutationRevision: true)
+                } catch is CancellationError {
+                    inFlightTaskPatches[taskID] = nil
+                    restoreFailedTaskPatch(patch, taskID: taskID)
+                    taskSaveStates[taskID] = .failed("任务保存已取消，请重试。")
+                    return false
+                } catch {
+                    inFlightTaskPatches[taskID] = nil
+                    restoreFailedTaskPatch(patch, taskID: taskID)
+                    taskSaveStates[taskID] = .failed(error.localizedDescription)
+                    return false
+                }
+                continue
+            }
+
+            guard let attachmentMutation = takeNextAttachmentMutation(taskID: taskID) else {
+                taskSaveStates[taskID] = .idle
+                return true
+            }
+
+            taskSaveStates[taskID] = .saving
+            do {
+                let snapshot = try await performAttachmentMutation(
+                    attachmentMutation,
+                    taskID: taskID
+                )
+                apply(snapshot, acceptingEqualMutationRevision: true)
+            } catch {
+                if await recoverAmbiguousAttachmentMutation(
+                    attachmentMutation,
+                    taskID: taskID,
+                    error: error
+                ) {
+                    continue
+                }
+                restoreFailedAttachmentMutation(attachmentMutation, taskID: taskID)
+                taskSaveStates[taskID] = .failed(
+                    isAmbiguousAttachmentMutationError(error)
+                        ? "附件操作结果尚未确认：\(error.localizedDescription)；请重试，系统会避免重复执行。"
+                        : error.localizedDescription
+                )
+                return false
+            }
+        }
+    }
+
+    private func performAttachmentMutation(
+        _ mutation: TaskAttachmentMutation,
+        taskID: UUID
+    ) async throws -> AppSnapshot {
+        switch mutation {
+        case let .add(sourcePaths, clientMutationID):
+            try await repository.addTaskAttachments(
+                taskID: taskID,
+                sourcePaths: sourcePaths,
+                clientMutationID: clientMutationID
+            )
+        case let .remove(attachmentID, clientMutationID):
+            try await repository.removeTaskAttachment(
+                taskID: taskID,
+                attachmentID: attachmentID,
+                clientMutationID: clientMutationID
+            )
+        }
+    }
+
+    private func recoverAmbiguousAttachmentMutation(
+        _ mutation: TaskAttachmentMutation,
+        taskID: UUID,
+        error: any Error
+    ) async -> Bool {
+        guard isAmbiguousAttachmentMutationError(error) else { return false }
+
+        do {
+            let recovered = try await repository.sync()
+            apply(recovered)
+
+            if case let .remove(attachmentID, _) = mutation,
+               task(id: taskID)?.attachments.contains(where: { $0.id == attachmentID }) != true {
+                return true
+            }
+
+            // Add cannot be correlated from attachment names alone. Replaying
+            // the exact durable mutation ID asks the Engine to resolve the
+            // outcome without copying a second file. It also safely completes
+            // an operation that was definitely not committed before restart.
+            let resolved = try await performAttachmentMutation(mutation, taskID: taskID)
+            apply(resolved, acceptingEqualMutationRevision: true)
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private func isAmbiguousAttachmentMutationError(_ error: any Error) -> Bool {
+        if error is CancellationError { return true }
+        guard let error = error as? EngineClientError else { return false }
+        return switch error {
+        case .notRunning, .invalidMessage, .timedOut, .processExited:
+            true
+        case .executableMissing, .alreadyStarted, .launchFailed, .protocolMismatch,
+             .requestFailed:
+            false
+        }
+    }
+
+    private func restoreFailedTaskPatch(_ patch: TaskPatch, taskID: UUID) {
+        // Restore the failed write before any newer draft so newer fields win.
+        let restored = patch.merging(pendingTaskPatches[taskID] ?? TaskPatch())
+        pendingTaskPatches[taskID] = restored
+        applyDraft(restored, to: taskID)
+    }
+
+    private func takeNextAttachmentMutation(taskID: UUID) -> TaskAttachmentMutation? {
+        guard var queued = pendingTaskAttachmentMutations[taskID], queued.isEmpty == false else {
+            pendingTaskAttachmentMutations[taskID] = nil
+            return nil
+        }
+        let mutation = queued.removeFirst()
+        pendingTaskAttachmentMutations[taskID] = queued.isEmpty ? nil : queued
+        return mutation
+    }
+
+    private func restoreFailedAttachmentMutation(
+        _ mutation: TaskAttachmentMutation,
+        taskID: UUID
+    ) {
+        pendingTaskAttachmentMutations[taskID, default: []].insert(mutation, at: 0)
+    }
+
+    private func finishTaskFlush(taskID: UUID, token: UUID) {
+        guard activeTaskFlushes[taskID]?.token == token else { return }
+        activeTaskFlushes[taskID] = nil
+    }
+
+    private func applyDraft(_ patch: TaskPatch, to taskID: UUID) {
+        guard let index = tasks.firstIndex(where: { $0.id == taskID }) else { return }
+        tasks[index].apply(patch)
+        rebuildProjection()
+    }
+
+    private func reapplyTaskDrafts() {
+        for (taskID, patch) in inFlightTaskPatches {
+            guard let index = tasks.firstIndex(where: { $0.id == taskID }) else { continue }
+            tasks[index].apply(patch)
+        }
+        for (taskID, patch) in pendingTaskPatches {
+            guard let index = tasks.firstIndex(where: { $0.id == taskID }) else { continue }
+            tasks[index].apply(patch)
+        }
+    }
+
+    private func rebuildProjection() {
+        projection = TaskProjection(tasks: tasks, today: currentDay)
+    }
+
+    private func installCalendarObservers() {
+        let center = NotificationCenter.default
+        let names: [Notification.Name] = [
+            .NSCalendarDayChanged,
+            .NSSystemClockDidChange,
+            .NSSystemTimeZoneDidChange,
+            NSApplication.didBecomeActiveNotification,
+        ]
+        calendarObservers = names.map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.refreshLocalDay()
+                }
+            }
+        }
+
+        workspaceCalendarObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshLocalDay()
+            }
+        }
+    }
+
+    func refreshLocalDay(now: Date = .now) {
+        let newDay = LocalDay(now, calendar: calendar)
+        if newDay != currentDay {
+            let wasFollowingToday = selectedDay == currentDay
+            currentDay = newDay
+            if wasFollowingToday {
+                selectedDay = newDay
+            }
+            rebuildProjection()
+        }
+        scheduleLocalDayRefresh(now: now)
+    }
+
+    private func scheduleLocalDayRefresh(now: Date = .now) {
+        localDayRefreshTask?.cancel()
+        let start = calendar.startOfDay(for: now)
+        guard let nextDay = calendar.date(byAdding: .day, value: 1, to: start) else { return }
+        let delay = max(nextDay.timeIntervalSince(now) + 0.25, 0.25)
+        localDayRefreshTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(for: .seconds(delay))
+            } catch { return }
+            guard !Task.isCancelled else { return }
+            self?.refreshLocalDay()
+        }
     }
 }
 
@@ -430,10 +1351,12 @@ final class AssistantViewState {
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var eventGeneration: UInt64 = 0
     @ObservationIgnored private var historyLoadGeneration: UInt64 = 0
+    @ObservationIgnored private var shouldEnsureDefaultSession = false
 
     private var bundles: [String: AssistantSessionBundle] = [:]
     private var drafts: [String: AssistantStreamingDraft] = [:]
     private var toolsBySession: [String: [String: AssistantToolActivity]] = [:]
+    private var toolOrderBySession: [String: [String]] = [:]
     private var turnErrors: [String: String] = [:]
     private var sendingSessionIDs: Set<String> = []
     private var pendingSends: [String: PendingSend] = [:]
@@ -484,7 +1407,61 @@ final class AssistantViewState {
     var selectedTools: [AssistantToolActivity] {
         guard let selectedSessionID else { return [] }
         guard let tools = toolsBySession[selectedSessionID]?.values else { return [] }
-        return tools.sorted { $0.toolCallID < $1.toolCallID }
+        let orderedIDs = toolOrderBySession[selectedSessionID] ?? []
+        let order = Dictionary(uniqueKeysWithValues: orderedIDs.enumerated().map { ($0.element, $0.offset) })
+        return tools.sorted { lhs, rhs in
+            let left = order[lhs.toolCallID] ?? .max
+            let right = order[rhs.toolCallID] ?? .max
+            return left == right ? lhs.toolCallID < rhs.toolCallID : left < right
+        }
+    }
+
+    var selectedTimelineItems: [AssistantConversationTimelineItem] {
+        Self.conversationTimeline(messages: selectedMessages, tools: selectedTools)
+    }
+
+    static func conversationTimeline(
+        messages: [AssistantMessage],
+        tools: [AssistantToolActivity]
+    ) -> [AssistantConversationTimelineItem] {
+        var toolsByTurn: [String: [AssistantToolActivity]] = [:]
+        for tool in tools {
+            if !tool.turnID.isEmpty {
+                toolsByTurn[tool.turnID, default: []].append(tool)
+            }
+        }
+
+        var insertedToolIDs = Set<String>()
+        var timeline: [AssistantConversationTimelineItem] = []
+
+        func appendTools(for turnID: String?) {
+            guard let turnID, let turnTools = toolsByTurn[turnID] else { return }
+            for tool in turnTools where insertedToolIDs.insert(tool.toolCallID).inserted {
+                timeline.append(.tool(tool))
+            }
+        }
+
+        for message in messages.sorted(by: { $0.sequence < $1.sequence }) {
+            // A recovered history can contain the final assistant message even
+            // if its user message fell outside the current page. Insert the
+            // turn's tools before that final response in this case.
+            if message.role == .todoAgent {
+                appendTools(for: message.turnID)
+            }
+
+            timeline.append(.message(message))
+
+            // During a live turn, tools become visible immediately after the
+            // user's request and before streaming/final assistant text.
+            if message.role == .user {
+                appendTools(for: message.turnID)
+            }
+        }
+
+        for tool in tools where insertedToolIDs.insert(tool.toolCallID).inserted {
+            timeline.append(.tool(tool))
+        }
+        return timeline
     }
 
     /// Test-visible guardrail for the one-detailed-conversation memory policy.
@@ -538,6 +1515,16 @@ final class AssistantViewState {
         selectedSessionID = sessionID
         evictDetailedHistory(except: sessionID)
         await loadHistory(sessionID: sessionID, after: 0, replaceActiveTurn: true)
+    }
+
+    /// Makes the first TodoAgent open land in a usable conversation instead
+    /// of an intermediate "create session" screen. If opening happens while
+    /// credentials or Engine state are still loading, the intent is retained
+    /// and fulfilled by the next successful content reload.
+    @discardableResult
+    func ensureDefaultSession() async -> Bool {
+        shouldEnsureDefaultSession = true
+        return await provisionDefaultSessionIfPossible()
     }
 
     @discardableResult
@@ -597,6 +1584,7 @@ final class AssistantViewState {
             bundles.removeValue(forKey: selectedSessionID)
             drafts.removeValue(forKey: selectedSessionID)
             toolsBySession.removeValue(forKey: selectedSessionID)
+            toolOrderBySession.removeValue(forKey: selectedSessionID)
             turnErrors.removeValue(forKey: selectedSessionID)
 
             let nextID = activeSessions.first?.id
@@ -808,12 +1796,33 @@ final class AssistantViewState {
                 await loadHistory(sessionID: selectedSessionID, after: 0, replaceActiveTurn: true)
             }
             loadState = .loaded
+            if shouldEnsureDefaultSession {
+                _ = await provisionDefaultSessionIfPossible()
+            }
         } catch is CancellationError {
             return
         } catch {
             loadState = .failed(error.localizedDescription)
             errorMessage = nil
         }
+    }
+
+    private func provisionDefaultSessionIfPossible() async -> Bool {
+        if selectedSession != nil {
+            shouldEnsureDefaultSession = false
+            return true
+        }
+        if let existing = activeSessions.first {
+            await selectSession(existing.id)
+            let selected = selectedSessionID == existing.id
+            if selected { shouldEnsureDefaultSession = false }
+            return selected
+        }
+        guard loadState == .loaded, canUseAssistant else { return false }
+
+        let created = await createSession()
+        if created { shouldEnsureDefaultSession = false }
+        return created
     }
 
     private func loadHistory(
@@ -890,6 +1899,7 @@ final class AssistantViewState {
             // projections before rebuilding them from persisted history.
             drafts.removeAll()
             toolsBySession.removeAll()
+            toolOrderBySession.removeAll()
             turnErrors.removeAll()
             sendingSessionIDs.removeAll()
         }
@@ -1035,6 +2045,7 @@ final class AssistantViewState {
         guard payload.sessionID == selectedSessionID else { return }
         var tools = toolsBySession[payload.sessionID] ?? [:]
         guard tools[payload.toolCallID]?.state != .running else { return }
+        rememberToolOrder(sessionID: payload.sessionID, callID: payload.toolCallID)
         tools[payload.toolCallID] = AssistantToolActivity(
             sessionID: payload.sessionID,
             turnID: payload.turnID,
@@ -1049,6 +2060,7 @@ final class AssistantViewState {
     private func applyToolFinished(_ payload: AssistantToolFinishedEvent) {
         guard payload.sessionID == selectedSessionID else { return }
         var tools = toolsBySession[payload.sessionID] ?? [:]
+        rememberToolOrder(sessionID: payload.sessionID, callID: payload.toolCallID)
         tools[payload.toolCallID] = AssistantToolActivity(
             sessionID: payload.sessionID,
             turnID: payload.turnID,
@@ -1071,6 +2083,7 @@ final class AssistantViewState {
         for tool in incoming.tools {
             persistedByCallID[tool.callID] = tool
             if let activity = tool.activity {
+                rememberToolOrder(sessionID: tool.sessionID, callID: tool.callID)
                 var activities = toolsBySession[tool.sessionID] ?? [:]
                 activities[tool.callID] = activity
                 toolsBySession[tool.sessionID] = activities
@@ -1140,7 +2153,15 @@ final class AssistantViewState {
                 activeTurn: existing.session.isRunning ? existing.activeTurn : nil
             )
             toolsBySession.removeValue(forKey: sessionID)
+            toolOrderBySession.removeValue(forKey: sessionID)
         }
+    }
+
+    private func rememberToolOrder(sessionID: String, callID: String) {
+        var ordered = toolOrderBySession[sessionID] ?? []
+        guard ordered.contains(callID) == false else { return }
+        ordered.append(callID)
+        toolOrderBySession[sessionID] = ordered
     }
 
     private func latestStableSequence(for sessionID: String) -> Int64 {

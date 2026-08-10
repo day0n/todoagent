@@ -1,27 +1,29 @@
 import Foundation
 
-private struct EngineBootstrap: Decodable, Sendable {
+struct EngineBootstrap: Decodable, Sendable {
     let revision: Int64
     let lists: [EngineList]
     let tasks: [EngineTask]
+    let taskAttachments: [TaskAttachment]
     let runtimes: [RuntimeInfo]
     let sessions: [TaskSessionDescriptor]
 }
 
-private struct EngineList: Decodable, Sendable {
+struct EngineList: Decodable, Sendable {
     let id: UUID
     let name: String
     let color: String
     let repositoryPath: String?
 }
 
-private struct EngineTask: Decodable, Sendable {
+struct EngineTask: Decodable, Sendable {
     let id: UUID
     let listID: UUID?
     let title: String
     let note: String
     let status: TaskStatus
-    let dueDate: String?
+    let executionDate: LocalDay?
+    let dueDate: LocalDay?
     let completedAt: String?
     let createdAt: String
     let updatedAt: String
@@ -29,7 +31,7 @@ private struct EngineTask: Decodable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id
         case listID = "listId"
-        case title, note, status, dueDate, completedAt, createdAt, updatedAt
+        case title, note, status, executionDate, dueDate, completedAt, createdAt, updatedAt
     }
 }
 
@@ -37,13 +39,64 @@ struct CreateTaskRequest: Encodable, Sendable {
     let title: String
     let note: String
     let listID: UUID?
-    let dueDate: String?
+    let executionDate: LocalDay?
+    let dueDate: LocalDay?
 
     private enum CodingKeys: String, CodingKey {
         case title, note
         case listID = "listId"
-        case dueDate
+        case executionDate, dueDate
     }
+}
+struct UpdateTaskRequest: Encodable, Sendable {
+    let taskID: UUID
+    let patch: TaskPatch
+
+    private enum CodingKeys: String, CodingKey {
+        case taskID = "taskId"
+        case patch
+    }
+}
+struct DeleteTaskRequest: Encodable, Sendable {
+    let taskID: UUID
+
+    private enum CodingKeys: String, CodingKey {
+        case taskID = "taskId"
+    }
+}
+struct CreateListFromTaskRequest: Encodable, Sendable {
+    let taskID: UUID
+
+    private enum CodingKeys: String, CodingKey {
+        case taskID = "taskId"
+    }
+}
+struct AddTaskAttachmentsRequest: Encodable, Sendable {
+    let taskID: UUID
+    let sourcePaths: [String]
+    let clientMutationID: UUID
+
+    private enum CodingKeys: String, CodingKey {
+        case taskID = "taskId"
+        case sourcePaths
+        case clientMutationID = "clientMutationId"
+    }
+}
+struct RemoveTaskAttachmentRequest: Encodable, Sendable {
+    let taskID: UUID
+    let attachmentID: UUID
+    let clientMutationID: UUID
+
+    private enum CodingKeys: String, CodingKey {
+        case taskID = "taskId"
+        case attachmentID = "attachmentId"
+        case clientMutationID = "clientMutationId"
+    }
+}
+struct CreateListRequest: Encodable, Sendable {
+    let name: String
+    let color: String
+    let repositoryPath: String?
 }
 struct TaskIDRequest: Encodable, Sendable {
     let taskID: UUID
@@ -63,12 +116,10 @@ struct CreateSessionRequest: Encodable, Sendable {
     let taskID: UUID
     let runtimeKind: RuntimeKind
     let workingDirectory: String
-    let clientMessageID: UUID
 
     private enum CodingKeys: String, CodingKey {
         case taskID = "taskId"
         case runtimeKind, workingDirectory
-        case clientMessageID = "clientMessageId"
     }
 }
 struct SendSessionRequest: Encodable, Sendable {
@@ -121,6 +172,7 @@ private struct EmptyResult: Decodable, Sendable { let ok: Bool }
 actor EngineRepository: AppRepository {
     nonisolated let requiresExecutionConsent = true
     private static let runtimeVerificationTimeout: Duration = .seconds(30)
+    private static let attachmentMutationTimeout: Duration = .seconds(300)
     private let client: EngineClient
     private var snapshot = AppSnapshot(revision: 0, lists: [], tasks: [], runtimes: [], sessions: [], messages: [])
 
@@ -134,16 +186,86 @@ actor EngineRepository: AppRepository {
     func sync() async throws -> AppSnapshot { try await refresh(method: "app.sync") }
     func events() async -> AsyncStream<EngineEvent> { await client.events() }
 
-    func createTask(title: String, note: String, listID: UUID?, dueDate: Date?) async throws -> AppSnapshot {
-        let request = CreateTaskRequest(title: title, note: note, listID: listID, dueDate: dueDate.map(Self.dayFormatter.string))
-        _ = try await client.request(method: "task.create", params: request, as: EngineTask.self)
+    func createList(name: String, color: String) async throws -> AppSnapshot {
+        let request = CreateListRequest(name: name, color: color, repositoryPath: nil)
+        _ = try await client.request(method: "list.create", params: request, as: EngineList.self)
         return try await sync()
+    }
+
+    func createTask(
+        title: String,
+        note: String,
+        listID: UUID?,
+        executionDate: LocalDay?,
+        dueDate: LocalDay?
+    ) async throws -> AppSnapshot {
+        try await mutate(
+            method: "task.create",
+            params: CreateTaskRequest(
+                title: title,
+                note: note,
+                listID: listID,
+                executionDate: executionDate,
+                dueDate: dueDate
+            )
+        )
+    }
+
+    func updateTask(taskID: UUID, patch: TaskPatch) async throws -> AppSnapshot {
+        try await mutate(
+            method: "task.update",
+            params: UpdateTaskRequest(taskID: taskID, patch: patch)
+        )
+    }
+
+    func deleteTask(taskID: UUID) async throws -> AppSnapshot {
+        try await mutate(
+            method: "task.delete",
+            params: DeleteTaskRequest(taskID: taskID)
+        )
+    }
+
+    func createListFromTask(taskID: UUID) async throws -> AppSnapshot {
+        try await mutate(
+            method: "task.create_list",
+            params: CreateListFromTaskRequest(taskID: taskID)
+        )
+    }
+
+    func addTaskAttachments(
+        taskID: UUID,
+        sourcePaths: [String],
+        clientMutationID: UUID
+    ) async throws -> AppSnapshot {
+        try await mutate(
+            method: "task.attachment.add",
+            params: AddTaskAttachmentsRequest(
+                taskID: taskID,
+                sourcePaths: sourcePaths,
+                clientMutationID: clientMutationID
+            ),
+            timeout: Self.attachmentMutationTimeout
+        )
+    }
+
+    func removeTaskAttachment(
+        taskID: UUID,
+        attachmentID: UUID,
+        clientMutationID: UUID
+    ) async throws -> AppSnapshot {
+        try await mutate(
+            method: "task.attachment.remove",
+            params: RemoveTaskAttachmentRequest(
+                taskID: taskID,
+                attachmentID: attachmentID,
+                clientMutationID: clientMutationID
+            )
+        )
     }
 
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot {
         let method = completed ? "task.complete" : "task.reopen"
-        _ = try await client.request(method: method, params: TaskIDRequest(taskID: taskID), as: EngineTask.self)
-        return try await sync()
+        return try await mutate(method: method, params: TaskIDRequest(taskID: taskID))
     }
 
     func detectRuntimes() async throws -> AppSnapshot {
@@ -172,7 +294,15 @@ actor EngineRepository: AppRepository {
 
     func createSession(taskID: UUID, runtime: RuntimeKind, workspace: String) async throws -> SessionBundle {
         _ = try await client.request(method: "workspace.authorize", params: WorkspaceRequest(path: workspace), as: WorkspaceResult.self)
-        return try await client.request(method: "session.create", params: CreateSessionRequest(taskID: taskID, runtimeKind: runtime, workingDirectory: workspace, clientMessageID: UUID()), as: SessionBundle.self)
+        return try await client.request(
+            method: "session.create",
+            params: CreateSessionRequest(
+                taskID: taskID,
+                runtimeKind: runtime,
+                workingDirectory: workspace
+            ),
+            as: SessionBundle.self
+        )
     }
 
     func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle {
@@ -283,26 +413,59 @@ actor EngineRepository: AppRepository {
 
     private func refresh(method: String) async throws -> AppSnapshot {
         let engine: EngineBootstrap = try await client.request(method: method, params: EmptyRepositoryParams())
-        snapshot = AppSnapshot(
+        let incoming = Self.mapSnapshot(engine, messages: snapshot.messages)
+        if incoming.revision >= snapshot.revision { snapshot = incoming }
+        return incoming
+    }
+
+    private func mutate<Params: Encodable & Sendable>(
+        method: String,
+        params: Params,
+        timeout: Duration? = nil
+    ) async throws -> AppSnapshot {
+        let engine: EngineBootstrap = try await client.request(
+            method: method,
+            params: params,
+            timeout: timeout
+        )
+        let incoming = Self.mapSnapshot(engine, messages: snapshot.messages)
+        if incoming.revision >= snapshot.revision { snapshot = incoming }
+        return incoming
+    }
+
+    nonisolated static func mapSnapshot(
+        _ engine: EngineBootstrap,
+        messages: [ChatMessage]
+    ) -> AppSnapshot {
+        let attachmentsByTask = Dictionary(grouping: engine.taskAttachments, by: \.taskID)
+        return AppSnapshot(
             revision: engine.revision,
             lists: engine.lists.map { TodoList(id: $0.id, name: $0.name, colorName: $0.color, repositoryPath: $0.repositoryPath) },
-            tasks: engine.tasks.map(Self.mapTask),
+            tasks: engine.tasks.map { task in
+                Self.mapTask(task, attachments: attachmentsByTask[task.id, default: []])
+            },
             runtimes: engine.runtimes,
             sessions: engine.sessions,
-            messages: snapshot.messages
+            messages: messages
         )
-        return snapshot
     }
 
-    private static func mapTask(_ task: EngineTask) -> TaskItem {
-        TaskItem(id: task.id, listID: task.listID, title: task.title, note: task.note, status: task.status, dueDate: task.dueDate.flatMap(dayFormatter.date), completedAt: task.completedAt, createdAt: ISO8601DateFormatter().date(from: task.createdAt) ?? .distantPast, updatedAt: task.updatedAt)
+    private nonisolated static func mapTask(
+        _ task: EngineTask,
+        attachments: [TaskAttachment]
+    ) -> TaskItem {
+        TaskItem(
+            id: task.id,
+            listID: task.listID,
+            title: task.title,
+            note: task.note,
+            status: task.status,
+            executionDate: task.executionDate,
+            dueDate: task.dueDate,
+            attachments: attachments,
+            completedAt: task.completedAt,
+            createdAt: ISO8601DateFormatter().date(from: task.createdAt) ?? .distantPast,
+            updatedAt: task.updatedAt
+        )
     }
-
-    private static let dayFormatter: DateFormatter = {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter
-    }()
 }

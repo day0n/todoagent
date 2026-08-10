@@ -13,12 +13,19 @@ struct TodoAgentApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
 
     var body: some Scene {
-        WindowGroup(id: TodoAgentMainWindow.sceneID) {
+        Window("TodoAgent", id: TodoAgentMainWindow.sceneID) {
             ContentView(state: AppContainer.shared.state)
-                .frame(minWidth: 980, minHeight: 680)
+                .frame(
+                    minWidth: TodoAgentMainWindowPlacement.minimumContentSize.width,
+                    minHeight: TodoAgentMainWindowPlacement.minimumContentSize.height
+                )
                 .background(TodoAgentMainWindowMarker())
         }
-        .defaultSize(width: 1380, height: 860)
+        .defaultSize(
+            width: TodoAgentMainWindowPlacement.preferredContentSize.width,
+            height: TodoAgentMainWindowPlacement.preferredContentSize.height
+        )
+        .defaultPosition(.center)
         .windowResizability(.contentMinSize)
         .commands {
             CommandGroup(replacing: .appSettings) {
