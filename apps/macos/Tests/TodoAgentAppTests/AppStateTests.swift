@@ -56,6 +56,30 @@ struct AppStateTests {
         ) == .sideBySide(assistantWidth: 280))
     }
 
+    @Test("assistant rail uses a visible native-paced transition")
+    func assistantWorkspaceMotionIsPerceptible() {
+        #expect(AssistantWorkspaceMotion.duration >= 0.30)
+        #expect(AssistantWorkspaceMotion.duration <= 0.40)
+        #expect(abs(MainWorkspaceLayoutPolicy.assistantWidth(availableWidth: 960) - 326.4) < 0.001)
+    }
+
+    @Test("timeline columns resize continuously without breakpoint jumps")
+    func timelineColumnWidthHasNoBreakpointJumps() {
+        let widths = [
+            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 819),
+            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 820),
+            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 1_179),
+            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 1_180),
+        ]
+
+        #expect(abs(widths[1] - widths[0]) <= 0.25)
+        #expect(abs(widths[3] - widths[2]) <= 0.25)
+        #expect(widths.allSatisfy {
+            $0 >= TodoAgentUI.columnMinimumWidth
+                && $0 <= TodoAgentUI.columnMaximumWidth
+        })
+    }
+
     @Test("right-click menu keeps its task highlighted through nested submenus")
     func taskContextMenuHighlightTracksMenuLifetime() {
         var highlight = TaskContextHighlightState(pointerInside: true)

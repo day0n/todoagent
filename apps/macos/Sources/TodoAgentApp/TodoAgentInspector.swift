@@ -55,8 +55,11 @@ struct TodoAgentInspector: View {
                     onArchive: beginArchivingSelectedSession
                 )
                 .padding(.horizontal, 10)
-                .padding(.top, TodoAgentToolbar.height + 7)
-                .transition(.move(edge: .top).combined(with: .opacity))
+                .offset(y: AssistantSessionSwitcherLayout.panelTopOffset)
+                .transition(
+                    .scale(scale: 0.985, anchor: .topLeading)
+                        .combined(with: .opacity)
+                )
                 .zIndex(2)
             }
         }
@@ -81,7 +84,10 @@ struct TodoAgentInspector: View {
         } message: {
             Text("会话会从列表中隐藏，已有任务和清单不会被删除。")
         }
-        .animation(reduceMotion ? nil : .easeOut(duration: 0.16), value: sessionSwitcherPresented)
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: AssistantSessionSwitcherLayout.animationDuration),
+            value: sessionSwitcherPresented
+        )
         .accessibilityIdentifier("todoagent.inspector")
     }
 
@@ -466,7 +472,7 @@ struct TodoAgentToolbar: View {
                     .accessibilityHidden(true)
             }
             .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+            .frame(minHeight: 30, alignment: .leading)
             .background(
                 sessionSwitcherPresented ? TodoAgentUI.selectionBackground : .clear,
                 in: .rect(cornerRadius: 8)
@@ -475,6 +481,7 @@ struct TodoAgentToolbar: View {
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .layoutPriority(1)
         .disabled(assistant.activeSessions.isEmpty || assistant.isManagingSession)
         .help("切换对话 · \(statusLabel)")
         .accessibilityValue("\(statusLabel)，\(sessionSwitcherPresented ? "已展开" : "已折叠")")
@@ -501,20 +508,23 @@ struct AssistantSessionSwitcherPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Text("对话")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(TodoAgentUI.secondaryText)
-                .padding(.horizontal, 10)
-                .padding(.top, 10)
-                .padding(.bottom, 5)
-
             ScrollView {
-                LazyVStack(spacing: 3) {
-                    ForEach(sessions) { session in
-                        sessionRow(session)
+                LazyVStack(alignment: .leading, spacing: 2) {
+                    ForEach(historySections) { section in
+                        Text(section.title)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(TodoAgentUI.secondaryText)
+                            .padding(.horizontal, 10)
+                            .padding(.top, 7)
+                            .padding(.bottom, 3)
+
+                        ForEach(section.sessions) { session in
+                            sessionRow(session)
+                        }
                     }
                 }
                 .padding(.horizontal, 6)
+                .padding(.vertical, 4)
             }
             .scrollIndicators(.visible)
             .frame(height: sessionListHeight)
@@ -539,9 +549,21 @@ struct AssistantSessionSwitcherPanel: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .todoAgentGlassSurface(cornerRadius: TodoAgentUI.panelRadius, elevated: true)
+        .background(
+            TodoAgentUI.surfaceBackground,
+            in: .rect(cornerRadius: AssistantSessionSwitcherLayout.cornerRadius)
+        )
+        .overlay {
+            RoundedRectangle(cornerRadius: AssistantSessionSwitcherLayout.cornerRadius)
+                .stroke(TodoAgentUI.hairline, lineWidth: 1)
+        }
+        .shadow(color: TodoAgentUI.shadowColor, radius: 14, y: 6)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("assistant.session-switcher")
+    }
+
+    private var historySections: [AssistantSessionHistorySection] {
+        AssistantSessionHistoryProjection.sections(from: sessions)
     }
 
     private func sessionRow(_ session: AssistantSessionDescriptor) -> some View {
@@ -586,7 +608,97 @@ struct AssistantSessionSwitcherPanel: View {
     }
 
     private var sessionListHeight: CGFloat {
-        min(max(CGFloat(sessions.count) * 39, 39), 234)
+        AssistantSessionSwitcherLayout.listHeight(
+            sessionCount: sessions.count,
+            sectionCount: historySections.count
+        )
+    }
+}
+
+@MainActor
+enum AssistantSessionSwitcherLayout {
+    static let verticalGap: CGFloat = 4
+    static let panelTopOffset = TodoAgentToolbar.height + verticalGap
+    static let cornerRadius: CGFloat = 12
+    static let animationDuration: TimeInterval = 0.18
+    static let maximumListHeight: CGFloat = 172
+
+    static func listHeight(sessionCount: Int, sectionCount: Int) -> CGFloat {
+        let rows = CGFloat(max(sessionCount, 1)) * 39
+        let headings = CGFloat(max(sectionCount, 1)) * 23
+        return min(max(rows + headings + 8, 70), maximumListHeight)
+    }
+}
+
+struct AssistantSessionHistorySection: Identifiable, Equatable {
+    let id: String
+    let title: String
+    var sessions: [AssistantSessionDescriptor]
+}
+
+enum AssistantSessionHistoryProjection {
+    static func sections(
+        from sessions: [AssistantSessionDescriptor],
+        now: Date = .now,
+        calendar: Calendar = .todoAgentLocal
+    ) -> [AssistantSessionHistorySection] {
+        let today = LocalDay(now, calendar: calendar)
+        let yesterday = calendar.date(byAdding: .day, value: -1, to: now)
+            .map { LocalDay($0, calendar: calendar) }
+        var sections: [AssistantSessionHistorySection] = []
+
+        for session in sessions {
+            let date = date(from: session.updatedAt) ?? date(from: session.createdAt)
+            let day = date.map { LocalDay($0, calendar: calendar) }
+            let id = day?.rawValue ?? "recent"
+
+            if let index = sections.firstIndex(where: { $0.id == id }) {
+                sections[index].sessions.append(session)
+            } else {
+                sections.append(
+                    AssistantSessionHistorySection(
+                        id: id,
+                        title: title(
+                            for: day,
+                            displayDate: date,
+                            today: today,
+                            yesterday: yesterday
+                        ),
+                        sessions: [session]
+                    )
+                )
+            }
+        }
+
+        if sections.isEmpty {
+            sections.append(
+                AssistantSessionHistorySection(
+                    id: "recent",
+                    title: "最近",
+                    sessions: []
+                )
+            )
+        }
+        return sections
+    }
+
+    private static func date(from value: String) -> Date? {
+        guard !value.isEmpty else { return nil }
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return fractional.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+    }
+
+    private static func title(
+        for day: LocalDay?,
+        displayDate: Date?,
+        today: LocalDay,
+        yesterday: LocalDay?
+    ) -> String {
+        guard let day else { return "最近" }
+        if day == today { return "今天" }
+        if day == yesterday { return "昨天" }
+        return displayDate?.formatted(.dateTime.month().day()) ?? day.rawValue
     }
 }
 

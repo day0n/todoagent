@@ -23,32 +23,45 @@ struct ContentView: View {
                 )
         } detail: {
             GeometryReader { proxy in
-                let layout = MainWorkspaceLayoutPolicy.resolve(
-                    availableWidth: proxy.size.width,
-                    assistantRequested: state.inspectorPresented
+                let assistantWidth = MainWorkspaceLayoutPolicy.assistantWidth(
+                    availableWidth: proxy.size.width
                 )
+                let assistantContainerWidth = state.inspectorPresented
+                    ? assistantWidth + MainWorkspaceLayoutPolicy.dividerWidth
+                    : 0
 
                 HStack(spacing: 0) {
                     boardWorkspace
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                    if case let .sideBySide(assistantWidth) = layout {
-                        HStack(spacing: 0) {
-                            Divider()
+                    ZStack(alignment: .trailing) {
+                        if state.inspectorPresented {
+                            HStack(spacing: 0) {
+                                Divider()
 
-                            TodoAgentInspector(state: state)
-                                .frame(width: assistantWidth)
+                                TodoAgentInspector(state: state)
+                                    .frame(width: assistantWidth)
+                            }
+                            .frame(width: assistantWidth + MainWorkspaceLayoutPolicy.dividerWidth)
+                            .transition(
+                                .move(edge: .trailing)
+                                    .combined(with: .opacity)
+                            )
                         }
-                        .frame(width: assistantWidth + 1)
-                        .transition(.move(edge: .trailing).combined(with: .opacity))
                     }
+                    .frame(width: assistantContainerWidth, alignment: .trailing)
+                    .clipped()
                 }
                 .clipped()
+                .animation(
+                    AssistantWorkspaceMotion.animation(reduceMotion: reduceMotion),
+                    value: state.inspectorPresented
+                )
             }
         }
         .navigationSplitViewStyle(.balanced)
         .tint(TodoAgentUI.primaryText)
         .disabled(state.loadState == .loading || state.isPreparingToTerminate)
-        .animation(reduceMotion ? nil : .snappy(duration: 0.22), value: state.inspectorPresented)
         .background {
             GeometryReader { proxy in
                 Color.clear.preference(
@@ -130,6 +143,10 @@ struct ContentView: View {
             }
         }
         .background(TodoAgentUI.canvasBackground)
+        .animation(
+            AssistantWorkspaceMotion.animation(reduceMotion: reduceMotion),
+            value: state.inspectorPresented
+        )
     }
 
     @ViewBuilder
@@ -158,6 +175,7 @@ enum MainWorkspaceLayout: Equatable, Sendable {
 }
 
 enum MainWorkspaceLayoutPolicy {
+    static let dividerWidth: CGFloat = 1
     static let assistantWidthFraction: CGFloat = 0.34
     static let assistantMinimumWidth: CGFloat = 320
     static let assistantMaximumWidth: CGFloat = 400
@@ -169,6 +187,12 @@ enum MainWorkspaceLayoutPolicy {
     ) -> MainWorkspaceLayout {
         guard assistantRequested else { return .boardOnly }
 
+        return .sideBySide(
+            assistantWidth: assistantWidth(availableWidth: availableWidth)
+        )
+    }
+
+    static func assistantWidth(availableWidth: CGFloat) -> CGFloat {
         let proposed = min(
             max(availableWidth * assistantWidthFraction, assistantMinimumWidth),
             assistantMaximumWidth
@@ -178,9 +202,17 @@ enum MainWorkspaceLayoutPolicy {
             0
         )
 
-        return .sideBySide(
-            assistantWidth: min(proposed, widthThatPreservesBoard)
-        )
+        return min(proposed, widthThatPreservesBoard)
+    }
+}
+
+enum AssistantWorkspaceMotion {
+    /// Long enough for the eye to follow the board compression, while keeping
+    /// the pane feeling attached to the window rather than modal.
+    static let duration: TimeInterval = 0.34
+
+    static func animation(reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .easeInOut(duration: duration)
     }
 }
 

@@ -87,7 +87,40 @@ struct TaskConversationViewTests {
         #expect(compactHeight > TodoAgentToolbar.height)
         #expect(compactHeight < 240)
         #expect(crowdedHeight > compactHeight)
-        #expect(crowdedHeight < 380)
+        #expect(crowdedHeight < 300)
+        #expect(AssistantSessionSwitcherLayout.panelTopOffset > TodoAgentToolbar.height)
+    }
+
+    @Test("conversation history groups today and yesterday below a stable toolbar")
+    func conversationSwitcherGroupsRecentDaysWithoutMovingToolbar() throws {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = try #require(TimeZone(identifier: "Asia/Shanghai"))
+        let now = try #require(
+            ISO8601DateFormatter().date(from: "2026-08-10T02:00:00Z")
+        )
+        let sessions = [
+            AssistantSessionDescriptor(
+                id: "today",
+                title: "今天的对话",
+                updatedAt: "2026-08-10T01:30:00Z"
+            ),
+            AssistantSessionDescriptor(
+                id: "yesterday",
+                title: "昨天的对话",
+                updatedAt: "2026-08-09T01:30:00Z"
+            ),
+        ]
+
+        let sections = AssistantSessionHistoryProjection.sections(
+            from: sessions,
+            now: now,
+            calendar: calendar
+        )
+
+        #expect(sections.map(\.title) == ["今天", "昨天"])
+        #expect(sections.map(\.sessions.first?.id) == ["today", "yesterday"])
+        #expect(hostedToolbarHeight(isSwitcherPresented: false) == TodoAgentToolbar.height)
+        #expect(hostedToolbarHeight(isSwitcherPresented: true) == TodoAgentToolbar.height)
     }
 
     @Test("task detail sheet follows the parent window instead of covering it")
@@ -175,6 +208,20 @@ struct TaskConversationViewTests {
                 onArchive: {}
             )
             .frame(width: 300)
+        )
+        host.layoutSubtreeIfNeeded()
+        return host.fittingSize.height
+    }
+
+    private func hostedToolbarHeight(isSwitcherPresented: Bool) -> CGFloat {
+        let state = AppState(repository: AssistantTestRepository())
+        let host = NSHostingView(
+            rootView: TodoAgentToolbar(
+                state: state,
+                sessionSwitcherPresented: .constant(isSwitcherPresented),
+                onClose: {}
+            )
+            .frame(width: 360)
         )
         host.layoutSubtreeIfNeeded()
         return host.fittingSize.height
