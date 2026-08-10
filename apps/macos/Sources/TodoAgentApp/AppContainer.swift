@@ -72,6 +72,15 @@ private actor FailedRepository: AppRepository {
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationTask: Task<Void, Never>?
+    private let inputFocusMonitor = WindowInputFocusMonitor()
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        inputFocusMonitor.start()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        inputFocusMonitor.stop()
+    }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard terminationTask == nil else { return .terminateLater }
