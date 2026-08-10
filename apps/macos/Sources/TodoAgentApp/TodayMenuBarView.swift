@@ -14,16 +14,23 @@ struct TodayMenuBarProjection: Equatable, Sendable {
     }
 }
 
-/// The menu-bar popover cannot infer a useful ideal height from a ScrollView.
-/// Giving the real task region a finite, nonzero height prevents the rows from
-/// collapsing while still capping long lists.
+/// Keeps the menu compact for short lists and introduces a scroll container
+/// only after ten rows. A fixed row height makes the 10/11-task boundary
+/// deterministic instead of relying on the popover's intrinsic sizing.
 enum TodayMenuBarTaskAreaMetrics {
-    static let rowHeight: CGFloat = 52
-    static let minimumHeight: CGFloat = 52
-    static let maximumHeight: CGFloat = 300
+    static let rowHeight: CGFloat = 42
+    static let rowSpacing: CGFloat = 2
+    static let maximumVisibleTaskCount = 10
 
     static func height(taskCount: Int) -> CGFloat {
-        min(max(CGFloat(taskCount) * rowHeight, minimumHeight), maximumHeight)
+        let visibleTaskCount = min(max(taskCount, 0), maximumVisibleTaskCount)
+        guard visibleTaskCount > 0 else { return 0 }
+        return CGFloat(visibleTaskCount) * rowHeight
+            + CGFloat(visibleTaskCount - 1) * rowSpacing
+    }
+
+    static func requiresScrolling(taskCount: Int) -> Bool {
+        taskCount > maximumVisibleTaskCount
     }
 }
 
@@ -42,15 +49,15 @@ struct TodayMenuBarView: View {
             Divider()
 
             content
-                .padding(.vertical, 8)
+                .padding(.vertical, 6)
 
             Divider()
-            openAppButton
-                .padding(.top, 8)
+            actions
         }
-        .padding(14)
-        .frame(width: 340)
-        .background(TodoAgentUI.surfaceBackground)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .frame(width: 304)
+        .background(.regularMaterial)
         .task { await state.load() }
     }
 
@@ -74,7 +81,7 @@ struct TodayMenuBarView: View {
                 .background(TodoAgentUI.selectionBackground, in: .capsule)
                 .accessibilityLabel("今日任务 \(projection.tasks.count) 项")
         }
-        .padding(.bottom, 10)
+        .padding(.bottom, 8)
         .accessibilityIdentifier("menubar.today.header")
     }
 
@@ -131,18 +138,54 @@ struct TodayMenuBarView: View {
         }
     }
 
-    private var openAppButton: some View {
-        Button {
-            TodoAgentMainWindow.show(using: openWindow)
-        } label: {
-            Label("打开 TodoAgent", systemImage: "macwindow")
-                .frame(maxWidth: .infinity, minHeight: 30, alignment: .leading)
+    private var actions: some View {
+        VStack(spacing: 0) {
+            TodayMenuBarActionButton(
+                title: "Open TodoAgent",
+                accessibilityIdentifier: "menubar.open-main-window"
+            ) {
+                TodoAgentMainWindow.show(using: openWindow)
+            }
+            .help("打开 TodoAgent 主窗口")
+            .accessibilityHint("激活已有主窗口，或在主窗口已关闭时重新打开")
+
+            Divider()
+
+            TodayMenuBarActionButton(
+                title: "Quit TodoAgent",
+                accessibilityIdentifier: "menubar.quit"
+            ) {
+                NSApp.terminate(nil)
+            }
+            .help("退出 TodoAgent")
+        }
+        .padding(.top, 4)
+    }
+}
+
+private struct TodayMenuBarActionButton: View {
+    let title: String
+    let accessibilityIdentifier: String
+    let action: () -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.callout)
+                .foregroundStyle(TodoAgentUI.primaryText)
+                .frame(maxWidth: .infinity, minHeight: 34, alignment: .leading)
+                .padding(.horizontal, 6)
+                .background(
+                    isHovering ? TodoAgentUI.selectionBackground : .clear,
+                    in: .rect(cornerRadius: 6)
+                )
+                .contentShape(.rect)
         }
         .buttonStyle(.plain)
-        .contentShape(.rect)
-        .help("打开 TodoAgent 主窗口")
-        .accessibilityHint("激活已有主窗口，或在主窗口已关闭时重新打开")
-        .accessibilityIdentifier("menubar.open-main-window")
+        .onHover { isHovering = $0 }
+        .accessibilityIdentifier(accessibilityIdentifier)
     }
 }
 
@@ -153,54 +196,72 @@ struct TodayMenuTaskList: View {
     var onOpen: (TaskItem) -> Void = { _ in }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 2) {
-                ForEach(tasks) { task in
-                    Button {
-                        onOpen(task)
-                    } label: {
-                        TodayMenuTaskRow(task: task)
-                    }
-                    .buttonStyle(.plain)
+        Group {
+            if TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: tasks.count) {
+                ScrollView(.vertical) {
+                    rows
                 }
+                .scrollIndicators(.visible)
+            } else {
+                rows
             }
         }
-        .frame(
-            minHeight: TodayMenuBarTaskAreaMetrics.minimumHeight,
-            idealHeight: TodayMenuBarTaskAreaMetrics.height(taskCount: tasks.count),
-            maxHeight: TodayMenuBarTaskAreaMetrics.height(taskCount: tasks.count)
-        )
+        .frame(height: TodayMenuBarTaskAreaMetrics.height(taskCount: tasks.count))
         .accessibilityIdentifier("menubar.today.task-list")
+    }
+
+    private var rows: some View {
+        LazyVStack(alignment: .leading, spacing: TodayMenuBarTaskAreaMetrics.rowSpacing) {
+            ForEach(tasks) { task in
+                Button {
+                    onOpen(task)
+                } label: {
+                    TodayMenuTaskRow(task: task)
+                }
+                .buttonStyle(.plain)
+            }
+        }
     }
 }
 
 private struct TodayMenuTaskRow: View {
     let task: TaskItem
 
-    var body: some View {
-        HStack(alignment: .top, spacing: 10) {
-            Image(systemName: task.status == .completed ? "checkmark.circle.fill" : "circle")
-                .font(.callout)
-                .foregroundStyle(task.status == .completed ? Color.green : TodoAgentUI.secondaryText)
-                .padding(.top, 2)
+    @State private var isHovering = false
 
-            VStack(alignment: .leading, spacing: 2) {
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: task.status == .completed ? "checkmark.circle.fill" : "circle")
+                .font(.subheadline)
+                .foregroundStyle(task.status == .completed ? Color.green : TodoAgentUI.secondaryText)
+                .padding(.top, 1)
+
+            VStack(alignment: .leading, spacing: 0) {
                 Text(task.title)
-                    .font(.callout.weight(.medium))
+                    .font(.subheadline.weight(.medium))
                     .foregroundStyle(TodoAgentUI.primaryText)
                     .strikethrough(task.status == .completed)
-                    .lineLimit(2)
+                    .lineLimit(1)
                 Text(task.status.title)
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundStyle(TodoAgentUI.secondaryText)
             }
 
             Spacer(minLength: 0)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
-        .frame(maxWidth: .infinity, minHeight: TodayMenuBarTaskAreaMetrics.rowHeight, alignment: .leading)
+        .padding(.horizontal, 6)
+        .frame(
+            maxWidth: .infinity,
+            minHeight: TodayMenuBarTaskAreaMetrics.rowHeight,
+            maxHeight: TodayMenuBarTaskAreaMetrics.rowHeight,
+            alignment: .leading
+        )
+        .background(
+            isHovering ? TodoAgentUI.selectionBackground : .clear,
+            in: .rect(cornerRadius: 6)
+        )
         .contentShape(.rect)
+        .onHover { isHovering = $0 }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(task.title)，\(task.status.title)")
         .accessibilityIdentifier("menubar.today.task.\(task.id.uuidString)")

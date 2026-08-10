@@ -138,6 +138,19 @@ struct TodayMenuBarViewTests {
         blankWindow.orderOut(nil)
     }
 
+    @Test("ten tasks expand without scrolling and the eleventh caps the viewport")
+    func scrollingStartsAfterTenTasks() {
+        let tenTaskHeight = TodayMenuBarTaskAreaMetrics.height(taskCount: 10)
+
+        #expect(TodayMenuBarTaskAreaMetrics.maximumVisibleTaskCount == 10)
+        #expect(!TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 0))
+        #expect(!TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 10))
+        #expect(TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 11))
+        #expect(TodayMenuBarTaskAreaMetrics.height(taskCount: 0) == 0)
+        #expect(TodayMenuBarTaskAreaMetrics.height(taskCount: 11) == tenTaskHeight)
+        #expect(TodayMenuBarTaskAreaMetrics.height(taskCount: 50) == tenTaskHeight)
+    }
+
     private func shanghaiCalendar() -> Calendar {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = TimeZone(identifier: "Asia/Shanghai")!
