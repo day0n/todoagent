@@ -205,102 +205,53 @@ struct TodoAgentInspector: View {
     }
 
     private var transcript: some View {
-        GeometryReader { geometry in
-            ScrollViewReader { proxy in
-                ScrollView {
-                    LazyVStack(spacing: TodoAgentUI.standardSpacing) {
-                        if assistant.isLoadingHistory, assistant.selectedTimelineItems.isEmpty {
-                            Text("正在载入历史…")
-                                .font(.caption)
-                                .foregroundStyle(TodoAgentUI.secondaryText)
-                                .padding(.vertical, 30)
-                        } else if assistant.selectedTimelineItems.isEmpty, assistant.selectedDraft == nil {
-                            AssistantConversationEmptyState { suggestion in
-                                draft = suggestion
-                                composerFocused = true
-                            }
-                                .padding(.vertical, 32)
-                        }
-
-                        ForEach(assistant.selectedTimelineItems) { item in
-                            switch item {
-                            case let .message(message):
-                                AssistantMessageRow(message: message, state: state)
-                            case let .toolGroup(group):
-                                AssistantToolStepsView(group: group, state: state)
-                            }
-                        }
-
-                        if let draft = assistant.selectedDraft, !draft.body.isEmpty {
-                            AssistantStreamingRow(draft: draft)
-                                .id("streaming-\(draft.messageID)-\(draft.attempt)")
-                        }
-
-                        if let processingPhase {
-                            AssistantProcessingRow(phase: processingPhase)
-                                .id("assistant-processing")
-                        }
-
-                        if let turnError = assistant.selectedTurnError {
-                            AssistantFriendlyErrorView(rawMessage: turnError)
-                                .id("assistant-turn-error")
-                        }
-
-                        Color.clear.frame(height: 1).id("assistant-bottom")
-                    }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 14)
+        ChatTranscriptView(
+            transcript: assistant.selectedChatTranscript,
+            taskReferences: chatTaskReferences,
+            horizontalPadding: 24,
+            verticalPadding: 18
+        ) {
+            if assistant.isLoadingHistory {
+                Text("正在载入历史…")
+                    .font(.caption)
+                    .foregroundStyle(TodoAgentUI.secondaryText)
+                    .padding(.vertical, 30)
+            } else {
+                AssistantConversationEmptyState { suggestion in
+                    draft = suggestion
+                    composerFocused = true
                 }
-                .scrollIndicators(
-                    AssistantScrollIndicatorPolicy.showsIndicators(
-                        pointerNearIndicator: pointerNearTranscriptIndicator
-                    ) ? .visible : .hidden,
-                    axes: .vertical
-                )
-                .background(TodoAgentUI.canvasBackground)
-                .onContinuousHover { phase in
-                    switch phase {
-                    case let .active(location):
-                        pointerNearTranscriptIndicator = location.x
-                            >= geometry.size.width - AssistantScrollIndicatorPolicy.hoverZoneWidth
-                    case .ended:
-                        pointerNearTranscriptIndicator = false
-                    }
-                }
-                .overlay(alignment: .trailing) {
-                    Rectangle()
-                        .fill(TodoAgentUI.canvasBackground)
-                        .frame(width: AssistantScrollIndicatorPolicy.coverWidth)
-                        .opacity(
-                            AssistantScrollIndicatorPolicy.coverOpacity(
-                                pointerNearIndicator: pointerNearTranscriptIndicator
-                            )
-                        )
-                        .allowsHitTesting(false)
-                }
-                .animation(.easeOut(duration: 0.18), value: pointerNearTranscriptIndicator)
-                .onChange(of: assistant.selectedMessages.last?.id) {
-                    scrollToBottom(proxy)
-                }
-                .onChange(of: assistant.selectedTimelineItems.last?.id) {
-                    scrollToBottom(proxy)
-                }
-                .onChange(of: assistant.selectedDraft?.body) {
-                    scrollToBottom(proxy)
-                }
-                .onChange(of: assistant.selectedSessionID) {
-                    scrollToBottom(proxy, animated: false)
-                }
+                .padding(.vertical, 32)
             }
         }
+        .background(TodoAgentUI.canvasBackground)
+    }
+
+    private var chatTaskReferences: ChatTaskReferenceActions {
+        ChatTaskReferenceActions(
+            title: { taskID in state.task(id: taskID)?.title },
+            open: { taskID in
+                guard let task = state.task(id: taskID) else { return }
+                state.openTask(task)
+            }
+        )
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: 11) {
+        ChatComposer(
+            text: $draft,
+            focus: $composerFocused,
+            placeholder: "告诉 TodoAgent…",
+            isRunning: assistant.isSelectedSessionRunning,
+            canSubmit: canSubmit,
+            accessibilityPrefix: "assistant",
+            onSubmit: submit,
+            onStop: { Task { await assistant.cancelSelectedTurn() } }
+        ) {
             if !pendingAttachments.isEmpty {
                 FlowLayout(spacing: 6) {
                     ForEach(Array(pendingAttachments.enumerated()), id: \.offset) { index, attachment in
-                        AssistantAttachmentChip(
+                        ChatAttachmentChip(
                             attachment: AssistantAttachmentSummary(
                                 name: attachment.name,
                                 mediaType: attachment.mediaType,
@@ -323,69 +274,29 @@ struct TodoAgentInspector: View {
                     .foregroundStyle(.red)
                     .accessibilityIdentifier("assistant.attachment-error")
             }
-
-            TextField("告诉 TodoAgent…", text: $draft, axis: .vertical)
-                .lineLimit(2...6)
-                .textFieldStyle(.plain)
-                .focused($composerFocused)
-                .onSubmit(submit)
-                .accessibilityIdentifier("assistant.composer")
-
-            HStack(alignment: .center, spacing: 8) {
-                Button("添加文本附件", systemImage: "plus") {
-                    pickTextAttachments()
-                }
-                .labelStyle(.iconOnly)
-                .buttonStyle(AssistantComposerUtilityButtonStyle())
-                .help("添加 .txt 或 .md 附件")
-                .accessibilityHint("选择文本或 Markdown 文件")
-                .accessibilityIdentifier("assistant.add-attachment")
-                .disabled(assistant.isSelectedSessionRunning)
-
-                Button {
-                    SettingsWindowController.show(tab: .model)
-                } label: {
-                    Label("自动", systemImage: "slider.horizontal.3")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(TodoAgentUI.secondaryText)
-                }
-                .buttonStyle(.plain)
-                .help("TodoAgent 设置 · 当前模型 \(model)")
-                .accessibilityLabel("TodoAgent 设置，自动模式")
-                .accessibilityIdentifier("assistant.composer-settings")
-
-                Spacer()
-                if assistant.isSelectedSessionRunning {
-                    Button("停止本轮", systemImage: "stop.fill", role: .destructive) {
-                        Task { await assistant.cancelSelectedTurn() }
-                    }
-                    .labelStyle(.iconOnly)
-                    .buttonStyle(AssistantComposerCircleButtonStyle(isEnabled: true))
-                    .help("停止本轮")
-                    .accessibilityIdentifier("assistant.stop")
-                } else {
-                    Button("发送", systemImage: "arrow.up") { submit() }
-                        .labelStyle(.iconOnly)
-                        .buttonStyle(AssistantComposerCircleButtonStyle(isEnabled: canSubmit))
-                        .disabled(!canSubmit)
-                        .help("发送")
-                        .accessibilityIdentifier("assistant.send")
-                }
+        } accessories: {
+            Button("添加文本附件", systemImage: "plus") {
+                pickTextAttachments()
             }
+            .labelStyle(.iconOnly)
+            .buttonStyle(ChatComposerUtilityButtonStyle())
+            .help("添加 .txt 或 .md 附件")
+            .accessibilityHint("选择文本或 Markdown 文件")
+            .accessibilityIdentifier("assistant.add-attachment")
+            .disabled(assistant.isSelectedSessionRunning)
+
+            Button {
+                SettingsWindowController.show(tab: .model)
+            } label: {
+                Label("自动", systemImage: "slider.horizontal.3")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(TodoAgentUI.secondaryText)
+            }
+            .buttonStyle(.plain)
+            .help("TodoAgent 设置 · 当前模型 \(model)")
+            .accessibilityLabel("TodoAgent 设置，自动模式")
+            .accessibilityIdentifier("assistant.composer-settings")
         }
-        .padding(13)
-        .todoAgentGlassSurface(cornerRadius: TodoAgentUI.composerRadius, elevated: true)
-        .overlay {
-            RoundedRectangle(cornerRadius: TodoAgentUI.composerRadius)
-                .stroke(
-                    composerFocused ? Color.accentColor : TodoAgentUI.hairline,
-                    lineWidth: composerFocused ? 1.5 : 1
-                )
-        }
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
-        .padding(.bottom, 12)
-        .background(TodoAgentUI.canvasBackground)
     }
 
     private var canSubmit: Bool {
@@ -825,6 +736,26 @@ private struct AssistantToolbarButtonStyle: ButtonStyle {
     }
 }
 
+struct AssistantTranscriptTrack<Content: View>: View {
+    @ViewBuilder let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    var body: some View {
+        LazyVStack(spacing: TodoAgentUI.standardSpacing) {
+            content
+        }
+        // The transcript owns one stable, viewport-wide message track.
+        // Expandable descendants may grow vertically, but must never resize
+        // and recenter unrelated history rows.
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 14)
+    }
+}
+
 private struct AssistantComposerUtilityButtonStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
         configuration.label
@@ -870,7 +801,11 @@ private struct AssistantMessageRow: View {
             VStack(alignment: .leading, spacing: 6) {
                 Label(message.kind, systemImage: "wrench.and.screwdriver")
                     .font(.caption.bold())
-                AssistantMarkdownView(message.body)
+                ChatLazyMarkdownContent(
+                    id: message.id,
+                    text: message.body,
+                    isStreaming: false
+                )
                     .font(.caption)
                 taskReferences
             }
@@ -922,7 +857,11 @@ private struct AssistantMessageRow: View {
 
         case .todoAgent:
             VStack(alignment: .leading, spacing: 7) {
-                AssistantMarkdownView(message.body)
+                ChatLazyMarkdownContent(
+                    id: message.id,
+                    text: message.body,
+                    isStreaming: false
+                )
                     .font(.callout)
                     .foregroundStyle(TodoAgentUI.primaryText)
                 taskReferences
@@ -1000,7 +939,11 @@ private struct AssistantStreamingRow: View {
     var body: some View {
         HStack(alignment: .top) {
             VStack(alignment: .leading, spacing: 7) {
-                AssistantMarkdownView(draft.body)
+                ChatLazyMarkdownContent(
+                    id: draft.messageID,
+                    text: draft.body,
+                    isStreaming: true
+                )
                     .font(.callout)
             }
             .foregroundStyle(TodoAgentUI.primaryText)

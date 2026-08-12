@@ -24,6 +24,7 @@ use crate::assistant::{
 use crate::models::{
     AssistantContextHistory, AssistantHistory, AssistantMessage, AssistantSession,
     AssistantToolSummary, AssistantTurn, AssistantTurnStatus, QueuedAssistantTurn,
+    SessionTimelineItem,
 };
 use crate::protocol::Event;
 use crate::store::AssistantDeleteTaskOutcome;
@@ -36,10 +37,11 @@ const MAX_TEXT_ATTACHMENTS: usize = 4;
 const MAX_ATTACHMENT_NAME_CHARACTERS: usize = 255;
 const MAX_ATTACHMENT_BYTES: usize = 131_072;
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 262_144;
-const HISTORY_LIMIT: i64 = 2_000;
 const MAX_ASSISTANT_CONCURRENCY: usize = 2;
-const DELTA_CHARACTER_LIMIT: usize = 128;
+const DELTA_FLUSH_BYTES: usize = 8 * 1024;
 const DELTA_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+const PUBLIC_THOUGHT_SUMMARY_MAX_BYTES: usize = 256 * 1024;
+const THOUGHT_DELTA_FLUSH_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Error)]
 pub enum AssistantServiceError {
@@ -136,6 +138,7 @@ pub struct AssistantBundleView {
     session: AssistantSessionView,
     messages: Vec<AssistantMessageView>,
     tools: Vec<AssistantToolView>,
+    timeline: Vec<SessionTimelineItem>,
     active_turn: Option<AssistantTurnView>,
 }
 
@@ -663,20 +666,11 @@ impl AssistantService {
                     // cancellation won the outer select. A terminal completion is
                     // immutable, so recover and publish the actual stored state.
                     let turn_id = queued.turn.id.clone();
-                    let session_id = queued.session.id.clone();
                     match self
                         .store
                         .call(move |store| {
                             let turn = store.assistant_turn(&turn_id)?;
-                            let message = store
-                                .assistant_history(&session_id, 0, HISTORY_LIMIT)?
-                                .messages
-                                .into_iter()
-                                .find(|message| {
-                                    message.turn_id.as_deref() == Some(turn_id.as_str())
-                                        && message.role == "todoagent"
-                                        && message.kind == "text"
-                                });
+                            let message = store.assistant_final_message_for_turn(&turn_id)?;
                             Ok((message, turn))
                         })
                         .await
@@ -834,7 +828,43 @@ struct HostState {
     draft_buffer: String,
     draft_generation: u64,
     draft_timer_generation: Option<u64>,
+    thought_attempt: usize,
+    thought_provider_attempt: usize,
+    thought_interaction: usize,
+    thought_pending_delta: String,
+    thought_emitted_bytes: usize,
+    thought_original_bytes: usize,
+    thought_generation: u64,
+    thought_timer_generation: Option<u64>,
     completed_turn: Option<AssistantTurn>,
+}
+
+struct ThoughtEmission {
+    global_attempt: usize,
+    provider_attempt: usize,
+    interaction_ordinal: usize,
+    content: String,
+    original_bytes: usize,
+    truncated: bool,
+}
+
+fn take_thought_emission(state: &mut HostState) -> Option<ThoughtEmission> {
+    if state.thought_pending_delta.is_empty() {
+        state.thought_timer_generation = None;
+        return None;
+    }
+    let content = std::mem::take(&mut state.thought_pending_delta);
+    state.thought_emitted_bytes = state.thought_emitted_bytes.saturating_add(content.len());
+    state.thought_generation = state.thought_generation.wrapping_add(1);
+    state.thought_timer_generation = None;
+    Some(ThoughtEmission {
+        global_attempt: state.thought_attempt.max(1),
+        provider_attempt: state.thought_provider_attempt.max(1),
+        interaction_ordinal: state.thought_interaction.max(1),
+        content,
+        original_bytes: state.thought_original_bytes,
+        truncated: state.thought_original_bytes > PUBLIC_THOUGHT_SUMMARY_MAX_BYTES,
+    })
 }
 
 #[derive(Clone)]
@@ -868,6 +898,7 @@ impl EngineAssistantHost {
     }
 
     fn begin_model_interaction(&self) {
+        self.flush_thought();
         let attempt = if let Ok(mut state) = self.state.lock() {
             state.model_interaction += 1;
             let attempt = global_draft_attempt(state.model_interaction, 1);
@@ -880,6 +911,102 @@ impl EngineAssistantHost {
             return;
         };
         self.send_delta(attempt, String::new());
+    }
+
+    fn append_thought_summary(&self, provider_attempt: usize, delta: &str) {
+        let mut emissions = Vec::new();
+        let mut timer = None;
+        if let Ok(mut state) = self.state.lock() {
+            let interaction = state.model_interaction.max(1);
+            let global_attempt = global_draft_attempt(interaction, provider_attempt);
+            if state.thought_attempt != global_attempt {
+                if let Some(emission) = take_thought_emission(&mut state) {
+                    emissions.push(emission);
+                }
+                state.thought_attempt = global_attempt;
+                state.thought_provider_attempt = provider_attempt;
+                state.thought_interaction = interaction;
+                state.thought_pending_delta.clear();
+                state.thought_emitted_bytes = 0;
+                state.thought_original_bytes = 0;
+                state.thought_generation = state.thought_generation.wrapping_add(1);
+                state.thought_timer_generation = None;
+            }
+            state.thought_original_bytes = state.thought_original_bytes.saturating_add(delta.len());
+            let accepted_bytes = state
+                .thought_emitted_bytes
+                .saturating_add(state.thought_pending_delta.len());
+            let remaining = PUBLIC_THOUGHT_SUMMARY_MAX_BYTES.saturating_sub(accepted_bytes);
+            state
+                .thought_pending_delta
+                .push_str(&bounded_utf8_prefix(delta, remaining));
+            if state.thought_pending_delta.len() >= THOUGHT_DELTA_FLUSH_BYTES {
+                if let Some(emission) = take_thought_emission(&mut state) {
+                    emissions.push(emission);
+                }
+            } else if !state.thought_pending_delta.is_empty()
+                && state.thought_timer_generation.is_none()
+            {
+                let generation = state.thought_generation;
+                state.thought_timer_generation = Some(generation);
+                timer = Some((global_attempt, generation));
+            }
+        }
+        for emission in emissions {
+            self.send_thought_delta(emission);
+        }
+        if let Some((attempt, generation)) = timer {
+            let host = self.clone();
+            tokio::spawn(async move {
+                sleep(DELTA_FLUSH_INTERVAL).await;
+                host.flush_thought_generation(attempt, generation);
+            });
+        }
+    }
+
+    fn flush_thought(&self) {
+        let emission = self
+            .state
+            .lock()
+            .ok()
+            .and_then(|mut state| take_thought_emission(&mut state));
+        if let Some(emission) = emission {
+            self.send_thought_delta(emission);
+        }
+    }
+
+    fn flush_thought_generation(&self, attempt: usize, generation: u64) {
+        let emission = self.state.lock().ok().and_then(|mut state| {
+            if state.thought_attempt != attempt
+                || state.thought_generation != generation
+                || state.thought_timer_generation != Some(generation)
+            {
+                return None;
+            }
+            take_thought_emission(&mut state)
+        });
+        if let Some(emission) = emission {
+            self.send_thought_delta(emission);
+        }
+    }
+
+    fn send_thought_delta(&self, emission: ThoughtEmission) {
+        self.service.emit_ephemeral(
+            "assistant.thought.summary",
+            json!({
+                "sessionId": self.session_id,
+                "turnId": self.turn_id,
+                "attempt": emission.global_attempt,
+                "providerAttempt": emission.provider_attempt,
+                "interactionOrdinal": emission.interaction_ordinal,
+                "partId": format!("assistant-live-reasoning-{}-{}", self.turn_id, emission.global_attempt),
+                "partOrdinal": emission.global_attempt,
+                "isDelta": true,
+                "originalBytes": emission.original_bytes,
+                "truncated": emission.truncated,
+                "content": emission.content,
+            }),
+        );
     }
 
     fn reset_draft(&self, provider_attempt: usize) {
@@ -911,7 +1038,7 @@ impl EngineAssistantHost {
                 return;
             }
             state.draft_buffer.push_str(text);
-            if state.draft_buffer.chars().count() >= DELTA_CHARACTER_LIMIT {
+            if state.draft_buffer.len() >= DELTA_FLUSH_BYTES {
                 flush = Some((
                     state.draft_attempt.max(1),
                     std::mem::take(&mut state.draft_buffer),
@@ -1319,10 +1446,14 @@ impl AssistantHost for EngineAssistantHost {
 
     fn emit(&self, _session_id: &str, _turn_id: &str, event: AgentEvent) {
         match event {
-            AgentEvent::DraftReset { attempt, .. } => self.reset_draft(attempt),
+            AgentEvent::DraftReset { attempt, .. } => {
+                self.flush_thought();
+                self.reset_draft(attempt);
+            }
             AgentEvent::Delta { attempt, text } => self.append_delta(attempt, &text),
             AgentEvent::ToolStarted { call_id, name } => {
                 self.flush_draft();
+                self.flush_thought();
                 self.service.emit(
                     "assistant.tool.started",
                     json!({
@@ -1339,6 +1470,7 @@ impl AssistantHost for EngineAssistantHost {
                 is_error,
             } => {
                 self.flush_draft();
+                self.flush_thought();
                 let task_references = self
                     .state
                     .lock()
@@ -1357,11 +1489,20 @@ impl AssistantHost for EngineAssistantHost {
                     }),
                 );
             }
-            AgentEvent::Final { .. } | AgentEvent::Failed { .. } => self.flush_draft(),
+            AgentEvent::Final { .. } | AgentEvent::Failed { .. } => {
+                self.flush_draft();
+                self.flush_thought();
+            }
             AgentEvent::Status { phase, .. } if phase == "model" => {
                 self.begin_model_interaction();
             }
-            AgentEvent::Status { .. } | AgentEvent::ThoughtSummary { .. } => {}
+            AgentEvent::ThoughtSummary { attempt, content } => {
+                let content = public_thought_summary_text(&content);
+                if !content.is_empty() {
+                    self.append_thought_summary(attempt, &content);
+                }
+            }
+            AgentEvent::Status { .. } => {}
         }
     }
 }
@@ -1427,6 +1568,28 @@ impl AssistantBundleView {
             session: AssistantSessionView::from_session(session, queued.turn.model_id.clone()),
             messages: vec![AssistantMessageView::from(queued.message.clone())],
             tools: Vec::new(),
+            timeline: vec![SessionTimelineItem {
+                id: format!("assistant-timeline-message-{}", queued.message.id),
+                session_id: queued.message.session_id.clone(),
+                turn_id: queued.turn.id.clone(),
+                sequence: 1,
+                turn_ordinal: queued.turn.ordinal,
+                item_ordinal: 0,
+                kind: "user".to_owned(),
+                body: queued.message.body.clone(),
+                call_id: None,
+                tool_name: None,
+                input_json: None,
+                output_text: None,
+                tool_state: None,
+                is_error: false,
+                source_event_sequence: None,
+                source_block_index: None,
+                fidelity: "exact".to_owned(),
+                metadata_json: None,
+                created_at: queued.message.created_at.clone(),
+                updated_at: queued.message.updated_at.clone(),
+            }],
             active_turn,
         }
     }
@@ -1455,6 +1618,7 @@ impl AssistantBundleView {
                 .into_iter()
                 .map(AssistantToolView::from)
                 .collect(),
+            timeline: history.timeline,
             active_turn,
         }
     }
@@ -1797,6 +1961,46 @@ fn global_draft_attempt(model_interaction: usize, provider_attempt: usize) -> us
         .saturating_sub(1)
         .saturating_mul(3)
         .saturating_add(provider_attempt.max(1))
+}
+
+fn public_thought_summary_text(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(values) => values
+            .iter()
+            .map(public_thought_summary_text)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Value::Object(object) => {
+            if matches!(object.get("type").and_then(Value::as_str), Some("text")) {
+                return object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+            ["content", "summary"]
+                .into_iter()
+                .filter_map(|key| object.get(key))
+                .map(public_thought_summary_text)
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+fn bounded_utf8_prefix(value: &str, maximum_bytes: usize) -> String {
+    if value.len() <= maximum_bytes {
+        return value.to_owned();
+    }
+    let mut end = maximum_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 async fn execute_assistant_delete_tool(
@@ -2783,6 +2987,132 @@ mod tests {
         let event = receiver.try_recv().expect("deadline should flush a delta");
         assert_eq!(event["event"], "assistant.message.delta");
         assert_eq!(event["data"]["delta"], "短片段");
+
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fast_megabyte_delta_stream_is_coalesced_into_bounded_event_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
+        let (writer, receiver) = std::sync::mpsc::sync_channel(256);
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(directory.path().to_path_buf()),
+            Arc::new(Mutex::new(())),
+        );
+        let host = EngineAssistantHost::new(service, "session".to_owned(), "turn".to_owned());
+        host.begin_model_interaction();
+        let _ = receiver.try_recv();
+
+        let chunk = "x".repeat(256);
+        for _ in 0..(1024 * 1024 / chunk.len()) {
+            host.append_delta(1, &chunk);
+        }
+        host.flush_draft();
+
+        let deltas = receiver
+            .try_iter()
+            .filter(|event| event["event"] == "assistant.message.delta")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            deltas
+                .iter()
+                .map(|event| event["data"]["delta"].as_str().unwrap().len())
+                .sum::<usize>(),
+            1024 * 1024
+        );
+        assert!(deltas.len() <= 1024 * 1024 / DELTA_FLUSH_BYTES + 1);
+
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn thought_summary_events_are_public_bounded_deltas_with_global_parts() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
+        let (writer, receiver) = std::sync::mpsc::sync_channel(16);
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(directory.path().to_path_buf()),
+            Arc::new(Mutex::new(())),
+        );
+        let host = EngineAssistantHost::new(service, "session".to_owned(), "turn".to_owned());
+        host.begin_model_interaction();
+        let _ = receiver.try_recv();
+
+        AssistantHost::emit(
+            &host,
+            "session",
+            "turn",
+            AgentEvent::ThoughtSummary {
+                attempt: 1,
+                content: json!({"type":"text","text":"先"}),
+            },
+        );
+        sleep(DELTA_FLUSH_INTERVAL + Duration::from_millis(20)).await;
+        let first = receiver.recv().unwrap();
+        assert_eq!(first["data"]["content"], "先");
+        assert_eq!(first["data"]["attempt"], 1);
+        assert_eq!(first["data"]["interactionOrdinal"], 1);
+        assert_eq!(first["data"]["isDelta"], true);
+
+        AssistantHost::emit(
+            &host,
+            "session",
+            "turn",
+            AgentEvent::ThoughtSummary {
+                attempt: 1,
+                content: json!({
+                    "summary":[{"type":"text","text":"想"}],
+                    "signature":"PRIVATE-SIGNATURE"
+                }),
+            },
+        );
+        sleep(DELTA_FLUSH_INTERVAL + Duration::from_millis(20)).await;
+        let accumulated = receiver.recv().unwrap();
+        assert_eq!(accumulated["data"]["content"], "想");
+        assert!(!accumulated.to_string().contains("PRIVATE-SIGNATURE"));
+
+        host.begin_model_interaction();
+        let _ = receiver.try_recv();
+        AssistantHost::emit(
+            &host,
+            "session",
+            "turn",
+            AgentEvent::ThoughtSummary {
+                attempt: 1,
+                content: json!({"type":"text","text":"后"}),
+            },
+        );
+        sleep(DELTA_FLUSH_INTERVAL + Duration::from_millis(20)).await;
+        let next = receiver.recv().unwrap();
+        assert_eq!(next["data"]["content"], "后");
+        assert_eq!(next["data"]["attempt"], 4);
+        assert_ne!(first["data"]["partId"], next["data"]["partId"]);
+
+        for _ in 0..1_000 {
+            AssistantHost::emit(
+                &host,
+                "session",
+                "turn",
+                AgentEvent::ThoughtSummary {
+                    attempt: 1,
+                    content: json!({"type":"text","text":"界".repeat(512)}),
+                },
+            );
+        }
+        host.flush_thought();
+        {
+            let state = host.state.lock().unwrap();
+            assert!(state.thought_emitted_bytes <= PUBLIC_THOUGHT_SUMMARY_MAX_BYTES);
+            assert!(PUBLIC_THOUGHT_SUMMARY_MAX_BYTES - state.thought_emitted_bytes < "界".len());
+            assert!(state.thought_original_bytes > PUBLIC_THOUGHT_SUMMARY_MAX_BYTES);
+        }
 
         worker.shutdown().await.unwrap();
     }

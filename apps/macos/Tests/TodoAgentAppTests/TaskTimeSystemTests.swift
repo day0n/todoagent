@@ -1150,6 +1150,49 @@ struct TaskTimeSystemTests {
         #expect(state.taskSaveState(taskID: item.id) == .idle)
     }
 
+    @Test("task card agent lights distinguish running work from unread replies")
+    func taskCardAgentLights() {
+        let taskID = UUID()
+        let idle = sessionBundle(taskID: taskID).session
+        let running = sessionBundle(
+            taskID: taskID,
+            state: .running,
+            lastAgentSequence: 4,
+            lastReadSequence: 4
+        ).session
+        let unread = sessionBundle(
+            taskID: taskID,
+            lastAgentSequence: 5,
+            lastReadSequence: 4
+        ).session
+        let runningUnread = sessionBundle(
+            taskID: taskID,
+            state: .running,
+            lastAgentSequence: 6,
+            lastReadSequence: 4
+        ).session
+
+        #expect(TaskCardAgentStatus(session: nil) == .init(isRunning: false, hasUnread: false))
+        #expect(TaskCardAgentStatus(session: idle) == .init(isRunning: false, hasUnread: false))
+        #expect(TaskCardAgentStatus(session: running) == .init(isRunning: true, hasUnread: false))
+        #expect(TaskCardAgentStatus(session: unread) == .init(isRunning: false, hasUnread: true))
+        #expect(TaskCardAgentStatus(session: runningUnread) == .init(isRunning: true, hasUnread: true))
+    }
+
+    @Test("task cards stay compact when a local Agent session exists")
+    func taskCardStaysCompactWithSession() async throws {
+        let executionDay = try day("2026-08-11")
+        var item = task("完善中英文 skill 教程", execution: executionDay)
+        item.note = "增加 instruction 和 information 教程"
+        let repository = TaskMutationSpyRepository(snapshot: snapshot(tasks: [item]))
+        let state = AppState(repository: repository)
+        await state.load()
+        await state.consume(try sessionChangedEvent(sessionBundle(taskID: item.id)))
+
+        #expect(state.session(for: item) != nil)
+        #expect(hostedCardHeight(task: item, state: state) < 100)
+    }
+
     @Test("managed attachments honor the isolated data root and strict path shape")
     func managedAttachmentURL() {
         let taskID = UUID()
@@ -1539,7 +1582,12 @@ struct TaskTimeSystemTests {
         EngineEvent(name: "session.changed", data: try JSONEncoder().encode(bundle))
     }
 
-    private func sessionBundle(taskID: UUID) -> SessionBundle {
+    private func sessionBundle(
+        taskID: UUID,
+        state: SessionState = .idle,
+        lastAgentSequence: Int64 = 0,
+        lastReadSequence: Int64 = 0
+    ) -> SessionBundle {
         SessionBundle(
             session: TaskSessionDescriptor(
                 id: "session-\(taskID.uuidString)",
@@ -1548,9 +1596,9 @@ struct TaskTimeSystemTests {
                 workingDirectory: "/tmp/project",
                 providerSessionID: nil,
                 providerEngine: nil,
-                state: .idle,
-                lastAgentSequence: 0,
-                lastReadSequence: 0,
+                state: state,
+                lastAgentSequence: lastAgentSequence,
+                lastReadSequence: lastReadSequence,
                 lastErrorCode: nil,
                 lastErrorMessage: nil,
                 createdAt: "2026-08-09T00:00:00Z",

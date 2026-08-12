@@ -160,13 +160,28 @@ struct TaskConversationSnapshot: Sendable {
     let state: SessionState
     let entries: [TaskConversationEntry]
     let latestSequence: Int64
+    let timelineRevision: Int64
+    let transcript: ChatTranscript
 
-    init(bundle: SessionBundle) {
+    init(
+        bundle: SessionBundle,
+        timelinePage: SessionTimelinePage? = nil,
+        entries projectedEntries: [TaskConversationEntry]? = nil,
+        transcript projectedTranscript: ChatTranscript? = nil
+    ) {
         sessionID = bundle.session.id
         runtime = bundle.session.runtimeKind
         workspace = bundle.session.workingDirectory
         state = bundle.session.state
-        entries = bundle.messages.map { message in
+        entries = projectedEntries ?? Self.entries(from: bundle.messages)
+        latestSequence = bundle.messages.last?.sequence ?? 0
+        timelineRevision = timelinePage?.nextSequence ?? 0
+        transcript = projectedTranscript
+            ?? ChatTranscriptProjection.task(bundle: bundle, timelinePage: timelinePage)
+    }
+
+    static func entries(from messages: [SessionMessage]) -> [TaskConversationEntry] {
+        messages.map { message in
             let role: TaskConversationRole = switch message.role {
             case .system: .system
             case .agent: .agent
@@ -183,6 +198,5 @@ struct TaskConversationSnapshot: Sendable {
                 payloadJSON: message.payloadJSON
             )
         }
-        latestSequence = bundle.messages.last?.sequence ?? 0
     }
 }

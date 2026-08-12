@@ -159,6 +159,29 @@ struct HistoryRequest: Encodable, Sendable {
         case afterSequence, limit
     }
 }
+struct TimelineRequest: Encodable, Sendable {
+    let sessionID: String
+    let afterSequence: Int64
+    let afterCursor: SessionTimelineCursor?
+    let limit: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case afterSequence, afterCursor, limit
+    }
+}
+struct TimelineTurnRequest: Encodable, Sendable {
+    let sessionID: String
+    let turnID: String
+    let afterCursor: SessionTimelineCursor?
+    let limit: Int
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case turnID = "turnId"
+        case afterCursor, limit
+    }
+}
 struct MarkReadRequest: Encodable, Sendable {
     let sessionID: String
     let throughSequence: Int64
@@ -342,6 +365,46 @@ actor EngineRepository: AppRepository {
 
     func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle {
         try await client.request(method: "session.history", params: HistoryRequest(sessionID: sessionID, afterSequence: sequence, limit: 500), as: SessionBundle.self)
+    }
+
+    func timeline(sessionID: String, after sequence: Int64) async throws -> SessionTimelinePage? {
+        try await timeline(sessionID: sessionID, after: sequence, afterCursor: nil)
+    }
+
+    func timeline(
+        sessionID: String,
+        after sequence: Int64,
+        afterCursor: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage? {
+        guard await client.capabilities.contains("session.timeline") else { return nil }
+        return try await client.request(
+            method: "session.timeline",
+            params: TimelineRequest(
+                sessionID: sessionID,
+                afterSequence: sequence,
+                afterCursor: afterCursor,
+                limit: 500
+            ),
+            as: SessionTimelinePage.self
+        )
+    }
+
+    func timelineTurn(
+        sessionID: String,
+        turnID: String,
+        afterCursor: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage? {
+        guard await client.capabilities.contains("session.timeline.turn") else { return nil }
+        return try await client.request(
+            method: "session.timeline.turn",
+            params: TimelineTurnRequest(
+                sessionID: sessionID,
+                turnID: turnID,
+                afterCursor: afterCursor,
+                limit: 500
+            ),
+            as: SessionTimelinePage.self
+        )
     }
 
     func markRead(sessionID: String, through sequence: Int64) async throws {

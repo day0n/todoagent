@@ -17,13 +17,13 @@ use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
-use adapters::{ProviderEvent, TurnOutcome, TurnRequest};
+use adapters::{ProviderEvent, ProviderFrame, TurnOutcome, TurnRequest};
 use models::{MessageRole, QueuedTurn, RuntimeKind, TaskAttachment, TurnStatus, UpdateTaskInput};
 use protocol::{Request, Response};
 use serde::Serialize;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use store::StoreError;
+use store::{AppliedProviderFrame, AppliedTimelineMutation, StoreError};
 use store_worker::{StoreWorker, StoreWorkerError};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -34,6 +34,9 @@ use zeroize::Zeroizing;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_TASK_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
+const PROVIDER_FRAME_BATCH_INTERVAL: Duration = Duration::from_millis(100);
+const PROVIDER_FRAME_BATCH_MAX_FRAMES: usize = 32;
+const PROVIDER_FRAME_BATCH_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
 struct Engine {
@@ -52,6 +55,61 @@ struct Engine {
 struct ActiveCliTurn {
     turn_id: String,
     cancellation: CancellationToken,
+}
+
+#[derive(Default)]
+struct PendingProviderMutations {
+    messages: Vec<models::SessionMessage>,
+    timeline: Vec<AppliedTimelineMutation>,
+}
+
+impl PendingProviderMutations {
+    fn merge(&mut self, applied: AppliedProviderFrame) {
+        for message in applied.messages {
+            if let Some(existing) = self.messages.iter_mut().find(|item| item.id == message.id) {
+                *existing = message;
+            } else {
+                self.messages.push(message);
+            }
+        }
+        for mutation in applied.timeline {
+            if let Some(existing) = self
+                .timeline
+                .iter_mut()
+                .find(|item| item.item.id == mutation.item.id)
+            {
+                // If creation has not been published yet, keep this as one
+                // appended event carrying the newest committed snapshot.
+                let first_is_update = existing.is_update;
+                *existing = mutation;
+                existing.is_update = first_is_update;
+            } else {
+                self.timeline.push(mutation);
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.messages.is_empty() && self.timeline.is_empty()
+    }
+}
+
+fn provider_frame_bytes(frame: &ProviderFrame) -> usize {
+    frame
+        .raw_payload
+        .as_ref()
+        .map_or(0, |payload| payload.to_string().len())
+        .saturating_add(frame.raw_kind.as_ref().map_or(0, String::len))
+}
+
+fn enqueue_provider_frame(
+    batch: &mut Vec<ProviderFrame>,
+    batch_bytes: &mut usize,
+    frame: ProviderFrame,
+) -> bool {
+    *batch_bytes = batch_bytes.saturating_add(provider_frame_bytes(&frame));
+    batch.push(frame);
+    batch.len() >= PROVIDER_FRAME_BATCH_MAX_FRAMES || *batch_bytes >= PROVIDER_FRAME_BATCH_MAX_BYTES
 }
 
 #[derive(Debug, Error)]
@@ -183,6 +241,21 @@ struct SessionHistoryParams {
     session_id: String,
     #[serde(default)]
     after_sequence: i64,
+    #[serde(default)]
+    after_cursor: Option<models::SessionTimelineCursor>,
+    #[serde(default = "default_history_limit")]
+    limit: i64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionTimelineTurnParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    turn_id: String,
+    #[serde(default)]
+    after_cursor: Option<models::SessionTimelineCursor>,
     #[serde(default = "default_history_limit")]
     limit: i64,
 }
@@ -657,6 +730,36 @@ impl Engine {
                         .await?,
                 )
             }
+            "session.timeline" => {
+                let params: SessionHistoryParams = parse(&request.params)?;
+                to_value(
+                    self.store
+                        .call(move |store| {
+                            store.session_timeline_page(
+                                &params.session_id,
+                                params.after_sequence,
+                                params.after_cursor.as_ref(),
+                                params.limit,
+                            )
+                        })
+                        .await?,
+                )
+            }
+            "session.timeline.turn" => {
+                let params: SessionTimelineTurnParams = parse(&request.params)?;
+                to_value(
+                    self.store
+                        .call(move |store| {
+                            store.session_timeline_turn_page(
+                                &params.session_id,
+                                &params.turn_id,
+                                params.after_cursor.as_ref(),
+                                params.limit,
+                            )
+                        })
+                        .await?,
+                )
+            }
             "session.send" => {
                 let params: SendSessionParams = parse(&request.params)?;
                 validate_text(&params.text, 200_000, "text")?;
@@ -928,41 +1031,46 @@ impl Engine {
         let (event_tx, mut event_rx) = mpsc::channel(256);
         let runner = tokio::spawn(adapters::run_turn(request, token, event_tx));
         tokio::pin!(runner);
-        let mut text_buffer = String::new();
-        let mut flush_clock = interval(Duration::from_millis(400));
-        flush_clock.tick().await;
+        let mut pending = PendingProviderMutations::default();
+        let mut frame_batch = Vec::<ProviderFrame>::new();
+        let mut frame_batch_bytes = 0_usize;
+        let mut store_clock = interval(PROVIDER_FRAME_BATCH_INTERVAL);
+        let mut emit_clock = interval(Duration::from_millis(400));
+        store_clock.tick().await;
+        emit_clock.tick().await;
         let outcome = loop {
             tokio::select! {
                 result = &mut runner => break result.unwrap_or_else(|error| TurnOutcome {
                     status:"failed",exit_code:None,final_output:String::new(),provider_session_id:None,
                     error_code:Some("engine_error".to_owned()),error_message:Some(error.to_string()),usage:None,
                 }),
-                _ = flush_clock.tick() => {
-                    self.flush_text(&queued.turn.id, &mut text_buffer).await;
+                _ = store_clock.tick() => {
+                    self.persist_provider_batch(queued, &mut frame_batch, &mut pending).await;
+                    frame_batch_bytes = 0;
                 }
-                event = event_rx.recv() => match event {
-                    Some(ProviderEvent::Text(text)) => {
-                        text_buffer.push_str(&text);
-                        if text_buffer.chars().count() >= 120 { self.flush_text(&queued.turn.id, &mut text_buffer).await; }
+                _ = emit_clock.tick() => {
+                    self.flush_provider_mutations(&mut pending).await;
+                }
+                frame = event_rx.recv() => {
+                    if let Some(frame) = frame {
+                        if enqueue_provider_frame(&mut frame_batch, &mut frame_batch_bytes, frame) {
+                            self.persist_provider_batch(queued, &mut frame_batch, &mut pending).await;
+                            frame_batch_bytes = 0;
+                        }
                     }
-                    Some(event) => {
-                        self.flush_text(&queued.turn.id, &mut text_buffer).await;
-                        self.persist_provider_event(queued, event).await;
-                    }
-                    None => {}
                 }
             }
         };
-        while let Ok(event) = event_rx.try_recv() {
-            match event {
-                ProviderEvent::Text(text) => text_buffer.push_str(&text),
-                event => {
-                    self.flush_text(&queued.turn.id, &mut text_buffer).await;
-                    self.persist_provider_event(queued, event).await;
-                }
+        while let Ok(frame) = event_rx.try_recv() {
+            if enqueue_provider_frame(&mut frame_batch, &mut frame_batch_bytes, frame) {
+                self.persist_provider_batch(queued, &mut frame_batch, &mut pending)
+                    .await;
+                frame_batch_bytes = 0;
             }
         }
-        self.flush_text(&queued.turn.id, &mut text_buffer).await;
+        self.persist_provider_batch(queued, &mut frame_batch, &mut pending)
+            .await;
+        self.flush_provider_mutations(&mut pending).await;
         outcome
     }
 
@@ -1025,97 +1133,115 @@ impl Engine {
         .await
     }
 
-    async fn flush_text(&self, turn_id: &str, buffer: &mut String) {
-        if buffer.is_empty() {
+    async fn flush_provider_mutations(&self, pending: &mut PendingProviderMutations) {
+        if pending.is_empty() {
             return;
         }
-        let text = std::mem::take(buffer);
-        let turn_id = turn_id.to_owned();
-        match self
-            .store
-            .call(move |store| store.append_agent_text(&turn_id, &text))
-            .await
-        {
-            Ok(message) => self.emit("session.message.delta", &message).await,
-            Err(error) => tracing::error!("failed to persist agent text: {error}"),
+        let committed = std::mem::take(pending);
+        for message in committed.messages {
+            self.emit(
+                if message.role == MessageRole::Agent && message.kind == "text" {
+                    "session.message.delta"
+                } else {
+                    "session.message.appended"
+                },
+                &message,
+            )
+            .await;
+        }
+        for mutation in committed.timeline {
+            self.emit_timeline_mutation(&mutation).await;
         }
     }
 
-    async fn persist_provider_event(&self, queued: &QueuedTurn, event: ProviderEvent) {
-        match event {
-            ProviderEvent::SessionId(id) => {
-                let session_id = queued.session.id.clone();
-                let _ = self
-                    .store
-                    .call(move |store| store.set_provider_session(&session_id, &id))
-                    .await;
-            }
-            ProviderEvent::ToolUse {
-                name,
-                call_id,
-                input,
-            } => {
-                let payload = json!({"name":name,"callId":call_id,"input":input});
-                let turn_id = queued.turn.id.clone();
-                if let Ok(message) = self
-                    .store
-                    .call(move |store| {
-                        store.append_message(
-                            &turn_id,
-                            MessageRole::Tool,
-                            "tool_call",
-                            &name,
-                            Some(&payload.to_string()),
-                        )
-                    })
-                    .await
-                {
-                    self.emit("session.message.appended", &message).await;
+    async fn emit_timeline_mutation(&self, mutation: &AppliedTimelineMutation) {
+        let event = if mutation.is_update {
+            "session.timeline.item.updated"
+        } else {
+            "session.timeline.item.appended"
+        };
+        self.emit(event, &mutation.item).await;
+    }
+
+    async fn persist_provider_batch(
+        &self,
+        queued: &QueuedTurn,
+        frames: &mut Vec<ProviderFrame>,
+        pending: &mut PendingProviderMutations,
+    ) {
+        if frames.is_empty() {
+            return;
+        }
+        let frames = std::mem::take(frames);
+        let retry_frames = frames.clone();
+        let turn_id = queued.turn.id.clone();
+        match self
+            .store
+            .call(move |store| store.apply_provider_frames(&turn_id, frames))
+            .await
+        {
+            Ok(applied) => pending.merge(applied),
+            Err(error) => {
+                tracing::error!("failed to atomically persist provider frame batch: {error}");
+                // A malformed provider frame must not discard other valid
+                // frames in the bounded batch. Retry individually only on this
+                // rare path; if semantics are invalid, retain its raw audit
+                // frame without a UI projection.
+                for frame in retry_frames {
+                    let turn_id = queued.turn.id.clone();
+                    let raw_fallback = ProviderFrame {
+                        raw_kind: frame.raw_kind.clone(),
+                        raw_payload: frame.raw_payload.clone(),
+                        events: Vec::new(),
+                    };
+                    match self
+                        .store
+                        .call(move |store| store.apply_provider_frame(&turn_id, frame))
+                        .await
+                    {
+                        Ok(applied) => pending.merge(applied),
+                        Err(frame_error) => {
+                            let semantic_error =
+                                format!("provider frame semantic projection failed: {frame_error}");
+                            tracing::error!("{semantic_error}");
+                            let turn_id = queued.turn.id.clone();
+                            let raw_result = self
+                                .store
+                                .call(move |store| {
+                                    store.apply_provider_frame(&turn_id, raw_fallback)
+                                })
+                                .await;
+                            let (fidelity, degradation_error) = match raw_result {
+                                Ok(_) => ("partial", semantic_error),
+                                Err(raw_error) => {
+                                    let error = format!(
+                                        "{semantic_error}; provider raw audit persistence failed: {raw_error}"
+                                    );
+                                    tracing::error!("{error}");
+                                    ("failed", error)
+                                }
+                            };
+                            let turn_id = queued.turn.id.clone();
+                            let degradation_error_for_store = degradation_error.clone();
+                            if let Err(mark_error) = self
+                                .store
+                                .call(move |store| {
+                                    store.mark_timeline_projection_degraded(
+                                        &turn_id,
+                                        fidelity,
+                                        &degradation_error_for_store,
+                                    )
+                                })
+                                .await
+                            {
+                                tracing::error!(
+                                    "failed to mark degraded timeline projection: {mark_error}; original: {degradation_error}"
+                                );
+                            }
+                        }
+                    }
                 }
             }
-            ProviderEvent::ToolResult {
-                name,
-                call_id,
-                output,
-            } => {
-                let payload = json!({"name":name,"callId":call_id});
-                let turn_id = queued.turn.id.clone();
-                if let Ok(message) = self
-                    .store
-                    .call(move |store| {
-                        store.append_message(
-                            &turn_id,
-                            MessageRole::Tool,
-                            "tool_result",
-                            &output,
-                            Some(&payload.to_string()),
-                        )
-                    })
-                    .await
-                {
-                    self.emit("session.message.appended", &message).await;
-                }
-            }
-            ProviderEvent::Status(status) => {
-                let turn_id = queued.turn.id.clone();
-                if let Ok(message) = self
-                    .store
-                    .call(move |store| {
-                        store.append_message(&turn_id, MessageRole::System, "status", &status, None)
-                    })
-                    .await
-                {
-                    self.emit("session.message.appended", &message).await;
-                }
-            }
-            ProviderEvent::Raw { kind, payload } => {
-                let turn_id = queued.turn.id.clone();
-                let _ = self
-                    .store
-                    .call(move |store| store.append_turn_event(&turn_id, &kind, &payload))
-                    .await;
-            }
-            ProviderEvent::Text(_) => {}
         }
     }
 
@@ -1127,21 +1253,24 @@ impl Engine {
         };
         // Some providers only expose final text in their terminal event.
         if status == TurnStatus::Completed && !outcome.final_output.is_empty() {
-            let session_id = queued.session.id.clone();
-            let bundle = self
+            let turn_id = queued.turn.id.clone();
+            let has_agent = self
                 .store
-                .call(move |store| store.session_bundle(&session_id, 0, 2000))
+                .call(move |store| store.turn_has_agent_text(&turn_id))
                 .await
-                .ok();
-            let has_agent = bundle.as_ref().is_some_and(|bundle| {
-                bundle.messages.iter().any(|message| {
-                    message.turn_id.as_deref() == Some(&queued.turn.id)
-                        && message.role == MessageRole::Agent
-                })
-            });
+                .unwrap_or(false);
             if !has_agent {
-                self.flush_text(&queued.turn.id, &mut outcome.final_output.clone())
+                let fallback_text = outcome.final_output.clone();
+                let fallback_frame = ProviderFrame {
+                    raw_kind: Some("todoagent.final_output_fallback".to_owned()),
+                    raw_payload: Some(json!({"text":fallback_text})),
+                    events: vec![ProviderEvent::Text(outcome.final_output.clone())],
+                };
+                let mut frames = vec![fallback_frame];
+                let mut pending = PendingProviderMutations::default();
+                self.persist_provider_batch(queued, &mut frames, &mut pending)
                     .await;
+                self.flush_provider_mutations(&mut pending).await;
             }
         }
         let usage = outcome.usage.as_ref().map(Value::to_string);
@@ -1162,12 +1291,22 @@ impl Engine {
             })
             .await
         {
-            Ok(bundle) => {
+            Ok(finished) => {
                 self.remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
                     .await;
+                let bundle = finished.bundle;
                 self.emit("session.turn.finished", &bundle).await;
-                self.emit("session.state_changed", &bundle).await;
                 self.emit("session.unread_changed", &bundle.session).await;
+                self.emit(
+                    "session.timeline.turn.finished",
+                    &json!({
+                        "sessionId": bundle.session.id,
+                        "turnId": queued.turn.id,
+                        "fidelity": finished.timeline_fidelity,
+                        "items": finished.timeline_mutations
+                    }),
+                )
+                .await;
             }
             Err(error) => {
                 self.remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
@@ -1887,6 +2026,36 @@ mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use uuid::Uuid;
+
+    #[test]
+    fn provider_tail_drain_uses_the_same_bounded_batches_as_live_streaming() {
+        let mut batch = Vec::new();
+        let mut batch_bytes = 0;
+        let mut flushed_batches = 0;
+        let mut maximum_frames = 0;
+        for index in 0..256 {
+            let frame = ProviderFrame {
+                raw_kind: Some("tail".to_owned()),
+                raw_payload: Some(json!({
+                    "index":index,
+                    "payload":"x".repeat(32 * 1024)
+                })),
+                events: Vec::new(),
+            };
+            if enqueue_provider_frame(&mut batch, &mut batch_bytes, frame) {
+                maximum_frames = maximum_frames.max(batch.len());
+                assert!(batch.len() <= PROVIDER_FRAME_BATCH_MAX_FRAMES);
+                flushed_batches += 1;
+                batch.clear();
+                batch_bytes = 0;
+            }
+        }
+        if !batch.is_empty() {
+            flushed_batches += 1;
+        }
+        assert!(flushed_batches > 1);
+        assert!(maximum_frames <= PROVIDER_FRAME_BATCH_MAX_FRAMES);
+    }
 
     fn test_runtime(kind: RuntimeKind, status: &str) -> models::Runtime {
         models::Runtime {

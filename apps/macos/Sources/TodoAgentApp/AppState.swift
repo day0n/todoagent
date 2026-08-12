@@ -32,6 +32,22 @@ final class AppState {
         let task: Task<Void, Never>
     }
 
+    private struct TimelineRefreshWork {
+        let token: UUID
+        let task: Task<Void, Never>
+    }
+
+    private struct TaskConversationProjectionCache {
+        let structureRevision: UInt64
+        let stableRevision: UInt64
+        let legacyRevision: UInt64
+        let activeTurnID: String?
+        let stableItems: [ChatTranscriptItem]
+        let stableTailRevision: Int
+        let entries: [TaskConversationEntry]
+        let snapshot: TaskConversationSnapshot
+    }
+
     private let repository: any AppRepository
     private let calendar: Calendar
     private let taskTextAutosaveDelay: Duration
@@ -45,6 +61,13 @@ final class AppState {
     private var sessionLoadTask: Task<Void, Never>?
     private var sessionLoadGeneration: UInt64 = 0
     private var bundles: [UUID: SessionBundle] = [:]
+    private var timelinePages: [UUID: SessionTimelinePage] = [:]
+    @ObservationIgnored private var conversationProjectionCache: [UUID: TaskConversationProjectionCache] = [:]
+    @ObservationIgnored private var timelineItemIndices: [UUID: [String: Int]] = [:]
+    @ObservationIgnored private var timelineRefreshWork: [UUID: TimelineRefreshWork] = [:]
+    private var conversationStructureRevisions: [UUID: UInt64] = [:]
+    private var conversationStableRevisions: [UUID: UInt64] = [:]
+    private var conversationLegacyRevisions: [UUID: UInt64] = [:]
     private var pendingTaskPatches: [UUID: TaskPatch] = [:]
     private var inFlightTaskPatches: [UUID: TaskPatch] = [:]
     private var pendingTaskAttachmentMutations: [UUID: [TaskAttachmentMutation]] = [:]
@@ -191,6 +214,8 @@ final class AppState {
         eventGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
+        for work in timelineRefreshWork.values { work.task.cancel() }
+        timelineRefreshWork.removeAll()
         activeEngineRecovery?.task.cancel()
         activeEngineRecovery = nil
         sessionLoadGeneration &+= 1
@@ -744,6 +769,7 @@ final class AppState {
 
             if let bundle {
                 merge(bundle, taskID: taskID)
+                await refreshTimeline(taskID: taskID, sessionID: bundle.session.id)
             } else {
                 // The persisted lookup is authoritative if the bootstrap
                 // descriptor was stale. Fall back to the setup screen.
@@ -773,8 +799,198 @@ final class AppState {
     }
 
     func conversation(for task: TaskItem) -> TaskConversationSnapshot? {
-        guard let bundle = bundles[task.id] else { return nil }
-        return TaskConversationSnapshot(bundle: bundle)
+        guard let persistedBundle = bundles[task.id] else { return nil }
+        let timelinePage = timelinePages[task.id]
+        let bundle = SessionBundle(
+            session: timelinePage?.session ?? persistedBundle.session,
+            messages: persistedBundle.messages,
+            activeTurn: timelinePage?.activeTurn ?? persistedBundle.activeTurn
+        )
+        let structureRevision = conversationStructureRevisions[task.id, default: 0]
+        let stableRevision = conversationStableRevisions[task.id, default: 0]
+        let legacyRevision = conversationLegacyRevisions[task.id, default: 0]
+        let activeTurnID = activeTaskTurnID(bundle: bundle, timelinePage: timelinePage)
+        if let cached = conversationProjectionCache[task.id],
+           cached.structureRevision == structureRevision,
+           cached.stableRevision == stableRevision,
+           cached.legacyRevision == legacyRevision,
+           cached.activeTurnID == activeTurnID {
+            return cached.snapshot
+        }
+
+        let cached = conversationProjectionCache[task.id]
+        let stableItems: [ChatTranscriptItem]
+        let stableTailRevision: Int
+        if let cached,
+           cached.stableRevision == stableRevision,
+           cached.activeTurnID == activeTurnID {
+            stableItems = cached.stableItems
+            stableTailRevision = cached.stableTailRevision
+        } else {
+            let stableTimeline = taskTimeline(
+                bundle: bundle,
+                timelinePage: timelinePage,
+                excludingTurnID: activeTurnID
+            )
+            let stable = ChatTranscriptProjection.project(
+                sessionID: bundle.session.id,
+                timeline: stableTimeline,
+                activeTurnID: nil,
+                isRunning: false
+            )
+            stableItems = stable.items
+            stableTailRevision = stable.tailRevision
+        }
+
+        let transcript: ChatTranscript
+        if let activeTurnID {
+            var activeTimeline = taskTimeline(
+                bundle: bundle,
+                timelinePage: timelinePage,
+                includingOnlyTurnID: activeTurnID
+            )
+            if !activeTimeline.contains(where: { item in
+                switch item.kind {
+                case .assistantText, .reasoning, .tool, .status, .error, .unknown: true
+                case .user: false
+                }
+            }) {
+                activeTimeline.append(
+                    ChatTimelineItem(
+                        id: "task-status-\(activeTurnID)",
+                        sessionID: bundle.session.id,
+                        turnID: activeTurnID,
+                        order: ChatTimelineOrder(
+                            sequence: (activeTimeline.last?.order.sequence ?? 0) + 1,
+                            subindex: 0
+                        ),
+                        kind: .status,
+                        body: "正在思考",
+                        callID: nil,
+                        toolName: nil,
+                        inputJSON: nil,
+                        outputText: nil,
+                        toolState: nil,
+                        isError: false,
+                        taskReferences: [],
+                        attachments: [],
+                        createdAt: "",
+                        updatedAt: "",
+                        fidelity: .exact
+                    )
+                )
+            }
+            let active = ChatTranscriptProjection.project(
+                sessionID: bundle.session.id,
+                timeline: activeTimeline,
+                activeTurnID: activeTurnID,
+                isRunning: true
+            )
+            transcript = ChatTranscript(
+                sessionID: bundle.session.id,
+                items: stableItems + active.items,
+                tailRevision: stableTailRevision &* 31 &+ active.tailRevision,
+                isRunning: true
+            )
+        } else {
+            transcript = ChatTranscript(
+                sessionID: bundle.session.id,
+                items: stableItems,
+                tailRevision: stableTailRevision,
+                isRunning: false
+            )
+        }
+
+        let entries: [TaskConversationEntry]
+        if let cached, cached.legacyRevision == legacyRevision {
+            entries = cached.entries
+        } else {
+            entries = TaskConversationSnapshot.entries(from: bundle.messages)
+        }
+        let snapshot = TaskConversationSnapshot(
+            bundle: bundle,
+            timelinePage: timelinePage,
+            entries: entries,
+            transcript: transcript
+        )
+        conversationProjectionCache[task.id] = TaskConversationProjectionCache(
+            structureRevision: structureRevision,
+            stableRevision: stableRevision,
+            legacyRevision: legacyRevision,
+            activeTurnID: activeTurnID,
+            stableItems: stableItems,
+            stableTailRevision: stableTailRevision,
+            entries: entries,
+            snapshot: snapshot
+        )
+        return snapshot
+    }
+
+    private func activeTaskTurnID(
+        bundle: SessionBundle,
+        timelinePage: SessionTimelinePage?
+    ) -> String? {
+        guard bundle.session.state.isBusy else { return nil }
+        if let turnID = timelinePage?.activeTurn?.id ?? bundle.activeTurn?.id {
+            return turnID
+        }
+        if let turnID = timelinePage?.items.last?.turnID { return turnID }
+        if let turnID = bundle.messages.last(where: { $0.turnID != nil })?.turnID {
+            return turnID
+        }
+        guard let user = bundle.messages.last(where: { $0.role == .user }) else {
+            return "legacy-active-\(bundle.session.id)"
+        }
+        return "legacy-turn-\(user.id)"
+    }
+
+    private func taskTimeline(
+        bundle: SessionBundle,
+        timelinePage: SessionTimelinePage?,
+        excludingTurnID: String? = nil,
+        includingOnlyTurnID: String? = nil
+    ) -> [ChatTimelineItem] {
+        if let timelinePage {
+            let records = timelinePage.items.filter { item in
+                if let includingOnlyTurnID { return item.turnID == includingOnlyTurnID }
+                if let excludingTurnID { return item.turnID != excludingTurnID }
+                return true
+            }
+            return ChatTranscriptProjection.normalize(records)
+        }
+
+        let messages: [SessionMessage]
+        if let includingOnlyTurnID {
+            if let firstExplicit = bundle.messages.firstIndex(where: {
+                $0.turnID == includingOnlyTurnID
+            }) {
+                messages = Array(bundle.messages[firstExplicit...])
+            } else if let lastUser = bundle.messages.lastIndex(where: { $0.role == .user }) {
+                messages = Array(bundle.messages[lastUser...])
+            } else {
+                messages = []
+            }
+        } else {
+            messages = bundle.messages
+        }
+        let normalized = ChatTranscriptProjection.normalize(messages)
+        if let includingOnlyTurnID {
+            return normalized.filter { $0.turnID == includingOnlyTurnID }
+        }
+        if let excludingTurnID {
+            return normalized.filter { $0.turnID != excludingTurnID }
+        }
+        return normalized
+    }
+
+    private func markTaskConversationChanged(
+        taskID: UUID,
+        stable: Bool = false,
+        legacy: Bool = false
+    ) {
+        conversationStructureRevisions[taskID, default: 0] &+= 1
+        if stable { conversationStableRevisions[taskID, default: 0] &+= 1 }
+        if legacy { conversationLegacyRevisions[taskID, default: 0] &+= 1 }
     }
 
     func suggestedWorkspace(for task: TaskItem) -> String {
@@ -815,6 +1031,7 @@ final class AppState {
                 return false
             }
             merge(bundle, taskID: task.id)
+            await refreshTimeline(taskID: task.id, sessionID: bundle.session.id)
             if let snapshot = try? await repository.sync() {
                 apply(snapshot)
             }
@@ -840,6 +1057,7 @@ final class AppState {
         do {
             let bundle = try await repository.send(sessionID: session.id, text: value, clientMessageID: UUID())
             merge(bundle, taskID: task.id)
+            await hydrateTimeline(taskID: task.id, sessionID: session.id)
             return true
         } catch { errorMessage = error.localizedDescription; return false }
     }
@@ -863,6 +1081,11 @@ final class AppState {
         do {
             let incoming = try await repository.history(sessionID: session.id, after: sequence)
             merge(incoming, taskID: taskID)
+            if timelinePages[taskID] == nil {
+                await refreshTimeline(taskID: taskID, sessionID: session.id)
+            } else {
+                await hydrateTimeline(taskID: taskID, sessionID: session.id)
+            }
         } catch { errorMessage = error.localizedDescription }
     }
 
@@ -936,7 +1159,38 @@ final class AppState {
         } else if event.name == "engine.ready" {
             recoverSnapshotAfterEngineReadyIfNeeded()
         } else if event.name.hasPrefix("session.") {
-            if let bundle = try? JSONDecoder.engineDecoder.decode(SessionBundle.self, from: event.data) {
+            if event.name == "session.timeline.turn.finished",
+               let payload = try? JSONDecoder.engineDecoder.decode(
+                   SessionTimelineTurnFinishedEvent.self,
+                   from: event.data
+               ),
+               let taskID = taskID(forSessionID: payload.sessionID) {
+                if payload.fidelity.lowercased() == "exact",
+                   let terminalItems = payload.items,
+                   timelinePages[taskID] != nil,
+                   terminalItems.allSatisfy({
+                       $0.sessionID == payload.sessionID && $0.turnID == payload.turnID
+                   }) {
+                    for item in terminalItems { mergeTimelineItem(item) }
+                }
+                scheduleFinishedTimelineReconciliation(
+                    taskID: taskID,
+                    sessionID: payload.sessionID,
+                    turnID: payload.turnID
+                )
+            } else if event.name == "session.timeline.turn.finished",
+                      let page = try? JSONDecoder.engineDecoder.decode(
+                          SessionTimelinePage.self,
+                          from: event.data
+                      ) {
+                // Compatibility with the first additive Chat V2 Engine build,
+                // which briefly emitted a whole authoritative page here.
+                mergeTimelinePage(page, taskID: page.session.taskID, replaceExisting: true)
+            } else if event.name == "session.timeline.item.appended"
+                || event.name == "session.timeline.item.updated",
+               let item = try? JSONDecoder.engineDecoder.decode(SessionTimelineItem.self, from: event.data) {
+                mergeTimelineItem(item)
+            } else if let bundle = try? JSONDecoder.engineDecoder.decode(SessionBundle.self, from: event.data) {
                 merge(bundle, taskID: bundle.session.taskID)
             } else if let session = try? JSONDecoder.engineDecoder.decode(TaskSessionDescriptor.self, from: event.data), let task = tasks.first(where: { $0.id == session.taskID }) {
                 sessions.removeAll(where: { $0.id == session.id }); sessions.append(session)
@@ -946,6 +1200,12 @@ final class AppState {
                     let latestSequence = current.messages.last?.sequence ?? 0
                     if message.sequence <= latestSequence + 1 {
                         bundles[session.taskID] = current.merging(message: message)
+                        markTaskConversationChanged(
+                            taskID: session.taskID,
+                            stable: !current.session.state.isBusy
+                                && timelinePages[session.taskID] == nil,
+                            legacy: true
+                        )
                     } else {
                         await refreshSession(taskID: session.taskID, after: latestSequence)
                     }
@@ -998,11 +1258,487 @@ final class AppState {
         guard task(id: taskID) != nil else { return }
         let existing = bundles[taskID]
         var bySequence = Dictionary(uniqueKeysWithValues: (existing?.messages ?? []).map { ($0.sequence, $0) })
-        for message in incoming.messages { bySequence[message.sequence] = message }
+        var messagesChanged = false
+        for message in incoming.messages {
+            if bySequence[message.sequence] != message { messagesChanged = true }
+            bySequence[message.sequence] = message
+        }
         let messages = bySequence.values.sorted { $0.sequence < $1.sequence }
         bundles[taskID] = SessionBundle(session: incoming.session, messages: messages, activeTurn: incoming.activeTurn)
+        if let page = timelinePages[taskID] {
+            timelinePages[taskID] = SessionTimelinePage(
+                session: incoming.session,
+                items: page.items,
+                activeTurn: incoming.activeTurn,
+                nextSequence: page.nextSequence,
+                nextCursor: page.nextCursor,
+                hasMore: page.hasMore,
+                fidelity: page.fidelity
+            )
+        }
         sessions.removeAll(where: { $0.id == incoming.session.id })
         sessions.append(incoming.session)
+        let completedActiveTurn = existing?.session.state.isBusy == true
+            && !incoming.session.state.isBusy
+        markTaskConversationChanged(
+            taskID: taskID,
+            stable: completedActiveTurn
+                || (timelinePages[taskID] == nil && !incoming.session.state.isBusy && messagesChanged),
+            legacy: messagesChanged
+        )
+    }
+
+    @discardableResult
+    private func refreshTimeline(
+        taskID: UUID,
+        sessionID: String,
+        replaceExisting: Bool = true
+    ) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        guard let page = await fetchTimelinePages(
+            sessionID: sessionID,
+            after: 0,
+            afterCursor: nil
+        ) else { return false }
+        guard task(id: taskID) != nil, page.session.id == sessionID else { return false }
+        mergeTimelinePage(page, taskID: taskID, replaceExisting: replaceExisting)
+        return true
+    }
+
+    private func hydrateTimeline(taskID: UUID, sessionID: String) async {
+        guard let current = timelinePages[taskID] else {
+            await refreshTimeline(taskID: taskID, sessionID: sessionID)
+            return
+        }
+        let cursor = current.nextCursor ?? current.items.last.map {
+            SessionTimelineCursor(turnOrdinal: $0.turnOrdinal, itemOrdinal: $0.itemOrdinal)
+        }
+        guard let page = await fetchTimelinePages(
+            sessionID: sessionID,
+            after: current.nextSequence,
+            afterCursor: cursor
+        ) else { return }
+        mergeTimelinePage(page, taskID: taskID, replaceExisting: false)
+    }
+
+    private func fetchTimelinePages(
+        sessionID: String,
+        after sequence: Int64,
+        afterCursor: SessionTimelineCursor?
+    ) async -> SessionTimelinePage? {
+        guard !Task.isCancelled else { return nil }
+        do {
+            guard var page = try await repository.timeline(
+                sessionID: sessionID,
+                after: sequence,
+                afterCursor: afterCursor
+            ) else { return nil }
+            var accumulator = ChatTimelineHydrationAccumulator(budget: .sessionHistory)
+            accumulator.appendPage(page.items)
+            var seenCursors = Set<SessionTimelineCursor>()
+            var pageCount = 1
+            while page.hasMore {
+                guard let cursor = page.nextCursor,
+                      seenCursors.insert(cursor).inserted,
+                      pageCount < 128,
+                      !Task.isCancelled
+                else {
+                    guard !Task.isCancelled else { return nil }
+                    return limitedTimelinePage(
+                        latestPage: page,
+                        retainedItems: accumulator.items,
+                        noticeTurnID: nil
+                    )
+                }
+                guard let next = try await repository.timeline(
+                    sessionID: sessionID,
+                    after: page.nextSequence,
+                    afterCursor: cursor
+                ) else { return nil }
+                accumulator.appendPage(next.items)
+                page = next
+                pageCount += 1
+            }
+            if accumulator.reachedLimit {
+                return limitedTimelinePage(
+                    latestPage: page,
+                    retainedItems: accumulator.items,
+                    noticeTurnID: nil
+                )
+            }
+            return SessionTimelinePage(
+                session: page.session,
+                items: accumulator.items,
+                activeTurn: page.activeTurn,
+                nextSequence: page.nextSequence,
+                nextCursor: page.nextCursor,
+                hasMore: false,
+                fidelity: page.fidelity
+            )
+        } catch {
+            guard !Task.isCancelled else { return nil }
+            errorMessage = error.localizedDescription
+            return nil
+        }
+    }
+
+    private func fetchTimelineTurnPages(
+        sessionID: String,
+        turnID: String
+    ) async -> SessionTimelinePage? {
+        guard !Task.isCancelled else { return nil }
+        do {
+            guard var page = try await repository.timelineTurn(
+                sessionID: sessionID,
+                turnID: turnID,
+                afterCursor: nil
+            ), page.fidelity.lowercased() == "exact" else { return nil }
+            var accumulator = ChatTimelineHydrationAccumulator(budget: .singleTurn)
+            accumulator.appendPage(page.items)
+            var seenCursors = Set<SessionTimelineCursor>()
+            var pageCount = 1
+            while page.hasMore {
+                guard let cursor = page.nextCursor,
+                      seenCursors.insert(cursor).inserted,
+                      pageCount < 128,
+                      !Task.isCancelled
+                else {
+                    guard !Task.isCancelled else { return nil }
+                    return limitedTimelinePage(
+                        latestPage: page,
+                        retainedItems: accumulator.items,
+                        noticeTurnID: turnID
+                    )
+                }
+                guard let next = try await repository.timelineTurn(
+                    sessionID: sessionID,
+                    turnID: turnID,
+                    afterCursor: cursor
+                ), next.fidelity.lowercased() == "exact" else { return nil }
+                accumulator.appendPage(next.items)
+                page = next
+                pageCount += 1
+            }
+            if accumulator.reachedLimit {
+                return limitedTimelinePage(
+                    latestPage: page,
+                    retainedItems: accumulator.items,
+                    noticeTurnID: turnID
+                )
+            }
+            return SessionTimelinePage(
+                session: page.session,
+                items: accumulator.items,
+                activeTurn: page.activeTurn,
+                nextSequence: page.nextSequence,
+                nextCursor: page.nextCursor,
+                hasMore: false,
+                fidelity: page.fidelity
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private func limitedTimelinePage(
+        latestPage: SessionTimelinePage,
+        retainedItems: [SessionTimelineItem],
+        noticeTurnID: String?
+    ) -> SessionTimelinePage {
+        let noticeBody = noticeTurnID == nil
+            ? "对话历史较长，为保护界面响应，仅显示最近的部分内容。"
+            : "这一轮内容较长，为保护界面响应，仅显示最近的部分内容。"
+        errorMessage = noticeBody
+        let first = retainedItems.first
+        let last = retainedItems.last
+        let resolvedTurnID = noticeTurnID
+            ?? "client-history-limit-\(latestPage.session.id)"
+        let turnOrdinal = noticeTurnID == nil
+            ? (first?.turnOrdinal ?? 0) - 1
+            : last?.turnOrdinal ?? 0
+        let itemOrdinal = noticeTurnID == nil
+            ? 0
+            : (retainedItems.last(where: { $0.turnID == resolvedTurnID })?.itemOrdinal ?? -1) + 1
+        let nextSequence = latestPage.nextSequence
+        let notice = SessionTimelineItem(
+            id: "client-timeline-limit-\(latestPage.session.id)-\(resolvedTurnID)",
+            sessionID: latestPage.session.id,
+            turnID: resolvedTurnID,
+            sequence: nextSequence,
+            turnOrdinal: turnOrdinal,
+            itemOrdinal: itemOrdinal,
+            kind: "status",
+            body: noticeBody,
+            fidelity: "partial"
+        )
+        return SessionTimelinePage(
+            session: latestPage.session,
+            items: noticeTurnID == nil ? [notice] + retainedItems : retainedItems + [notice],
+            activeTurn: latestPage.activeTurn,
+            nextSequence: nextSequence,
+            nextCursor: latestPage.nextCursor,
+            hasMore: false,
+            fidelity: "partial"
+        )
+    }
+
+    private func scheduleFinishedTimelineReconciliation(
+        taskID: UUID,
+        sessionID: String,
+        turnID: String
+    ) {
+        timelineRefreshWork[taskID]?.task.cancel()
+        let token = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.reconcileFinishedTimeline(
+                taskID: taskID,
+                sessionID: sessionID,
+                turnID: turnID
+            )
+            guard self.timelineRefreshWork[taskID]?.token == token else { return }
+            self.timelineRefreshWork[taskID] = nil
+        }
+        timelineRefreshWork[taskID] = TimelineRefreshWork(token: token, task: task)
+    }
+
+    private func reconcileFinishedTimeline(
+        taskID: UUID,
+        sessionID: String,
+        turnID: String
+    ) async {
+        if let turnPage = await fetchTimelineTurnPages(
+            sessionID: sessionID,
+            turnID: turnID
+        ), turnPage.session.id == sessionID {
+            let scopedItemsAreValid = turnPage.items.allSatisfy {
+                $0.sessionID == sessionID && $0.turnID == turnID
+            }
+            if turnPage.fidelity.lowercased() == "exact", scopedItemsAreValid {
+                mergeFinishedTimelinePage(turnPage, taskID: taskID, turnID: turnID)
+                return
+            }
+            if turnPage.fidelity.lowercased() == "partial" {
+                for item in turnPage.items where item.sessionID == sessionID
+                    && item.turnID == turnID {
+                    mergeTimelineItem(item)
+                }
+                return
+            }
+        }
+        guard let current = timelinePages[taskID],
+              let turnOrdinal = current.items.first(where: { $0.turnID == turnID })?.turnOrdinal
+        else {
+            await refreshTimeline(taskID: taskID, sessionID: sessionID)
+            return
+        }
+        let beforeTurn = SessionTimelineCursor(
+            turnOrdinal: turnOrdinal,
+            itemOrdinal: -1
+        )
+        guard let page = await fetchTimelinePages(
+            sessionID: sessionID,
+            after: 0,
+            afterCursor: beforeTurn
+        ), page.items.contains(where: { $0.turnID == turnID }) else {
+            await refreshTimeline(taskID: taskID, sessionID: sessionID)
+            return
+        }
+        if page.fidelity.lowercased() == "partial" {
+            for item in page.items where item.sessionID == sessionID
+                && item.turnID == turnID {
+                mergeTimelineItem(item)
+            }
+            return
+        }
+        mergeFinishedTimelinePage(page, taskID: taskID, turnID: turnID)
+    }
+
+    private func mergeTimelinePage(
+        _ incoming: SessionTimelinePage,
+        taskID: UUID,
+        replaceExisting: Bool
+    ) {
+        guard task(id: taskID) != nil else { return }
+        let existing = timelinePages[taskID]
+        let items: [SessionTimelineItem]
+        if replaceExisting {
+            items = incoming.items.sorted(by: timelineItemOrderedBefore)
+        } else {
+            var byID = Dictionary(
+                uniqueKeysWithValues: (timelinePages[taskID]?.items ?? []).map { ($0.id, $0) }
+            )
+            for item in incoming.items { byID[item.id] = item }
+            items = byID.values.sorted(by: timelineItemOrderedBefore)
+        }
+        timelinePages[taskID] = SessionTimelinePage(
+            session: incoming.session,
+            items: items,
+            activeTurn: incoming.activeTurn,
+            nextSequence: max(incoming.nextSequence, items.map(\.sequence).max() ?? 0),
+            nextCursor: replaceExisting
+                ? incoming.nextCursor
+                : maximumTimelineCursor(existing?.nextCursor, incoming.nextCursor),
+            hasMore: incoming.hasMore,
+            fidelity: incoming.fidelity
+        )
+        if let bundle = bundles[taskID] {
+            bundles[taskID] = SessionBundle(
+                session: incoming.session,
+                messages: bundle.messages,
+                activeTurn: incoming.activeTurn
+            )
+            sessions.removeAll(where: { $0.id == incoming.session.id })
+            sessions.append(incoming.session)
+        }
+        timelineItemIndices[taskID] = Dictionary(
+            uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) }
+        )
+        markTaskConversationChanged(taskID: taskID, stable: replaceExisting)
+    }
+
+    private func mergeFinishedTimelinePage(
+        _ incoming: SessionTimelinePage,
+        taskID: UUID,
+        turnID: String
+    ) {
+        guard task(id: taskID) != nil else { return }
+        let current = timelinePages[taskID]
+        let existingBundle = bundles[taskID]
+        let currentSession = current?.session ?? existingBundle?.session
+        let currentActiveTurn = current?.activeTurn ?? existingBundle?.activeTurn
+        let observedBusyTurnID = currentActiveTurn?.id
+            ?? (currentSession?.state.isBusy == true ? current?.items.last?.turnID : nil)
+        let preservesNewerActiveTurn = currentSession?.state.isBusy == true
+            && observedBusyTurnID != nil
+            && observedBusyTurnID != turnID
+        let resolvedSession = preservesNewerActiveTurn
+            ? currentSession ?? incoming.session
+            : incoming.session
+        let resolvedActiveTurn = preservesNewerActiveTurn
+            ? currentActiveTurn
+            : incoming.activeTurn
+        var byID = Dictionary(
+            uniqueKeysWithValues: (current?.items ?? [])
+                .filter { $0.turnID != turnID }
+                .map { ($0.id, $0) }
+        )
+        for item in incoming.items where item.turnID == turnID { byID[item.id] = item }
+        let items = byID.values.sorted(by: timelineItemOrderedBefore)
+        timelinePages[taskID] = SessionTimelinePage(
+            session: resolvedSession,
+            items: items,
+            activeTurn: resolvedActiveTurn,
+            nextSequence: max(
+                max(current?.nextSequence ?? 0, incoming.nextSequence),
+                items.map(\.sequence).max() ?? 0
+            ),
+            nextCursor: maximumTimelineCursor(current?.nextCursor, incoming.nextCursor),
+            hasMore: incoming.hasMore,
+            fidelity: incoming.fidelity
+        )
+        if let bundle = bundles[taskID] {
+            bundles[taskID] = SessionBundle(
+                session: resolvedSession,
+                messages: bundle.messages,
+                activeTurn: resolvedActiveTurn
+            )
+            sessions.removeAll(where: { $0.id == resolvedSession.id })
+            sessions.append(resolvedSession)
+        }
+        timelineItemIndices[taskID] = Dictionary(
+            uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) }
+        )
+        markTaskConversationChanged(taskID: taskID, stable: true)
+    }
+
+    private func mergeTimelineItem(_ incoming: SessionTimelineItem) {
+        guard let taskID = taskID(forSessionID: incoming.sessionID),
+              let bundle = bundles[taskID]
+        else { return }
+        let current = timelinePages[taskID]
+        var items = current?.items ?? []
+        var indices = timelineItemIndices[taskID]
+            ?? Dictionary(uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) })
+        if let index = indices[incoming.id] {
+            items[index] = incoming
+        } else if let last = items.last, timelineItemOrderedBefore(last, incoming) {
+            indices[incoming.id] = items.count
+            items.append(incoming)
+        } else {
+            let insertionIndex = timelineInsertionIndex(for: incoming, in: items)
+            items.insert(incoming, at: insertionIndex)
+            indices = Dictionary(
+                uniqueKeysWithValues: items.enumerated().map { ($0.element.id, $0.offset) }
+            )
+        }
+        timelineItemIndices[taskID] = indices
+        timelinePages[taskID] = SessionTimelinePage(
+            session: bundle.session,
+            items: items,
+            activeTurn: bundle.activeTurn,
+            nextSequence: max(current?.nextSequence ?? 0, incoming.sequence),
+            nextCursor: maximumTimelineCursor(
+                current?.nextCursor,
+                SessionTimelineCursor(
+                    turnOrdinal: incoming.turnOrdinal,
+                    itemOrdinal: incoming.itemOrdinal
+                )
+            ),
+            hasMore: current?.hasMore ?? false,
+            fidelity: current?.fidelity ?? incoming.fidelity
+        )
+        let activeTurnID = current?.activeTurn?.id ?? bundle.activeTurn?.id
+        markTaskConversationChanged(
+            taskID: taskID,
+            stable: !bundle.session.state.isBusy || incoming.turnID != activeTurnID
+        )
+    }
+
+    private func timelineInsertionIndex(
+        for item: SessionTimelineItem,
+        in items: [SessionTimelineItem]
+    ) -> Int {
+        var lowerBound = 0
+        var upperBound = items.count
+        while lowerBound < upperBound {
+            let middle = lowerBound + (upperBound - lowerBound) / 2
+            if timelineItemOrderedBefore(items[middle], item) {
+                lowerBound = middle + 1
+            } else {
+                upperBound = middle
+            }
+        }
+        return lowerBound
+    }
+
+    private func maximumTimelineCursor(
+        _ lhs: SessionTimelineCursor?,
+        _ rhs: SessionTimelineCursor?
+    ) -> SessionTimelineCursor? {
+        guard let lhs else { return rhs }
+        guard let rhs else { return lhs }
+        if lhs.turnOrdinal != rhs.turnOrdinal {
+            return lhs.turnOrdinal > rhs.turnOrdinal ? lhs : rhs
+        }
+        return lhs.itemOrdinal >= rhs.itemOrdinal ? lhs : rhs
+    }
+
+    private func taskID(forSessionID sessionID: String) -> UUID? {
+        if let match = bundles.first(where: { $0.value.session.id == sessionID }) {
+            return match.key
+        }
+        return sessions.first(where: { $0.id == sessionID })?.taskID
+    }
+
+    private func timelineItemOrderedBefore(
+        _ lhs: SessionTimelineItem,
+        _ rhs: SessionTimelineItem
+    ) -> Bool {
+        if lhs.turnOrdinal != rhs.turnOrdinal { return lhs.turnOrdinal < rhs.turnOrdinal }
+        if lhs.itemOrdinal != rhs.itemOrdinal { return lhs.itemOrdinal < rhs.itemOrdinal }
+        if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+        return lhs.id < rhs.id
     }
 
     private func update(_ operation: () async throws -> AppSnapshot) async -> Bool {
@@ -1068,6 +1804,14 @@ final class AppState {
         taskSaveStates[taskID] = nil
         failedTaskCommands[taskID] = nil
         bundles[taskID] = nil
+        timelinePages[taskID] = nil
+        conversationProjectionCache[taskID] = nil
+        timelineItemIndices[taskID] = nil
+        conversationStructureRevisions[taskID] = nil
+        conversationStableRevisions[taskID] = nil
+        conversationLegacyRevisions[taskID] = nil
+        timelineRefreshWork[taskID]?.task.cancel()
+        timelineRefreshWork[taskID] = nil
         sessions.removeAll(where: { $0.taskID == taskID })
         if presentedSheet == .taskSession(taskID) || loadingSessionTaskID == taskID {
             finishDismissingTaskSession(taskID: taskID)
@@ -1500,6 +2244,12 @@ extension SessionBundle {
 @MainActor
 @Observable
 final class AssistantViewState {
+    private struct FinishedHistoryWork {
+        let token: UUID
+        let turnID: String
+        let task: Task<Void, Never>
+    }
+
     private struct PendingSend {
         let clientMessageID: UUID
         let text: String
@@ -1507,20 +2257,278 @@ final class AssistantViewState {
         let attachments: [AssistantTextAttachment]
     }
 
+    private struct TranscriptProjectionCacheEntry {
+        let structureRevision: UInt64
+        let stableRevision: UInt64
+        let draftRevision: UInt64
+        let isRunning: Bool
+        let activeTurnID: String?
+        let errorMessage: String?
+        let stableItems: [ChatTranscriptItem]
+        let stableTailRevision: Int
+        let activeTimeline: [ChatTimelineItem]
+        let activeMessages: [AssistantMessage]
+        let activeTools: [AssistantToolActivity]
+        let transcript: ChatTranscript
+    }
+
+    private struct LiveTurnTimeline {
+        let sessionID: String
+        let turnID: String
+        var coversTurnFromStart = false
+        var items: [ChatTimelineItem] = []
+        var nextOrdinal: Int64 = 0
+        var activeTextIndex: Int?
+        var activeTextAttempt: Int?
+        var activeTextMessageID: String?
+        var activeTextUTF8ByteCount = 0
+
+        var streamingDraft: AssistantStreamingDraft? {
+            guard let activeTextIndex,
+                  items.indices.contains(activeTextIndex),
+                  let activeTextAttempt,
+                  let activeTextMessageID
+            else {
+                return nil
+            }
+            return AssistantStreamingDraft(
+                sessionID: sessionID,
+                turnID: turnID,
+                messageID: activeTextMessageID,
+                attempt: activeTextAttempt,
+                boundedBody: items[activeTextIndex].body,
+                bodyUTF8ByteCount: activeTextUTF8ByteCount
+            )
+        }
+
+        mutating func appendDelta(_ payload: AssistantMessageDeltaEvent) {
+            if let index = activeTextIndex {
+                let currentAttempt = activeTextAttempt ?? payload.attempt ?? 1
+                let incomingAttempt = max(payload.attempt ?? 1, 1)
+                guard incomingAttempt >= currentAttempt else { return }
+                let current = items[index]
+                let bounded: (body: String, utf8Bytes: Int)
+                if incomingAttempt > currentAttempt {
+                    let body = AssistantLiveContentBounds.prefix(
+                        payload.delta,
+                        maxUTF8Bytes: AssistantLiveContentBounds.assistantTextBytes
+                    )
+                    bounded = (body, body.utf8.count)
+                } else {
+                    bounded = AssistantLiveContentBounds.appending(
+                        payload.delta,
+                        to: current.body,
+                        currentUTF8Bytes: activeTextUTF8ByteCount,
+                        maxUTF8Bytes: AssistantLiveContentBounds.assistantTextBytes
+                    )
+                }
+                items[index] = replacing(
+                    current,
+                    body: bounded.body,
+                    updatedAt: "delta-\(incomingAttempt)-\(bounded.utf8Bytes)"
+                )
+                activeTextAttempt = incomingAttempt
+                activeTextMessageID = payload.messageID
+                activeTextUTF8ByteCount = bounded.utf8Bytes
+                return
+            }
+
+            let attempt = max(payload.attempt ?? 1, 1)
+            let body = AssistantLiveContentBounds.prefix(
+                payload.delta,
+                maxUTF8Bytes: AssistantLiveContentBounds.assistantTextBytes
+            )
+            let item = ChatTimelineItem(
+                id: "assistant-live-text-\(turnID)-\(nextOrdinal)",
+                sessionID: sessionID,
+                turnID: turnID,
+                order: ChatTimelineOrder(sequence: nextOrdinal, subindex: 0),
+                kind: .assistantText,
+                body: body,
+                callID: nil,
+                toolName: nil,
+                inputJSON: nil,
+                outputText: nil,
+                toolState: nil,
+                isError: false,
+                taskReferences: [],
+                attachments: [],
+                createdAt: "",
+                updatedAt: "delta-\(attempt)-\(body.utf8.count)",
+                fidelity: .partial
+            )
+            items.append(item)
+            activeTextIndex = items.count - 1
+            activeTextAttempt = attempt
+            activeTextMessageID = payload.messageID
+            activeTextUTF8ByteCount = body.utf8.count
+            nextOrdinal += 1
+        }
+
+        mutating func upsertThought(_ payload: AssistantThoughtSummaryEvent) {
+            freezeText()
+            let identity = payload.stablePartIdentity
+            let id = "assistant-live-reasoning-\(identity)"
+            if let index = items.firstIndex(where: { $0.id == id }) {
+                let current = items[index]
+                let body: String
+                if payload.isDelta == true {
+                    body = AssistantLiveContentBounds.appending(
+                        payload.content,
+                        to: current.body,
+                        currentUTF8Bytes: current.body.utf8.count,
+                        maxUTF8Bytes: AssistantLiveContentBounds.reasoningBytes
+                    ).body
+                } else {
+                    body = payload.content
+                }
+                items[index] = replacing(
+                    current,
+                    body: body,
+                    updatedAt: "thought-\(identity)-\(body.utf8.count)"
+                )
+                return
+            }
+            items.append(
+                ChatTimelineItem(
+                    id: id,
+                    sessionID: sessionID,
+                    turnID: turnID,
+                    order: ChatTimelineOrder(sequence: nextOrdinal, subindex: 0),
+                    kind: .reasoning,
+                    body: payload.content,
+                    callID: nil,
+                    toolName: nil,
+                    inputJSON: nil,
+                    outputText: nil,
+                    toolState: nil,
+                    isError: false,
+                    taskReferences: [],
+                    attachments: [],
+                    createdAt: "",
+                    updatedAt: "thought-\(identity)-\(payload.content.utf8.count)",
+                    fidelity: .partial
+                )
+            )
+            nextOrdinal += 1
+        }
+
+        mutating func upsertTool(
+            callID: String,
+            name: String,
+            state: ChatToolState,
+            taskReferences: [UUID]
+        ) {
+            freezeText()
+            if let index = items.firstIndex(where: { $0.callID == callID }) {
+                let current = items[index]
+                items[index] = ChatTimelineItem(
+                    id: current.id,
+                    sessionID: current.sessionID,
+                    turnID: current.turnID,
+                    order: current.order,
+                    kind: .tool,
+                    body: "",
+                    callID: callID,
+                    toolName: name,
+                    inputJSON: current.inputJSON,
+                    outputText: current.outputText,
+                    toolState: state,
+                    isError: state == .failed,
+                    taskReferences: taskReferences,
+                    attachments: [],
+                    createdAt: current.createdAt,
+                    updatedAt: "tool-\(state)",
+                    fidelity: .partial
+                )
+                return
+            }
+            items.append(
+                ChatTimelineItem(
+                    id: "assistant-live-tool-\(callID)",
+                    sessionID: sessionID,
+                    turnID: turnID,
+                    order: ChatTimelineOrder(sequence: nextOrdinal, subindex: 0),
+                    kind: .tool,
+                    body: "",
+                    callID: callID,
+                    toolName: name,
+                    inputJSON: nil,
+                    outputText: nil,
+                    toolState: state,
+                    isError: state == .failed,
+                    taskReferences: taskReferences,
+                    attachments: [],
+                    createdAt: "",
+                    updatedAt: "tool-\(state)",
+                    fidelity: .partial
+                )
+            )
+            nextOrdinal += 1
+        }
+
+        mutating func freezeText() {
+            activeTextIndex = nil
+            activeTextAttempt = nil
+            activeTextMessageID = nil
+            activeTextUTF8ByteCount = 0
+        }
+
+        mutating func discardActiveText() {
+            if let activeTextIndex, items.indices.contains(activeTextIndex) {
+                items.remove(at: activeTextIndex)
+            }
+            freezeText()
+        }
+
+        private func replacing(
+            _ item: ChatTimelineItem,
+            body: String,
+            updatedAt: String
+        ) -> ChatTimelineItem {
+            ChatTimelineItem(
+                id: item.id,
+                sessionID: item.sessionID,
+                turnID: item.turnID,
+                order: item.order,
+                kind: item.kind,
+                body: body,
+                callID: item.callID,
+                toolName: item.toolName,
+                inputJSON: item.inputJSON,
+                outputText: item.outputText,
+                toolState: item.toolState,
+                isError: item.isError,
+                taskReferences: item.taskReferences,
+                attachments: item.attachments,
+                createdAt: item.createdAt,
+                updatedAt: updatedAt,
+                fidelity: item.fidelity
+            )
+        }
+    }
+
     @ObservationIgnored private let repository: any AppRepository
     @ObservationIgnored private let keyLoader: @MainActor @Sendable () throws -> String?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var eventGeneration: UInt64 = 0
     @ObservationIgnored private var historyLoadGeneration: UInt64 = 0
+    @ObservationIgnored private var finishedHistoryWork: [String: FinishedHistoryWork] = [:]
     @ObservationIgnored private var shouldEnsureDefaultSession = false
+    @ObservationIgnored private var transcriptProjectionCache: [String: TranscriptProjectionCacheEntry] = [:]
 
     private var bundles: [String: AssistantSessionBundle] = [:]
-    private var drafts: [String: AssistantStreamingDraft] = [:]
+    private var thoughtSummariesBySession: [String: AssistantThoughtSummaryEvent] = [:]
+    private var liveTurnTimelines: [String: LiveTurnTimeline] = [:]
     private var toolsBySession: [String: [String: AssistantToolActivity]] = [:]
     private var toolOrderBySession: [String: [String]] = [:]
     private var turnErrors: [String: String] = [:]
     private var sendingSessionIDs: Set<String> = []
     private var pendingSends: [String: PendingSend] = [:]
+    private var transcriptStructureRevisions: [String: UInt64] = [:]
+    private var transcriptStableRevisions: [String: UInt64] = [:]
+    private var transcriptDraftRevisions: [String: UInt64] = [:]
+    private var historyFloorSequences: [String: Int64] = [:]
 
     private(set) var status: AssistantStatus?
     private(set) var sessions: [AssistantSessionDescriptor] = []
@@ -1562,13 +2570,33 @@ final class AssistantViewState {
 
     var selectedDraft: AssistantStreamingDraft? {
         guard let selectedSessionID else { return nil }
-        return drafts[selectedSessionID]
+        return liveTurnTimelines[selectedSessionID]?.streamingDraft
+    }
+
+    /// Test-visible accounting for the single canonical streaming text store.
+    /// `selectedDraft` is a transient compatibility snapshot of these items.
+    var retainedLiveTextBodyCount: Int {
+        liveTurnTimelines.values.reduce(into: 0) { count, timeline in
+            count += timeline.items.lazy.filter { $0.kind == .assistantText }.count
+        }
+    }
+
+    var retainedLiveTextUTF8ByteCount: Int {
+        liveTurnTimelines.values.reduce(into: 0) { byteCount, timeline in
+            byteCount += timeline.items.lazy
+                .filter { $0.kind == .assistantText }
+                .reduce(into: 0) { $0 += $1.body.utf8.count }
+        }
     }
 
     var selectedTools: [AssistantToolActivity] {
         guard let selectedSessionID else { return [] }
-        guard let tools = toolsBySession[selectedSessionID]?.values else { return [] }
-        let orderedIDs = toolOrderBySession[selectedSessionID] ?? []
+        return orderedTools(for: selectedSessionID)
+    }
+
+    private func orderedTools(for sessionID: String) -> [AssistantToolActivity] {
+        guard let tools = toolsBySession[sessionID]?.values else { return [] }
+        let orderedIDs = toolOrderBySession[sessionID] ?? []
         let order = Dictionary(uniqueKeysWithValues: orderedIDs.enumerated().map { ($0.element, $0.offset) })
         return tools.sorted { lhs, rhs in
             let left = order[lhs.toolCallID] ?? .max
@@ -1579,6 +2607,311 @@ final class AssistantViewState {
 
     var selectedTimelineItems: [AssistantConversationTimelineItem] {
         Self.conversationTimeline(messages: selectedMessages, tools: selectedTools)
+    }
+
+    var selectedChatTranscript: ChatTranscript {
+        guard let selectedSessionID else { return .empty() }
+        let bundle = bundle(for: selectedSessionID)
+        let orderedLiveTurn = liveTurnTimelines[selectedSessionID]
+        let draft = orderedLiveTurn?.streamingDraft
+        let isRunning = isSelectedSessionRunning
+        let structureRevision = transcriptStructureRevisions[selectedSessionID, default: 0]
+        let stableRevision = transcriptStableRevisions[selectedSessionID, default: 0]
+        let draftRevision = transcriptDraftRevisions[selectedSessionID, default: 0]
+        let errorMessage = turnErrors[selectedSessionID]
+        let liveReasoning = thoughtSummariesBySession[selectedSessionID]
+        let activeTurnID: String?
+        if isRunning {
+            let runningToolTurnID = toolsBySession[selectedSessionID]?
+                .values
+                .first(where: { $0.state == .running })?
+                .turnID
+            let fallbackTurnID = sendingSessionIDs.contains(selectedSessionID)
+                ? "assistant-pending-\(selectedSessionID)"
+                : bundle.messages.last?.turnID
+            activeTurnID = bundle.activeTurn?.id
+                ?? draft?.turnID
+                ?? runningToolTurnID
+                ?? bundle.timeline?.last?.turnID
+                ?? fallbackTurnID
+        } else {
+            activeTurnID = nil
+        }
+        if let cached = transcriptProjectionCache[selectedSessionID],
+           cached.structureRevision == structureRevision,
+           cached.stableRevision == stableRevision,
+           cached.draftRevision == draftRevision,
+           cached.isRunning == isRunning,
+           cached.activeTurnID == activeTurnID,
+           cached.errorMessage == errorMessage {
+            return cached.transcript
+        }
+
+        let stableItems: [ChatTranscriptItem]
+        let stableTailRevision: Int
+        let activeTimeline: [ChatTimelineItem]
+        let activeMessages: [AssistantMessage]
+        let activeTools: [AssistantToolActivity]
+        let cached = transcriptProjectionCache[selectedSessionID]
+        if let cached,
+           cached.stableRevision == stableRevision,
+           cached.isRunning == isRunning,
+           cached.activeTurnID == activeTurnID,
+           cached.errorMessage == errorMessage {
+            stableItems = cached.stableItems
+            stableTailRevision = cached.stableTailRevision
+        } else {
+            let allTools = orderedTools(for: selectedSessionID)
+            if let exactTimeline = bundle.timeline {
+                var stableTimeline = ChatTranscriptProjection.normalizeAssistantHistory(
+                    exactTimeline.filter { $0.turnID != activeTurnID },
+                    supplementing: bundle.messages.filter { $0.turnID != activeTurnID }
+                )
+                if activeTurnID == nil, let orderedLiveTurn {
+                    stableTimeline = mergingLiveTimeline(
+                        orderedLiveTurn,
+                        into: stableTimeline
+                    )
+                }
+                let stable = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    timeline: stableTimeline,
+                    liveTools: [],
+                    draft: nil,
+                    isRunning: false,
+                    errorMessage: activeTurnID == nil ? errorMessage : nil,
+                    activeTurnID: nil
+                )
+                stableItems = stable.items
+                stableTailRevision = stable.tailRevision
+            } else if activeTurnID == nil, let orderedLiveTurn {
+                let stable = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    timeline: mergingLiveTimeline(
+                        orderedLiveTurn,
+                        into: ChatTranscriptProjection.normalize(bundle.messages, tools: allTools)
+                    ),
+                    liveTools: [],
+                    draft: nil,
+                    isRunning: false,
+                    errorMessage: errorMessage,
+                    activeTurnID: nil
+                )
+                stableItems = stable.items
+                stableTailRevision = stable.tailRevision
+            } else if let activeTurnID {
+                let stable = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    messages: bundle.messages.filter { $0.turnID != activeTurnID },
+                    tools: allTools.filter { $0.turnID != activeTurnID },
+                    draft: nil,
+                    isRunning: false
+                )
+                stableItems = stable.items
+                stableTailRevision = stable.tailRevision
+            } else {
+                let stable = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    messages: bundle.messages,
+                    tools: allTools,
+                    draft: nil,
+                    isRunning: false,
+                    errorMessage: errorMessage
+                )
+                stableItems = stable.items
+                stableTailRevision = stable.tailRevision
+            }
+        }
+
+        if let activeTurnID {
+            if let cached,
+               cached.structureRevision == structureRevision,
+               cached.draftRevision == draftRevision,
+               cached.activeTurnID == activeTurnID {
+                activeTimeline = cached.activeTimeline
+               activeMessages = cached.activeMessages
+               activeTools = cached.activeTools
+            } else {
+                activeMessages = bundle.messages.filter { $0.turnID == activeTurnID }
+                activeTools = orderedTools(for: selectedSessionID).filter { $0.turnID == activeTurnID }
+                let persistedTimeline = bundle.timeline.map { exactTimeline in
+                    ChatTranscriptProjection.normalizeAssistantHistory(
+                        exactTimeline.filter { $0.turnID == activeTurnID },
+                        supplementing: activeMessages
+                    )
+                } ?? ChatTranscriptProjection.normalize(activeMessages, tools: [])
+                if let orderedLiveTurn, orderedLiveTurn.turnID == activeTurnID {
+                    activeTimeline = mergingLiveTimeline(
+                        orderedLiveTurn,
+                        into: persistedTimeline
+                    )
+                } else {
+                    activeTimeline = persistedTimeline
+                }
+            }
+        } else {
+            activeTimeline = []
+            activeMessages = []
+            activeTools = []
+        }
+
+        let transcript: ChatTranscript
+        if let activeTurnID {
+            let statusText = draft == nil && activeTools.isEmpty ? "正在思考" : nil
+            let active: ChatTranscript
+            if orderedLiveTurn?.turnID == activeTurnID {
+                active = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    timeline: activeTimeline,
+                    liveTools: [],
+                    draft: nil,
+                    isRunning: true,
+                    statusText: statusText,
+                    errorMessage: errorMessage,
+                    activeTurnID: activeTurnID
+                )
+            } else if bundle.timeline != nil {
+                active = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    timeline: activeTimeline,
+                    liveReasoning: liveReasoning?.turnID == activeTurnID ? liveReasoning : nil,
+                    liveTools: activeTools,
+                    draft: draft,
+                    isRunning: true,
+                    statusText: statusText,
+                    errorMessage: errorMessage,
+                    activeTurnID: activeTurnID
+                )
+            } else if let liveReasoning, liveReasoning.turnID == activeTurnID {
+                active = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    timeline: ChatTranscriptProjection.normalize(activeMessages, tools: []),
+                    liveReasoning: liveReasoning,
+                    liveTools: activeTools,
+                    draft: draft,
+                    isRunning: true,
+                    statusText: statusText,
+                    errorMessage: errorMessage,
+                    activeTurnID: activeTurnID
+                )
+            } else {
+                active = ChatTranscriptProjection.assistant(
+                    sessionID: selectedSessionID,
+                    messages: activeMessages,
+                    tools: activeTools,
+                    draft: draft,
+                    isRunning: true,
+                    statusText: statusText,
+                    errorMessage: errorMessage,
+                    activeTurnID: activeTurnID
+                )
+            }
+            transcript = ChatTranscript(
+                sessionID: selectedSessionID,
+                items: stableItems + active.items,
+                tailRevision: stableTailRevision &* 31 &+ active.tailRevision,
+                isRunning: true
+            )
+        } else {
+            transcript = ChatTranscript(
+                sessionID: selectedSessionID,
+                items: stableItems,
+                tailRevision: stableTailRevision,
+                isRunning: false
+            )
+        }
+        transcriptProjectionCache[selectedSessionID] = TranscriptProjectionCacheEntry(
+            structureRevision: structureRevision,
+            stableRevision: stableRevision,
+            draftRevision: draftRevision,
+            isRunning: isRunning,
+            activeTurnID: activeTurnID,
+            errorMessage: errorMessage,
+            stableItems: stableItems,
+            stableTailRevision: stableTailRevision,
+            activeTimeline: activeTimeline,
+            activeMessages: activeMessages,
+            activeTools: activeTools,
+            transcript: transcript
+        )
+        return transcript
+    }
+
+    private func mergingLiveTimeline(
+        _ liveTimeline: LiveTurnTimeline,
+        into persistedItems: [ChatTimelineItem]
+    ) -> [ChatTimelineItem] {
+        let liveItems = liveTimeline.items
+        guard let liveTurnID = liveItems.first?.turnID else { return persistedItems }
+        let liveCallIDs = Set(liveItems.compactMap(\.callID))
+        let replacesPersistedNarrative = liveTimeline.coversTurnFromStart
+        let hasLiveReasoning = replacesPersistedNarrative
+            && liveItems.contains { $0.kind == .reasoning }
+        let hasLiveText = replacesPersistedNarrative
+            && liveItems.contains { $0.kind == .assistantText }
+        var merged = persistedItems.filter { item in
+            guard item.turnID == liveTurnID else { return true }
+            if item.kind == .tool,
+               let callID = item.callID,
+               liveCallIDs.contains(callID) {
+                return false
+            }
+            if hasLiveReasoning, item.kind == .reasoning { return false }
+            if hasLiveText, item.kind == .assistantText { return false }
+            return true
+        }
+        let startingSequence = (merged.map(\.order.sequence).max() ?? 0) + 1
+        let persistedIDs = Set(merged.map(\.id))
+        let persistedNarrativeBodies = Set(merged.compactMap { item -> String? in
+            guard item.turnID == liveTurnID,
+                  item.kind == .assistantText || item.kind == .reasoning
+            else { return nil }
+            return "\(item.kind):\(item.body)"
+        })
+        let appendableLiveItems = liveItems.filter { item in
+            guard !persistedIDs.contains(item.id) else { return false }
+            guard !replacesPersistedNarrative,
+                  item.kind == .assistantText || item.kind == .reasoning
+            else { return true }
+            return !persistedNarrativeBodies.contains("\(item.kind):\(item.body)")
+        }
+        for (offset, item) in appendableLiveItems.enumerated() {
+            merged.append(
+                copying(
+                    item,
+                    order: ChatTimelineOrder(
+                        sequence: startingSequence + Int64(offset),
+                        subindex: 0
+                    )
+                )
+            )
+        }
+        return merged
+    }
+
+    private func copying(
+        _ item: ChatTimelineItem,
+        order: ChatTimelineOrder
+    ) -> ChatTimelineItem {
+        ChatTimelineItem(
+            id: item.id,
+            sessionID: item.sessionID,
+            turnID: item.turnID,
+            order: order,
+            kind: item.kind,
+            body: item.body,
+            callID: item.callID,
+            toolName: item.toolName,
+            inputJSON: item.inputJSON,
+            outputText: item.outputText,
+            toolState: item.toolState,
+            isError: item.isError,
+            taskReferences: item.taskReferences,
+            attachments: item.attachments,
+            createdAt: item.createdAt,
+            updatedAt: item.updatedAt,
+            fidelity: item.fidelity
+        )
     }
 
     static func conversationTimeline(
@@ -1680,6 +3013,8 @@ final class AssistantViewState {
         historyLoadGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
+        for work in finishedHistoryWork.values { work.task.cancel() }
+        finishedHistoryWork.removeAll()
     }
 
     func resumeEventsIfNeeded() { startEventsIfNeeded() }
@@ -1760,10 +3095,15 @@ final class AssistantViewState {
             merge(bundle, replaceActiveTurn: false)
             sessions.removeAll(where: { $0.id == selectedSessionID })
             bundles.removeValue(forKey: selectedSessionID)
-            drafts.removeValue(forKey: selectedSessionID)
+            liveTurnTimelines.removeValue(forKey: selectedSessionID)
             toolsBySession.removeValue(forKey: selectedSessionID)
             toolOrderBySession.removeValue(forKey: selectedSessionID)
             turnErrors.removeValue(forKey: selectedSessionID)
+            transcriptProjectionCache.removeValue(forKey: selectedSessionID)
+            transcriptStructureRevisions.removeValue(forKey: selectedSessionID)
+            transcriptStableRevisions.removeValue(forKey: selectedSessionID)
+            transcriptDraftRevisions.removeValue(forKey: selectedSessionID)
+            historyFloorSequences.removeValue(forKey: selectedSessionID)
 
             let nextID = activeSessions.first?.id
             self.selectedSessionID = nextID
@@ -1798,7 +3138,11 @@ final class AssistantViewState {
 
         sendingSessionIDs.insert(sessionID)
         turnErrors.removeValue(forKey: sessionID)
-        defer { sendingSessionIDs.remove(sessionID) }
+        bumpTranscriptStructure(sessionID: sessionID)
+        defer {
+            sendingSessionIDs.remove(sessionID)
+            bumpTranscriptStructure(sessionID: sessionID)
+        }
 
         let pending: PendingSend
         if let existing = pendingSends[sessionID],
@@ -1910,6 +3254,13 @@ final class AssistantViewState {
                 )
                 applyDelta(payload)
 
+            case "assistant.thought.summary":
+                let payload = try JSONDecoder.engineDecoder.decode(
+                    AssistantThoughtSummaryEvent.self,
+                    from: event.data
+                )
+                applyThoughtSummary(payload)
+
             case "assistant.message.appended":
                 let payload = try JSONDecoder.engineDecoder.decode(
                     AssistantMessageAppendedEvent.self,
@@ -1935,10 +3286,9 @@ final class AssistantViewState {
                 let payload = try JSONDecoder.engineDecoder.decode(AssistantTurnEvent.self, from: event.data)
                 applyTurn(payload.turn, sessionID: payload.sessionID, finished: true)
                 if payload.sessionID == selectedSessionID {
-                    await loadHistory(
+                    scheduleFinishedHistoryReconciliation(
                         sessionID: payload.sessionID,
-                        after: max(0, latestStableSequence(for: payload.sessionID) - 10),
-                        replaceActiveTurn: true
+                        turnID: payload.turn.id
                     )
                 }
 
@@ -1950,6 +3300,31 @@ final class AssistantViewState {
         } catch {
             errorMessage = "TodoAgent 事件无法处理：\(error.localizedDescription)"
         }
+    }
+
+    private func scheduleFinishedHistoryReconciliation(sessionID: String, turnID: String) {
+        finishedHistoryWork[sessionID]?.task.cancel()
+        let token = UUID()
+        let afterSequence = max(0, latestStableSequence(for: sessionID) - 10)
+        let task = Task { @MainActor [weak self] in
+            guard let self,
+                  !Task.isCancelled,
+                  self.finishedHistoryWork[sessionID]?.token == token
+            else { return }
+            await self.loadHistory(
+                sessionID: sessionID,
+                after: afterSequence,
+                replaceActiveTurn: true,
+                reconcilingFinishedTurnID: turnID
+            )
+            guard self.finishedHistoryWork[sessionID]?.token == token else { return }
+            self.finishedHistoryWork[sessionID] = nil
+        }
+        finishedHistoryWork[sessionID] = FinishedHistoryWork(
+            token: token,
+            turnID: turnID,
+            task: task
+        )
     }
 
     private func reloadContent(showLoadingState: Bool) async {
@@ -2007,7 +3382,8 @@ final class AssistantViewState {
         sessionID: String,
         after sequence: Int64,
         replaceActiveTurn: Bool,
-        targetSequence: Int64? = nil
+        targetSequence: Int64? = nil,
+        reconcilingFinishedTurnID: String? = nil
     ) async {
         historyLoadGeneration &+= 1
         let generation = historyLoadGeneration
@@ -2020,28 +3396,86 @@ final class AssistantViewState {
         do {
             var cursor = sequence
             var desiredSequence = targetSequence ?? 0
+            var pageCount = 0
+            var hydration = AssistantHistoryHydrationAccumulator(budget: .sessionHistory)
+            if sequence > 0 {
+                applyAssistantHydrationResult(
+                    hydration.retainNewestTurns(in: bundle(for: sessionID)),
+                    sessionID: sessionID
+                )
+            }
             while true {
-                let bundle = try await repository.assistantHistory(
+                let response = try await repository.assistantHistory(
                     sessionID: sessionID,
                     after: cursor
                 )
+                pageCount += 1
                 guard
                     historyLoadGeneration == generation,
                     selectedSessionID == sessionID
                 else { return }
-                desiredSequence = max(desiredSequence, bundle.session.lastSequence)
-                merge(bundle, replaceActiveTurn: replaceActiveTurn)
+                desiredSequence = max(desiredSequence, response.session.lastSequence)
+                let responseCursor = response.messages.map(\.sequence).max() ?? cursor
+                merge(
+                    response,
+                    replaceActiveTurn: replaceActiveTurn,
+                    replaceTimeline: cursor == 0,
+                    reconcilingFinishedTurnID: reconcilingFinishedTurnID
+                )
+                let hydrationResult = hydration.retainNewestTurns(in: bundle(for: sessionID))
+                applyAssistantHydrationResult(hydrationResult, sessionID: sessionID)
+                if hydrationResult.didTruncate {
+                    errorMessage = "TodoAgent 对话历史较长，为保护界面响应，仅显示最近的部分内容。"
+                }
 
-                let nextCursor = latestStableSequence(for: sessionID)
-                if nextCursor >= desiredSequence || nextCursor <= cursor || bundle.messages.isEmpty {
+                if responseCursor >= desiredSequence
+                    || responseCursor <= cursor
+                    || response.messages.isEmpty {
                     break
                 }
-                cursor = nextCursor
+                guard pageCount < 128 else {
+                    errorMessage = "TodoAgent 对话历史较长，为保护界面响应，仅显示最近的部分内容。"
+                    break
+                }
+                cursor = responseCursor
+            }
+            if sequence == 0, !hydration.reachedLimit {
+                historyFloorSequences.removeValue(forKey: sessionID)
             }
         } catch is CancellationError {
             return
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    private func applyAssistantHydrationResult(
+        _ result: AssistantHistoryHydrationResult,
+        sessionID: String
+    ) {
+        guard result.bundle.session.id == sessionID else { return }
+        bundles[sessionID] = result.bundle
+        if let evictedThroughSequence = result.evictedThroughSequence {
+            historyFloorSequences[sessionID] = max(
+                historyFloorSequences[sessionID] ?? 0,
+                evictedThroughSequence
+            )
+        }
+
+        let retainedCallIDs = Set(result.bundle.tools.map(\.callID))
+        let retainedTurnIDs = Set(
+            result.retainedTurnKeys.compactMap { key in
+                key.hasPrefix("turn:") ? String(key.dropFirst(5)) : nil
+            }
+        )
+        if let activities = toolsBySession[sessionID] {
+            let retainedActivities = activities.filter { callID, activity in
+                retainedCallIDs.contains(callID) || retainedTurnIDs.contains(activity.turnID)
+            }
+            toolsBySession[sessionID] = retainedActivities
+            toolOrderBySession[sessionID] = (toolOrderBySession[sessionID] ?? []).filter {
+                retainedActivities[$0] != nil
+            }
         }
     }
 
@@ -2075,11 +3509,19 @@ final class AssistantViewState {
         if resetEphemeralState {
             // A restarted sidecar has no in-memory turn state. Drop ephemeral
             // projections before rebuilding them from persisted history.
-            drafts.removeAll()
+            thoughtSummariesBySession.removeAll()
+            liveTurnTimelines.removeAll()
             toolsBySession.removeAll()
             toolOrderBySession.removeAll()
             turnErrors.removeAll()
             sendingSessionIDs.removeAll()
+            transcriptProjectionCache.removeAll()
+            transcriptStructureRevisions.removeAll()
+            transcriptStableRevisions.removeAll()
+            transcriptDraftRevisions.removeAll()
+            historyFloorSequences.removeAll()
+            for work in finishedHistoryWork.values { work.task.cancel() }
+            finishedHistoryWork.removeAll()
         }
         var credentialError: String?
 
@@ -2115,26 +3557,47 @@ final class AssistantViewState {
                 session: bundle.session.updating(isRunning: false, lastModel: turn.model),
                 messages: bundle.messages,
                 tools: bundle.tools,
+                timeline: bundle.timeline,
                 activeTurn: nil
             )
-            drafts.removeValue(forKey: sessionID)
             if turn.status == .failed || turn.status == .interrupted,
                let message = turn.errorMessage, !message.isEmpty {
                 turnErrors[sessionID] = message
             }
         } else {
+            if let work = finishedHistoryWork[sessionID], work.turnID != turn.id {
+                work.task.cancel()
+                finishedHistoryWork[sessionID] = nil
+                historyLoadGeneration &+= 1
+            }
+            if liveTurnTimelines[sessionID]?.turnID != turn.id {
+                liveTurnTimelines[sessionID] = LiveTurnTimeline(
+                    sessionID: sessionID,
+                    turnID: turn.id,
+                    coversTurnFromStart: true
+                )
+            } else if liveTurnTimelines[sessionID]?.items.isEmpty == true {
+                liveTurnTimelines[sessionID]?.coversTurnFromStart = true
+            }
             if bundle.activeTurn?.id == turn.id, bundle.activeTurn?.status == turn.status { return }
             turnErrors.removeValue(forKey: sessionID)
+            if thoughtSummariesBySession[sessionID]?.turnID != turn.id {
+                thoughtSummariesBySession.removeValue(forKey: sessionID)
+            }
             bundle = AssistantSessionBundle(
                 session: bundle.session.updating(isRunning: true, lastModel: turn.model),
                 messages: bundle.messages,
                 tools: bundle.tools,
+                timeline: bundle.timeline,
                 activeTurn: turn
             )
         }
 
         bundles[sessionID] = bundle
         upsertSession(bundle.session)
+        if finished {
+            bumpTranscriptStable(sessionID: sessionID)
+        }
     }
 
     private func applyDelta(_ payload: AssistantMessageDeltaEvent) {
@@ -2142,29 +3605,35 @@ final class AssistantViewState {
             $0.id == payload.messageID || ($0.turnID == payload.turnID && $0.role == .todoAgent)
         }) else { return }
 
-        let attempt = max(payload.attempt ?? 1, 1)
-        if var draft = drafts[payload.sessionID], draft.turnID == payload.turnID {
-            guard attempt >= draft.attempt else { return }
-            if attempt > draft.attempt {
-                draft = AssistantStreamingDraft(
-                    sessionID: payload.sessionID,
-                    turnID: payload.turnID,
-                    messageID: payload.messageID,
-                    attempt: attempt,
-                    body: ""
-                )
-            }
-            draft.body += payload.delta
-            drafts[payload.sessionID] = draft
-        } else {
-            drafts[payload.sessionID] = AssistantStreamingDraft(
-                sessionID: payload.sessionID,
-                turnID: payload.turnID,
-                messageID: payload.messageID,
-                attempt: attempt,
-                body: payload.delta
-            )
+        var liveTimeline = liveTurnTimelines[payload.sessionID]
+            ?? LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
+        if liveTimeline.turnID != payload.turnID {
+            liveTimeline = LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
         }
+        liveTimeline.appendDelta(payload)
+        liveTurnTimelines[payload.sessionID] = liveTimeline
+        bumpTranscriptDraft(sessionID: payload.sessionID)
+    }
+
+    private func applyThoughtSummary(_ payload: AssistantThoughtSummaryEvent) {
+        let payload = payload.boundedForPresentation()
+        guard payload.sessionID == selectedSessionID, !payload.content.isEmpty else { return }
+        if let existing = thoughtSummariesBySession[payload.sessionID] {
+            guard existing.turnID != payload.turnID
+                    || payload.stableInteractionOrdinal >= existing.stableInteractionOrdinal
+            else {
+                return
+            }
+        }
+        thoughtSummariesBySession[payload.sessionID] = payload
+        var liveTimeline = liveTurnTimelines[payload.sessionID]
+            ?? LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
+        if liveTimeline.turnID != payload.turnID {
+            liveTimeline = LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
+        }
+        liveTimeline.upsertThought(payload)
+        liveTurnTimelines[payload.sessionID] = liveTimeline
+        bumpTranscriptStructure(sessionID: payload.sessionID)
     }
 
     private func applyAppended(_ payload: AssistantMessageAppendedEvent) async {
@@ -2177,9 +3646,6 @@ final class AssistantViewState {
                 )
             )
             upsertSession(session)
-            if payload.message.role == .todoAgent {
-                drafts.removeValue(forKey: payload.sessionID)
-            }
             return
         }
         let current = latestStableSequence(for: payload.sessionID)
@@ -2196,7 +3662,13 @@ final class AssistantViewState {
 
         var bundle = bundle(for: payload.sessionID)
         if bundle.messages.contains(where: { $0.id == payload.message.id && $0 == payload.message }) {
-            if payload.message.role == .todoAgent { drafts.removeValue(forKey: payload.sessionID) }
+            if payload.message.role == .todoAgent {
+                discardLiveDraft(
+                    sessionID: payload.sessionID,
+                    turnID: payload.message.turnID
+                )
+                bumpTranscriptDraft(sessionID: payload.sessionID)
+            }
             return
         }
         var messages = bundle.messages.filter {
@@ -2209,13 +3681,30 @@ final class AssistantViewState {
             session: bundle.session.updating(lastSequence: latestSequence),
             messages: messages,
             tools: bundle.tools,
+            timeline: bundle.timeline,
             activeTurn: bundle.activeTurn
         )
         bundles[payload.sessionID] = bundle
         upsertSession(bundle.session)
-
         if payload.message.role == .todoAgent {
-            drafts.removeValue(forKey: payload.sessionID)
+            discardLiveDraft(
+                sessionID: payload.sessionID,
+                turnID: payload.message.turnID
+            )
+            bumpTranscriptDraft(sessionID: payload.sessionID)
+        }
+        bumpTranscriptStable(sessionID: payload.sessionID)
+    }
+
+    private func discardLiveDraft(sessionID: String, turnID: String?) {
+        guard var timeline = liveTurnTimelines[sessionID],
+              turnID == nil || timeline.turnID == turnID
+        else { return }
+        timeline.discardActiveText()
+        if timeline.items.isEmpty {
+            liveTurnTimelines.removeValue(forKey: sessionID)
+        } else {
+            liveTurnTimelines[sessionID] = timeline
         }
     }
 
@@ -2233,6 +3722,19 @@ final class AssistantViewState {
             taskReferences: []
         )
         toolsBySession[payload.sessionID] = tools
+        var liveTimeline = liveTurnTimelines[payload.sessionID]
+            ?? LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
+        if liveTimeline.turnID != payload.turnID {
+            liveTimeline = LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
+        }
+        liveTimeline.upsertTool(
+            callID: payload.toolCallID,
+            name: payload.name,
+            state: .running,
+            taskReferences: []
+        )
+        liveTurnTimelines[payload.sessionID] = liveTimeline
+        bumpTranscriptStructure(sessionID: payload.sessionID)
     }
 
     private func applyToolFinished(_ payload: AssistantToolFinishedEvent) {
@@ -2248,9 +3750,27 @@ final class AssistantViewState {
             taskReferences: payload.taskReferences
         )
         toolsBySession[payload.sessionID] = tools
+        var liveTimeline = liveTurnTimelines[payload.sessionID]
+            ?? LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
+        if liveTimeline.turnID != payload.turnID {
+            liveTimeline = LiveTurnTimeline(sessionID: payload.sessionID, turnID: payload.turnID)
+        }
+        liveTimeline.upsertTool(
+            callID: payload.toolCallID,
+            name: payload.name,
+            state: payload.isError ? .failed : .completed,
+            taskReferences: payload.taskReferences
+        )
+        liveTurnTimelines[payload.sessionID] = liveTimeline
+        bumpTranscriptStructure(sessionID: payload.sessionID)
     }
 
-    private func merge(_ incoming: AssistantSessionBundle, replaceActiveTurn: Bool) {
+    private func merge(
+        _ incoming: AssistantSessionBundle,
+        replaceActiveTurn: Bool,
+        replaceTimeline: Bool = false,
+        reconcilingFinishedTurnID: String? = nil
+    ) {
         let existing = bundles[incoming.session.id]
         var bySequence = Dictionary(uniqueKeysWithValues: (existing?.messages ?? []).map { ($0.sequence, $0) })
         for message in incoming.messages { bySequence[message.sequence] = message }
@@ -2268,7 +3788,28 @@ final class AssistantViewState {
             }
         }
         let persistedTools = persistedByCallID.values.sorted { $0.callID < $1.callID }
-        let activeTurn: AssistantTurn? = if replaceActiveTurn {
+        let timeline: [SessionTimelineItem]?
+        if replaceTimeline, let incomingTimeline = incoming.timeline {
+            timeline = incomingTimeline.sorted(by: assistantTimelineOrderedBefore)
+        } else if incoming.timeline != nil || existing?.timeline != nil {
+            var byID = Dictionary(
+                uniqueKeysWithValues: (existing?.timeline ?? []).map { ($0.id, $0) }
+            )
+            for item in incoming.timeline ?? [] { byID[item.id] = item }
+            timeline = byID.values.sorted(by: assistantTimelineOrderedBefore)
+        } else {
+            timeline = nil
+        }
+        let preservedNewerActiveTurn: AssistantTurn? = if let reconcilingFinishedTurnID,
+                                                          let existingActiveTurn = existing?.activeTurn,
+                                                          existingActiveTurn.id != reconcilingFinishedTurnID {
+            existingActiveTurn
+        } else {
+            nil
+        }
+        let activeTurn: AssistantTurn? = if let preservedNewerActiveTurn {
+            preservedNewerActiveTurn
+        } else if replaceActiveTurn {
             incoming.activeTurn
         } else if incoming.session.isRunning {
             incoming.activeTurn ?? existing?.activeTurn
@@ -2284,20 +3825,46 @@ final class AssistantViewState {
             isRunning: activeTurn?.status.isRunning ?? incoming.session.isRunning,
             lastModel: activeTurn?.model ?? incoming.session.lastModel
         )
+        let ephemeralTurnID = liveTurnTimelines[session.id]?.turnID
+            ?? thoughtSummariesBySession[session.id]?.turnID
+        let reconciledEphemeralTurn: Bool
+        if let ephemeralTurnID {
+            let fullTimelineIsAuthoritative = replaceTimeline && incoming.timeline != nil
+            let timelineCoversTurn = incoming.timeline?.contains(where: {
+                $0.turnID == ephemeralTurnID && $0.kind != "user"
+            }) == true
+            let legacyMessagesCoverTurn = incoming.messages.contains(where: { message in
+                guard message.turnID == ephemeralTurnID else { return false }
+                return switch message.role {
+                case .user: false
+                case .todoAgent, .system, .tool: true
+                }
+            })
+            reconciledEphemeralTurn = fullTimelineIsAuthoritative
+                || timelineCoversTurn
+                || legacyMessagesCoverTurn
+        } else {
+            reconciledEphemeralTurn = true
+        }
         bundles[session.id] = AssistantSessionBundle(
             session: session,
             messages: messages,
             tools: persistedTools,
+            timeline: timeline,
             activeTurn: activeTurn
         )
         upsertSession(session)
+        if !session.isRunning, reconciledEphemeralTurn {
+            thoughtSummariesBySession.removeValue(forKey: session.id)
+            liveTurnTimelines.removeValue(forKey: session.id)
+        }
+        bumpTranscriptStable(sessionID: session.id)
     }
 
     private func upsertSession(_ session: AssistantSessionDescriptor) {
         sessions.removeAll(where: { $0.id == session.id })
         if !session.archived { sessions.append(session) }
         if !session.isRunning {
-            drafts.removeValue(forKey: session.id)
             sendingSessionIDs.remove(session.id)
         }
 
@@ -2306,11 +3873,13 @@ final class AssistantViewState {
                 session: session,
                 messages: existing.messages,
                 tools: existing.tools,
+                timeline: existing.timeline,
                 activeTurn: session.isRunning ? existing.activeTurn : nil
             )
         } else {
             bundles[session.id] = AssistantSessionBundle(session: session)
         }
+        bumpTranscriptStructure(sessionID: session.id)
     }
 
     private func bundle(for sessionID: String) -> AssistantSessionBundle {
@@ -2331,8 +3900,37 @@ final class AssistantViewState {
                 activeTurn: existing.session.isRunning ? existing.activeTurn : nil
             )
             toolsBySession.removeValue(forKey: sessionID)
+            thoughtSummariesBySession.removeValue(forKey: sessionID)
+            liveTurnTimelines.removeValue(forKey: sessionID)
             toolOrderBySession.removeValue(forKey: sessionID)
+            transcriptProjectionCache.removeValue(forKey: sessionID)
+            transcriptStructureRevisions.removeValue(forKey: sessionID)
+            transcriptStableRevisions.removeValue(forKey: sessionID)
+            transcriptDraftRevisions.removeValue(forKey: sessionID)
         }
+    }
+
+    private func bumpTranscriptStructure(sessionID: String) {
+        transcriptStructureRevisions[sessionID, default: 0] &+= 1
+    }
+
+    private func bumpTranscriptStable(sessionID: String) {
+        transcriptStableRevisions[sessionID, default: 0] &+= 1
+        bumpTranscriptStructure(sessionID: sessionID)
+    }
+
+    private func bumpTranscriptDraft(sessionID: String) {
+        transcriptDraftRevisions[sessionID, default: 0] &+= 1
+    }
+
+    private func assistantTimelineOrderedBefore(
+        _ lhs: SessionTimelineItem,
+        _ rhs: SessionTimelineItem
+    ) -> Bool {
+        if lhs.turnOrdinal != rhs.turnOrdinal { return lhs.turnOrdinal < rhs.turnOrdinal }
+        if lhs.itemOrdinal != rhs.itemOrdinal { return lhs.itemOrdinal < rhs.itemOrdinal }
+        if lhs.sequence != rhs.sequence { return lhs.sequence < rhs.sequence }
+        return lhs.id < rhs.id
     }
 
     private func rememberToolOrder(sessionID: String, callID: String) {
@@ -2343,7 +3941,7 @@ final class AssistantViewState {
     }
 
     private func latestStableSequence(for sessionID: String) -> Int64 {
-        var expected: Int64 = 1
+        var expected = (historyFloorSequences[sessionID] ?? 0) + 1
         for message in (bundles[sessionID]?.messages ?? []).sorted(by: { $0.sequence < $1.sequence }) {
             if message.sequence < expected { continue }
             guard message.sequence == expected else { break }

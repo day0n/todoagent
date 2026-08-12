@@ -292,6 +292,53 @@ pub struct SessionBundle {
     pub active_turn: Option<SessionTurn>,
 }
 
+/// Provider-neutral Chat V2 item. Provider call/result frames are paired into
+/// one stable tool item, while text and reasoning retain their original turn
+/// position instead of being collapsed into a single final message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTimelineItem {
+    pub id: String,
+    pub session_id: String,
+    pub turn_id: String,
+    pub sequence: i64,
+    pub turn_ordinal: i64,
+    pub item_ordinal: i64,
+    pub kind: String,
+    pub body: String,
+    pub call_id: Option<String>,
+    pub tool_name: Option<String>,
+    pub input_json: Option<String>,
+    pub output_text: Option<String>,
+    pub tool_state: Option<String>,
+    pub is_error: bool,
+    pub source_event_sequence: Option<i64>,
+    pub source_block_index: Option<i64>,
+    pub fidelity: String,
+    pub metadata_json: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTimelineCursor {
+    pub turn_ordinal: i64,
+    pub item_ordinal: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionTimelinePage {
+    pub session: TaskSession,
+    pub items: Vec<SessionTimelineItem>,
+    pub active_turn: Option<SessionTurn>,
+    pub next_sequence: i64,
+    pub next_cursor: Option<SessionTimelineCursor>,
+    pub has_more: bool,
+    pub fidelity: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueuedTurn {
     pub session: TaskSession,
@@ -466,6 +513,11 @@ pub struct AssistantHistory {
     pub messages: Vec<AssistantMessage>,
     #[serde(default)]
     pub tools: Vec<AssistantToolSummary>,
+    /// Provider-neutral ordered parts for the TodoAgent conversation. Thought
+    /// items contain provider-exposed summaries only; signatures and raw
+    /// provider payloads never cross this UI boundary.
+    #[serde(default)]
+    pub timeline: Vec<SessionTimelineItem>,
     pub active_turn: Option<AssistantTurn>,
     pub compaction: Option<AssistantCompaction>,
 }

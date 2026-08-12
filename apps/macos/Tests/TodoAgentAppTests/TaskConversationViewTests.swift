@@ -43,6 +43,55 @@ struct TaskConversationViewTests {
         #expect(String(inline.characters) == "已删除 6 个任务")
     }
 
+    @Test("long Markdown prepares block and inline content through a bounded async cache")
+    func longMarkdownUsesBoundedRenderCache() async throws {
+        let cache = AssistantMarkdownRenderCache(
+            maximumEntryCount: 2,
+            maximumSourceBytes: 320 * 1_024
+        )
+        let longSource = "**完成** " + String(repeating: "长正文内容 ", count: 20_000)
+        let document = try #require(await cache.document(id: "long", source: longSource))
+
+        #expect(document.blocks.count == 1)
+        guard case let .paragraph(parsedLongSource) = document.blocks.first else {
+            Issue.record("long Markdown should remain one paragraph")
+            return
+        }
+        #expect(parsedLongSource.hasPrefix("**完成** 长正文内容"))
+        #expect(parsedLongSource.utf8.count >= longSource.utf8.count - 1)
+        let shortDocument = try #require(
+            await cache.document(id: "short", source: "**完成** 长正文内容")
+        )
+        #expect(
+            String(shortDocument.inlineValue(for: "**完成** 长正文内容").characters)
+                == "完成 长正文内容"
+        )
+
+        for index in 0 ..< 2 {
+            _ = await cache.document(id: "small-\(index)", source: "**\(index)**")
+        }
+        let metrics = await cache.cacheMetrics()
+        #expect(metrics.entryCount <= 2)
+        #expect(metrics.sourceBytes <= 320 * 1_024)
+    }
+
+    @Test("a late Markdown parse cannot replace the newest row revision")
+    func staleMarkdownResultIsRejected() {
+        let oldKey = ChatMarkdownLoadKey(id: "answer", body: "old", shouldParse: true)
+        let newKey = ChatMarkdownLoadKey(id: "answer", body: "new", shouldParse: true)
+        let oldDocument = AssistantMarkdownDocument(markdown: "**old**")
+        let newDocument = AssistantMarkdownDocument(markdown: "**new**")
+        var state = ChatMarkdownLoadState()
+
+        state.begin(oldKey)
+        state.begin(newKey)
+        #expect(state.accept(oldDocument, for: oldKey) == false)
+        #expect(state.document == nil)
+        let acceptedNewestDocument = state.accept(newDocument, for: newKey)
+        #expect(acceptedNewestDocument)
+        #expect(state.document == newDocument)
+    }
+
     @Test("technical provider failures are hidden behind a friendly summary")
     func assistantErrorPresentation() {
         let raw = "Gemini 请求失败：provider network error: error sending request for url (https://example.invalid/v1)"
@@ -92,28 +141,33 @@ struct TaskConversationViewTests {
         #expect(runningHeight < 500)
     }
 
-    @Test("completed tool steps reveal in order and collapse when a run finishes")
+    @Test("expandable transcript content cannot resize the message track")
+    func expandableContentKeepsTranscriptTrackWidthStable() {
+        let collapsedWidth = hostedTranscriptTrackWidth(showsExpandedContent: false)
+        let expandedWidth = hostedTranscriptTrackWidth(showsExpandedContent: true)
+
+        #expect(collapsedWidth == 360)
+        #expect(expandedWidth == collapsedWidth)
+    }
+
+    @Test("completed tool steps expand in one stable layout transaction")
     func toolGroupDisclosureLifecycle() {
         var disclosure = AssistantToolGroupDisclosureState()
 
         #expect(disclosure.isExpanded(isRunning: false) == false)
-        disclosure.toggleGroup(isRunning: false, totalStepCount: 8, reduceMotion: false)
+        disclosure.toggleGroup(isRunning: false)
         #expect(disclosure.isExpanded(isRunning: false))
-        #expect(disclosure.revealedCompletedStepCount == 0)
 
-        disclosure.revealNextCompletedStep(totalStepCount: 8)
-        disclosure.revealNextCompletedStep(totalStepCount: 8)
         disclosure.toggleTool("step-1")
-        #expect(disclosure.revealedCompletedStepCount == 2)
         #expect(disclosure.expandedToolIDs == ["step-1"])
 
         disclosure.finishRunningGroup()
         #expect(disclosure.isExpanded(isRunning: false) == false)
-        #expect(disclosure.revealedCompletedStepCount == 0)
         #expect(disclosure.expandedToolIDs.isEmpty)
 
-        disclosure.toggleGroup(isRunning: false, totalStepCount: 8, reduceMotion: true)
-        #expect(disclosure.revealedCompletedStepCount == 8)
+        disclosure.toggleGroup(isRunning: true)
+        #expect(disclosure.manuallyExpanded == false)
+        #expect(disclosure.isExpanded(isRunning: true))
     }
 
     @Test("tool results are collapsed by default and toggle their complete body")
@@ -295,6 +349,27 @@ struct TaskConversationViewTests {
         )
         host.layoutSubtreeIfNeeded()
         return host.fittingSize.height
+    }
+
+    private func hostedTranscriptTrackWidth(showsExpandedContent: Bool) -> CGFloat {
+        let host = NSHostingView(
+            rootView: AssistantTranscriptTrack {
+                Text("之前的消息")
+                    .frame(maxWidth: .infinity, alignment: .trailing)
+
+                if showsExpandedContent {
+                    VStack(alignment: .leading) {
+                        Text("已检查相关任务")
+                        Text("已检查相关任务")
+                        Text("已创建任务")
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(width: 360)
+        )
+        host.layoutSubtreeIfNeeded()
+        return host.fittingSize.width
     }
 
     private func hostedHeight(

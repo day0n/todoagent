@@ -409,27 +409,36 @@ struct AssistantSessionBundle: Codable, Equatable, Sendable {
     let session: AssistantSessionDescriptor
     let messages: [AssistantMessage]
     let tools: [AssistantPersistedTool]
+    /// Ordered provider-neutral UI parts. `nil` means an older Engine that only
+    /// supports the legacy messages/tools projection; an empty array is an
+    /// authoritative empty Chat V2 history.
+    let timeline: [SessionTimelineItem]?
     let activeTurn: AssistantTurn?
 
     init(
         session: AssistantSessionDescriptor,
         messages: [AssistantMessage] = [],
         tools: [AssistantPersistedTool] = [],
+        timeline: [SessionTimelineItem]? = nil,
         activeTurn: AssistantTurn? = nil
     ) {
         self.session = session
         self.messages = messages
         self.tools = tools
+        self.timeline = timeline
         self.activeTurn = activeTurn
     }
 
-    private enum CodingKeys: String, CodingKey { case session, messages, tools, activeTurn }
+    private enum CodingKeys: String, CodingKey {
+        case session, messages, tools, timeline, activeTurn
+    }
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         session = try values.decode(AssistantSessionDescriptor.self, forKey: .session)
         messages = try values.decodeIfPresent([AssistantMessage].self, forKey: .messages) ?? []
         tools = try values.decodeIfPresent([AssistantPersistedTool].self, forKey: .tools) ?? []
+        timeline = try values.decodeIfPresent([SessionTimelineItem].self, forKey: .timeline)
         activeTurn = try values.decodeIfPresent(AssistantTurn.self, forKey: .activeTurn)
     }
 }
@@ -488,6 +497,75 @@ struct AssistantStreamingDraft: Equatable, Sendable {
     let messageID: String
     var attempt: Int
     var body: String
+    var bodyUTF8ByteCount: Int
+
+    init(
+        sessionID: String,
+        turnID: String,
+        messageID: String,
+        attempt: Int,
+        body: String
+    ) {
+        self.sessionID = sessionID
+        self.turnID = turnID
+        self.messageID = messageID
+        self.attempt = attempt
+        self.body = AssistantLiveContentBounds.prefix(
+            body,
+            maxUTF8Bytes: AssistantLiveContentBounds.assistantTextBytes
+        )
+        bodyUTF8ByteCount = self.body.utf8.count
+    }
+
+    /// Builds a compatibility snapshot from the canonical live timeline
+    /// without re-bounding or re-scanning its already bounded body.
+    init(
+        sessionID: String,
+        turnID: String,
+        messageID: String,
+        attempt: Int,
+        boundedBody: String,
+        bodyUTF8ByteCount: Int
+    ) {
+        self.sessionID = sessionID
+        self.turnID = turnID
+        self.messageID = messageID
+        self.attempt = attempt
+        body = boundedBody
+        self.bodyUTF8ByteCount = bodyUTF8ByteCount
+    }
+}
+
+enum AssistantLiveContentBounds {
+    static let assistantTextBytes = 1_048_576
+    static let reasoningBytes = 262_144
+
+    static func prefix(_ value: String, maxUTF8Bytes: Int) -> String {
+        guard maxUTF8Bytes > 0 else { return "" }
+        guard value.utf8.count > maxUTF8Bytes else { return value }
+        var end = value.startIndex
+        var byteCount = 0
+        while end < value.endIndex {
+            let next = value.index(after: end)
+            let characterBytes = value[end ..< next].utf8.count
+            guard byteCount + characterBytes <= maxUTF8Bytes else { break }
+            byteCount += characterBytes
+            end = next
+        }
+        return String(value[..<end])
+    }
+
+    static func appending(
+        _ delta: String,
+        to body: String,
+        currentUTF8Bytes: Int,
+        maxUTF8Bytes: Int
+    ) -> (body: String, utf8Bytes: Int) {
+        let remaining = max(0, maxUTF8Bytes - currentUTF8Bytes)
+        guard remaining > 0, !delta.isEmpty else { return (body, currentUTF8Bytes) }
+        let suffix = prefix(delta, maxUTF8Bytes: remaining)
+        return (body + suffix, currentUTF8Bytes + suffix.utf8.count)
+    }
 }
 
 enum AssistantToolState: Equatable, Sendable { case running, completed, failed }
@@ -631,6 +709,80 @@ struct AssistantMessageDeltaEvent: Decodable, Sendable {
         case turnID = "turnId"
         case messageID = "messageId"
         case attempt, delta
+    }
+}
+
+struct AssistantThoughtSummaryEvent: Decodable, Equatable, Sendable {
+    let sessionID: String
+    let turnID: String
+    /// Monotonic across the whole turn. Older Engines only send this field;
+    /// newer Engines also expose the provider-local attempt for diagnostics.
+    let attempt: Int
+    let providerAttempt: Int?
+    let interactionOrdinal: Int?
+    let partID: String?
+    let partOrdinal: Int?
+    let isDelta: Bool?
+    let originalBytes: Int?
+    let truncated: Bool?
+    let content: String
+
+    var stableInteractionOrdinal: Int { interactionOrdinal ?? attempt }
+    var stablePartIdentity: String {
+        partID ?? "\(turnID)-\(stableInteractionOrdinal)-\(partOrdinal ?? 0)"
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case turnID = "turnId"
+        case attempt, providerAttempt, interactionOrdinal
+        case partID = "partId"
+        case partOrdinal, isDelta, originalBytes, truncated, content
+    }
+
+    init(
+        sessionID: String,
+        turnID: String,
+        attempt: Int,
+        providerAttempt: Int? = nil,
+        interactionOrdinal: Int? = nil,
+        partID: String? = nil,
+        partOrdinal: Int? = nil,
+        isDelta: Bool? = nil,
+        originalBytes: Int? = nil,
+        truncated: Bool? = nil,
+        content: String
+    ) {
+        self.sessionID = sessionID
+        self.turnID = turnID
+        self.attempt = attempt
+        self.providerAttempt = providerAttempt
+        self.interactionOrdinal = interactionOrdinal
+        self.partID = partID
+        self.partOrdinal = partOrdinal
+        self.isDelta = isDelta
+        self.originalBytes = originalBytes
+        self.truncated = truncated
+        self.content = content
+    }
+
+    func boundedForPresentation() -> Self {
+        Self(
+            sessionID: sessionID,
+            turnID: turnID,
+            attempt: attempt,
+            providerAttempt: providerAttempt,
+            interactionOrdinal: interactionOrdinal,
+            partID: partID,
+            partOrdinal: partOrdinal,
+            isDelta: isDelta,
+            originalBytes: originalBytes,
+            truncated: truncated,
+            content: AssistantLiveContentBounds.prefix(
+                content,
+                maxUTF8Bytes: AssistantLiveContentBounds.reasoningBytes
+            )
+        )
     }
 }
 struct AssistantMessageAppendedEvent: Decodable, Sendable {

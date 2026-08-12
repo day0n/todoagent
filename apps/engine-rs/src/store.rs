@@ -14,19 +14,30 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::adapters::{ProviderEvent, ProviderFrame, RecordedEventParser};
 use crate::models::{
     AssistantCompaction, AssistantContextHistory, AssistantHistory, AssistantMessage,
     AssistantSession, AssistantStep, AssistantToolExecution, AssistantToolResult,
     AssistantToolSummary, AssistantTurn, AssistantTurnStatus, Bootstrap, CreateTaskInput, List,
     MessageRole, QueuedAssistantTurn, QueuedTurn, Runtime, RuntimeKind, SessionBundle,
-    SessionMessage, SessionState, SessionTurn, Task, TaskAttachment, TaskSession, TaskState,
-    TaskStatus, TurnStatus, UpdateTaskInput,
+    SessionMessage, SessionState, SessionTimelineCursor, SessionTimelineItem, SessionTimelinePage,
+    SessionTurn, Task, TaskAttachment, TaskSession, TaskState, TaskStatus, TurnStatus,
+    UpdateTaskInput,
 };
 
 pub const SCHEMA_VERSION: i64 = 4;
 const SCHEMA_CHECKSUM: &str = "todoagent-native-v4-unified-task-time-and-attachments";
 const ASSISTANT_TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
 const ASSISTANT_FILTERED_TASK_PAGE_SIZE: usize = 50;
+const SESSION_TIMELINE_PARSER_VERSION: i64 = 2;
+const SESSION_TIMELINE_BACKFILL_TURN_BATCH: i64 = 32;
+const SESSION_TIMELINE_PAYLOAD_MAX_BYTES: usize = 256 * 1024;
+const SESSION_TIMELINE_TEXT_MAX_BYTES: usize = 1024 * 1024;
+const SESSION_TIMELINE_REASONING_MAX_BYTES: usize = 256 * 1024;
+const SESSION_TIMELINE_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const ASSISTANT_HISTORY_MESSAGE_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const ASSISTANT_HISTORY_DETAIL_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const ASSISTANT_HISTORY_PARTIAL_NOTICE_RESERVE_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -58,6 +69,25 @@ pub enum StoreError {
 }
 
 pub type StoreResult<T> = Result<T, StoreError>;
+
+#[derive(Debug, Clone)]
+pub struct AppliedTimelineMutation {
+    pub item: SessionTimelineItem,
+    pub is_update: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct AppliedProviderFrame {
+    pub messages: Vec<SessionMessage>,
+    pub timeline: Vec<AppliedTimelineMutation>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinishedSessionTurn {
+    pub bundle: SessionBundle,
+    pub timeline_mutations: Vec<SessionTimelineItem>,
+    pub timeline_fidelity: String,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentMutationOutcome {
@@ -1221,8 +1251,9 @@ impl Store {
             params![timestamp, session_id],
         )?;
         bump_revision(&transaction)?;
+        let turn = assistant_turn_connection(&transaction, turn_id)?.ok_or(StoreError::NotFound)?;
         transaction.commit()?;
-        self.assistant_turn(turn_id)?.ok_or(StoreError::NotFound)
+        Ok(turn)
     }
 
     #[allow(dead_code)]
@@ -1263,19 +1294,24 @@ impl Store {
             repair_code,
             repair_message,
         )?;
+        let final_output =
+            final_output.map(|value| bounded_utf8(value, SESSION_TIMELINE_TEXT_MAX_BYTES));
+        let error_message =
+            error_message.map(|value| bounded_utf8(value, SESSION_TIMELINE_PAYLOAD_MAX_BYTES));
         transaction.execute(
             "UPDATE assistant_turn SET status=?1,final_output=coalesce(?2,final_output),
              error_code=coalesce(?3,error_code),error_message=coalesce(?4,error_message),
              usage_json=coalesce(?5,usage_json),ended_at=coalesce(ended_at,?6),updated_at=?6 WHERE id=?7",
-            params![status.as_str(), final_output, error_code, error_message, usage_json, timestamp, turn_id],
+            params![status.as_str(), final_output.as_deref(), error_code, error_message.as_deref(), usage_json, timestamp, turn_id],
         )?;
         transaction.execute(
             "UPDATE chat_session SET updated_at=?1 WHERE id=?2",
             params![timestamp, session_id],
         )?;
         bump_revision(&transaction)?;
+        let turn = assistant_turn_connection(&transaction, turn_id)?.ok_or(StoreError::NotFound)?;
         transaction.commit()?;
-        self.assistant_turn(turn_id)?.ok_or(StoreError::NotFound)
+        Ok(turn)
     }
 
     /// Atomically terminalizes a non-successful turn and optionally appends one
@@ -1324,11 +1360,10 @@ impl Store {
             AssistantTurnStatus::Queued | AssistantTurnStatus::Running
         ) {
             if current == status {
+                let turn = assistant_turn_connection(&transaction, turn_id)?
+                    .ok_or(StoreError::NotFound)?;
                 transaction.commit()?;
-                return Ok((
-                    None,
-                    self.assistant_turn(turn_id)?.ok_or(StoreError::NotFound)?,
-                ));
+                return Ok((None, turn));
             }
             return Err(StoreError::Conflict("assistant_turn_already_finished"));
         }
@@ -1345,23 +1380,28 @@ impl Store {
         let message_id = if let Some((kind, body)) = visible_message {
             let id = Uuid::new_v4().to_string();
             let sequence = next_assistant_message_sequence(&transaction, session_id)?;
+            let (body, payload_json) = bounded_assistant_message_body("system", kind, body, None);
             transaction.execute(
-                "INSERT INTO chat_message(id,session_id,turn_id,sequence,role,kind,body,created_at,updated_at)
-                 VALUES(?1,?2,?3,?4,'system',?5,?6,?7,?7)",
-                params![id, session_id, turn_id, sequence, kind, body, timestamp],
+                "INSERT INTO chat_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at)
+                 VALUES(?1,?2,?3,?4,'system',?5,?6,?7,?8,?8)",
+                params![id, session_id, turn_id, sequence, kind, body, payload_json.as_deref(), timestamp],
             )?;
             Some(id)
         } else {
             None
         };
+        let final_output =
+            final_output.map(|value| bounded_utf8(value, SESSION_TIMELINE_TEXT_MAX_BYTES));
+        let error_message =
+            error_message.map(|value| bounded_utf8(value, SESSION_TIMELINE_PAYLOAD_MAX_BYTES));
         transaction.execute(
             "UPDATE assistant_turn SET status=?1,final_output=?2,error_code=?3,error_message=?4,
              usage_json=?5,ended_at=?6,updated_at=?6 WHERE id=?7",
             params![
                 status.as_str(),
-                final_output,
+                final_output.as_deref(),
                 error_code,
-                error_message,
+                error_message.as_deref(),
                 usage_json,
                 timestamp,
                 turn_id
@@ -1372,16 +1412,14 @@ impl Store {
             params![timestamp, session_id],
         )?;
         bump_revision(&transaction)?;
-        transaction.commit()?;
         let message = message_id
             .as_deref()
-            .map(|id| self.assistant_message(id))
+            .map(|id| assistant_message_connection(&transaction, id))
             .transpose()?
             .flatten();
-        Ok((
-            message,
-            self.assistant_turn(turn_id)?.ok_or(StoreError::NotFound)?,
-        ))
+        let turn = assistant_turn_connection(&transaction, turn_id)?.ok_or(StoreError::NotFound)?;
+        transaction.commit()?;
+        Ok((message, turn))
     }
 
     /// Atomically commits the final visible assistant message and the completed
@@ -1418,27 +1456,29 @@ impl Store {
             "tool_result_missing",
             "模型结束前工具调用没有返回结果，TodoAgent 已将其安全终止。",
         )?;
+        let (visible_text, text_metadata) =
+            bounded_assistant_message_body("todoagent", "text", text, None);
         let sequence = next_assistant_message_sequence(&transaction, session_id)?;
         transaction.execute(
-            "INSERT INTO chat_message(id,session_id,turn_id,sequence,role,kind,body,task_refs_json,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,'todoagent','text',?5,?6,?7,?7)",
-            params![id, session_id, turn_id, sequence, text, task_refs_json, timestamp],
+            "INSERT INTO chat_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,task_refs_json,created_at,updated_at)
+             VALUES(?1,?2,?3,?4,'todoagent','text',?5,?6,?7,?8,?8)",
+            params![id, session_id, turn_id, sequence, visible_text, text_metadata.as_deref(), task_refs_json, timestamp],
         )?;
         transaction.execute(
             "UPDATE assistant_turn SET status='completed',final_output=?1,error_code=NULL,error_message=NULL,
              usage_json=?2,ended_at=?3,updated_at=?3 WHERE id=?4",
-            params![text, usage_json, timestamp, turn_id],
+            params![visible_text, usage_json, timestamp, turn_id],
         )?;
         transaction.execute(
             "UPDATE chat_session SET updated_at=?1 WHERE id=?2",
             params![timestamp, session_id],
         )?;
         bump_revision(&transaction)?;
+        let message =
+            assistant_message_connection(&transaction, &id)?.ok_or(StoreError::NotFound)?;
+        let turn = assistant_turn_connection(&transaction, turn_id)?.ok_or(StoreError::NotFound)?;
         transaction.commit()?;
-        Ok((
-            self.assistant_message(&id)?.ok_or(StoreError::NotFound)?,
-            self.assistant_turn(turn_id)?.ok_or(StoreError::NotFound)?,
-        ))
+        Ok((message, turn))
     }
 
     #[allow(dead_code, clippy::too_many_arguments)]
@@ -1491,10 +1531,11 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
         let sequence = next_assistant_message_sequence(&transaction, session_id)?;
+        let (body, payload_json) = bounded_assistant_message_body(role, kind, body, payload_json);
         transaction.execute(
             "INSERT INTO chat_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,task_refs_json,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10)",
-            params![id, session_id, turn_id, sequence, role, kind, body, payload_json, task_refs_json, timestamp],
+            params![id, session_id, turn_id, sequence, role, kind, body, payload_json.as_deref(), task_refs_json, timestamp],
         )?;
         transaction.execute(
             "UPDATE chat_session SET updated_at=?1 WHERE id=?2",
@@ -1539,10 +1580,11 @@ impl Store {
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
         let sequence = next_assistant_step_sequence(&transaction, &session_id)?;
+        let payload_json = bounded_assistant_step_payload(kind, payload_json);
         transaction.execute(
             "INSERT INTO assistant_step(id,session_id,turn_id,sequence,interaction_ordinal,provider_step_index,kind,status,title,payload_json,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",
-            params![id, session_id, turn_id, sequence, interaction_ordinal, provider_step_index, kind, status, title, payload_json, timestamp],
+            params![id, session_id, turn_id, sequence, interaction_ordinal, provider_step_index, kind, status, title, payload_json.as_deref(), timestamp],
         )?;
         transaction.execute(
             "UPDATE chat_session SET updated_at=?1 WHERE id=?2",
@@ -1590,10 +1632,11 @@ impl Store {
             .iter()
             .map(|(kind, title, payload_json, provider_step_index)| {
                 let id = Uuid::new_v4().to_string();
+                let payload_json = bounded_assistant_step_payload(kind, *payload_json);
                 transaction.execute(
                     "INSERT INTO assistant_step(id,session_id,turn_id,sequence,interaction_ordinal,provider_step_index,kind,status,title,payload_json,created_at,updated_at)
                      VALUES(?1,?2,?3,?4,?5,?6,?7,'completed',?8,?9,?10,?10)",
-                    params![id, session_id, turn_id, sequence, interaction_ordinal, provider_step_index, kind, title, payload_json, timestamp],
+                    params![id, session_id, turn_id, sequence, interaction_ordinal, provider_step_index, kind, title, payload_json.as_deref(), timestamp],
                 )?;
                 sequence += 1;
                 Ok::<_, rusqlite::Error>(id)
@@ -1654,12 +1697,13 @@ impl Store {
 
         let (result, task_refs, did_mutate) = execute_builtin_tool(&transaction, name, &arguments)?;
         let result_json = bounded_tool_result_json(name, &result);
+        let stored_arguments_json = bounded_tool_request_json(name, arguments_json);
         let task_refs_json = task_refs.to_string();
         let timestamp = now();
         transaction.execute(
             "INSERT INTO assistant_tool_execution(id,session_id,turn_id,call_id,tool_name,request_json,response_json,task_refs_json,is_error,status,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,'completed',?9,?9)",
-            params![Uuid::new_v4().to_string(), session_id, turn_id, call_id, name, arguments_json, result_json, task_refs_json, timestamp],
+            params![Uuid::new_v4().to_string(), session_id, turn_id, call_id, name, stored_arguments_json, result_json, task_refs_json, timestamp],
         )?;
         if did_mutate {
             bump_task_data_revision(&transaction)?;
@@ -1805,6 +1849,7 @@ impl Store {
             }),
         );
         let task_refs_json = "[]".to_owned();
+        let stored_arguments_json = bounded_tool_request_json("delete_task", arguments_json);
         let timestamp = now();
         transaction.execute(
             "INSERT INTO assistant_tool_execution(id,session_id,turn_id,call_id,tool_name,request_json,response_json,task_refs_json,is_error,status,created_at,updated_at)
@@ -1814,7 +1859,7 @@ impl Store {
                 session_id,
                 turn_id,
                 call_id,
-                arguments_json,
+                stored_arguments_json,
                 result_json,
                 task_refs_json,
                 timestamp
@@ -1921,6 +1966,7 @@ impl Store {
         }
         let response_json =
             response_json.map(|response| bounded_tool_result_text(tool_name, response));
+        let request_json = bounded_tool_request_json(tool_name, request_json);
         let timestamp = now();
         let id = Uuid::new_v4().to_string();
         transaction.execute(
@@ -2049,16 +2095,13 @@ impl Store {
             .ok_or(StoreError::NotFound)?;
         let compaction = self.assistant_compaction(session_id)?;
         let limit = limit.clamp(1, 2000);
-        let mut messages = self.connection.prepare(
+        let mut messages_statement = self.connection.prepare(
             "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,task_refs_json,created_at,updated_at
              FROM chat_message WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
         )?;
-        let messages = messages
-            .query_map(
-                params![session_id, after_sequence, limit],
-                row_to_assistant_message,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut message_rows =
+            messages_statement.query(params![session_id, after_sequence, limit])?;
+        let messages = collect_bounded_assistant_message_rows(&mut message_rows)?;
         let active_turn = self.connection.query_row(
             "SELECT id,session_id,ordinal,user_message_id,model_id,attempt_count,status,final_output,usage_json,error_code,error_message,started_at,ended_at,created_at,updated_at
              FROM assistant_turn WHERE session_id=?1 AND status IN ('queued','running') ORDER BY ordinal DESC LIMIT 1",
@@ -2072,30 +2115,134 @@ impl Store {
         if let Some(turn) = active_turn.as_ref() {
             visible_turns.insert(turn.id.clone());
         }
-        let tools = if visible_turns.is_empty() {
-            Vec::new()
+        let visible_turns = visible_turns.into_iter().collect::<Vec<_>>();
+        let (steps, tools, turn_ordinals, mut detail_truncated) = if visible_turns.is_empty() {
+            (Vec::new(), Vec::new(), HashMap::new(), false)
         } else {
-            let visible_turns = visible_turns.into_iter().collect::<Vec<_>>();
             let placeholders = std::iter::repeat_n("?", visible_turns.len())
                 .collect::<Vec<_>>()
                 .join(",");
-            let sql = format!(
+            let steps_sql = format!(
+                "SELECT id,session_id,turn_id,sequence,interaction_ordinal,provider_step_index,kind,status,title,payload_json,created_at,updated_at
+                 FROM assistant_step
+                 WHERE session_id=? AND turn_id IN ({placeholders})
+                 ORDER BY sequence"
+            );
+            let mut steps_statement = self.connection.prepare(&steps_sql)?;
+            let arguments =
+                std::iter::once(session_id).chain(visible_turns.iter().map(String::as_str));
+            let mut step_rows = steps_statement.query(params_from_iter(arguments))?;
+            let mut detail_scan_bytes = 0_usize;
+            let mut detail_truncated = false;
+            let mut steps = Vec::new();
+            while let Some(row) = step_rows.next()? {
+                let step = row_to_assistant_step(row)?;
+                let step_bytes = serialized_wire_bytes(&step);
+                if detail_scan_bytes.saturating_add(step_bytes)
+                    > ASSISTANT_HISTORY_DETAIL_PAGE_MAX_BYTES
+                {
+                    detail_truncated = true;
+                    break;
+                }
+                detail_scan_bytes = detail_scan_bytes.saturating_add(step_bytes);
+                steps.push(step);
+            }
+
+            let tools_sql = format!(
                 "SELECT id,session_id,turn_id,call_id,tool_name,task_refs_json,is_error,status,created_at,updated_at
                  FROM assistant_tool_execution
                  WHERE session_id=? AND turn_id IN ({placeholders})
                  ORDER BY created_at,id"
             );
-            let mut tools_statement = self.connection.prepare(&sql)?;
+            let mut tools_statement = self.connection.prepare(&tools_sql)?;
             let arguments =
                 std::iter::once(session_id).chain(visible_turns.iter().map(String::as_str));
-            tools_statement
-                .query_map(params_from_iter(arguments), row_to_assistant_tool_summary)?
-                .collect::<Result<Vec<_>, _>>()?
+            let mut tool_rows = tools_statement.query(params_from_iter(arguments))?;
+            let mut tools = Vec::new();
+            while let Some(row) = tool_rows.next()? {
+                let tool = row_to_assistant_tool_summary(row)?;
+                let tool_bytes = serialized_wire_bytes(&tool);
+                if detail_scan_bytes.saturating_add(tool_bytes)
+                    > ASSISTANT_HISTORY_DETAIL_PAGE_MAX_BYTES
+                {
+                    detail_truncated = true;
+                    break;
+                }
+                detail_scan_bytes = detail_scan_bytes.saturating_add(tool_bytes);
+                tools.push(tool);
+            }
+
+            let turns_sql = format!(
+                "SELECT id,ordinal FROM assistant_turn WHERE session_id=? AND id IN ({placeholders})"
+            );
+            let mut turns_statement = self.connection.prepare(&turns_sql)?;
+            let arguments =
+                std::iter::once(session_id).chain(visible_turns.iter().map(String::as_str));
+            let turn_ordinals = turns_statement
+                .query_map(params_from_iter(arguments), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<Result<HashMap<_, _>, _>>()?;
+            (steps, tools, turn_ordinals, detail_truncated)
         };
+        let projected_timeline =
+            project_assistant_timeline(&messages, &steps, &tools, &turn_ordinals);
+        let detail_payload_budget = ASSISTANT_HISTORY_DETAIL_PAGE_MAX_BYTES
+            .saturating_sub(ASSISTANT_HISTORY_PARTIAL_NOTICE_RESERVE_BYTES);
+        // Swift treats a non-empty timeline as authoritative, so legacy messages
+        // cannot recover a final answer that was trimmed out here. Reserve every
+        // turn's user message, last assistant text, and terminal status/error
+        // before admitting reasoning/tool details. The legacy tools array is
+        // lowest priority and can never evict those essential transcript items.
+        let essential_ids = assistant_history_essential_timeline_ids(&projected_timeline);
+        let mut detail_response_bytes = projected_timeline
+            .iter()
+            .filter(|item| essential_ids.contains(&item.id))
+            .map(serialized_wire_bytes)
+            .fold(0_usize, usize::saturating_add);
+        if detail_response_bytes > detail_payload_budget {
+            detail_truncated = true;
+        }
+        let mut selected_ids = essential_ids.clone();
+        for item in &projected_timeline {
+            if selected_ids.contains(&item.id) {
+                continue;
+            }
+            let item_bytes = serialized_wire_bytes(&item);
+            if detail_response_bytes.saturating_add(item_bytes) > detail_payload_budget {
+                detail_truncated = true;
+                continue;
+            }
+            detail_response_bytes = detail_response_bytes.saturating_add(item_bytes);
+            selected_ids.insert(item.id.clone());
+        }
+        let mut bounded_tools = Vec::new();
+        for tool in tools {
+            let tool_bytes = serialized_wire_bytes(&tool);
+            if detail_response_bytes.saturating_add(tool_bytes) > detail_payload_budget {
+                detail_truncated = true;
+                continue;
+            }
+            detail_response_bytes = detail_response_bytes.saturating_add(tool_bytes);
+            bounded_tools.push(tool);
+        }
+        let mut timeline = projected_timeline
+            .into_iter()
+            .filter(|item| selected_ids.contains(&item.id))
+            .collect::<Vec<_>>();
+        if detail_truncated {
+            timeline.push(assistant_history_partial_notice(
+                &session,
+                active_turn.as_ref(),
+                &timeline,
+                after_sequence,
+            ));
+        }
         Ok(AssistantHistory {
             session,
             messages,
-            tools,
+            tools: bounded_tools,
+            timeline,
             active_turn,
             compaction,
         })
@@ -2156,21 +2303,28 @@ impl Store {
     }
 
     pub fn assistant_turn(&self, id: &str) -> StoreResult<Option<AssistantTurn>> {
-        Ok(self.connection.query_row(
-            "SELECT id,session_id,ordinal,user_message_id,model_id,attempt_count,status,final_output,usage_json,error_code,error_message,started_at,ended_at,created_at,updated_at
-             FROM assistant_turn WHERE id=?1",
-            [id],
-            row_to_assistant_turn,
-        ).optional()?)
+        assistant_turn_connection(&self.connection, id)
     }
 
     fn assistant_message(&self, id: &str) -> StoreResult<Option<AssistantMessage>> {
-        Ok(self.connection.query_row(
-            "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,task_refs_json,created_at,updated_at
-             FROM chat_message WHERE id=?1",
-            [id],
-            row_to_assistant_message,
-        ).optional()?)
+        assistant_message_connection(&self.connection, id)
+    }
+
+    pub fn assistant_final_message_for_turn(
+        &self,
+        turn_id: &str,
+    ) -> StoreResult<Option<AssistantMessage>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,task_refs_json,created_at,updated_at
+                 FROM chat_message
+                 WHERE turn_id=?1 AND role='todoagent' AND kind='text'
+                 ORDER BY sequence DESC LIMIT 1",
+                [turn_id],
+                row_to_assistant_message,
+            )
+            .optional()?)
     }
 
     fn assistant_message_for_client_id(
@@ -2277,6 +2431,7 @@ impl Store {
             |row| row.get(0),
         )?;
         let sequence = next_message_sequence(&transaction, &session_id)?;
+        let message_id = Uuid::new_v4().to_string();
         transaction.execute(
             "INSERT INTO session_turn(id,session_id,ordinal,user_message_id,provider_session_id_before,status,created_at)
              VALUES(?1,?2,?3,?4,?5,'queued',?6)",
@@ -2285,7 +2440,29 @@ impl Store {
         transaction.execute(
             "INSERT INTO session_message(id,session_id,turn_id,sequence,client_message_id,role,kind,body,created_at,updated_at)
              VALUES(?1,?2,?3,?4,?5,'user','text',?6,?7,?7)",
-            params![Uuid::new_v4().to_string(), session_id, turn_id, sequence, client_message_id, prompt, timestamp],
+            params![message_id, session_id, turn_id, sequence, client_message_id, prompt, timestamp],
+        )?;
+        insert_timeline_item(
+            &transaction,
+            NewTimelineItem {
+                id: format!("timeline-{message_id}"),
+                session_id: &session_id,
+                turn_id: &turn_id,
+                turn_ordinal: ordinal,
+                kind: "user",
+                body: prompt,
+                call_id: None,
+                tool_name: None,
+                input_json: None,
+                output_text: None,
+                tool_state: None,
+                is_error: false,
+                source_event_sequence: None,
+                source_block_index: None,
+                fidelity: "exact",
+                metadata_json: None,
+                timestamp: &timestamp,
+            },
         )?;
         transaction.execute(
             "UPDATE task_session SET state='queued',last_error_code=NULL,last_error_message=NULL,updated_at=?1 WHERE id=?2",
@@ -2352,6 +2529,7 @@ impl Store {
         self.turn(turn_id)?.ok_or(StoreError::NotFound)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_provider_session(
         &self,
         session_id: &str,
@@ -2420,45 +2598,31 @@ impl Store {
         ))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn append_agent_text(&self, turn_id: &str, chunk: &str) -> StoreResult<SessionMessage> {
         if chunk.is_empty() {
             return Err(StoreError::Invalid("message chunk is empty".to_owned()));
         }
         let transaction = self.connection.unchecked_transaction()?;
-        let session_id: String = transaction
+        let (session_id, turn_ordinal): (String, i64) = transaction
             .query_row(
-                "SELECT session_id FROM session_turn WHERE id=?1",
+                "SELECT session_id,ordinal FROM session_turn WHERE id=?1",
                 [turn_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()?
             .ok_or(StoreError::NotFound)?;
-        let existing: Option<String> = transaction.query_row(
-            "SELECT id FROM session_message WHERE turn_id=?1 AND role='agent' AND kind='text' ORDER BY sequence LIMIT 1",
-            [turn_id],
-            |row| row.get(0),
-        ).optional()?;
         let timestamp = now();
-        let id = if let Some(id) = existing {
-            transaction.execute(
-                "UPDATE session_message SET body=body||?1,updated_at=?2 WHERE id=?3",
-                params![chunk, timestamp, id],
-            )?;
-            id
-        } else {
-            let id = Uuid::new_v4().to_string();
-            let sequence = next_message_sequence(&transaction, &session_id)?;
-            transaction.execute(
-                "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,created_at,updated_at)
-                 VALUES(?1,?2,?3,?4,'agent','text',?5,?6,?6)",
-                params![id, session_id, turn_id, sequence, chunk, timestamp],
-            )?;
-            transaction.execute(
-                "UPDATE task_session SET last_agent_sequence=?1,updated_at=?2 WHERE id=?3",
-                params![sequence, timestamp, session_id],
-            )?;
-            id
-        };
+        let (id, _, _) = append_agent_text_in_transaction(
+            &transaction,
+            &session_id,
+            turn_id,
+            turn_ordinal,
+            chunk,
+            None,
+            None,
+            &timestamp,
+        )?;
         bump_revision(&transaction)?;
         transaction.commit()?;
         self.message(&id)?.ok_or(StoreError::NotFound)
@@ -2489,6 +2653,17 @@ impl Store {
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
             params![id, session_id, turn_id, sequence, role.as_str(), kind, body, payload_json, timestamp],
         )?;
+        mirror_legacy_message_to_timeline(
+            &transaction,
+            &id,
+            &session_id,
+            turn_id,
+            role,
+            kind,
+            body,
+            payload_json,
+            &timestamp,
+        )?;
         if role == MessageRole::Agent && kind == "text" {
             transaction.execute(
                 "UPDATE task_session SET last_agent_sequence=?1,updated_at=?2 WHERE id=?3",
@@ -2500,27 +2675,334 @@ impl Store {
         self.message(&id)?.ok_or(StoreError::NotFound)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn append_turn_event(
         &self,
         turn_id: &str,
         event_type: &str,
         payload: &Value,
     ) -> StoreResult<()> {
-        let payload = payload.to_string();
-        let payload = if payload.len() > 256 * 1024 {
-            &payload[..256 * 1024]
-        } else {
-            &payload
-        };
-        let sequence: i64 = self.connection.query_row(
-            "SELECT coalesce(max(sequence),0)+1 FROM turn_event WHERE turn_id=?1",
+        let transaction = self.connection.unchecked_transaction()?;
+        insert_turn_event(&transaction, turn_id, event_type, payload, &now())?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically stores a provider transport frame, its legacy projection and
+    /// the Chat V2 timeline projection. Callers must not publish returned UI
+    /// mutations until this method commits successfully.
+    pub fn apply_provider_frame(
+        &self,
+        turn_id: &str,
+        frame: ProviderFrame,
+    ) -> StoreResult<AppliedProviderFrame> {
+        self.apply_provider_frames(turn_id, vec![frame])
+    }
+
+    /// Persists a bounded ordered batch in one transaction. Each frame keeps
+    /// its own raw sequence and semantic block indices while the batch removes
+    /// per-token SQLite transaction overhead.
+    pub fn apply_provider_frames(
+        &self,
+        turn_id: &str,
+        frames: Vec<ProviderFrame>,
+    ) -> StoreResult<AppliedProviderFrame> {
+        if frames.is_empty() {
+            return Ok(AppliedProviderFrame {
+                messages: Vec::new(),
+                timeline: Vec::new(),
+            });
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let (session_id, turn_ordinal): (String, i64) = transaction
+            .query_row(
+                "SELECT session_id,ordinal FROM session_turn WHERE id=?1",
+                [turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let timestamp = now();
+        let mut has_semantic_events = false;
+        let mut message_ids = Vec::<String>::new();
+        let mut timeline_mutations = Vec::<(String, bool)>::new();
+        for frame in frames {
+            let (source_event_sequence, raw_truncated) =
+                match (frame.raw_kind.as_deref(), frame.raw_payload.as_ref()) {
+                    (Some(kind), Some(payload)) => {
+                        let (sequence, truncated) =
+                            insert_turn_event(&transaction, turn_id, kind, payload, &timestamp)?;
+                        (Some(sequence), truncated)
+                    }
+                    (None, None) => (None, false),
+                    _ => {
+                        return Err(StoreError::Invalid(
+                            "provider frame raw kind and payload must be paired".to_owned(),
+                        ));
+                    }
+                };
+            has_semantic_events |= !frame.events.is_empty();
+            for (block_index, event) in frame.events.into_iter().enumerate() {
+                let block_index = i64::try_from(block_index).unwrap_or(i64::MAX);
+                match event {
+                    ProviderEvent::SessionId(provider_session_id) => {
+                        transaction.execute(
+                        "UPDATE task_session SET provider_session_id=?1,updated_at=?2 WHERE id=?3",
+                        params![provider_session_id, timestamp, session_id],
+                    )?;
+                    }
+                    ProviderEvent::Text(text) => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let (message_id, timeline_id, is_update) =
+                            append_agent_text_in_transaction(
+                                &transaction,
+                                &session_id,
+                                turn_id,
+                                turn_ordinal,
+                                &text,
+                                source_event_sequence,
+                                Some(block_index),
+                                &timestamp,
+                            )?;
+                        record_once(&mut message_ids, message_id);
+                        record_timeline_mutation(&mut timeline_mutations, timeline_id, is_update);
+                    }
+                    ProviderEvent::Reasoning(reasoning) => {
+                        if reasoning.is_empty() {
+                            continue;
+                        }
+                        let (timeline_id, is_update) = append_reasoning_in_transaction(
+                            &transaction,
+                            &session_id,
+                            turn_id,
+                            turn_ordinal,
+                            &reasoning,
+                            source_event_sequence,
+                            Some(block_index),
+                            &timestamp,
+                        )?;
+                        record_timeline_mutation(&mut timeline_mutations, timeline_id, is_update);
+                    }
+                    ProviderEvent::ToolUse {
+                        name,
+                        call_id,
+                        input,
+                    } => {
+                        if name.trim().is_empty() || call_id.trim().is_empty() {
+                            return Err(StoreError::Invalid(
+                                "provider tool call requires name and callId".to_owned(),
+                            ));
+                        }
+                        let input_encoded = input.to_string();
+                        let input_truncated =
+                            input_encoded.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES;
+                        let bounded_input = if input_truncated {
+                            json!({
+                                "_todoagentTruncated": {
+                                    "originalBytes": input_encoded.len(),
+                                    "truncated": true
+                                }
+                            })
+                        } else {
+                            input
+                        };
+                        let payload = json!({
+                            "name":name,
+                            "callId":call_id,
+                            "input":bounded_input,
+                            "inputOriginalBytes":input_encoded.len(),
+                            "inputTruncated":input_truncated
+                        });
+                        let (message_id, timeline) = append_legacy_message_in_transaction(
+                            &transaction,
+                            &session_id,
+                            turn_id,
+                            MessageRole::Tool,
+                            "tool_call",
+                            &name,
+                            Some(&payload.to_string()),
+                            source_event_sequence,
+                            Some(block_index),
+                            &timestamp,
+                        )?;
+                        record_once(&mut message_ids, message_id);
+                        if let Some((timeline_id, is_update)) = timeline {
+                            record_timeline_mutation(
+                                &mut timeline_mutations,
+                                timeline_id,
+                                is_update,
+                            );
+                        }
+                    }
+                    ProviderEvent::ToolResult {
+                        name,
+                        call_id,
+                        output,
+                        is_error,
+                    } => {
+                        if call_id.trim().is_empty() {
+                            return Err(StoreError::Invalid(
+                                "provider tool result requires callId".to_owned(),
+                            ));
+                        }
+                        let output_original_bytes = output.len();
+                        let output_truncated =
+                            output_original_bytes > SESSION_TIMELINE_PAYLOAD_MAX_BYTES;
+                        let bounded_output =
+                            bounded_utf8(&output, SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
+                        let payload = json!({
+                            "name":name,
+                            "callId":call_id,
+                            "isError":is_error,
+                            "outputOriginalBytes":output_original_bytes,
+                            "outputTruncated":output_truncated
+                        });
+                        let (message_id, timeline) = append_legacy_message_in_transaction(
+                            &transaction,
+                            &session_id,
+                            turn_id,
+                            MessageRole::Tool,
+                            "tool_result",
+                            &bounded_output,
+                            Some(&payload.to_string()),
+                            source_event_sequence,
+                            Some(block_index),
+                            &timestamp,
+                        )?;
+                        record_once(&mut message_ids, message_id);
+                        if let Some((timeline_id, is_update)) = timeline {
+                            record_timeline_mutation(
+                                &mut timeline_mutations,
+                                timeline_id,
+                                is_update,
+                            );
+                        }
+                    }
+                    ProviderEvent::Status(status) => {
+                        if status.is_empty() {
+                            continue;
+                        }
+                        let (message_id, timeline) = append_legacy_message_in_transaction(
+                            &transaction,
+                            &session_id,
+                            turn_id,
+                            MessageRole::System,
+                            "status",
+                            &status,
+                            None,
+                            source_event_sequence,
+                            Some(block_index),
+                            &timestamp,
+                        )?;
+                        record_once(&mut message_ids, message_id);
+                        if let Some((timeline_id, is_update)) = timeline {
+                            record_timeline_mutation(
+                                &mut timeline_mutations,
+                                timeline_id,
+                                is_update,
+                            );
+                        }
+                    }
+                }
+            }
+            if let Some(raw_through_sequence) = source_event_sequence {
+                transaction.execute(
+                "INSERT INTO session_timeline_projection(turn_id,parser_version,raw_through_sequence,fidelity,updated_at)
+                 VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(turn_id) DO UPDATE SET parser_version=excluded.parser_version,
+                 raw_through_sequence=max(session_timeline_projection.raw_through_sequence,excluded.raw_through_sequence),
+                 fidelity=CASE
+                   WHEN session_timeline_projection.fidelity='failed' OR excluded.fidelity='failed'
+                   THEN 'failed'
+                   WHEN session_timeline_projection.fidelity='partial' OR excluded.fidelity='partial'
+                   THEN 'partial'
+                   ELSE 'exact'
+                 END,
+                 last_error=CASE
+                   WHEN session_timeline_projection.fidelity IN ('partial','failed')
+                   THEN session_timeline_projection.last_error
+                   ELSE NULL
+                 END,
+                 updated_at=excluded.updated_at",
+                params![
+                    turn_id,
+                    SESSION_TIMELINE_PARSER_VERSION,
+                    raw_through_sequence,
+                    if raw_truncated { "partial" } else { "exact" },
+                    timestamp
+                ],
+                )?;
+            }
+        }
+        if has_semantic_events {
+            bump_revision(&transaction)?;
+        }
+        let mut messages = Vec::with_capacity(message_ids.len());
+        for id in &message_ids {
+            messages.push(transaction.query_row(
+                "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
+                 FROM session_message WHERE id=?1",
+                [id],
+                row_to_message,
+            )?);
+        }
+        let mut timeline = Vec::with_capacity(timeline_mutations.len());
+        for (id, is_update) in &timeline_mutations {
+            let item = transaction.query_row(
+                &format!("{} WHERE id=?1", timeline_select()),
+                [id],
+                row_to_timeline_item,
+            )?;
+            timeline.push(AppliedTimelineMutation {
+                item,
+                is_update: *is_update,
+            });
+        }
+        transaction.commit()?;
+        Ok(AppliedProviderFrame { messages, timeline })
+    }
+
+    pub fn mark_timeline_projection_degraded(
+        &self,
+        turn_id: &str,
+        fidelity: &str,
+        error: &str,
+    ) -> StoreResult<()> {
+        if !matches!(fidelity, "partial" | "failed") {
+            return Err(StoreError::Invalid(
+                "timeline degradation fidelity must be partial or failed".to_owned(),
+            ));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let raw_through_sequence: i64 = transaction.query_row(
+            "SELECT coalesce(max(sequence),0) FROM turn_event WHERE turn_id=?1",
             [turn_id],
             |row| row.get(0),
         )?;
-        self.connection.execute(
-            "INSERT INTO turn_event(turn_id,sequence,type,payload,created_at) VALUES(?1,?2,?3,?4,?5)",
-            params![turn_id, sequence, event_type, payload, now()],
+        transaction.execute(
+            "INSERT INTO session_timeline_projection(
+               turn_id,parser_version,raw_through_sequence,fidelity,last_error,updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6)
+             ON CONFLICT(turn_id) DO UPDATE SET
+               parser_version=excluded.parser_version,
+               raw_through_sequence=max(session_timeline_projection.raw_through_sequence,excluded.raw_through_sequence),
+               fidelity=CASE
+                 WHEN session_timeline_projection.fidelity='failed' OR excluded.fidelity='failed'
+                 THEN 'failed' ELSE 'partial' END,
+               last_error=excluded.last_error,
+               updated_at=excluded.updated_at",
+            params![
+                turn_id,
+                SESSION_TIMELINE_PARSER_VERSION,
+                raw_through_sequence,
+                fidelity,
+                bounded_utf8(error, 4096),
+                now(),
+            ],
         )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -2535,7 +3017,7 @@ impl Store {
         error_code: Option<&str>,
         error_message: Option<&str>,
         provider_usage_json: Option<&str>,
-    ) -> StoreResult<SessionBundle> {
+    ) -> StoreResult<FinishedSessionTurn> {
         let transaction = self.connection.unchecked_transaction()?;
         let session_id: String = transaction
             .query_row(
@@ -2546,6 +3028,16 @@ impl Store {
             .optional()?
             .ok_or(StoreError::NotFound)?;
         let timestamp = now();
+        let mut terminal_timeline_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM session_timeline_item
+                 WHERE turn_id=?1 AND kind='tool' AND tool_state='running'
+                 ORDER BY item_ordinal",
+            )?;
+            statement
+                .query_map([turn_id], |row| row.get::<_, String>(0))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
         transaction.execute(
             "UPDATE session_turn SET status=?1,exit_code=?2,final_output=?3,provider_session_id_after=?4,
              error_code=?5,error_message=?6,provider_usage_json=?7,ended_at=?8 WHERE id=?9",
@@ -2569,9 +3061,115 @@ impl Store {
                 session_id
             ],
         )?;
+        transaction.execute(
+            "UPDATE session_timeline_item
+             SET tool_state=?1,is_error=?2,updated_at=?3
+             WHERE turn_id=?4 AND kind='tool' AND tool_state='running'",
+            params![
+                if status == TurnStatus::Failed {
+                    "failed"
+                } else {
+                    "interrupted"
+                },
+                i64::from(status == TurnStatus::Failed),
+                timestamp,
+                turn_id,
+            ],
+        )?;
+        if status != TurnStatus::Completed {
+            let (kind, default_body) = if status == TurnStatus::Failed {
+                ("error", "本轮执行失败。")
+            } else {
+                ("status", "已取消本轮执行。")
+            };
+            let original_body = error_message.unwrap_or(default_body);
+            let body = bounded_utf8(original_body, SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
+            let payload = json!({
+                "terminal": true,
+                "turnStatus": status.as_str(),
+                "originalBytes": original_body.len(),
+                "truncated": original_body.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES,
+            })
+            .to_string();
+            let message_id = format!("terminal-{turn_id}");
+            let existing: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_message WHERE id=?1)",
+                [&message_id],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )?;
+            if existing {
+                transaction.execute(
+                    "UPDATE session_message
+                     SET role='system',kind=?1,body=?2,payload_json=?3,updated_at=?4
+                     WHERE id=?5",
+                    params![kind, body, payload, timestamp, message_id],
+                )?;
+            } else {
+                let sequence = next_message_sequence(&transaction, &session_id)?;
+                transaction.execute(
+                    "INSERT INTO session_message(
+                       id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at
+                     ) VALUES(?1,?2,?3,?4,'system',?5,?6,?7,?8,?8)",
+                    params![
+                        message_id,
+                        session_id,
+                        turn_id,
+                        sequence,
+                        kind,
+                        body,
+                        payload,
+                        timestamp,
+                    ],
+                )?;
+            }
+            mirror_legacy_message_to_timeline(
+                &transaction,
+                &message_id,
+                &session_id,
+                turn_id,
+                MessageRole::System,
+                kind,
+                &body,
+                Some(&payload),
+                &timestamp,
+            )?;
+            terminal_timeline_ids.push(format!("timeline-{message_id}"));
+        }
         bump_revision(&transaction)?;
+        // Build the terminal DTOs from the same transaction before commit. If
+        // any authoritative read fails, dropping the transaction rolls the
+        // terminal state back instead of committing a state the caller cannot
+        // publish or reconcile.
+        let bundle = session_bundle_for_turn_connection(&transaction, &session_id, turn_id, 1000)?;
+        let timeline_mutations = terminal_timeline_ids
+            .iter()
+            .map(|id| timeline_item_connection(&transaction, id)?.ok_or(StoreError::NotFound))
+            .collect::<StoreResult<Vec<_>>>()?;
+        let timeline_fidelity = transaction
+            .query_row(
+                "SELECT fidelity FROM session_timeline_projection WHERE turn_id=?1",
+                [turn_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| "partial".to_owned());
         transaction.commit()?;
-        self.session_bundle(&session_id, 0, 1000)
+        Ok(FinishedSessionTurn {
+            bundle,
+            timeline_mutations,
+            timeline_fidelity,
+        })
+    }
+
+    pub fn turn_has_agent_text(&self, turn_id: &str) -> StoreResult<bool> {
+        Ok(self.connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_message
+               WHERE turn_id=?1 AND role='agent' AND kind='text'
+             )",
+            [turn_id],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?)
     }
 
     pub fn session_bundle(
@@ -2603,6 +3201,626 @@ impl Store {
             messages,
             active_turn,
         })
+    }
+
+    /// Persists provider-exposed reasoning without forcing it through the
+    /// legacy session_message CHECK constraint. Adjacent reasoning chunks share
+    /// one stable timeline item; any intervening semantic item starts a new one.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn append_reasoning(&self, turn_id: &str, chunk: &str) -> StoreResult<SessionTimelineItem> {
+        if chunk.is_empty() {
+            return Err(StoreError::Invalid("reasoning chunk is empty".to_owned()));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let (session_id, turn_ordinal): (String, i64) = transaction
+            .query_row(
+                "SELECT session_id,ordinal FROM session_turn WHERE id=?1",
+                [turn_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .ok_or(StoreError::NotFound)?;
+        let timestamp = now();
+        let (id, _) = append_reasoning_in_transaction(
+            &transaction,
+            &session_id,
+            turn_id,
+            turn_ordinal,
+            chunk,
+            None,
+            None,
+            &timestamp,
+        )?;
+        transaction.commit()?;
+        self.timeline_item(&id)?.ok_or(StoreError::NotFound)
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn session_timeline(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        limit: i64,
+    ) -> StoreResult<SessionTimelinePage> {
+        self.session_timeline_page(session_id, after_sequence, None, limit)
+    }
+
+    pub fn session_timeline_page(
+        &self,
+        session_id: &str,
+        after_sequence: i64,
+        after_cursor: Option<&SessionTimelineCursor>,
+        limit: i64,
+    ) -> StoreResult<SessionTimelinePage> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        self.backfill_legacy_timeline(
+            &session_id,
+            after_cursor.map(|cursor| cursor.turn_ordinal),
+            SESSION_TIMELINE_BACKFILL_TURN_BATCH,
+        )?;
+        let session = self.session(&session_id)?.ok_or(StoreError::NotFound)?;
+        let items = if let Some(cursor) = after_cursor {
+            let mut statement = self.connection.prepare(&format!(
+                "{} WHERE session_id=?1 AND
+                 (turn_ordinal>?2 OR (turn_ordinal=?2 AND item_ordinal>?3))
+                 ORDER BY turn_ordinal,item_ordinal LIMIT ?4",
+                timeline_select()
+            ))?;
+            let mut rows = statement.query(params![
+                session_id,
+                cursor.turn_ordinal,
+                cursor.item_ordinal,
+                limit.clamp(1, 2000)
+            ])?;
+            collect_bounded_timeline_rows(&mut rows)?
+        } else if after_sequence > 0 {
+            let mut statement = self.connection.prepare(&format!(
+                "{} WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
+                timeline_select()
+            ))?;
+            let mut rows =
+                statement.query(params![session_id, after_sequence, limit.clamp(1, 2000)])?;
+            collect_bounded_timeline_rows(&mut rows)?
+        } else {
+            // Chat V2 pages are authoritative in turn/item order from the
+            // first page onward. Sequence remains accepted only as an explicit
+            // legacy continuation cursor, because repairing an early turn can
+            // allocate a high sequence that must not jump behind later turns.
+            let mut statement = self.connection.prepare(&format!(
+                "{} WHERE session_id=?1 ORDER BY turn_ordinal,item_ordinal LIMIT ?2",
+                timeline_select()
+            ))?;
+            let mut rows = statement.query(params![session_id, limit.clamp(1, 2000)])?;
+            collect_bounded_timeline_rows(&mut rows)?
+        };
+        let next_sequence = items
+            .iter()
+            .map(|item| item.sequence)
+            .max()
+            .unwrap_or(after_sequence);
+        let next_cursor = items.last().map(|item| SessionTimelineCursor {
+            turn_ordinal: item.turn_ordinal,
+            item_ordinal: item.item_ordinal,
+        });
+        let active_turn = self.connection.query_row(
+            "SELECT id,session_id,ordinal,user_message_id,provider_session_id_before,provider_session_id_after,status,
+             exit_code,final_output,error_code,error_message,provider_usage_json,started_at,ended_at,created_at
+             FROM session_turn WHERE session_id=?1 AND status IN ('queued','running') ORDER BY ordinal DESC LIMIT 1",
+            [&session_id],
+            row_to_turn,
+        ).optional()?;
+        let pending_backfill: bool = self.connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_turn turn_row
+               WHERE turn_row.session_id=?1
+                 AND turn_row.status NOT IN ('queued','running')
+                 AND NOT EXISTS(
+                   SELECT 1 FROM session_timeline_projection projection
+                   WHERE projection.turn_id=turn_row.id
+                     AND projection.parser_version=?2
+                     AND (projection.last_error IS NULL
+                          OR projection.last_error='preserved_unreplayable')
+                     AND projection.raw_through_sequence>=(
+                       SELECT coalesce(max(raw.sequence),0) FROM turn_event raw WHERE raw.turn_id=turn_row.id
+                     )
+                     AND EXISTS(SELECT 1 FROM session_timeline_item item WHERE item.turn_id=turn_row.id)
+                 )
+             )",
+            params![session_id, SESSION_TIMELINE_PARSER_VERSION],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        let degraded_projection: bool = self.connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM session_timeline_projection projection
+               JOIN session_turn turn_row ON turn_row.id=projection.turn_id
+               WHERE turn_row.session_id=?1 AND projection.fidelity IN ('partial','failed')
+             )",
+            [&session_id],
+            |row| row.get::<_, i64>(0).map(|value| value != 0),
+        )?;
+        let has_more_items: bool = if let Some(cursor) = next_cursor.as_ref() {
+            self.connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM session_timeline_item
+                   WHERE session_id=?1 AND
+                     (turn_ordinal>?2 OR (turn_ordinal=?2 AND item_ordinal>?3))
+                 )",
+                params![session_id, cursor.turn_ordinal, cursor.item_ordinal],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )?
+        } else {
+            false
+        };
+        let fidelity = if pending_backfill || degraded_projection {
+            "partial"
+        } else if items.iter().all(|item| item.fidelity == "exact") {
+            "exact"
+        } else if items.iter().all(|item| item.fidelity == "legacy") {
+            "legacy"
+        } else {
+            "mixed"
+        };
+        Ok(SessionTimelinePage {
+            session,
+            items,
+            active_turn,
+            next_sequence,
+            next_cursor,
+            has_more: pending_backfill || has_more_items,
+            fidelity: fidelity.to_owned(),
+        })
+    }
+
+    pub fn session_timeline_turn_page(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        after_cursor: Option<&SessionTimelineCursor>,
+        limit: i64,
+    ) -> StoreResult<SessionTimelinePage> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let turn_id = canonical_uuid(turn_id, "turnId")?;
+        let session = self.session(&session_id)?.ok_or(StoreError::NotFound)?;
+        let turn = self.turn(&turn_id)?.ok_or(StoreError::NotFound)?;
+        if turn.session_id != session_id {
+            return Err(StoreError::NotFound);
+        }
+        if after_cursor.is_some_and(|cursor| cursor.turn_ordinal != turn.ordinal) {
+            return Err(StoreError::Invalid(
+                "timeline cursor does not belong to the requested turn".to_owned(),
+            ));
+        }
+        if !matches!(turn.status, TurnStatus::Queued | TurnStatus::Running) {
+            let needs_backfill: bool = self.connection.query_row(
+                "SELECT NOT EXISTS(
+                   SELECT 1 FROM session_timeline_projection projection
+                   WHERE projection.turn_id=?1
+                     AND projection.parser_version=?2
+                     AND (projection.last_error IS NULL
+                          OR projection.last_error='preserved_unreplayable')
+                     AND projection.raw_through_sequence>=(
+                       SELECT coalesce(max(raw.sequence),0) FROM turn_event raw WHERE raw.turn_id=?1
+                     )
+                     AND EXISTS(SELECT 1 FROM session_timeline_item item WHERE item.turn_id=?1)
+                 )",
+                params![turn_id, SESSION_TIMELINE_PARSER_VERSION],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )?;
+            if needs_backfill {
+                self.backfill_legacy_timeline(&session_id, Some(turn.ordinal), 1)?;
+            }
+        }
+        let mut statement = self.connection.prepare(&format!(
+            "{} WHERE session_id=?1 AND turn_id=?2 AND item_ordinal>?3
+             ORDER BY item_ordinal LIMIT ?4",
+            timeline_select()
+        ))?;
+        let mut rows = statement.query(params![
+            session_id,
+            turn_id,
+            after_cursor.map_or(-1, |cursor| cursor.item_ordinal),
+            limit.clamp(1, 500)
+        ])?;
+        let items = collect_bounded_timeline_rows(&mut rows)?;
+        let next_sequence = items.iter().map(|item| item.sequence).max().unwrap_or(0);
+        let next_cursor = items.last().map(|item| SessionTimelineCursor {
+            turn_ordinal: item.turn_ordinal,
+            item_ordinal: item.item_ordinal,
+        });
+        let fidelity = self
+            .connection
+            .query_row(
+                "SELECT fidelity FROM session_timeline_projection WHERE turn_id=?1",
+                [&turn_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .unwrap_or_else(|| {
+                if items.iter().all(|item| item.fidelity == "exact") {
+                    "exact".to_owned()
+                } else {
+                    "partial".to_owned()
+                }
+            });
+        let active_turn =
+            matches!(turn.status, TurnStatus::Queued | TurnStatus::Running).then_some(turn);
+        let has_more = if let Some(cursor) = next_cursor.as_ref() {
+            self.connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM session_timeline_item
+                   WHERE session_id=?1 AND turn_id=?2 AND item_ordinal>?3
+                 )",
+                params![session_id, turn_id, cursor.item_ordinal],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )?
+        } else {
+            false
+        };
+        Ok(SessionTimelinePage {
+            session,
+            items,
+            active_turn,
+            next_sequence,
+            next_cursor,
+            has_more,
+            fidelity,
+        })
+    }
+
+    fn timeline_item(&self, id: &str) -> StoreResult<Option<SessionTimelineItem>> {
+        timeline_item_connection(&self.connection, id)
+    }
+
+    fn backfill_legacy_timeline(
+        &self,
+        session_id: &str,
+        minimum_turn_ordinal: Option<i64>,
+        turn_limit: i64,
+    ) -> StoreResult<()> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let runtime_value: String = transaction.query_row(
+            "SELECT runtime_kind FROM task_session WHERE id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let runtime = RuntimeKind::parse(&runtime_value).ok_or(rusqlite::Error::InvalidQuery)?;
+        let mut turn_statement = transaction.prepare(
+            "SELECT turn_row.id,turn_row.ordinal,turn_row.status FROM session_turn turn_row
+             WHERE turn_row.session_id=?1 AND turn_row.ordinal>=?2
+               AND turn_row.status NOT IN ('queued','running')
+               AND NOT EXISTS(
+                 SELECT 1 FROM session_timeline_projection projection
+                 WHERE projection.turn_id=turn_row.id
+                   AND projection.parser_version=?4
+                   AND (projection.last_error IS NULL
+                        OR projection.last_error='preserved_unreplayable')
+                   AND projection.raw_through_sequence>=(
+                     SELECT coalesce(max(raw.sequence),0) FROM turn_event raw WHERE raw.turn_id=turn_row.id
+                   )
+                   AND EXISTS(SELECT 1 FROM session_timeline_item item WHERE item.turn_id=turn_row.id)
+               )
+             ORDER BY turn_row.ordinal LIMIT ?3",
+        )?;
+        let turns = turn_statement
+            .query_map(
+                params![
+                    session_id,
+                    minimum_turn_ordinal.unwrap_or(0),
+                    turn_limit.clamp(1, SESSION_TIMELINE_BACKFILL_TURN_BATCH),
+                    SESSION_TIMELINE_PARSER_VERSION,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(turn_statement);
+
+        for (turn_id, turn_ordinal, turn_status) in turns {
+            let mut message_statement = transaction.prepare(
+                "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
+                 FROM session_message WHERE turn_id=?1 ORDER BY sequence",
+            )?;
+            let messages = message_statement
+                .query_map([&turn_id], row_to_message)?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(message_statement);
+
+            let mut raw_statement = transaction.prepare(
+                "SELECT sequence,payload,created_at FROM turn_event WHERE turn_id=?1 ORDER BY sequence",
+            )?;
+            let raw_events = raw_statement
+                .query_map([&turn_id], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(raw_statement);
+
+            let existing_non_user_count: i64 = transaction.query_row(
+                "SELECT count(*) FROM session_timeline_item WHERE turn_id=?1 AND kind<>'user'",
+                [&turn_id],
+                |row| row.get(0),
+            )?;
+            let existing_items_are_legacy: bool = transaction.query_row(
+                "SELECT NOT EXISTS(
+                   SELECT 1 FROM session_timeline_item
+                   WHERE turn_id=?1 AND kind<>'user'
+                     AND (fidelity<>'legacy' OR source_event_sequence IS NOT NULL)
+                 )",
+                [&turn_id],
+                |row| row.get::<_, i64>(0).map(|value| value != 0),
+            )?;
+            let (existing_requires_text, existing_requires_reasoning): (bool, bool) = transaction
+                .query_row(
+                    "SELECT
+                       EXISTS(SELECT 1 FROM session_timeline_item WHERE turn_id=?1 AND kind='assistant_text'),
+                       EXISTS(SELECT 1 FROM session_timeline_item WHERE turn_id=?1 AND kind='reasoning')",
+                    [&turn_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)? != 0,
+                            row.get::<_, i64>(1)? != 0,
+                        ))
+                    },
+                )?;
+            let existing_projection_parser: Option<i64> = transaction
+                .query_row(
+                    "SELECT parser_version FROM session_timeline_projection WHERE turn_id=?1",
+                    [&turn_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let mut replay_parser = RecordedEventParser::new(runtime);
+            let mut raw_replayable = !raw_events.is_empty();
+            let mut replayed_raw_events = Vec::with_capacity(raw_events.len());
+            for (event_sequence, payload, timestamp) in &raw_events {
+                let value = match serde_json::from_str::<Value>(payload) {
+                    Ok(value) if value.get("_todoagentRaw").is_none() => value,
+                    _ => {
+                        raw_replayable = false;
+                        continue;
+                    }
+                };
+                replayed_raw_events.push((
+                    *event_sequence,
+                    timestamp.clone(),
+                    replay_parser.parse(value),
+                ));
+            }
+            let replayed_events = replayed_raw_events
+                .iter()
+                .flat_map(|(_, _, events)| events.iter())
+                .collect::<Vec<_>>();
+            let candidate_has_semantics = replayed_events
+                .iter()
+                .any(|event| !matches!(event, ProviderEvent::SessionId(_)));
+            let candidate_has_text = replayed_events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Text(_)));
+            let candidate_has_reasoning = replayed_events
+                .iter()
+                .any(|event| matches!(event, ProviderEvent::Reasoning(_)));
+            let unwatermarked_candidate_preserves_semantic_kinds = candidate_has_semantics
+                && (!existing_requires_text || candidate_has_text)
+                && (!existing_requires_reasoning || candidate_has_reasoning);
+            // A read must never destroy semantic items that may be the only
+            // surviving copy of provider-exposed reasoning. Replace an old
+            // projection only when every raw frame can be replayed, or when
+            // there is no non-user projection to preserve.
+            let replace_projection = existing_non_user_count == 0
+                || (!raw_events.is_empty()
+                    && raw_replayable
+                    && (existing_projection_parser == Some(SESSION_TIMELINE_PARSER_VERSION)
+                        || existing_items_are_legacy
+                        || (existing_projection_parser.is_none()
+                            && unwatermarked_candidate_preserves_semantic_kinds)));
+            if replace_projection && !raw_events.is_empty() {
+                transaction.execute(
+                    "DELETE FROM session_timeline_item WHERE turn_id=?1 AND kind<>'user'",
+                    [&turn_id],
+                )?;
+            }
+
+            let user_message = messages
+                .iter()
+                .find(|message| message.role == MessageRole::User && message.kind == "text");
+            if let Some(message) = user_message {
+                let user_id = format!("timeline-{}", message.id);
+                let user_exists: bool = transaction.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM session_timeline_item WHERE id=?1)",
+                    [&user_id],
+                    |row| row.get::<_, i64>(0).map(|value| value != 0),
+                )?;
+                if !user_exists {
+                    insert_timeline_item(
+                        &transaction,
+                        NewTimelineItem {
+                            id: user_id,
+                            session_id,
+                            turn_id: &turn_id,
+                            turn_ordinal,
+                            kind: "user",
+                            body: &message.body,
+                            call_id: None,
+                            tool_name: None,
+                            input_json: None,
+                            output_text: None,
+                            tool_state: None,
+                            is_error: false,
+                            source_event_sequence: None,
+                            source_block_index: None,
+                            fidelity: if raw_events.is_empty() {
+                                "legacy"
+                            } else {
+                                "exact"
+                            },
+                            metadata_json: message.payload_json.as_deref(),
+                            timestamp: &message.created_at,
+                        },
+                    )?;
+                }
+            }
+
+            let (raw_through_sequence, mut fidelity) = if raw_events.is_empty() {
+                for message in &messages {
+                    if message.role == MessageRole::User && message.kind == "text" {
+                        continue;
+                    }
+                    match (message.role, message.kind.as_str()) {
+                        (MessageRole::Agent, "text") => {
+                            insert_legacy_agent_text_if_missing(
+                                &transaction,
+                                session_id,
+                                &turn_id,
+                                turn_ordinal,
+                                message,
+                            )?;
+                        }
+                        _ => mirror_legacy_message_to_timeline(
+                            &transaction,
+                            &message.id,
+                            session_id,
+                            &turn_id,
+                            message.role,
+                            &message.kind,
+                            &message.body,
+                            message.payload_json.as_deref(),
+                            &message.created_at,
+                        )?,
+                    }
+                }
+                (
+                    0,
+                    if existing_non_user_count == 0 {
+                        "legacy"
+                    } else {
+                        "partial"
+                    },
+                )
+            } else if replace_projection {
+                let raw_through = raw_events.last().map_or(0, |event| event.0);
+                for (event_sequence, timestamp, events) in replayed_raw_events {
+                    for (block_index, event) in events.into_iter().enumerate() {
+                        mirror_replayed_provider_event(
+                            &transaction,
+                            session_id,
+                            &turn_id,
+                            turn_ordinal,
+                            event_sequence,
+                            i64::try_from(block_index).unwrap_or(i64::MAX),
+                            event,
+                            &timestamp,
+                        )?;
+                    }
+                }
+                (
+                    raw_through,
+                    if raw_replayable { "exact" } else { "partial" },
+                )
+            } else {
+                (raw_events.last().map_or(0, |event| event.0), "partial")
+            };
+
+            let assistant_text_count: i64 = transaction.query_row(
+                "SELECT count(*) FROM session_timeline_item
+                 WHERE turn_id=?1 AND kind='assistant_text'",
+                [&turn_id],
+                |row| row.get(0),
+            )?;
+            if !raw_events.is_empty() && (fidelity != "exact" || assistant_text_count == 0) {
+                // A partially understood raw stream may still contain a valid
+                // tool frame. Merge missing legacy assistant text by stable
+                // message ID instead of treating any visible item as proof the
+                // textual projection is complete.
+                let mut inserted_legacy_text = false;
+                for message in &messages {
+                    if message.role == MessageRole::Agent && message.kind == "text" {
+                        inserted_legacy_text |= insert_legacy_agent_text_if_missing(
+                            &transaction,
+                            session_id,
+                            &turn_id,
+                            turn_ordinal,
+                            message,
+                        )?;
+                    }
+                }
+                if inserted_legacy_text && fidelity == "exact" {
+                    fidelity = "partial";
+                }
+            }
+            if !raw_events.is_empty() {
+                // Raw frames are authoritative for text/reasoning order. Legacy
+                // tool and terminal status/error rows fill gaps left by older
+                // non-atomic writers and are idempotent by call/message ID.
+                for message in &messages {
+                    if matches!(message.role, MessageRole::Tool | MessageRole::System) {
+                        mirror_legacy_message_to_timeline(
+                            &transaction,
+                            &message.id,
+                            session_id,
+                            &turn_id,
+                            message.role,
+                            &message.kind,
+                            &message.body,
+                            message.payload_json.as_deref(),
+                            &message.created_at,
+                        )?;
+                    }
+                }
+            }
+            if matches!(
+                turn_status.as_str(),
+                "completed" | "cancelled" | "interrupted" | "failed"
+            ) {
+                transaction.execute(
+                    "UPDATE session_timeline_item
+                     SET tool_state=?1,is_error=?2,updated_at=?3
+                     WHERE turn_id=?4 AND kind='tool' AND tool_state='running'",
+                    params![
+                        if turn_status == "failed" {
+                            "failed"
+                        } else {
+                            "interrupted"
+                        },
+                        i64::from(turn_status == "failed"),
+                        now(),
+                        turn_id,
+                    ],
+                )?;
+            }
+            // The preserved marker records that the current parser was attempted
+            // without claiming raw replay. This also lets a v1 projection converge
+            // under v2 while a future v3 can retry.
+            let projected_parser_version = SESSION_TIMELINE_PARSER_VERSION;
+            let projection_last_error = (!(replace_projection
+                || raw_events.is_empty() && existing_non_user_count == 0))
+                .then_some("preserved_unreplayable");
+            transaction.execute(
+                "INSERT INTO session_timeline_projection(turn_id,parser_version,raw_through_sequence,fidelity,last_error,updated_at)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(turn_id) DO UPDATE SET parser_version=excluded.parser_version,
+                 raw_through_sequence=excluded.raw_through_sequence,
+                 fidelity=excluded.fidelity,last_error=excluded.last_error,updated_at=excluded.updated_at",
+                params![
+                    turn_id,
+                    projected_parser_version,
+                    raw_through_sequence,
+                    fidelity,
+                    projection_last_error,
+                    now()
+                ],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     pub fn session_for_task(&self, task_id: &str) -> StoreResult<Option<TaskSession>> {
@@ -2734,10 +3952,29 @@ impl Store {
                 params![timestamp, turn_id],
             )?;
             let sequence = next_message_sequence(&transaction, session_id)?;
+            let message_id = Uuid::new_v4().to_string();
+            let body = "TodoAgent 上次退出时本轮仍在运行，请重新发送消息继续。";
             transaction.execute(
                 "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,created_at,updated_at)
                  VALUES(?1,?2,?3,?4,'system','error','TodoAgent 上次退出时本轮仍在运行，请重新发送消息继续。',?5,?5)",
-                params![Uuid::new_v4().to_string(), session_id, turn_id, sequence, timestamp],
+                params![message_id, session_id, turn_id, sequence, timestamp],
+            )?;
+            mirror_legacy_message_to_timeline(
+                &transaction,
+                &message_id,
+                session_id,
+                turn_id,
+                MessageRole::System,
+                "error",
+                body,
+                None,
+                &timestamp,
+            )?;
+            transaction.execute(
+                "UPDATE session_timeline_item
+                 SET tool_state='interrupted',is_error=0,updated_at=?1
+                 WHERE turn_id=?2 AND kind='tool' AND tool_state='running'",
+                params![timestamp, turn_id],
             )?;
             transaction.execute(
                 "UPDATE task_session SET state='failed',last_error_code='engine_interrupted',
@@ -3086,6 +4323,1442 @@ fn next_message_sequence(transaction: &Transaction<'_>, session_id: &str) -> rus
         [session_id],
         |row| row.get(0),
     )
+}
+
+struct NewTimelineItem<'a> {
+    id: String,
+    session_id: &'a str,
+    turn_id: &'a str,
+    turn_ordinal: i64,
+    kind: &'a str,
+    body: &'a str,
+    call_id: Option<&'a str>,
+    tool_name: Option<&'a str>,
+    input_json: Option<&'a str>,
+    output_text: Option<&'a str>,
+    tool_state: Option<&'a str>,
+    is_error: bool,
+    source_event_sequence: Option<i64>,
+    source_block_index: Option<i64>,
+    fidelity: &'a str,
+    metadata_json: Option<&'a str>,
+    timestamp: &'a str,
+}
+
+fn next_timeline_sequence(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+) -> rusqlite::Result<i64> {
+    transaction.query_row(
+        "SELECT coalesce(max(sequence),0)+1 FROM session_timeline_item WHERE session_id=?1",
+        [session_id],
+        |row| row.get(0),
+    )
+}
+
+fn next_timeline_item_ordinal(
+    transaction: &Transaction<'_>,
+    turn_id: &str,
+) -> rusqlite::Result<i64> {
+    transaction.query_row(
+        "SELECT coalesce(max(item_ordinal),-1)+1 FROM session_timeline_item WHERE turn_id=?1",
+        [turn_id],
+        |row| row.get(0),
+    )
+}
+
+fn insert_timeline_item(
+    transaction: &Transaction<'_>,
+    item: NewTimelineItem<'_>,
+) -> StoreResult<()> {
+    let sequence = next_timeline_sequence(transaction, item.session_id)?;
+    let item_ordinal = next_timeline_item_ordinal(transaction, item.turn_id)?;
+    transaction.execute(
+        "INSERT INTO session_timeline_item(
+           id,session_id,turn_id,sequence,turn_ordinal,item_ordinal,kind,body,
+           call_id,tool_name,input_json,output_text,tool_state,is_error,
+           source_event_sequence,source_block_index,fidelity,metadata_json,created_at,updated_at
+         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)",
+        params![
+            item.id,
+            item.session_id,
+            item.turn_id,
+            sequence,
+            item.turn_ordinal,
+            item_ordinal,
+            item.kind,
+            item.body,
+            item.call_id,
+            item.tool_name,
+            item.input_json,
+            item.output_text,
+            item.tool_state,
+            i64::from(item.is_error),
+            item.source_event_sequence,
+            item.source_block_index,
+            item.fidelity,
+            item.metadata_json,
+            item.timestamp,
+        ],
+    )?;
+    Ok(())
+}
+
+fn insert_turn_event(
+    transaction: &Transaction<'_>,
+    turn_id: &str,
+    event_type: &str,
+    payload: &Value,
+    timestamp: &str,
+) -> StoreResult<(i64, bool)> {
+    let encoded = payload.to_string();
+    let truncated = encoded.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES;
+    // Never byte-slice JSON: it can split UTF-8 and, even on a boundary, leave
+    // syntactically invalid JSON. Oversized frames retain a small valid audit
+    // envelope; live semantic projections are committed in the same transaction.
+    let stored = if truncated {
+        json!({
+            "_todoagentRaw": {
+                "originalBytes": encoded.len(),
+                "truncated": true
+            }
+        })
+        .to_string()
+    } else {
+        encoded
+    };
+    let sequence: i64 = transaction.query_row(
+        "SELECT coalesce(max(sequence),0)+1 FROM turn_event WHERE turn_id=?1",
+        [turn_id],
+        |row| row.get(0),
+    )?;
+    transaction.execute(
+        "INSERT INTO turn_event(turn_id,sequence,type,payload,created_at) VALUES(?1,?2,?3,?4,?5)",
+        params![turn_id, sequence, event_type, stored, timestamp],
+    )?;
+    Ok((sequence, truncated))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_agent_text_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: &str,
+    turn_ordinal: i64,
+    chunk: &str,
+    source_event_sequence: Option<i64>,
+    source_block_index: Option<i64>,
+    timestamp: &str,
+) -> StoreResult<(String, String, bool)> {
+    // Both projections must agree that text is the latest semantic item. A
+    // reasoning item is timeline-only, so consulting session_message alone
+    // would incorrectly merge text across exposed thinking.
+    let existing: Option<(String, String, Option<String>)> = transaction
+        .query_row(
+            "SELECT m.id,m.body,m.payload_json FROM session_message m
+             WHERE m.turn_id=?1 AND m.role='agent' AND m.kind='text'
+               AND m.sequence=(SELECT max(sequence) FROM session_message WHERE session_id=?2)
+               AND EXISTS(
+                 SELECT 1 FROM session_timeline_item t
+                 WHERE t.id='timeline-'||m.id AND t.turn_id=?1 AND t.kind='assistant_text'
+                   AND t.item_ordinal=(SELECT max(item_ordinal) FROM session_timeline_item WHERE turn_id=?1)
+               )",
+            params![turn_id, session_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((id, existing_body, existing_metadata)) = existing {
+        let previous_original_bytes = existing_metadata
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value.get("originalBytes").and_then(Value::as_u64))
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(existing_body.len());
+        let original_bytes = previous_original_bytes.saturating_add(chunk.len());
+        let mut body = bounded_utf8(&existing_body, SESSION_TIMELINE_TEXT_MAX_BYTES);
+        if body.len() < SESSION_TIMELINE_TEXT_MAX_BYTES {
+            body.push_str(&bounded_utf8(
+                chunk,
+                SESSION_TIMELINE_TEXT_MAX_BYTES - body.len(),
+            ));
+        }
+        let metadata = (original_bytes > SESSION_TIMELINE_TEXT_MAX_BYTES)
+            .then(|| json!({"originalBytes":original_bytes,"truncated":true}).to_string());
+        transaction.execute(
+            "UPDATE session_message SET body=?1,payload_json=?2,updated_at=?3 WHERE id=?4",
+            params![body, metadata.as_deref(), timestamp, id],
+        )?;
+        let timeline_id = format!("timeline-{id}");
+        transaction.execute(
+            "UPDATE session_timeline_item
+             SET body=?1,metadata_json=?2,updated_at=?3,
+                 source_event_sequence=coalesce(source_event_sequence,?4),
+                 source_block_index=coalesce(source_block_index,?5)
+             WHERE id=?6 AND kind='assistant_text'",
+            params![
+                body,
+                metadata.as_deref(),
+                timestamp,
+                source_event_sequence,
+                source_block_index,
+                timeline_id
+            ],
+        )?;
+        return Ok((id, timeline_id, true));
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let timeline_id = format!("timeline-{id}");
+    let body = bounded_utf8(chunk, SESSION_TIMELINE_TEXT_MAX_BYTES);
+    let metadata = (chunk.len() > SESSION_TIMELINE_TEXT_MAX_BYTES)
+        .then(|| json!({"originalBytes":chunk.len(),"truncated":true}).to_string());
+    let sequence = next_message_sequence(transaction, session_id)?;
+    transaction.execute(
+        "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,'agent','text',?5,?6,?7,?7)",
+        params![
+            id,
+            session_id,
+            turn_id,
+            sequence,
+            body,
+            metadata.as_deref(),
+            timestamp
+        ],
+    )?;
+    insert_timeline_item(
+        transaction,
+        NewTimelineItem {
+            id: timeline_id.clone(),
+            session_id,
+            turn_id,
+            turn_ordinal,
+            kind: "assistant_text",
+            body: &body,
+            call_id: None,
+            tool_name: None,
+            input_json: None,
+            output_text: None,
+            tool_state: None,
+            is_error: false,
+            source_event_sequence,
+            source_block_index,
+            fidelity: "exact",
+            metadata_json: metadata.as_deref(),
+            timestamp,
+        },
+    )?;
+    transaction.execute(
+        "UPDATE task_session SET last_agent_sequence=?1,updated_at=?2 WHERE id=?3",
+        params![sequence, timestamp, session_id],
+    )?;
+    Ok((id, timeline_id, false))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_reasoning_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: &str,
+    turn_ordinal: i64,
+    chunk: &str,
+    source_event_sequence: Option<i64>,
+    source_block_index: Option<i64>,
+    timestamp: &str,
+) -> StoreResult<(String, bool)> {
+    let latest: Option<(String, String, Option<String>)> = transaction
+        .query_row(
+            "SELECT id,body,metadata_json FROM session_timeline_item
+             WHERE turn_id=?1 AND kind='reasoning'
+               AND item_ordinal=(SELECT max(item_ordinal) FROM session_timeline_item WHERE turn_id=?1)",
+            [turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    if let Some((id, existing_body, existing_metadata)) = latest {
+        let previous_original_bytes = existing_metadata
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value.get("originalBytes").and_then(Value::as_u64))
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(existing_body.len());
+        let original_bytes = previous_original_bytes.saturating_add(chunk.len());
+        let mut combined = bounded_utf8(&existing_body, SESSION_TIMELINE_REASONING_MAX_BYTES);
+        if combined.len() < SESSION_TIMELINE_REASONING_MAX_BYTES {
+            let remaining = SESSION_TIMELINE_REASONING_MAX_BYTES - combined.len();
+            combined.push_str(&bounded_utf8(chunk, remaining));
+        }
+        let metadata = (original_bytes > SESSION_TIMELINE_REASONING_MAX_BYTES)
+            .then(|| json!({"originalBytes":original_bytes,"truncated":true}).to_string());
+        transaction.execute(
+            "UPDATE session_timeline_item
+             SET body=?1,metadata_json=?2,updated_at=?3,
+                 source_event_sequence=coalesce(source_event_sequence,?4),
+                 source_block_index=coalesce(source_block_index,?5)
+             WHERE id=?6",
+            params![
+                combined,
+                metadata,
+                timestamp,
+                source_event_sequence,
+                source_block_index,
+                id
+            ],
+        )?;
+        return Ok((id, true));
+    }
+
+    let id = Uuid::new_v4().to_string();
+    let body = bounded_utf8(chunk, SESSION_TIMELINE_REASONING_MAX_BYTES);
+    let metadata = (chunk.len() > SESSION_TIMELINE_REASONING_MAX_BYTES)
+        .then(|| json!({"originalBytes":chunk.len(),"truncated":true}).to_string());
+    insert_timeline_item(
+        transaction,
+        NewTimelineItem {
+            id: id.clone(),
+            session_id,
+            turn_id,
+            turn_ordinal,
+            kind: "reasoning",
+            body: &body,
+            call_id: None,
+            tool_name: None,
+            input_json: None,
+            output_text: None,
+            tool_state: None,
+            is_error: false,
+            source_event_sequence,
+            source_block_index,
+            fidelity: "exact",
+            metadata_json: metadata.as_deref(),
+            timestamp,
+        },
+    )?;
+    Ok((id, false))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_legacy_message_in_transaction(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: &str,
+    role: MessageRole,
+    kind: &str,
+    body: &str,
+    payload_json: Option<&str>,
+    source_event_sequence: Option<i64>,
+    source_block_index: Option<i64>,
+    timestamp: &str,
+) -> StoreResult<(String, Option<(String, bool)>)> {
+    let payload = payload_json
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or(Value::Null);
+    let call_id = payload_string(&payload, "callId").map(str::to_owned);
+    let existing_timeline_id = call_id
+        .as_deref()
+        .map(|call_id| {
+            transaction
+                .query_row(
+                    "SELECT id FROM session_timeline_item WHERE turn_id=?1 AND call_id=?2",
+                    params![turn_id, call_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        })
+        .transpose()?
+        .flatten();
+    let sequence = next_message_sequence(transaction, session_id)?;
+    let message_id = Uuid::new_v4().to_string();
+    transaction.execute(
+        "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
+        params![
+            message_id,
+            session_id,
+            turn_id,
+            sequence,
+            role.as_str(),
+            kind,
+            body,
+            payload_json,
+            timestamp
+        ],
+    )?;
+    mirror_legacy_message_to_timeline(
+        transaction,
+        &message_id,
+        session_id,
+        turn_id,
+        role,
+        kind,
+        body,
+        payload_json,
+        timestamp,
+    )?;
+    if role == MessageRole::Agent && kind == "text" {
+        transaction.execute(
+            "UPDATE task_session SET last_agent_sequence=?1,updated_at=?2 WHERE id=?3",
+            params![sequence, timestamp, session_id],
+        )?;
+    }
+    let timeline_id = match (role, kind) {
+        (MessageRole::Tool, "tool_call" | "tool_result") => {
+            if let Some(call_id) = call_id.as_deref() {
+                transaction
+                    .query_row(
+                        "SELECT id FROM session_timeline_item WHERE turn_id=?1 AND call_id=?2",
+                        params![turn_id, call_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+            } else if kind == "tool_call" {
+                Some(format!("timeline-tool-{turn_id}-legacy-{message_id}"))
+            } else {
+                Some(format!("timeline-tool-{turn_id}-orphan-{message_id}"))
+            }
+        }
+        (MessageRole::System, "status" | "error") => Some(format!("timeline-{message_id}")),
+        _ => None,
+    };
+    if let Some(timeline_id) = timeline_id.as_deref() {
+        transaction.execute(
+            "UPDATE session_timeline_item
+             SET source_event_sequence=coalesce(source_event_sequence,?1),
+                 source_block_index=coalesce(source_block_index,?2)
+             WHERE id=?3",
+            params![source_event_sequence, source_block_index, timeline_id],
+        )?;
+    }
+    Ok((
+        message_id,
+        timeline_id.map(|timeline_id| (timeline_id, existing_timeline_id.is_some())),
+    ))
+}
+
+fn record_once(values: &mut Vec<String>, value: String) {
+    if !values.iter().any(|existing| existing == &value) {
+        values.push(value);
+    }
+}
+
+fn record_timeline_mutation(values: &mut Vec<(String, bool)>, value: String, is_update: bool) {
+    if !values.iter().any(|(existing, _)| existing == &value) {
+        values.push((value, is_update));
+    }
+}
+
+fn timeline_payload(value: Option<&str>) -> Option<String> {
+    value.map(|value| bounded_utf8(value, SESSION_TIMELINE_PAYLOAD_MAX_BYTES))
+}
+
+fn bounded_utf8(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_owned();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
+}
+
+fn bounded_assistant_message_body(
+    role: &str,
+    kind: &str,
+    body: &str,
+    payload_json: Option<&str>,
+) -> (String, Option<String>) {
+    let maximum_bytes = if role == "todoagent" && kind == "text" {
+        SESSION_TIMELINE_TEXT_MAX_BYTES
+    } else if matches!(kind, "tool_call" | "tool_result" | "status" | "error") {
+        SESSION_TIMELINE_PAYLOAD_MAX_BYTES
+    } else {
+        return (body.to_owned(), payload_json.map(str::to_owned));
+    };
+    if body.len() <= maximum_bytes {
+        return (body.to_owned(), payload_json.map(str::to_owned));
+    }
+    let metadata = merged_metadata_json(
+        payload_json,
+        json!({
+            "originalBytes": body.len(),
+            "truncated": true,
+        }),
+    );
+    (bounded_utf8(body, maximum_bytes), Some(metadata))
+}
+
+fn bounded_assistant_step_payload(kind: &str, payload_json: Option<&str>) -> Option<String> {
+    let payload_json = payload_json?;
+    let maximum_bytes = if kind == "model_output" {
+        SESSION_TIMELINE_TEXT_MAX_BYTES
+    } else {
+        SESSION_TIMELINE_PAYLOAD_MAX_BYTES
+    };
+    if payload_json.len() <= maximum_bytes {
+        return Some(payload_json.to_owned());
+    }
+    let original_bytes = payload_json.len();
+    let payload = serde_json::from_str::<Value>(payload_json).unwrap_or(Value::Null);
+    let visible = match kind {
+        "model_output" => assistant_visible_content(payload.get("content")),
+        "thought" => assistant_visible_content(payload.get("summary")),
+        _ => String::new(),
+    };
+    if !visible.is_empty() {
+        let mut visible_limit = visible.len().min(maximum_bytes.saturating_sub(512));
+        loop {
+            let visible = bounded_utf8(&visible, visible_limit);
+            let candidate = if kind == "thought" {
+                json!({
+                    "type":"thought",
+                    "summary":[{"type":"text","text":visible}],
+                    "_todoagentTruncated":{"originalBytes":original_bytes,"truncated":true}
+                })
+            } else {
+                json!({
+                    "type":"model_output",
+                    "content":[{"type":"text","text":visible}],
+                    "_todoagentTruncated":{"originalBytes":original_bytes,"truncated":true}
+                })
+            }
+            .to_string();
+            if candidate.len() <= maximum_bytes || visible_limit == 0 {
+                return Some(candidate);
+            }
+            visible_limit /= 2;
+        }
+    }
+    let mut envelope = serde_json::Map::new();
+    envelope.insert("type".to_owned(), Value::String(kind.to_owned()));
+    for key in ["id", "call_id", "name"] {
+        if let Some(value) = payload.get(key).cloned() {
+            envelope.insert(key.to_owned(), value);
+        }
+    }
+    envelope.insert(
+        "_todoagentTruncated".to_owned(),
+        json!({"originalBytes":original_bytes,"truncated":true}),
+    );
+    Some(Value::Object(envelope).to_string())
+}
+
+fn bounded_tool_request_json(tool_name: &str, request_json: &str) -> String {
+    if request_json.len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES {
+        return request_json.to_owned();
+    }
+    let payload = serde_json::from_str::<Value>(request_json).unwrap_or(Value::Null);
+    let mut envelope = serde_json::Map::new();
+    for key in ["taskId", "id", "callId"] {
+        if let Some(value) = payload.get(key).cloned() {
+            envelope.insert(key.to_owned(), value);
+        }
+    }
+    envelope.insert(
+        "_todoagentTruncated".to_owned(),
+        json!({
+            "tool": tool_name,
+            "originalBytes": request_json.len(),
+            "truncated": true
+        }),
+    );
+    Value::Object(envelope).to_string()
+}
+
+fn payload_string<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty())
+}
+
+fn merged_metadata_json(existing: Option<&str>, additions: Value) -> String {
+    let mut metadata = existing
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Value::Object(additions) = additions {
+        metadata.extend(additions);
+    }
+    Value::Object(metadata).to_string()
+}
+
+fn insert_legacy_agent_text_if_missing(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: &str,
+    turn_ordinal: i64,
+    message: &SessionMessage,
+) -> StoreResult<bool> {
+    let timeline_id = format!("timeline-{}", message.id);
+    let exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_timeline_item WHERE id=?1)",
+        [&timeline_id],
+        |row| row.get::<_, i64>(0).map(|value| value != 0),
+    )?;
+    if exists {
+        return Ok(false);
+    }
+    let body = bounded_utf8(&message.body, SESSION_TIMELINE_TEXT_MAX_BYTES);
+    let metadata = if message.body.len() > SESSION_TIMELINE_TEXT_MAX_BYTES {
+        Some(json!({"originalBytes":message.body.len(),"truncated":true}).to_string())
+    } else {
+        message.payload_json.clone()
+    };
+    insert_timeline_item(
+        transaction,
+        NewTimelineItem {
+            id: timeline_id,
+            session_id,
+            turn_id,
+            turn_ordinal,
+            kind: "assistant_text",
+            body: &body,
+            call_id: None,
+            tool_name: None,
+            input_json: None,
+            output_text: None,
+            tool_state: None,
+            is_error: false,
+            source_event_sequence: None,
+            source_block_index: None,
+            fidelity: "legacy",
+            metadata_json: metadata.as_deref(),
+            timestamp: &message.created_at,
+        },
+    )?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mirror_legacy_message_to_timeline(
+    transaction: &Transaction<'_>,
+    message_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    role: MessageRole,
+    kind: &str,
+    body: &str,
+    payload_json: Option<&str>,
+    timestamp: &str,
+) -> StoreResult<()> {
+    let turn_ordinal: i64 = transaction.query_row(
+        "SELECT ordinal FROM session_turn WHERE id=?1",
+        [turn_id],
+        |row| row.get(0),
+    )?;
+    let payload = payload_json
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .unwrap_or(Value::Null);
+    match (role, kind) {
+        (MessageRole::Tool, "tool_call") => {
+            let call_id = payload_string(&payload, "callId")
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("legacy-{message_id}"));
+            let name = payload_string(&payload, "name").unwrap_or(body);
+            let input = payload
+                .get("input")
+                .filter(|value| !value.is_null())
+                .map(Value::to_string);
+            let input_original_bytes = payload
+                .get("inputOriginalBytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or_else(|| input.as_ref().map_or(0, String::len));
+            let input_truncated = payload
+                .get("inputTruncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(input_original_bytes > SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
+            let existing_metadata: Option<String> = transaction
+                .query_row(
+                    "SELECT metadata_json FROM session_timeline_item
+                     WHERE turn_id=?1 AND call_id=?2 AND kind='tool'",
+                    params![turn_id, call_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            let metadata = merged_metadata_json(
+                existing_metadata.as_deref(),
+                json!({
+                    "inputOriginalBytes": input_original_bytes,
+                    "inputTruncated": input_truncated,
+                }),
+            );
+            let input = timeline_payload(input.as_deref());
+            let changed = transaction.execute(
+                "UPDATE session_timeline_item
+                 SET tool_name=?1,input_json=?2,metadata_json=?3,updated_at=?4
+                 WHERE turn_id=?5 AND call_id=?6 AND kind='tool'",
+                params![name, input, metadata, timestamp, turn_id, call_id],
+            )?;
+            if changed == 0 {
+                insert_timeline_item(
+                    transaction,
+                    NewTimelineItem {
+                        id: format!("timeline-tool-{turn_id}-{call_id}"),
+                        session_id,
+                        turn_id,
+                        turn_ordinal,
+                        kind: "tool",
+                        body: "",
+                        call_id: Some(&call_id),
+                        tool_name: Some(name),
+                        input_json: input.as_deref(),
+                        output_text: None,
+                        tool_state: Some("running"),
+                        is_error: false,
+                        source_event_sequence: None,
+                        source_block_index: None,
+                        fidelity: if call_id.starts_with("legacy-") {
+                            "partial"
+                        } else {
+                            "exact"
+                        },
+                        metadata_json: Some(&metadata),
+                        timestamp,
+                    },
+                )?;
+            }
+        }
+        (MessageRole::Tool, "tool_result") => {
+            let call_id = payload_string(&payload, "callId").map(str::to_owned);
+            let is_error = payload.get("isError").and_then(Value::as_bool) == Some(true)
+                || payload.get("success").and_then(Value::as_bool) == Some(false)
+                || matches!(
+                    payload.get("status").and_then(Value::as_str),
+                    Some("error" | "failed" | "failure" | "cancelled" | "interrupted")
+                );
+            let output = bounded_utf8(body, SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
+            let output_original_bytes = payload
+                .get("outputOriginalBytes")
+                .and_then(Value::as_u64)
+                .and_then(|value| usize::try_from(value).ok())
+                .unwrap_or(body.len());
+            let output_truncated = payload
+                .get("outputTruncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(output_original_bytes > SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
+            let existing_metadata: Option<String> = call_id
+                .as_deref()
+                .map(|call_id| {
+                    transaction
+                        .query_row(
+                            "SELECT metadata_json FROM session_timeline_item
+                             WHERE turn_id=?1 AND call_id=?2 AND kind='tool'",
+                            params![turn_id, call_id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                })
+                .transpose()?
+                .flatten()
+                .flatten();
+            let metadata = merged_metadata_json(
+                existing_metadata.as_deref(),
+                json!({
+                    "outputOriginalBytes": output_original_bytes,
+                    "outputTruncated": output_truncated,
+                }),
+            );
+            let changed = if let Some(call_id) = call_id.as_deref() {
+                transaction.execute(
+                    "UPDATE session_timeline_item
+                     SET output_text=?1,tool_state=?2,is_error=?3,updated_at=?4,
+                         metadata_json=?5
+                     WHERE turn_id=?6 AND call_id=?7 AND kind='tool'",
+                    params![
+                        output,
+                        if is_error { "failed" } else { "completed" },
+                        i64::from(is_error),
+                        timestamp,
+                        metadata,
+                        turn_id,
+                        call_id,
+                    ],
+                )?
+            } else {
+                0
+            };
+            if changed == 0 {
+                let synthetic = call_id.unwrap_or_else(|| format!("orphan-{message_id}"));
+                let name = payload_string(&payload, "name").unwrap_or("tool");
+                insert_timeline_item(
+                    transaction,
+                    NewTimelineItem {
+                        id: format!("timeline-tool-{turn_id}-{synthetic}"),
+                        session_id,
+                        turn_id,
+                        turn_ordinal,
+                        kind: "tool",
+                        body: "",
+                        call_id: Some(&synthetic),
+                        tool_name: Some(name),
+                        input_json: None,
+                        output_text: Some(&output),
+                        tool_state: Some(if is_error { "failed" } else { "completed" }),
+                        is_error,
+                        source_event_sequence: None,
+                        source_block_index: None,
+                        fidelity: "partial",
+                        metadata_json: Some(&metadata),
+                        timestamp,
+                    },
+                )?;
+            }
+        }
+        (MessageRole::System, "status" | "error") => {
+            let timeline_id = format!("timeline-{message_id}");
+            let changed = transaction.execute(
+                "UPDATE session_timeline_item
+                 SET kind=?1,body=?2,is_error=?3,metadata_json=?4,updated_at=?5
+                 WHERE id=?6",
+                params![
+                    if kind == "error" { "error" } else { "status" },
+                    body,
+                    i64::from(kind == "error"),
+                    payload_json,
+                    timestamp,
+                    timeline_id,
+                ],
+            )?;
+            if changed == 0 {
+                insert_timeline_item(
+                    transaction,
+                    NewTimelineItem {
+                        id: timeline_id,
+                        session_id,
+                        turn_id,
+                        turn_ordinal,
+                        kind: if kind == "error" { "error" } else { "status" },
+                        body,
+                        call_id: None,
+                        tool_name: None,
+                        input_json: None,
+                        output_text: None,
+                        tool_state: None,
+                        is_error: kind == "error",
+                        source_event_sequence: None,
+                        source_block_index: None,
+                        fidelity: "exact",
+                        metadata_json: payload_json,
+                        timestamp,
+                    },
+                )?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_replayed_segment(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: &str,
+    turn_ordinal: i64,
+    kind: &str,
+    body: &str,
+    source_event_sequence: i64,
+    source_block_index: i64,
+    timestamp: &str,
+) -> StoreResult<()> {
+    let maximum_bytes = if kind == "reasoning" {
+        SESSION_TIMELINE_REASONING_MAX_BYTES
+    } else {
+        SESSION_TIMELINE_TEXT_MAX_BYTES
+    };
+    let latest: Option<(String, String, String, Option<String>)> = transaction
+        .query_row(
+            "SELECT id,kind,body,metadata_json FROM session_timeline_item WHERE turn_id=?1
+             ORDER BY item_ordinal DESC LIMIT 1",
+            [turn_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?;
+    if let Some((id, latest_kind, existing_body, existing_metadata)) = latest
+        && latest_kind == kind
+    {
+        let previous_original_bytes = existing_metadata
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<Value>(value).ok())
+            .and_then(|value| value.get("originalBytes").and_then(Value::as_u64))
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(existing_body.len());
+        let original_bytes = previous_original_bytes.saturating_add(body.len());
+        let mut combined = bounded_utf8(&existing_body, maximum_bytes);
+        if combined.len() < maximum_bytes {
+            combined.push_str(&bounded_utf8(body, maximum_bytes - combined.len()));
+        }
+        let metadata = (original_bytes > maximum_bytes)
+            .then(|| json!({"originalBytes":original_bytes,"truncated":true}).to_string());
+        transaction.execute(
+            "UPDATE session_timeline_item SET body=?1,metadata_json=?2,updated_at=?3 WHERE id=?4",
+            params![combined, metadata, timestamp, id],
+        )?;
+        return Ok(());
+    }
+    let bounded = bounded_utf8(body, maximum_bytes);
+    let metadata = (body.len() > maximum_bytes)
+        .then(|| json!({"originalBytes":body.len(),"truncated":true}).to_string());
+    insert_timeline_item(
+        transaction,
+        NewTimelineItem {
+            id: format!(
+                "timeline-raw-{turn_id}-{source_event_sequence}-{source_block_index}-{kind}"
+            ),
+            session_id,
+            turn_id,
+            turn_ordinal,
+            kind,
+            body: &bounded,
+            call_id: None,
+            tool_name: None,
+            input_json: None,
+            output_text: None,
+            tool_state: None,
+            is_error: false,
+            source_event_sequence: Some(source_event_sequence),
+            source_block_index: Some(source_block_index),
+            fidelity: "exact",
+            metadata_json: metadata.as_deref(),
+            timestamp,
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mirror_replayed_provider_event(
+    transaction: &Transaction<'_>,
+    session_id: &str,
+    turn_id: &str,
+    turn_ordinal: i64,
+    event_sequence: i64,
+    block_index: i64,
+    event: ProviderEvent,
+    timestamp: &str,
+) -> StoreResult<()> {
+    match event {
+        ProviderEvent::Text(text) => append_replayed_segment(
+            transaction,
+            session_id,
+            turn_id,
+            turn_ordinal,
+            "assistant_text",
+            &text,
+            event_sequence,
+            block_index,
+            timestamp,
+        ),
+        ProviderEvent::Reasoning(text) => append_replayed_segment(
+            transaction,
+            session_id,
+            turn_id,
+            turn_ordinal,
+            "reasoning",
+            &text,
+            event_sequence,
+            block_index,
+            timestamp,
+        ),
+        ProviderEvent::ToolUse {
+            name,
+            call_id,
+            input,
+        } => {
+            let payload = json!({"name":name,"callId":call_id,"input":input}).to_string();
+            mirror_legacy_message_to_timeline(
+                transaction,
+                &format!("raw-{event_sequence}-{block_index}"),
+                session_id,
+                turn_id,
+                MessageRole::Tool,
+                "tool_call",
+                &name,
+                Some(&payload),
+                timestamp,
+            )
+        }
+        ProviderEvent::ToolResult {
+            name,
+            call_id,
+            output,
+            is_error,
+        } => {
+            let payload = json!({"name":name,"callId":call_id,"isError":is_error}).to_string();
+            mirror_legacy_message_to_timeline(
+                transaction,
+                &format!("raw-{event_sequence}-{block_index}"),
+                session_id,
+                turn_id,
+                MessageRole::Tool,
+                "tool_result",
+                &output,
+                Some(&payload),
+                timestamp,
+            )
+        }
+        ProviderEvent::Status(status) => mirror_legacy_message_to_timeline(
+            transaction,
+            &format!("raw-{event_sequence}-{block_index}"),
+            session_id,
+            turn_id,
+            MessageRole::System,
+            "status",
+            &status,
+            None,
+            timestamp,
+        ),
+        ProviderEvent::SessionId(_) => Ok(()),
+    }
+}
+
+fn project_assistant_timeline(
+    messages: &[AssistantMessage],
+    steps: &[AssistantStep],
+    tools: &[AssistantToolSummary],
+    turn_ordinals: &HashMap<String, i64>,
+) -> Vec<SessionTimelineItem> {
+    let mut ordered_turns = turn_ordinals.iter().collect::<Vec<_>>();
+    ordered_turns.sort_by_key(|(_, ordinal)| **ordinal);
+    let tool_summaries = tools
+        .iter()
+        .filter_map(|tool| {
+            tool.turn_id
+                .as_ref()
+                .map(|turn_id| ((turn_id.as_str(), tool.call_id.as_str()), tool))
+        })
+        .collect::<HashMap<_, _>>();
+    let mut timeline = Vec::new();
+    for message in messages.iter().filter(|message| message.turn_id.is_none()) {
+        let (kind, is_error) = match (message.role.as_str(), message.kind.as_str()) {
+            ("user", "text") => ("user", false),
+            ("todoagent", "text") => ("assistant_text", false),
+            ("system", "error") => ("error", true),
+            ("system", "status") => ("status", false),
+            _ => continue,
+        };
+        let body = bounded_utf8(&message.body, SESSION_TIMELINE_TEXT_MAX_BYTES);
+        push_assistant_timeline_item(
+            &mut timeline,
+            format!("assistant-timeline-message-{}", message.id),
+            &message.session_id,
+            &format!("standalone-{}", message.id),
+            0,
+            message.sequence,
+            kind,
+            &body,
+            None,
+            None,
+            None,
+            is_error,
+            None,
+            None,
+            "legacy",
+            &message.created_at,
+            &message.updated_at,
+        );
+    }
+    for (turn_id, turn_ordinal) in ordered_turns {
+        // Slot zero is reserved for the turn's user message even when a later
+        // chat-message page does not include it. Provider part cursors therefore
+        // remain stable across overlapping assistant.history pages.
+        let mut item_ordinal = 1_i64;
+        let mut turn_messages = messages
+            .iter()
+            .filter(|message| message.turn_id.as_deref() == Some(turn_id.as_str()))
+            .collect::<Vec<_>>();
+        turn_messages.sort_by_key(|message| message.sequence);
+        for message in turn_messages
+            .iter()
+            .copied()
+            .filter(|message| message.role == "user" && message.kind == "text")
+        {
+            push_assistant_timeline_item(
+                &mut timeline,
+                format!("assistant-timeline-message-{}", message.id),
+                &message.session_id,
+                turn_id,
+                *turn_ordinal,
+                0,
+                "user",
+                &message.body,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+                "exact",
+                &message.created_at,
+                &message.updated_at,
+            );
+        }
+
+        let mut turn_steps = steps
+            .iter()
+            .filter(|step| step.turn_id == *turn_id)
+            .collect::<Vec<_>>();
+        turn_steps.sort_by_key(|step| step.sequence);
+        let mut tool_item_indices = HashMap::<String, usize>::new();
+        let mut emitted_model_text = false;
+        for step in turn_steps {
+            let payload = step
+                .payload_json
+                .as_deref()
+                .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                .unwrap_or(Value::Null);
+            match step.kind.as_str() {
+                "model_output" => {
+                    let text = assistant_visible_content(payload.get("content"));
+                    if text.is_empty() {
+                        continue;
+                    }
+                    emitted_model_text = true;
+                    let body = bounded_utf8(&text, SESSION_TIMELINE_TEXT_MAX_BYTES);
+                    push_assistant_timeline_item(
+                        &mut timeline,
+                        format!("assistant-timeline-step-{}", step.id),
+                        &step.session_id,
+                        turn_id,
+                        *turn_ordinal,
+                        item_ordinal,
+                        "assistant_text",
+                        &body,
+                        None,
+                        None,
+                        None,
+                        false,
+                        Some(step.sequence),
+                        step.provider_step_index,
+                        "exact",
+                        &step.created_at,
+                        &step.updated_at,
+                    );
+                    item_ordinal += 1;
+                }
+                "thought" => {
+                    // Only the provider's explicit summary is eligible for the
+                    // UI. Signature, encrypted thought and raw deltas remain in
+                    // the private context payload.
+                    let summary = assistant_visible_content(payload.get("summary"));
+                    if summary.is_empty() {
+                        continue;
+                    }
+                    let body = bounded_utf8(&summary, SESSION_TIMELINE_REASONING_MAX_BYTES);
+                    push_assistant_timeline_item(
+                        &mut timeline,
+                        format!("assistant-timeline-step-{}", step.id),
+                        &step.session_id,
+                        turn_id,
+                        *turn_ordinal,
+                        item_ordinal,
+                        "reasoning",
+                        &body,
+                        None,
+                        None,
+                        None,
+                        false,
+                        Some(step.sequence),
+                        step.provider_step_index,
+                        "exact",
+                        &step.created_at,
+                        &step.updated_at,
+                    );
+                    item_ordinal += 1;
+                }
+                "function_call" => {
+                    let Some(call_id) = payload
+                        .get("id")
+                        .or_else(|| payload.get("call_id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let name = payload
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .or(step.title.as_deref())
+                        .unwrap_or("tool");
+                    let summary = tool_summaries.get(&(turn_id.as_str(), call_id));
+                    let (tool_state, is_error) = summary.map_or(("running", false), |tool| {
+                        (
+                            assistant_tool_state(&tool.status, tool.is_error),
+                            tool.is_error,
+                        )
+                    });
+                    let index = timeline.len();
+                    push_assistant_timeline_item(
+                        &mut timeline,
+                        format!("assistant-timeline-tool-{turn_id}-{call_id}"),
+                        &step.session_id,
+                        turn_id,
+                        *turn_ordinal,
+                        item_ordinal,
+                        "tool",
+                        "",
+                        Some(call_id),
+                        Some(name),
+                        Some(tool_state),
+                        is_error,
+                        Some(step.sequence),
+                        step.provider_step_index,
+                        "exact",
+                        &step.created_at,
+                        summary.map_or(step.updated_at.as_str(), |tool| tool.updated_at.as_str()),
+                    );
+                    if let Some(arguments) = payload.get("arguments") {
+                        let raw = if let Some(value) = arguments.as_str() {
+                            value.to_owned()
+                        } else {
+                            arguments.to_string()
+                        };
+                        timeline[index].input_json =
+                            Some(bounded_utf8(&raw, SESSION_TIMELINE_PAYLOAD_MAX_BYTES));
+                        if raw.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES {
+                            timeline[index].metadata_json = Some(
+                                json!({
+                                    "inputOriginalBytes":raw.len(),
+                                    "inputTruncated":true
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                    tool_item_indices.insert(call_id.to_owned(), index);
+                    item_ordinal += 1;
+                }
+                "function_result" => {
+                    let Some(call_id) = payload
+                        .get("call_id")
+                        .or_else(|| payload.get("id"))
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                    else {
+                        continue;
+                    };
+                    let is_error = payload.get("is_error").and_then(Value::as_bool) == Some(true);
+                    if let Some(index) = tool_item_indices.get(call_id).copied() {
+                        let item = &mut timeline[index];
+                        item.tool_state =
+                            Some(if is_error { "failed" } else { "completed" }.to_owned());
+                        item.is_error = is_error;
+                        item.updated_at = step.updated_at.clone();
+                        if let Some(result) = payload.get("result") {
+                            let raw = if let Some(value) = result.as_str() {
+                                value.to_owned()
+                            } else {
+                                result.to_string()
+                            };
+                            item.output_text =
+                                Some(bounded_utf8(&raw, SESSION_TIMELINE_PAYLOAD_MAX_BYTES));
+                            if raw.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES {
+                                let mut metadata = item
+                                    .metadata_json
+                                    .as_deref()
+                                    .and_then(|value| serde_json::from_str::<Value>(value).ok())
+                                    .and_then(|value| value.as_object().cloned())
+                                    .unwrap_or_default();
+                                metadata.insert("outputOriginalBytes".to_owned(), json!(raw.len()));
+                                metadata.insert("outputTruncated".to_owned(), Value::Bool(true));
+                                item.metadata_json = Some(Value::Object(metadata).to_string());
+                            }
+                        }
+                    } else {
+                        let name = payload
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .or(step.title.as_deref())
+                            .unwrap_or("tool");
+                        push_assistant_timeline_item(
+                            &mut timeline,
+                            format!("assistant-timeline-tool-{turn_id}-{call_id}"),
+                            &step.session_id,
+                            turn_id,
+                            *turn_ordinal,
+                            item_ordinal,
+                            "tool",
+                            "",
+                            Some(call_id),
+                            Some(name),
+                            Some(if is_error { "failed" } else { "completed" }),
+                            is_error,
+                            Some(step.sequence),
+                            step.provider_step_index,
+                            "partial",
+                            &step.created_at,
+                            &step.updated_at,
+                        );
+                        let index = timeline.len() - 1;
+                        if let Some(result) = payload.get("result") {
+                            let raw = if let Some(value) = result.as_str() {
+                                value.to_owned()
+                            } else {
+                                result.to_string()
+                            };
+                            timeline[index].output_text =
+                                Some(bounded_utf8(&raw, SESSION_TIMELINE_PAYLOAD_MAX_BYTES));
+                            if raw.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES {
+                                timeline[index].metadata_json = Some(
+                                    json!({
+                                        "outputOriginalBytes":raw.len(),
+                                        "outputTruncated":true
+                                    })
+                                    .to_string(),
+                                );
+                            }
+                        }
+                        tool_item_indices.insert(call_id.to_owned(), index);
+                        item_ordinal += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        for tool in tools.iter().filter(|tool| {
+            tool.turn_id.as_deref() == Some(turn_id.as_str())
+                && !tool_item_indices.contains_key(&tool.call_id)
+        }) {
+            push_assistant_timeline_item(
+                &mut timeline,
+                format!("assistant-timeline-tool-{turn_id}-{}", tool.call_id),
+                &tool.session_id,
+                turn_id,
+                *turn_ordinal,
+                item_ordinal,
+                "tool",
+                "",
+                Some(&tool.call_id),
+                Some(&tool.tool_name),
+                Some(assistant_tool_state(&tool.status, tool.is_error)),
+                tool.is_error,
+                None,
+                None,
+                "partial",
+                &tool.created_at,
+                &tool.updated_at,
+            );
+            item_ordinal += 1;
+        }
+
+        for message in turn_messages.into_iter().filter(|message| {
+            (message.role == "todoagent" && message.kind == "text" && !emitted_model_text)
+                || (message.role == "system" && matches!(message.kind.as_str(), "status" | "error"))
+        }) {
+            let kind = if message.role == "todoagent" {
+                "assistant_text"
+            } else if message.kind == "error" {
+                "error"
+            } else {
+                "status"
+            };
+            let body = bounded_utf8(&message.body, SESSION_TIMELINE_TEXT_MAX_BYTES);
+            push_assistant_timeline_item(
+                &mut timeline,
+                format!("assistant-timeline-message-{}", message.id),
+                &message.session_id,
+                turn_id,
+                *turn_ordinal,
+                item_ordinal,
+                kind,
+                &body,
+                None,
+                None,
+                None,
+                kind == "error",
+                None,
+                None,
+                "legacy",
+                &message.created_at,
+                &message.updated_at,
+            );
+            item_ordinal += 1;
+        }
+    }
+    timeline.sort_by_key(|item| (item.turn_ordinal, item.item_ordinal, item.id.clone()));
+    timeline
+}
+
+fn assistant_visible_content(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(value)) => value.clone(),
+        Some(Value::Array(values)) => values
+            .iter()
+            .map(|value| assistant_visible_content(Some(value)))
+            .collect(),
+        Some(Value::Object(value)) => {
+            if value.get("type").and_then(Value::as_str) == Some("text") {
+                return value
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+            }
+            assistant_visible_content(value.get("content"))
+        }
+        Some(_) => String::new(),
+    }
+}
+
+fn assistant_tool_state(status: &str, is_error: bool) -> &'static str {
+    if is_error || status == "failed" {
+        "failed"
+    } else if status == "completed" {
+        "completed"
+    } else {
+        "running"
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_assistant_timeline_item(
+    timeline: &mut Vec<SessionTimelineItem>,
+    id: String,
+    session_id: &str,
+    turn_id: &str,
+    turn_ordinal: i64,
+    item_ordinal: i64,
+    kind: &str,
+    body: &str,
+    call_id: Option<&str>,
+    tool_name: Option<&str>,
+    tool_state: Option<&str>,
+    is_error: bool,
+    source_event_sequence: Option<i64>,
+    source_block_index: Option<i64>,
+    fidelity: &str,
+    created_at: &str,
+    updated_at: &str,
+) {
+    timeline.push(SessionTimelineItem {
+        id,
+        session_id: session_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        sequence: turn_ordinal
+            .saturating_mul(1_000_000)
+            .saturating_add(item_ordinal)
+            .saturating_add(1),
+        turn_ordinal,
+        item_ordinal,
+        kind: kind.to_owned(),
+        body: body.to_owned(),
+        call_id: call_id.map(str::to_owned),
+        tool_name: tool_name.map(str::to_owned),
+        input_json: None,
+        output_text: None,
+        tool_state: tool_state.map(str::to_owned),
+        is_error,
+        source_event_sequence,
+        source_block_index,
+        fidelity: fidelity.to_owned(),
+        metadata_json: None,
+        created_at: created_at.to_owned(),
+        updated_at: updated_at.to_owned(),
+    });
 }
 
 fn next_assistant_message_sequence(
@@ -4380,6 +7053,7 @@ fn bounded_tool_result_json(tool_name: &str, value: &Value) -> String {
         json!({
             "tool": tool_name,
             "truncated": true,
+            "originalBytes": encoded.len(),
             "message": "工具结果超过 8 KiB，已省略超出部分。请缩小查询范围。",
         })
         .to_string()
@@ -4396,6 +7070,7 @@ fn bounded_tool_result_text(tool_name: &str, value: &str) -> String {
             json!({
                 "tool": tool_name,
                 "truncated": true,
+                "originalBytes": value.len(),
                 "message": "工具结果超过 8 KiB，且不是有效 JSON，原内容已省略。",
             })
             .to_string()
@@ -4564,6 +7239,104 @@ fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
     })
 }
 
+fn timeline_select() -> &'static str {
+    "SELECT id,session_id,turn_id,sequence,turn_ordinal,item_ordinal,kind,body,
+            call_id,tool_name,input_json,output_text,tool_state,is_error,
+            source_event_sequence,source_block_index,fidelity,metadata_json,created_at,updated_at
+     FROM session_timeline_item"
+}
+
+fn session_bundle_for_turn_connection(
+    connection: &Connection,
+    session_id: &str,
+    turn_id: &str,
+    limit: i64,
+) -> StoreResult<SessionBundle> {
+    let session = connection
+        .query_row(&session_select("WHERE id=?1"), [session_id], row_to_session)
+        .optional()?
+        .ok_or(StoreError::NotFound)?;
+    let mut statement = connection.prepare(
+        "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
+         FROM session_message WHERE session_id=?1 AND turn_id=?2 ORDER BY sequence LIMIT ?3",
+    )?;
+    let messages = statement
+        .query_map(
+            params![session_id, turn_id, limit.clamp(1, 2000)],
+            row_to_message,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(SessionBundle {
+        session,
+        messages,
+        active_turn: None,
+    })
+}
+
+fn timeline_item_connection(
+    connection: &Connection,
+    id: &str,
+) -> StoreResult<Option<SessionTimelineItem>> {
+    Ok(connection
+        .query_row(
+            &format!("{} WHERE id=?1", timeline_select()),
+            [id],
+            row_to_timeline_item,
+        )
+        .optional()?)
+}
+
+fn row_to_timeline_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTimelineItem> {
+    Ok(SessionTimelineItem {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        turn_id: row.get(2)?,
+        sequence: row.get(3)?,
+        turn_ordinal: row.get(4)?,
+        item_ordinal: row.get(5)?,
+        kind: row.get(6)?,
+        body: row.get(7)?,
+        call_id: row.get(8)?,
+        tool_name: row.get(9)?,
+        input_json: row.get(10)?,
+        output_text: row.get(11)?,
+        tool_state: row.get(12)?,
+        is_error: row.get::<_, i64>(13)? != 0,
+        source_event_sequence: row.get(14)?,
+        source_block_index: row.get(15)?,
+        fidelity: row.get(16)?,
+        metadata_json: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
+    })
+}
+
+/// Steps SQLite lazily and stops before retaining a page whose serialized
+/// timeline items would exceed the IPC budget. The first item is always kept,
+/// even if a future schema introduces a single item larger than the current
+/// budget, so callers can always advance their ordinal cursor.
+fn collect_bounded_timeline_rows(
+    rows: &mut rusqlite::Rows<'_>,
+) -> rusqlite::Result<Vec<SessionTimelineItem>> {
+    let mut items = Vec::new();
+    let mut retained_bytes = 0_usize;
+    while let Some(row) = rows.next()? {
+        let item = row_to_timeline_item(row)?;
+        // SessionTimelineItem only contains JSON-safe scalar/string fields, so
+        // serialization cannot fail under the current model. Treat an
+        // unexpected future serializer error as an over-budget item.
+        let item_bytes = serde_json::to_vec(&item).map_or(usize::MAX, |value| value.len() + 1);
+        if !items.is_empty()
+            && retained_bytes.saturating_add(item_bytes) > SESSION_TIMELINE_PAGE_MAX_BYTES
+        {
+            break;
+        }
+        retained_bytes = retained_bytes.saturating_add(item_bytes);
+        items.push(item);
+    }
+    Ok(items)
+}
+
 fn row_to_assistant_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssistantSession> {
     Ok(AssistantSession {
         id: row.get(0)?,
@@ -4574,6 +7347,143 @@ fn row_to_assistant_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Assista
         last_sequence: row.get(5)?,
         is_running: row.get::<_, i64>(6)? != 0,
     })
+}
+
+fn assistant_turn_connection(
+    connection: &Connection,
+    id: &str,
+) -> StoreResult<Option<AssistantTurn>> {
+    Ok(connection
+        .query_row(
+            "SELECT id,session_id,ordinal,user_message_id,model_id,attempt_count,status,final_output,usage_json,error_code,error_message,started_at,ended_at,created_at,updated_at
+             FROM assistant_turn WHERE id=?1",
+            [id],
+            row_to_assistant_turn,
+        )
+        .optional()?)
+}
+
+fn assistant_message_connection(
+    connection: &Connection,
+    id: &str,
+) -> StoreResult<Option<AssistantMessage>> {
+    Ok(connection
+        .query_row(
+            "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,task_refs_json,created_at,updated_at
+             FROM chat_message WHERE id=?1",
+            [id],
+            row_to_assistant_message,
+        )
+        .optional()?)
+}
+
+fn serialized_wire_bytes<T: serde::Serialize>(value: &T) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |encoded| encoded.len() + 1)
+}
+
+fn collect_bounded_assistant_message_rows(
+    rows: &mut rusqlite::Rows<'_>,
+) -> rusqlite::Result<Vec<AssistantMessage>> {
+    let mut messages = Vec::new();
+    let mut retained_bytes = 0_usize;
+    while let Some(row) = rows.next()? {
+        let message = row_to_assistant_message(row)?;
+        let message_bytes = serialized_wire_bytes(&message);
+        if !messages.is_empty()
+            && retained_bytes.saturating_add(message_bytes)
+                > ASSISTANT_HISTORY_MESSAGE_PAGE_MAX_BYTES
+        {
+            break;
+        }
+        retained_bytes = retained_bytes.saturating_add(message_bytes);
+        messages.push(message);
+    }
+    Ok(messages)
+}
+
+fn assistant_history_essential_timeline_ids(timeline: &[SessionTimelineItem]) -> HashSet<String> {
+    let mut essential = timeline
+        .iter()
+        .filter(|item| matches!(item.kind.as_str(), "user" | "status" | "error"))
+        .map(|item| item.id.clone())
+        .collect::<HashSet<_>>();
+    let mut last_assistant_by_turn = HashMap::<&str, &SessionTimelineItem>::new();
+    for item in timeline.iter().filter(|item| item.kind == "assistant_text") {
+        let replace = last_assistant_by_turn
+            .get(item.turn_id.as_str())
+            .is_none_or(|current| {
+                (item.turn_ordinal, item.item_ordinal, item.sequence)
+                    > (current.turn_ordinal, current.item_ordinal, current.sequence)
+            });
+        if replace {
+            last_assistant_by_turn.insert(item.turn_id.as_str(), item);
+        }
+    }
+    essential.extend(
+        last_assistant_by_turn
+            .into_values()
+            .map(|item| item.id.clone()),
+    );
+    essential
+}
+
+fn assistant_history_partial_notice(
+    session: &AssistantSession,
+    active_turn: Option<&AssistantTurn>,
+    timeline: &[SessionTimelineItem],
+    after_sequence: i64,
+) -> SessionTimelineItem {
+    let tail = timeline.last();
+    let turn_ordinal = tail
+        .map(|item| item.turn_ordinal)
+        .or_else(|| active_turn.map(|turn| turn.ordinal))
+        .unwrap_or(0);
+    let turn_id = tail
+        .map(|item| item.turn_id.clone())
+        .or_else(|| active_turn.map(|turn| turn.id.clone()))
+        .unwrap_or_else(|| format!("standalone-history-{}", session.id));
+    let item_ordinal = timeline
+        .iter()
+        .filter(|item| item.turn_ordinal == turn_ordinal)
+        .map(|item| item.item_ordinal)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    let sequence = timeline
+        .iter()
+        .map(|item| item.sequence)
+        .max()
+        .unwrap_or_else(|| turn_ordinal.saturating_mul(1_000_000))
+        .saturating_add(1);
+    SessionTimelineItem {
+        id: format!("assistant-history-partial-{}-{after_sequence}", session.id),
+        session_id: session.id.clone(),
+        turn_id,
+        sequence,
+        turn_ordinal,
+        item_ordinal,
+        kind: "status".to_owned(),
+        body: "部分工具调用与思考步骤因历史页过大未加载；最终回复仍保留。".to_owned(),
+        call_id: None,
+        tool_name: None,
+        input_json: None,
+        output_text: None,
+        tool_state: None,
+        is_error: false,
+        source_event_sequence: None,
+        source_block_index: None,
+        fidelity: "partial".to_owned(),
+        metadata_json: Some(
+            json!({
+                "truncated":true,
+                "reason":"history_detail_budget",
+                "budgetBytes":ASSISTANT_HISTORY_DETAIL_PAGE_MAX_BYTES,
+            })
+            .to_string(),
+        ),
+        created_at: session.updated_at.clone(),
+        updated_at: session.updated_at.clone(),
+    }
 }
 
 fn row_to_assistant_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssistantTurn> {
@@ -5366,6 +8276,1064 @@ mod tests {
             .unwrap();
         assert!(read.last_agent_sequence <= read.last_read_sequence);
         assert_eq!(store.health().unwrap()["schemaVersion"], 4);
+    }
+
+    #[test]
+    fn reopening_v4_adds_chat_v2_tables_without_rewriting_legacy_rows() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("todoagent.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let task = store
+            .create_task("保留旧数据", "原始备注", None, Some("2026-08-11"), None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp/original")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "原始消息")
+            .unwrap();
+        let before: (String, String, String, String, i64) = store
+            .connection
+            .query_row(
+                "SELECT t.title,t.note,s.working_directory,m.body,m.sequence
+                 FROM task t JOIN task_session s ON s.task_id=t.id
+                 JOIN session_message m ON m.session_id=s.id
+                 WHERE t.id=?1 AND m.turn_id=?2",
+                params![task.id, queued.turn.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        let after: (String, String, String, String, i64) = reopened
+            .connection
+            .query_row(
+                "SELECT t.title,t.note,s.working_directory,m.body,m.sequence
+                 FROM task t JOIN task_session s ON s.task_id=t.id
+                 JOIN session_message m ON m.session_id=s.id
+                 WHERE t.id=?1 AND m.turn_id=?2",
+                params![task.id, queued.turn.id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(before, after);
+        assert_eq!(reopened.health().unwrap()["schemaVersion"], 4);
+        assert!(table_exists(&reopened.connection, "session_timeline_item").unwrap());
+        assert!(table_exists(&reopened.connection, "session_timeline_projection").unwrap());
+    }
+
+    #[test]
+    fn chat_v2_keeps_adjacent_text_but_splits_across_tools_and_reasoning() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("Chat V2", "", None, None, None).unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "检查项目")
+            .unwrap();
+        store.append_agent_text(&queued.turn.id, "第一段").unwrap();
+        store.append_agent_text(&queued.turn.id, "继续").unwrap();
+        store
+            .append_message(
+                &queued.turn.id,
+                MessageRole::Tool,
+                "tool_call",
+                "Read",
+                Some(r#"{"name":"Read","callId":"call-1","input":{"path":"a"}}"#),
+            )
+            .unwrap();
+        store
+            .append_message(
+                &queued.turn.id,
+                MessageRole::Tool,
+                "tool_result",
+                "contents",
+                Some(r#"{"name":"Read","callId":"call-1","isError":false}"#),
+            )
+            .unwrap();
+        store
+            .append_agent_text(&queued.turn.id, "工具之后")
+            .unwrap();
+        store.append_reasoning(&queued.turn.id, "考虑").unwrap();
+        store.append_reasoning(&queued.turn.id, "更多").unwrap();
+        store
+            .append_agent_text(&queued.turn.id, "思考之后")
+            .unwrap();
+
+        let page = store.session_timeline(&session.id, 0, 100).unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "user",
+                "assistant_text",
+                "tool",
+                "assistant_text",
+                "reasoning",
+                "assistant_text"
+            ]
+        );
+        assert_eq!(page.items[1].body, "第一段继续");
+        assert_eq!(page.items[2].tool_state.as_deref(), Some("completed"));
+        assert_eq!(page.items[2].output_text.as_deref(), Some("contents"));
+        assert_eq!(page.items[3].body, "工具之后");
+        assert_eq!(page.items[4].body, "考虑更多");
+        assert_eq!(page.items[5].body, "思考之后");
+        assert_eq!(store.health().unwrap()["schemaVersion"], 4);
+    }
+
+    #[test]
+    fn chat_v2_atomic_frame_preserves_raw_order_and_coalesces_adjacent_parts() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Atomic Chat V2", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        let applied = store
+            .apply_provider_frame(
+                &queued.turn.id,
+                ProviderFrame {
+                    raw_kind: Some("assistant".to_owned()),
+                    raw_payload: Some(json!({"type":"assistant","fixture":true})),
+                    events: vec![
+                        ProviderEvent::Text("前言".to_owned()),
+                        ProviderEvent::Text("继续".to_owned()),
+                        ProviderEvent::Reasoning("检查".to_owned()),
+                        ProviderEvent::Text("结论".to_owned()),
+                        ProviderEvent::ToolUse {
+                            name: "Read".to_owned(),
+                            call_id: "call-atomic".to_owned(),
+                            input: json!({"path":"a"}),
+                        },
+                        ProviderEvent::ToolResult {
+                            name: "Read".to_owned(),
+                            call_id: "call-atomic".to_owned(),
+                            output: "ok".to_owned(),
+                            is_error: false,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+
+        let raw_count: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM turn_event WHERE turn_id=?1",
+                [&queued.turn.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_count, 1);
+        assert_eq!(applied.messages.len(), 4);
+        assert_eq!(applied.timeline.len(), 4);
+        let page = store.session_timeline(&session.id, 0, 100).unwrap();
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "user",
+                "assistant_text",
+                "reasoning",
+                "assistant_text",
+                "tool"
+            ]
+        );
+        assert_eq!(page.items[1].body, "前言继续");
+        assert_eq!(page.items[2].body, "检查");
+        assert_eq!(page.items[3].body, "结论");
+        assert_eq!(page.items[4].tool_state.as_deref(), Some("completed"));
+        assert!(
+            page.items[1..]
+                .iter()
+                .all(|item| item.source_event_sequence == Some(1))
+        );
+        assert_eq!(page.next_cursor.unwrap().turn_ordinal, 1);
+    }
+
+    #[test]
+    fn chat_v2_provider_frame_rolls_back_raw_and_both_projections_together() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Atomic rollback", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        let counts = |table: &str| -> i64 {
+            store
+                .connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap()
+        };
+        let before = (
+            counts("turn_event"),
+            counts("session_message"),
+            counts("session_timeline_item"),
+        );
+        let result = store.apply_provider_frame(
+            &queued.turn.id,
+            ProviderFrame {
+                raw_kind: Some("assistant".to_owned()),
+                raw_payload: Some(json!({"type":"assistant","fixture":"rollback"})),
+                events: vec![
+                    ProviderEvent::Text("不得提交".to_owned()),
+                    ProviderEvent::ToolUse {
+                        name: "Read".to_owned(),
+                        call_id: String::new(),
+                        input: json!({}),
+                    },
+                ],
+            },
+        );
+        assert!(matches!(result, Err(StoreError::Invalid(_))));
+        assert_eq!(
+            (
+                counts("turn_event"),
+                counts("session_message"),
+                counts("session_timeline_item"),
+            ),
+            before
+        );
+    }
+
+    #[test]
+    fn chat_v2_projection_failure_is_monotonic_across_later_exact_frames() {
+        for (fidelity, error) in [
+            ("failed", "raw frame could not be persisted"),
+            ("partial", "raw frame was truncated"),
+        ] {
+            let directory = tempdir().unwrap();
+            let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+            let task = store
+                .create_task("Projection fidelity", "", None, None, None)
+                .unwrap();
+            let session = store
+                .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+                .unwrap();
+            let queued = store
+                .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+                .unwrap();
+            store
+                .mark_timeline_projection_degraded(&queued.turn.id, fidelity, error)
+                .unwrap();
+            store
+                .apply_provider_frame(
+                    &queued.turn.id,
+                    ProviderFrame {
+                        raw_kind: Some("assistant".to_owned()),
+                        raw_payload: Some(json!({"type":"assistant","text":"later"})),
+                        events: vec![ProviderEvent::Text("后续正常帧".to_owned())],
+                    },
+                )
+                .unwrap();
+
+            let projection: (String, Option<String>) = store
+                .connection
+                .query_row(
+                    "SELECT fidelity,last_error FROM session_timeline_projection WHERE turn_id=?1",
+                    [&queued.turn.id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(projection.0, fidelity);
+            assert_eq!(projection.1.as_deref(), Some(error));
+        }
+    }
+
+    #[test]
+    fn chat_v2_terminal_turn_maps_unfinished_tools_without_false_failures() {
+        for (status, expected_state, expected_error) in [
+            (TurnStatus::Completed, "interrupted", false),
+            (TurnStatus::Cancelled, "interrupted", false),
+            (TurnStatus::Failed, "failed", true),
+        ] {
+            let directory = tempdir().unwrap();
+            let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+            let task = store
+                .create_task("Tool terminal state", "", None, None, None)
+                .unwrap();
+            let session = store
+                .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+                .unwrap();
+            let queued = store
+                .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+                .unwrap();
+            store
+                .apply_provider_frame(
+                    &queued.turn.id,
+                    ProviderFrame {
+                        raw_kind: Some("assistant".to_owned()),
+                        raw_payload: Some(json!({"type":"assistant"})),
+                        events: vec![ProviderEvent::ToolUse {
+                            name: "Read".to_owned(),
+                            call_id: "unfinished".to_owned(),
+                            input: json!({}),
+                        }],
+                    },
+                )
+                .unwrap();
+            let finished = store
+                .finish_turn(&queued.turn.id, status, None, None, None, None, None, None)
+                .unwrap();
+            if status == TurnStatus::Completed {
+                assert!(
+                    finished
+                        .timeline_mutations
+                        .iter()
+                        .all(|item| item.kind == "tool")
+                );
+            } else {
+                let terminal = finished
+                    .timeline_mutations
+                    .iter()
+                    .find(|item| matches!(item.kind.as_str(), "status" | "error"))
+                    .unwrap();
+                assert_eq!(terminal.kind == "error", status == TurnStatus::Failed);
+                assert_eq!(terminal.is_error, status == TurnStatus::Failed);
+            }
+            let tool = store
+                .session_timeline(&session.id, 0, 100)
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|item| item.kind == "tool")
+                .unwrap();
+            assert_eq!(tool.tool_state.as_deref(), Some(expected_state));
+            assert_eq!(tool.is_error, expected_error);
+        }
+    }
+
+    #[test]
+    fn finish_turn_rolls_back_when_terminal_snapshot_read_fails() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Terminal snapshot rollback", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_terminal_snapshot
+                 AFTER UPDATE OF status ON session_turn
+                 WHEN NEW.id IS NOT NULL
+                 BEGIN
+                   DELETE FROM task_session WHERE id=NEW.session_id;
+                 END;",
+            )
+            .unwrap();
+
+        let result = store.finish_turn(
+            &queued.turn.id,
+            TurnStatus::Completed,
+            Some(0),
+            Some("不得提交"),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(StoreError::NotFound)));
+        assert_eq!(
+            store.turn(&queued.turn.id).unwrap().unwrap().status,
+            TurnStatus::Queued
+        );
+        assert_eq!(
+            store.session(&session.id).unwrap().unwrap().state,
+            SessionState::Queued
+        );
+    }
+
+    #[test]
+    fn chat_v2_truncation_is_utf8_safe_and_tracks_cumulative_original_bytes() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Bounded Chat V2", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        let reasoning = "界".repeat(SESSION_TIMELINE_REASONING_MAX_BYTES / 3 + 11);
+        store.append_reasoning(&queued.turn.id, &reasoning).unwrap();
+        store.append_reasoning(&queued.turn.id, "追加😀").unwrap();
+        let page = store.session_timeline(&session.id, 0, 100).unwrap();
+        let item = page
+            .items
+            .iter()
+            .find(|item| item.kind == "reasoning")
+            .unwrap();
+        assert!(item.body.len() <= SESSION_TIMELINE_REASONING_MAX_BYTES);
+        assert!(item.body.is_char_boundary(item.body.len()));
+        let metadata: Value = serde_json::from_str(item.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            metadata["originalBytes"].as_u64().unwrap() as usize,
+            reasoning.len() + "追加😀".len()
+        );
+
+        let oversized = json!({
+            "type":"assistant",
+            "text":"😀".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / 4 + 64)
+        });
+        let original_bytes = oversized.to_string().len();
+        store
+            .apply_provider_frame(
+                &queued.turn.id,
+                ProviderFrame {
+                    raw_kind: Some("assistant".to_owned()),
+                    raw_payload: Some(oversized),
+                    events: vec![ProviderEvent::Text("完成".to_owned())],
+                },
+            )
+            .unwrap();
+        let stored_raw: String = store
+            .connection
+            .query_row(
+                "SELECT payload FROM turn_event WHERE turn_id=?1 ORDER BY sequence DESC LIMIT 1",
+                [&queued.turn.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let audit: Value = serde_json::from_str(&stored_raw).unwrap();
+        assert_eq!(
+            audit["_todoagentRaw"]["originalBytes"].as_u64().unwrap() as usize,
+            original_bytes
+        );
+        assert_eq!(audit["_todoagentRaw"]["truncated"], true);
+        store
+            .finish_turn(
+                &queued.turn.id,
+                TurnStatus::Completed,
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        for _ in 0..2 {
+            let page = store.session_timeline(&session.id, 0, 100).unwrap();
+            assert_eq!(page.fidelity, "partial");
+            assert!(!page.has_more);
+        }
+    }
+
+    #[test]
+    fn chat_v2_bounds_legacy_text_and_tool_payloads_with_merged_metadata() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Bound every projection", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+
+        let first_text = "文".repeat(SESSION_TIMELINE_TEXT_MAX_BYTES / 3 + 8);
+        store
+            .append_agent_text(&queued.turn.id, &first_text)
+            .unwrap();
+        store.append_agent_text(&queued.turn.id, "追加😀").unwrap();
+        let message = store
+            .session_bundle(&session.id, 0, 100)
+            .unwrap()
+            .messages
+            .into_iter()
+            .find(|message| message.role == MessageRole::Agent)
+            .unwrap();
+        assert!(message.body.len() <= SESSION_TIMELINE_TEXT_MAX_BYTES);
+        assert!(message.body.is_char_boundary(message.body.len()));
+        let text_metadata: Value =
+            serde_json::from_str(message.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            text_metadata["originalBytes"].as_u64().unwrap() as usize,
+            first_text.len() + "追加😀".len()
+        );
+
+        let oversized_input = json!({
+            "emoji":"😀".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / 4 + 64)
+        });
+        let input_original_bytes = oversized_input.to_string().len();
+        let oversized_output = "界".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / 3 + 64);
+        let output_original_bytes = oversized_output.len();
+        store
+            .apply_provider_frame(
+                &queued.turn.id,
+                ProviderFrame {
+                    raw_kind: None,
+                    raw_payload: None,
+                    events: vec![
+                        ProviderEvent::ToolUse {
+                            name: "Read".to_owned(),
+                            call_id: "bounded-tool".to_owned(),
+                            input: oversized_input,
+                        },
+                        ProviderEvent::ToolResult {
+                            name: "Read".to_owned(),
+                            call_id: "bounded-tool".to_owned(),
+                            output: oversized_output,
+                            is_error: false,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+        let page = store.session_timeline(&session.id, 0, 100).unwrap();
+        let tool = page
+            .items
+            .iter()
+            .find(|item| item.call_id.as_deref() == Some("bounded-tool"))
+            .unwrap();
+        assert!(tool.input_json.as_ref().unwrap().len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
+        assert!(tool.output_text.as_ref().unwrap().len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
+        let metadata: Value = serde_json::from_str(tool.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            metadata["inputOriginalBytes"].as_u64().unwrap() as usize,
+            input_original_bytes
+        );
+        assert_eq!(
+            metadata["outputOriginalBytes"].as_u64().unwrap() as usize,
+            output_original_bytes
+        );
+        assert_eq!(metadata["inputTruncated"], true);
+        assert_eq!(metadata["outputTruncated"], true);
+
+        let tool_messages = store
+            .session_bundle(&session.id, 0, 100)
+            .unwrap()
+            .messages
+            .into_iter()
+            .filter(|message| message.role == MessageRole::Tool)
+            .collect::<Vec<_>>();
+        assert!(
+            tool_messages
+                .iter()
+                .all(|message| message.body.len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES)
+        );
+        assert!(tool_messages.iter().all(|message| {
+            message
+                .payload_json
+                .as_ref()
+                .is_none_or(|payload| payload.len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES)
+        }));
+    }
+
+    #[test]
+    fn chat_v2_pages_stop_at_byte_budget_and_resume_by_ordinal_cursor() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Bounded timeline pages", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        let long_text = "界".repeat(SESSION_TIMELINE_TEXT_MAX_BYTES / "界".len());
+        let long_tool_output = "果".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / "果".len() + 32);
+        let mut events = Vec::new();
+        for index in 0..10 {
+            events.push(ProviderEvent::Text(long_text.clone()));
+            if index == 4 {
+                events.push(ProviderEvent::ToolUse {
+                    name: "Read".to_owned(),
+                    call_id: "large-page-tool".to_owned(),
+                    input: json!({
+                        "payload":"参".repeat(
+                            SESSION_TIMELINE_PAYLOAD_MAX_BYTES / "参".len() + 32
+                        )
+                    }),
+                });
+                events.push(ProviderEvent::ToolResult {
+                    name: "Read".to_owned(),
+                    call_id: "large-page-tool".to_owned(),
+                    output: long_tool_output.clone(),
+                    is_error: false,
+                });
+            } else {
+                events.push(ProviderEvent::Reasoning(format!("分隔-{index}")));
+            }
+        }
+        store
+            .apply_provider_frame(
+                &queued.turn.id,
+                ProviderFrame {
+                    raw_kind: None,
+                    raw_payload: None,
+                    events,
+                },
+            )
+            .unwrap();
+        store
+            .finish_turn(
+                &queued.turn.id,
+                TurnStatus::Completed,
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let expected_count: usize = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM session_timeline_item WHERE turn_id=?1",
+                [&queued.turn.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let assert_pages = |turn_only: bool| {
+            let mut cursor = None;
+            let mut seen = HashSet::new();
+            let mut page_count = 0;
+            loop {
+                let page = if turn_only {
+                    store
+                        .session_timeline_turn_page(
+                            &session.id,
+                            &queued.turn.id,
+                            cursor.as_ref(),
+                            500,
+                        )
+                        .unwrap()
+                } else {
+                    store
+                        .session_timeline_page(&session.id, 0, cursor.as_ref(), 2000)
+                        .unwrap()
+                };
+                page_count += 1;
+                assert!(!page.items.is_empty());
+                let retained_bytes = page
+                    .items
+                    .iter()
+                    .map(|item| serde_json::to_vec(item).unwrap().len() + 1)
+                    .sum::<usize>();
+                assert!(retained_bytes <= SESSION_TIMELINE_PAGE_MAX_BYTES || page.items.len() == 1);
+                for item in &page.items {
+                    assert!(
+                        seen.insert(item.id.clone()),
+                        "timeline page duplicated an item"
+                    );
+                }
+                if !page.has_more {
+                    break;
+                }
+                cursor = page.next_cursor;
+                assert!(cursor.is_some());
+                assert!(page_count < 10);
+            }
+            assert!(page_count > 1, "fixture must cross the byte budget");
+            assert_eq!(seen.len(), expected_count);
+        };
+        assert_pages(false);
+        assert_pages(true);
+    }
+
+    #[test]
+    fn chat_v2_unknown_valid_raw_never_erases_unwatermarked_reasoning() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Preserve unknown reasoning", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        store
+            .append_reasoning(&queued.turn.id, "仅存的公开思考")
+            .unwrap();
+        store
+            .append_turn_event(
+                &queued.turn.id,
+                "future_provider_event",
+                &json!({"type":"future_provider_event","payload":{"v":99}}),
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO session_timeline_projection(
+                   turn_id,parser_version,raw_through_sequence,fidelity,updated_at
+                 ) VALUES(?1,1,0,'exact',?2)",
+                params![queued.turn.id, now()],
+            )
+            .unwrap();
+        store
+            .finish_turn(
+                &queued.turn.id,
+                TurnStatus::Completed,
+                Some(0),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        for _ in 0..2 {
+            let page = store.session_timeline(&session.id, 0, 100).unwrap();
+            assert!(
+                page.items.iter().any(|item| {
+                    item.kind == "reasoning" && item.body == "仅存的公开思考"
+                })
+            );
+            assert_eq!(page.fidelity, "partial");
+            assert!(!page.has_more);
+        }
+        let projection: (i64, String, Option<String>) = store
+            .connection
+            .query_row(
+                "SELECT parser_version,fidelity,last_error
+                 FROM session_timeline_projection WHERE turn_id=?1",
+                [&queued.turn.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projection.0, SESSION_TIMELINE_PARSER_VERSION);
+        assert_eq!(projection.1, "partial");
+        assert_eq!(projection.2.as_deref(), Some("preserved_unreplayable"));
+    }
+
+    #[test]
+    fn chat_v2_replays_raw_claude_order_and_provider_exposed_thinking() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("恢复 Claude", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        let thinking = "r".repeat(4_952);
+        for payload in [
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"前言"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"a"}}]}}),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"thinking","thinking":thinking}]}}),
+            json!({"type":"assistant","message":{"content":[{"type":"text","text":"结论"}]}}),
+        ] {
+            store
+                .append_turn_event(&queued.turn.id, payload["type"].as_str().unwrap(), &payload)
+                .unwrap();
+        }
+        store
+            .finish_turn(
+                &queued.turn.id,
+                TurnStatus::Completed,
+                Some(0),
+                Some("结论"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM session_timeline_item WHERE session_id=?1",
+                [&session.id],
+            )
+            .unwrap();
+
+        let first = store.session_timeline(&session.id, 0, 100).unwrap();
+        let second = store.session_timeline(&session.id, 0, 100).unwrap();
+        assert_eq!(first.items, second.items);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "user",
+                "assistant_text",
+                "tool",
+                "reasoning",
+                "assistant_text"
+            ]
+        );
+        assert_eq!(first.items[1].body, "前言");
+        assert_eq!(first.items[2].tool_state.as_deref(), Some("completed"));
+        assert_eq!(first.items[3].body.len(), 4_952);
+        assert_eq!(first.items[4].body, "结论");
+        assert_eq!(first.fidelity, "exact");
+    }
+
+    #[test]
+    fn chat_v2_legacy_recovery_is_bounded_and_continues_by_turn_cursor() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Long history", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        for ordinal in 1..=35 {
+            let queued = store
+                .send_message(
+                    &session.id,
+                    &Uuid::new_v4().to_string(),
+                    &format!("问题 {ordinal}"),
+                )
+                .unwrap();
+            store
+                .append_agent_text(&queued.turn.id, &format!("回答 {ordinal}"))
+                .unwrap();
+            store
+                .finish_turn(
+                    &queued.turn.id,
+                    TurnStatus::Completed,
+                    Some(0),
+                    Some(&format!("回答 {ordinal}")),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        store
+            .connection
+            .execute(
+                "DELETE FROM session_timeline_item WHERE session_id=?1",
+                [&session.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM session_timeline_projection WHERE turn_id IN
+                 (SELECT id FROM session_turn WHERE session_id=?1)",
+                [&session.id],
+            )
+            .unwrap();
+
+        let first = store.session_timeline(&session.id, 0, 1).unwrap();
+        let projected_after_first: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM session_timeline_projection projection
+                 JOIN session_turn turn_row ON turn_row.id=projection.turn_id
+                 WHERE turn_row.session_id=?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projected_after_first, SESSION_TIMELINE_BACKFILL_TURN_BATCH);
+        assert!(first.has_more);
+        assert_eq!(first.fidelity, "partial");
+
+        let cursor = first.next_cursor.unwrap();
+        let second = store
+            .session_timeline_page(&session.id, 0, Some(&cursor), 1)
+            .unwrap();
+        let projected_after_second: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM session_timeline_projection projection
+                 JOIN session_turn turn_row ON turn_row.id=projection.turn_id
+                 WHERE turn_row.session_id=?1",
+                [&session.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(projected_after_second, 35);
+        assert!(second.next_cursor.unwrap().turn_ordinal >= cursor.turn_ordinal);
+    }
+
+    #[test]
+    fn chat_v2_first_page_uses_turn_cursor_order_even_when_sequences_are_repaired_late() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Cursor order", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        for ordinal in 1..=2 {
+            let queued = store
+                .send_message(
+                    &session.id,
+                    &Uuid::new_v4().to_string(),
+                    &format!("问题 {ordinal}"),
+                )
+                .unwrap();
+            store
+                .append_agent_text(&queued.turn.id, &format!("回答 {ordinal}"))
+                .unwrap();
+            store
+                .finish_turn(
+                    &queued.turn.id,
+                    TurnStatus::Completed,
+                    Some(0),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        store
+            .connection
+            .execute(
+                "UPDATE session_timeline_item SET sequence=10000
+                 WHERE session_id=?1 AND turn_ordinal=1 AND kind='assistant_text'",
+                [&session.id],
+            )
+            .unwrap();
+
+        let first = store
+            .session_timeline_page(&session.id, 0, None, 2)
+            .unwrap();
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| (item.turn_ordinal, item.kind.as_str()))
+                .collect::<Vec<_>>(),
+            [(1, "user"), (1, "assistant_text")]
+        );
+        let second = store
+            .session_timeline_page(&session.id, 0, first.next_cursor.as_ref(), 2)
+            .unwrap();
+        assert_eq!(
+            second
+                .items
+                .iter()
+                .map(|item| (item.turn_ordinal, item.kind.as_str()))
+                .collect::<Vec<_>>(),
+            [(2, "user"), (2, "assistant_text")]
+        );
+    }
+
+    #[test]
+    fn chat_v2_restart_repairs_partial_turn_error_and_running_tool_idempotently() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("todoagent.sqlite3");
+        let store = Store::open(&database).unwrap();
+        let task = store
+            .create_task("Crash repair", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let queued = store
+            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
+            .unwrap();
+        store.mark_turn_running(&queued.turn.id).unwrap();
+        let raw = json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"text","text":"已开始"}]}
+        });
+        store
+            .append_turn_event(&queued.turn.id, "assistant", &raw)
+            .unwrap();
+        store.append_agent_text(&queued.turn.id, "旧投影").unwrap();
+        store
+            .append_message(
+                &queued.turn.id,
+                MessageRole::Tool,
+                "tool_call",
+                "Read",
+                Some(r#"{"name":"Read","callId":"crash-tool","input":{}}"#),
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(&database).unwrap();
+        let first = reopened.session_timeline(&session.id, 0, 100).unwrap();
+        let second = reopened.session_timeline(&session.id, 0, 100).unwrap();
+        assert_eq!(first.items, second.items);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "assistant_text", "tool", "error"]
+        );
+        assert_eq!(first.items[1].body, "已开始");
+        let tool = first.items.iter().find(|item| item.kind == "tool").unwrap();
+        assert_eq!(tool.tool_state.as_deref(), Some("interrupted"));
+        assert!(!tool.is_error);
+        assert!(first.items.iter().any(|item| {
+            item.kind == "error" && item.body.contains("上次退出时本轮仍在运行")
+        }));
+        let projection: (i64, i64, String) = reopened
+            .connection
+            .query_row(
+                "SELECT parser_version,raw_through_sequence,fidelity
+                 FROM session_timeline_projection WHERE turn_id=?1",
+                [&queued.turn.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(projection.0, SESSION_TIMELINE_PARSER_VERSION);
+        assert_eq!(projection.1, 1);
     }
 
     #[test]
@@ -6937,6 +10905,307 @@ mod tests {
     }
 
     #[test]
+    fn assistant_history_projects_stable_ordered_parts_without_private_thought_data() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let session = store.create_assistant_session("ordered parts").unwrap();
+        let welcome_id = Uuid::new_v4().to_string();
+        let timestamp = now();
+        store
+            .connection
+            .execute(
+                "INSERT INTO chat_message(id,session_id,sequence,role,kind,body,created_at,updated_at)
+                 VALUES(?1,?2,1,'todoagent','text','欢迎',?3,?3)",
+                params![welcome_id, session.id, timestamp],
+            )
+            .unwrap();
+        let queued = store
+            .begin_assistant_turn(
+                &session.id,
+                &Uuid::new_v4().to_string(),
+                "检查任务",
+                None,
+                Some("model-x"),
+            )
+            .unwrap();
+        store.mark_assistant_turn_running(&queued.turn.id).unwrap();
+        store
+            .append_assistant_steps(
+                &queued.turn.id,
+                1,
+                &[
+                    (
+                        "thought",
+                        None,
+                        Some(
+                            r#"{"type":"thought","signature":"PRIVATE-SIGNATURE","summary":[{"type":"text","text":"先检查任务"}]}"#,
+                        ),
+                        Some(0),
+                    ),
+                    (
+                        "function_call",
+                        Some("list_state"),
+                        Some(
+                            r#"{"type":"function_call","id":"call-1","name":"list_state","arguments":{"status":"open"}}"#,
+                        ),
+                        Some(1),
+                    ),
+                    (
+                        "function_result",
+                        Some("list_state"),
+                        Some(
+                            r#"{"type":"function_result","call_id":"call-1","name":"list_state","result":{"count":2},"is_error":false}"#,
+                        ),
+                        Some(2),
+                    ),
+                    (
+                        "model_output",
+                        None,
+                        Some(
+                            r#"{"type":"model_output","content":[{"type":"text","text":"共有两个任务"}]}"#,
+                        ),
+                        Some(3),
+                    ),
+                ],
+            )
+            .unwrap();
+        store
+            .complete_assistant_turn_with_message(
+                &session.id,
+                &queued.turn.id,
+                "共有两个任务",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let welcome_page = store.assistant_history(&session.id, 0, 1).unwrap();
+        assert_eq!(welcome_page.timeline.len(), 1);
+        assert_eq!(welcome_page.timeline[0].body, "欢迎");
+        assert!(welcome_page.timeline[0].turn_id.starts_with("standalone-"));
+
+        let user_page = store.assistant_history(&session.id, 1, 1).unwrap();
+        assert_eq!(
+            user_page
+                .timeline
+                .iter()
+                .map(|item| item.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["user", "reasoning", "tool", "assistant_text"]
+        );
+        let tool = user_page
+            .timeline
+            .iter()
+            .find(|item| item.kind == "tool")
+            .unwrap();
+        assert_eq!(tool.input_json.as_deref(), Some(r#"{"status":"open"}"#));
+        assert_eq!(tool.output_text.as_deref(), Some(r#"{"count":2}"#));
+        assert_eq!(tool.tool_state.as_deref(), Some("completed"));
+        let stable_parts = user_page
+            .timeline
+            .iter()
+            .filter(|item| item.source_event_sequence.is_some())
+            .map(|item| (item.id.clone(), item.sequence))
+            .collect::<Vec<_>>();
+
+        let final_page = store.assistant_history(&session.id, 2, 100).unwrap();
+        let final_parts = final_page
+            .timeline
+            .iter()
+            .filter(|item| item.source_event_sequence.is_some())
+            .map(|item| (item.id.clone(), item.sequence))
+            .collect::<Vec<_>>();
+        assert_eq!(stable_parts, final_parts);
+        assert_eq!(
+            final_page
+                .timeline
+                .iter()
+                .filter(|item| item.kind == "assistant_text")
+                .count(),
+            1
+        );
+        let encoded = serde_json::to_string(&final_page.timeline).unwrap();
+        assert!(!encoded.contains("PRIVATE-SIGNATURE"));
+        assert!(encoded.contains("先检查任务"));
+    }
+
+    #[test]
+    fn assistant_history_500_one_mib_rows_stop_before_the_decode_budget() {
+        let connection = Connection::open_in_memory().unwrap();
+        let mut statement = connection
+            .prepare(
+                "WITH RECURSIVE message_number(value) AS (
+                   VALUES(1)
+                   UNION ALL SELECT value+1 FROM message_number WHERE value<500
+                 )
+                 SELECT printf('message-%d',value),'session',NULL,value,NULL,
+                        'todoagent','text',printf('%*s',1048576,'x'),NULL,NULL,
+                        '2026-08-11T00:00:00Z','2026-08-11T00:00:00Z'
+                 FROM message_number ORDER BY value",
+            )
+            .unwrap();
+        let mut rows = statement.query([]).unwrap();
+        let messages = collect_bounded_assistant_message_rows(&mut rows).unwrap();
+        assert!(!messages.is_empty());
+        assert!(messages.len() < 500);
+        assert!(messages.last().unwrap().sequence > 0);
+        assert!(
+            messages.iter().map(serialized_wire_bytes).sum::<usize>()
+                <= ASSISTANT_HISTORY_MESSAGE_PAGE_MAX_BYTES
+                || messages.len() == 1
+        );
+    }
+
+    #[test]
+    fn assistant_history_message_budget_pages_advance_without_duplicates() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let session = store.create_assistant_session("large messages").unwrap();
+        let timestamp = now();
+        let body = "答".repeat(SESSION_TIMELINE_TEXT_MAX_BYTES / "答".len());
+        let transaction = store.connection.unchecked_transaction().unwrap();
+        for sequence in 1..=12_i64 {
+            transaction
+                .execute(
+                    "INSERT INTO chat_message(
+                       id,session_id,sequence,role,kind,body,created_at,updated_at
+                     ) VALUES(?1,?2,?3,'todoagent','text',?4,?5,?5)",
+                    params![
+                        format!("large-message-{sequence}"),
+                        session.id,
+                        sequence,
+                        body,
+                        timestamp
+                    ],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        let mut cursor = 0_i64;
+        let mut seen = HashSet::new();
+        let mut pages = 0;
+        while cursor < 12 {
+            let history = store.assistant_history(&session.id, cursor, 500).unwrap();
+            pages += 1;
+            assert_eq!(history.session.last_sequence, 12);
+            assert!(!history.messages.is_empty());
+            assert!(
+                history
+                    .messages
+                    .iter()
+                    .map(serialized_wire_bytes)
+                    .sum::<usize>()
+                    <= ASSISTANT_HISTORY_MESSAGE_PAGE_MAX_BYTES
+                    || history.messages.len() == 1
+            );
+            let next = history
+                .messages
+                .iter()
+                .map(|message| message.sequence)
+                .max()
+                .unwrap();
+            assert!(next > cursor);
+            for message in history.messages {
+                assert!(seen.insert(message.id));
+            }
+            cursor = next;
+            assert!(pages < 10);
+        }
+        assert!(pages > 1);
+        assert_eq!(seen.len(), 12);
+    }
+
+    #[test]
+    fn assistant_history_many_steps_is_bounded_and_keeps_final_message_with_partial_notice() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let session = store.create_assistant_session("large steps").unwrap();
+        let queued = store
+            .begin_assistant_turn(
+                &session.id,
+                &Uuid::new_v4().to_string(),
+                "分析大量步骤",
+                None,
+                Some("model-x"),
+            )
+            .unwrap();
+        store.mark_assistant_turn_running(&queued.turn.id).unwrap();
+        let summaries = (0..40)
+            .map(|index| {
+                json!({
+                    "type":"thought",
+                    "summary":[{
+                        "type":"text",
+                        "text":format!("{index}-{}", "思".repeat(
+                            SESSION_TIMELINE_REASONING_MAX_BYTES / "思".len()
+                        ))
+                    }]
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        let steps = summaries
+            .iter()
+            .enumerate()
+            .map(|(index, payload)| ("thought", None, Some(payload.as_str()), Some(index as i64)))
+            .collect::<Vec<_>>();
+        store
+            .append_assistant_steps(&queued.turn.id, 1, &steps)
+            .unwrap();
+        store
+            .complete_assistant_turn_with_message(
+                &session.id,
+                &queued.turn.id,
+                "最终正文必须保留",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let first = store.assistant_history(&session.id, 0, 500).unwrap();
+        assert!(first.messages.iter().any(|message| {
+            message.turn_id.as_deref() == Some(queued.turn.id.as_str())
+                && message.role == "todoagent"
+                && message.body == "最终正文必须保留"
+        }));
+        let final_timeline_index = first
+            .timeline
+            .iter()
+            .position(|item| {
+                item.turn_id == queued.turn.id
+                    && item.kind == "assistant_text"
+                    && item.body == "最终正文必须保留"
+            })
+            .expect("the authoritative timeline must retain the final answer");
+        let notice = first.timeline.last().unwrap();
+        assert!(final_timeline_index < first.timeline.len() - 1);
+        assert_eq!(notice.kind, "status");
+        assert_eq!(notice.fidelity, "partial");
+        assert!(notice.body.contains("最终回复仍保留"));
+        let metadata: Value =
+            serde_json::from_str(notice.metadata_json.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["reason"], "history_detail_budget");
+        assert_eq!(metadata["truncated"], true);
+        assert!(
+            serde_json::to_vec(&first).unwrap().len()
+                <= ASSISTANT_HISTORY_MESSAGE_PAGE_MAX_BYTES
+                    + ASSISTANT_HISTORY_DETAIL_PAGE_MAX_BYTES
+                    + 128 * 1024
+        );
+        let repeated = store.assistant_history(&session.id, 0, 500).unwrap();
+        assert_eq!(repeated.timeline.last().unwrap().id, notice.id);
+        assert_eq!(
+            store
+                .assistant_final_message_for_turn(&queued.turn.id)
+                .unwrap()
+                .unwrap()
+                .body,
+            "最终正文必须保留"
+        );
+    }
+
+    #[test]
     fn assistant_turn_writes_require_running_state_and_error_receipts_round_trip() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
@@ -7478,6 +11747,63 @@ mod tests {
     }
 
     #[test]
+    fn assistant_terminal_snapshot_failure_rolls_back_message_and_turn() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let session = store
+            .create_assistant_session("terminal read failure")
+            .unwrap();
+        let queued = store
+            .begin_assistant_turn(
+                &session.id,
+                &Uuid::new_v4().to_string(),
+                "hello",
+                None,
+                Some("model-x"),
+            )
+            .unwrap();
+        store.mark_assistant_turn_running(&queued.turn.id).unwrap();
+        store
+            .connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_assistant_terminal_snapshot
+                 AFTER UPDATE OF status ON assistant_turn
+                 WHEN NEW.status='completed'
+                 BEGIN
+                   DELETE FROM chat_session WHERE id=NEW.session_id;
+                 END;",
+            )
+            .unwrap();
+
+        let result = store.complete_assistant_turn_with_message(
+            &session.id,
+            &queued.turn.id,
+            "不得提交",
+            None,
+            None,
+        );
+        assert!(matches!(result, Err(StoreError::NotFound)));
+        assert_eq!(
+            store
+                .assistant_turn(&queued.turn.id)
+                .unwrap()
+                .unwrap()
+                .status,
+            AssistantTurnStatus::Running
+        );
+        let committed_final_messages: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM chat_message
+                 WHERE turn_id=?1 AND role='todoagent' AND kind='text'",
+                [&queued.turn.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed_final_messages, 0);
+    }
+
+    #[test]
     fn cancelling_multi_tool_turn_pairs_executed_and_unexecuted_calls() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
@@ -7559,6 +11885,22 @@ mod tests {
         assert_eq!(skipped["is_error"], true);
         assert_eq!(skipped["result"]["executed"], false);
         assert_eq!(skipped["result"]["error"]["code"], "turn_cancelled");
+
+        let (replayed_message, replayed_turn) = store
+            .finish_assistant_turn_with_message(
+                &session.id,
+                &queued.turn.id,
+                AssistantTurnStatus::Cancelled,
+                Some(("status", "不应重复")),
+                None,
+                Some("cancelled"),
+                Some("用户取消"),
+                None,
+            )
+            .unwrap();
+        assert!(replayed_message.is_none());
+        assert_eq!(replayed_turn.id, cancelled.id);
+        assert_eq!(replayed_turn.status, AssistantTurnStatus::Cancelled);
     }
 
     #[test]

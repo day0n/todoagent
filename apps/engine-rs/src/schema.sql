@@ -156,6 +156,45 @@ CREATE TABLE IF NOT EXISTS turn_event (
   UNIQUE(turn_id, sequence)
 );
 
+-- Chat V2 keeps a provider-neutral, product-facing timeline beside the legacy
+-- session_message projection.  The table is deliberately additive while the
+-- database remains at schema v4 so an older Engine can ignore it and still
+-- open the same database without a destructive migration.
+CREATE TABLE IF NOT EXISTS session_timeline_item (
+  id                     TEXT PRIMARY KEY,
+  session_id             TEXT NOT NULL REFERENCES task_session(id) ON DELETE CASCADE,
+  turn_id                TEXT NOT NULL REFERENCES session_turn(id) ON DELETE CASCADE,
+  sequence               INTEGER NOT NULL,
+  turn_ordinal           INTEGER NOT NULL,
+  item_ordinal           INTEGER NOT NULL,
+  kind                   TEXT NOT NULL CHECK(kind IN ('user','assistant_text','reasoning','tool','status','error')),
+  body                   TEXT NOT NULL DEFAULT '',
+  call_id                TEXT,
+  tool_name              TEXT,
+  input_json             TEXT,
+  output_text            TEXT,
+  tool_state             TEXT CHECK(tool_state IS NULL OR tool_state IN ('running','completed','failed','interrupted')),
+  is_error               INTEGER NOT NULL DEFAULT 0 CHECK(is_error IN (0,1)),
+  source_event_sequence  INTEGER,
+  source_block_index     INTEGER,
+  fidelity               TEXT NOT NULL DEFAULT 'exact' CHECK(fidelity IN ('exact','partial','legacy')),
+  metadata_json          TEXT,
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  UNIQUE(session_id, sequence),
+  UNIQUE(session_id, turn_ordinal, item_ordinal),
+  UNIQUE(turn_id, call_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_timeline_projection (
+  turn_id               TEXT PRIMARY KEY REFERENCES session_turn(id) ON DELETE CASCADE,
+  parser_version        INTEGER NOT NULL,
+  raw_through_sequence  INTEGER NOT NULL DEFAULT 0,
+  fidelity              TEXT NOT NULL CHECK(fidelity IN ('exact','partial','legacy','failed')),
+  last_error            TEXT,
+  updated_at            TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS chat_session (
   id           TEXT PRIMARY KEY,
   title        TEXT NOT NULL DEFAULT '',
@@ -273,6 +312,8 @@ CREATE INDEX IF NOT EXISTS idx_session_task ON task_session(task_id);
 CREATE INDEX IF NOT EXISTS idx_turn_session ON session_turn(session_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_message_session ON session_message(session_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_event_turn ON turn_event(turn_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_timeline_session ON session_timeline_item(session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_timeline_turn ON session_timeline_item(turn_id, item_ordinal);
 CREATE INDEX IF NOT EXISTS idx_chat_message_session ON chat_message(session_id, sequence);
 CREATE INDEX IF NOT EXISTS idx_assistant_turn_session ON assistant_turn(session_id, ordinal);
 CREATE INDEX IF NOT EXISTS idx_assistant_step_session ON assistant_step(session_id, sequence);

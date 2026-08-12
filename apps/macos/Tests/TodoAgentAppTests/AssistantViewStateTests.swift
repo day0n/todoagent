@@ -268,6 +268,425 @@ struct AssistantViewStateTests {
         ])
     }
 
+    @Test("live text remains ordered around tool boundaries")
+    func liveTextToolTextInterleaving() async throws {
+        let session = sessionDescriptor(isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: session.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let user = assistantMessage(id: "user", sequence: 1, role: .user, body: "检查")
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(
+                session: session,
+                messages: [user],
+                activeTurn: turn
+            ),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "先读取"))
+        let initialTurn = try #require(firstChatTurn(state.selectedChatTranscript))
+        let initialNarrationID = try #require(initialTurn.activity?.items.first?.id)
+
+        let started = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "toolCallId": "call-1",
+            "name": "list_state",
+        ])
+        await state.consumeAssistantEvent(EngineEvent(name: "assistant.tool.started", data: started))
+        let finished = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "toolCallId": "call-1",
+            "name": "list_state",
+            "isError": false,
+            "taskReferences": [],
+        ])
+        await state.consumeAssistantEvent(EngineEvent(name: "assistant.tool.finished", data: finished))
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 2, delta: "最终结果"))
+
+        let projectedTurn = try #require(firstChatTurn(state.selectedChatTranscript))
+        let activity = try #require(projectedTurn.activity)
+        #expect(projectedTurn.id == initialTurn.id)
+        #expect(activity.items.first?.id == initialNarrationID)
+        #expect(activity.items.compactMap { item -> String? in
+            guard case let .narration(text) = item else { return nil }
+            return text.body
+        } == ["先读取", "最终结果"])
+        #expect(activity.items.compactMap { item -> String? in
+            guard case let .tool(tool) = item else { return nil }
+            return tool.callID
+        } == ["call-1"])
+    }
+
+    @Test("live reducer coalesces six thousand deltas into bounded stable parts")
+    func liveReducerStressKeepsPartCountBounded() async throws {
+        let session = sessionDescriptor(isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: session.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, activeTurn: turn),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        let delta = try deltaEvent(attempt: 1, delta: "x")
+
+        for toolIndex in 0..<20 {
+            for _ in 0..<300 {
+                await state.consumeAssistantEvent(delta)
+            }
+            let callID = "stress-call-\(toolIndex)"
+            let started = try JSONSerialization.data(withJSONObject: [
+                "sessionId": session.id,
+                "turnId": turn.id,
+                "toolCallId": callID,
+                "name": "stress_tool",
+            ])
+            await state.consumeAssistantEvent(
+                EngineEvent(name: "assistant.tool.started", data: started)
+            )
+            let finished = try JSONSerialization.data(withJSONObject: [
+                "sessionId": session.id,
+                "turnId": turn.id,
+                "toolCallId": callID,
+                "name": "stress_tool",
+                "isError": false,
+                "taskReferences": [],
+            ])
+            await state.consumeAssistantEvent(
+                EngineEvent(name: "assistant.tool.finished", data: finished)
+            )
+        }
+
+        let transcript = state.selectedChatTranscript
+        let turns = chatTurns(transcript)
+        let activity = try #require(turns.first?.activity)
+        #expect(turns.count == 1)
+        #expect(turns.first?.isRunning == true)
+        #expect(activity.items.count == 40)
+        #expect(Set(activity.items.map(\.id)).count == 40)
+        let narration = activity.items.compactMap { item -> ChatTextItem? in
+            guard case let .narration(text) = item else { return nil }
+            return text
+        }
+        #expect(narration.count == 20)
+        #expect(narration.allSatisfy { $0.body.count == 300 })
+        #expect(activity.items.count < 6_000)
+    }
+
+    @Test("live text and reasoning enforce Engine UTF-8 bounds")
+    func liveBodiesRespectEngineBounds() async throws {
+        let session = sessionDescriptor(isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: session.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, activeTurn: turn),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        let oversizedText = String(
+            repeating: "界",
+            count: AssistantLiveContentBounds.assistantTextBytes / 3 + 100
+        )
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: oversizedText))
+        let oversizedReasoning = String(
+            repeating: "思",
+            count: AssistantLiveContentBounds.reasoningBytes / 3 + 100
+        )
+        let thought = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "attempt": 1,
+            "providerAttempt": 1,
+            "interactionOrdinal": 1,
+            "partId": "bounded-reasoning",
+            "partOrdinal": 0,
+            "isDelta": true,
+            "originalBytes": oversizedReasoning.utf8.count,
+            "truncated": true,
+            "content": oversizedReasoning,
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.thought.summary", data: thought)
+        )
+
+        let activity = try #require(firstChatTurn(state.selectedChatTranscript)?.activity)
+        let text = try #require(activity.items.compactMap { item -> ChatTextItem? in
+            guard case let .narration(text) = item else { return nil }
+            return text
+        }.first)
+        let reasoning = try #require(activity.items.compactMap { item -> ChatReasoningItem? in
+            guard case let .reasoning(reasoning) = item else { return nil }
+            return reasoning
+        }.first)
+        #expect(text.body.utf8.count <= AssistantLiveContentBounds.assistantTextBytes)
+        #expect(reasoning.body.utf8.count <= AssistantLiveContentBounds.reasoningBytes)
+    }
+
+    @Test("one MiB stream has one canonical retained text body")
+    func largeStreamUsesSingleLiveTextAuthority() async throws {
+        let session = sessionDescriptor(isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: session.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, activeTurn: turn),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        let engineSizedDelta = String(repeating: "x", count: 8_192)
+        let delta = try deltaEvent(attempt: 1, delta: engineSizedDelta)
+        for _ in 0..<128 {
+            await state.consumeAssistantEvent(delta)
+        }
+
+        let draft = try #require(state.selectedDraft)
+        let activity = try #require(firstChatTurn(state.selectedChatTranscript)?.activity)
+        let narration = try #require(activity.items.compactMap { item -> ChatTextItem? in
+            guard case let .narration(text) = item else { return nil }
+            return text
+        }.first)
+        #expect(draft.bodyUTF8ByteCount == AssistantLiveContentBounds.assistantTextBytes)
+        #expect(narration.body == draft.body)
+        #expect(state.retainedLiveTextBodyCount == 1)
+        #expect(state.retainedLiveTextUTF8ByteCount == AssistantLiveContentBounds.assistantTextBytes)
+    }
+
+    @Test("live public thought summaries appear as reasoning")
+    func liveThoughtSummaryProjection() async throws {
+        let session = sessionDescriptor(isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: session.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, activeTurn: turn),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        let data = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "attempt": 1,
+            "content": "先核对相关任务",
+        ])
+        await state.consumeAssistantEvent(EngineEvent(name: "assistant.thought.summary", data: data))
+
+        let projectedTurn = try #require(firstChatTurn(state.selectedChatTranscript))
+        guard case let .reasoning(reasoning) = projectedTurn.activity?.items.first else {
+            Issue.record("thought summary should project as reasoning")
+            return
+        }
+        #expect(reasoning.body == "先核对相关任务")
+        #expect(reasoning.isStreaming)
+    }
+
+    @Test("delta thought updates accumulate into one stable reasoning part")
+    func thoughtDeltaUpdatesAccumulate() async throws {
+        let session = sessionDescriptor(isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: session.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, activeTurn: turn),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        for content in ["先检查", "，再确认"] {
+            let data = try JSONSerialization.data(withJSONObject: [
+                "sessionId": session.id,
+                "turnId": turn.id,
+                "attempt": 1,
+                "partId": "reasoning-part-1",
+                "partOrdinal": 0,
+                "isDelta": true,
+                "content": content,
+            ])
+            await state.consumeAssistantEvent(
+                EngineEvent(name: "assistant.thought.summary", data: data)
+            )
+        }
+
+        let activity = try #require(firstChatTurn(state.selectedChatTranscript)?.activity)
+        let reasoning = activity.items.compactMap { item -> ChatReasoningItem? in
+            guard case let .reasoning(reasoning) = item else { return nil }
+            return reasoning
+        }
+        #expect(reasoning.count == 1)
+        #expect(reasoning.first?.body == "先检查，再确认")
+    }
+
+    @Test("reasoning remains ordered across a tool interaction")
+    func liveReasoningToolReasoningInterleaving() async throws {
+        let session = sessionDescriptor(isRunning: true)
+        let turn = AssistantTurn(
+            id: "turn-1",
+            sessionID: session.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(session: session, activeTurn: turn),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        let firstThought = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "attempt": 1,
+            "providerAttempt": 1,
+            "interactionOrdinal": 1,
+            "partId": "turn-1-reasoning-1",
+            "partOrdinal": 0,
+            "isDelta": true,
+            "originalBytes": 30,
+            "truncated": false,
+            "content": "先判断需要读取任务",
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.thought.summary", data: firstThought)
+        )
+
+        let started = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "toolCallId": "call-1",
+            "name": "list_state",
+        ])
+        await state.consumeAssistantEvent(EngineEvent(name: "assistant.tool.started", data: started))
+        let finished = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "toolCallId": "call-1",
+            "name": "list_state",
+            "isError": false,
+            "taskReferences": [],
+        ])
+        await state.consumeAssistantEvent(EngineEvent(name: "assistant.tool.finished", data: finished))
+
+        let secondThought = try JSONSerialization.data(withJSONObject: [
+            "sessionId": session.id,
+            "turnId": turn.id,
+            "attempt": 2,
+            "providerAttempt": 1,
+            "interactionOrdinal": 2,
+            "partId": "turn-1-reasoning-2",
+            "partOrdinal": 0,
+            "isDelta": true,
+            "originalBytes": 39,
+            "truncated": false,
+            "content": "读取完成，继续组织答案",
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.thought.summary", data: secondThought)
+        )
+
+        let projectedTurn = try #require(firstChatTurn(state.selectedChatTranscript))
+        let activity = try #require(projectedTurn.activity)
+        #expect(activity.items.count == 3)
+        let reasoning = activity.items.compactMap { item -> ChatReasoningItem? in
+            guard case let .reasoning(reasoning) = item else { return nil }
+            return reasoning
+        }
+        #expect(reasoning.map(\.body) == [
+            "先判断需要读取任务",
+            "读取完成，继续组织答案",
+        ])
+        #expect(Set(reasoning.map(\.id)).count == 2)
+        #expect(reasoning.map(\.isStreaming) == [false, true])
+        #expect(reasoning.map {
+            ChatDisclosurePreference.automatic.resolved(automaticValue: $0.isStreaming)
+        } == [false, true])
+        #expect(activity.items.compactMap { item -> String? in
+            guard case let .tool(tool) = item else { return nil }
+            return tool.callID
+        } == ["call-1"])
+    }
+
+    @Test("ordered Assistant history takes precedence over legacy messages and tools")
+    func orderedHistoryIsPreferred() async throws {
+        let session = sessionDescriptor(lastSequence: 2)
+        let legacy = [
+            assistantMessage(id: "legacy-user", sequence: 1, role: .user, body: "legacy"),
+            assistantMessage(id: "legacy-answer", sequence: 2, role: .todoAgent, body: "wrong"),
+        ]
+        let timeline = [
+            SessionTimelineItem(
+                id: "ordered-user",
+                sessionID: session.id,
+                turnID: "turn-1",
+                sequence: 8,
+                turnOrdinal: 1,
+                itemOrdinal: 0,
+                kind: "user",
+                body: "ordered"
+            ),
+            SessionTimelineItem(
+                id: "ordered-reasoning",
+                sessionID: session.id,
+                turnID: "turn-1",
+                sequence: 3,
+                turnOrdinal: 1,
+                itemOrdinal: 1,
+                kind: "reasoning",
+                body: "summary only"
+            ),
+            SessionTimelineItem(
+                id: "ordered-answer",
+                sessionID: session.id,
+                turnID: "turn-1",
+                sequence: 1,
+                turnOrdinal: 1,
+                itemOrdinal: 2,
+                kind: "assistant_text",
+                body: "correct"
+            ),
+        ]
+        let repository = AssistantTestRepository(bundles: [
+            session.id: AssistantSessionBundle(
+                session: session,
+                messages: legacy,
+                timeline: timeline
+            ),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        let turn = try #require(firstChatTurn(state.selectedChatTranscript))
+        #expect(turn.userMessages.first?.body == "ordered")
+        #expect(turn.assistant?.body == "correct")
+        guard case let .reasoning(reasoning) = turn.activity?.items.first else {
+            Issue.record("ordered reasoning should be retained")
+            return
+        }
+        #expect(reasoning.body == "summary only")
+    }
+
     @Test("turn completion reconciles a dropped tool event from SQLite")
     func droppedToolEventReconciles() async throws {
         let taskID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000302"))
@@ -324,10 +743,373 @@ struct AssistantViewStateTests {
             name: "assistant.turn.finished",
             data: finishedData
         ))
+        await repository.waitUntilHistoryRequestCount(2)
+        await drainMainActorTasks()
 
         #expect(state.selectedTools.first?.toolCallID == "call-dropped")
         #expect(state.selectedTools.first?.taskReferences == [taskID])
         #expect(state.selectedMessages.last == reply)
+    }
+
+    @Test("a finished history response cannot clear the next assistant turn")
+    func staleFinishedHistoryPreservesNewAssistantTurn() async throws {
+        let runningSessionA = sessionDescriptor(isRunning: true)
+        let turnA = AssistantTurn(
+            id: "turn-a",
+            sessionID: runningSessionA.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let repository = AssistantTestRepository(
+            bundles: [
+                runningSessionA.id: AssistantSessionBundle(
+                    session: runningSessionA,
+                    activeTurn: turnA
+                ),
+            ],
+            suspendHistoryAfterRequestCount: 1
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        let finishedA = AssistantTurn(
+            id: turnA.id,
+            sessionID: turnA.sessionID,
+            model: turnA.model,
+            status: .completed
+        )
+        let finishData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": runningSessionA.id,
+            "turn": try JSONSerialization.jsonObject(with: JSONEncoder().encode(finishedA)),
+        ])
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.turn.finished",
+            data: finishData
+        ))
+        await repository.waitUntilHistoryRequestCount(2)
+
+        let turnB = AssistantTurn(
+            id: "turn-b",
+            sessionID: runningSessionA.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let startData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": runningSessionA.id,
+            "turn": try JSONSerialization.jsonObject(with: JSONEncoder().encode(turnB)),
+        ])
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.turn.started",
+            data: startData
+        ))
+        let deltaData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": runningSessionA.id,
+            "turnId": turnB.id,
+            "messageId": "turn-b-draft",
+            "attempt": 1,
+            "delta": "第二轮仍在输出",
+        ])
+        await state.consumeAssistantEvent(EngineEvent(
+            name: "assistant.message.delta",
+            data: deltaData
+        ))
+
+        let staleCompletedA = AssistantSessionBundle(
+            session: sessionDescriptor(isRunning: false),
+            messages: [
+                AssistantMessage(
+                    id: "answer-a",
+                    sessionID: runningSessionA.id,
+                    turnID: turnA.id,
+                    sequence: 1,
+                    role: .todoAgent,
+                    body: "第一轮结果"
+                ),
+            ],
+            activeTurn: nil
+        )
+        await repository.releaseSuspendedHistory(with: staleCompletedA)
+        await drainMainActorTasks()
+
+        #expect(state.isSelectedSessionRunning)
+        #expect(state.selectedDraft?.turnID == turnB.id)
+        #expect(state.selectedDraft?.body == "第二轮仍在输出")
+        #expect(state.selectedChatTranscript.isRunning)
+        #expect(chatTurns(state.selectedChatTranscript).last?.turnID == turnB.id)
+        #expect(chatTurns(state.selectedChatTranscript).last?.isRunning == true)
+    }
+
+    @Test("third live turn completion preserves earlier authoritative turns")
+    func completedLiveTurnKeepsPriorHistory() async throws {
+        func item(
+            _ id: String,
+            turnID: String,
+            turnOrdinal: Int64,
+            itemOrdinal: Int64,
+            kind: String,
+            body: String
+        ) -> SessionTimelineItem {
+            SessionTimelineItem(
+                id: id,
+                sessionID: "assistant-session",
+                turnID: turnID,
+                sequence: turnOrdinal * 10 + itemOrdinal,
+                turnOrdinal: turnOrdinal,
+                itemOrdinal: itemOrdinal,
+                kind: kind,
+                body: body
+            )
+        }
+
+        let runningSession = sessionDescriptor(isRunning: true)
+        let activeTurn = AssistantTurn(
+            id: "turn-3",
+            sessionID: runningSession.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let initialTimeline = [
+            item("u1", turnID: "turn-1", turnOrdinal: 1, itemOrdinal: 0, kind: "user", body: "第一问"),
+            item("a1", turnID: "turn-1", turnOrdinal: 1, itemOrdinal: 1, kind: "assistant_text", body: "第一答"),
+            item("u2", turnID: "turn-2", turnOrdinal: 2, itemOrdinal: 0, kind: "user", body: "第二问"),
+            item("a2", turnID: "turn-2", turnOrdinal: 2, itemOrdinal: 1, kind: "assistant_text", body: "第二答"),
+            item("u3", turnID: "turn-3", turnOrdinal: 3, itemOrdinal: 0, kind: "user", body: "第三问"),
+        ]
+        let repository = AssistantTestRepository(bundles: [
+            runningSession.id: AssistantSessionBundle(
+                session: runningSession,
+                timeline: initialTimeline,
+                activeTurn: activeTurn
+            ),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+
+        let deltaData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": runningSession.id,
+            "turnId": activeTurn.id,
+            "messageId": "live-third-answer",
+            "attempt": 1,
+            "delta": "临时流式第三答",
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.message.delta", data: deltaData)
+        )
+        #expect(chatTurns(state.selectedChatTranscript).prefix(2).map(\.id) == [
+            "chat:turn:assistant-session:turn-1",
+            "chat:turn:assistant-session:turn-2",
+        ])
+
+        let completedSession = sessionDescriptor(isRunning: false)
+        let authoritativeTimeline = initialTimeline + [
+            item(
+                "a3",
+                turnID: "turn-3",
+                turnOrdinal: 3,
+                itemOrdinal: 1,
+                kind: "assistant_text",
+                body: "权威最终第三答"
+            ),
+        ]
+        await repository.setBundle(
+            AssistantSessionBundle(
+                session: completedSession,
+                timeline: authoritativeTimeline,
+                activeTurn: nil
+            )
+        )
+        let completedTurn = AssistantTurn(
+            id: activeTurn.id,
+            sessionID: activeTurn.sessionID,
+            model: activeTurn.model,
+            status: .completed
+        )
+        let finishedData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": completedSession.id,
+            "turn": try JSONSerialization.jsonObject(with: JSONEncoder().encode(completedTurn)),
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.turn.finished", data: finishedData)
+        )
+
+        // Before SQLite reconciliation gets a chance to run, the retained live
+        // third turn must only replace parts belonging to turn 3.
+        let optimisticTurns = chatTurns(state.selectedChatTranscript)
+        #expect(optimisticTurns.map(\.id) == [
+            "chat:turn:assistant-session:turn-1",
+            "chat:turn:assistant-session:turn-2",
+            "chat:turn:assistant-session:turn-3",
+        ])
+        #expect(optimisticTurns[0].assistant?.body == "第一答")
+        #expect(optimisticTurns[1].assistant?.body == "第二答")
+
+        await repository.waitUntilHistoryRequestCount(2)
+        await drainMainActorTasks()
+        let reconciledTurns = chatTurns(state.selectedChatTranscript)
+        #expect(reconciledTurns.map(\.id) == optimisticTurns.map(\.id))
+        #expect(reconciledTurns[0].assistant?.body == "第一答")
+        #expect(reconciledTurns[1].assistant?.body == "第二答")
+        #expect(reconciledTurns[2].assistant?.body == "权威最终第三答")
+        #expect(reconciledTurns[2].activity == nil)
+    }
+
+    @Test("restored running turn preserves earlier interaction parts when new live parts arrive")
+    func restoredRunningTurnMergesPartialLivePartsPrecisely() async throws {
+        func item(
+            _ id: String,
+            sessionID: String,
+            turnID: String,
+            itemOrdinal: Int64,
+            kind: String,
+            body: String = "",
+            callID: String? = nil,
+            toolName: String? = nil,
+            toolState: String? = nil
+        ) -> SessionTimelineItem {
+            SessionTimelineItem(
+                id: id,
+                sessionID: sessionID,
+                turnID: turnID,
+                sequence: itemOrdinal + 1,
+                turnOrdinal: 1,
+                itemOrdinal: itemOrdinal,
+                kind: kind,
+                body: body,
+                callID: callID,
+                toolName: toolName,
+                toolState: toolState
+            )
+        }
+
+        let sessionA = sessionDescriptor(id: "assistant-session-a", isRunning: true)
+        let sessionB = sessionDescriptor(id: "assistant-session-b")
+        let turn = AssistantTurn(
+            id: "shared-running-turn",
+            sessionID: sessionA.id,
+            model: "gemini-test",
+            status: .running
+        )
+        let earlyTimeline = [
+            item("early-user", sessionID: sessionA.id, turnID: turn.id, itemOrdinal: 0, kind: "user", body: "继续检查"),
+            item("early-reasoning", sessionID: sessionA.id, turnID: turn.id, itemOrdinal: 1, kind: "reasoning", body: "早期思考"),
+            item("early-text", sessionID: sessionA.id, turnID: turn.id, itemOrdinal: 2, kind: "assistant_text", body: "先读取"),
+            item(
+                "early-tool",
+                sessionID: sessionA.id,
+                turnID: turn.id,
+                itemOrdinal: 3,
+                kind: "tool",
+                callID: "call-early",
+                toolName: "read",
+                toolState: "completed"
+            ),
+        ]
+        let repository = AssistantTestRepository(bundles: [
+            sessionA.id: AssistantSessionBundle(
+                session: sessionA,
+                timeline: earlyTimeline,
+                activeTurn: turn
+            ),
+            sessionB.id: AssistantSessionBundle(session: sessionB),
+        ])
+        let state = AssistantViewState(repository: repository, keyLoader: { nil })
+        await state.load()
+        await state.selectSession(sessionB.id)
+        await state.selectSession(sessionA.id)
+
+        let restoredTurn = try #require(firstChatTurn(state.selectedChatTranscript))
+        let restoredActivity = try #require(restoredTurn.activity)
+        let earlyReasoningID = try #require(restoredActivity.items.first { item in
+            guard case let .reasoning(reasoning) = item else { return false }
+            return reasoning.body == "早期思考"
+        }?.id)
+        let earlyTextID = try #require(restoredActivity.items.first { item in
+            guard case let .narration(text) = item else { return false }
+            return text.body == "先读取"
+        }?.id)
+
+        let thoughtData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": sessionA.id,
+            "turnId": turn.id,
+            "attempt": 2,
+            "providerAttempt": 1,
+            "interactionOrdinal": 2,
+            "partId": "new-reasoning-part",
+            "partOrdinal": 0,
+            "isDelta": true,
+            "originalBytes": 12,
+            "truncated": false,
+            "content": "新思考",
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.thought.summary", data: thoughtData)
+        )
+        let deltaData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": sessionA.id,
+            "turnId": turn.id,
+            "messageId": "new-live-text",
+            "attempt": 2,
+            "delta": "新回答",
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.message.delta", data: deltaData)
+        )
+
+        let liveTurn = try #require(firstChatTurn(state.selectedChatTranscript))
+        let liveActivity = try #require(liveTurn.activity)
+        #expect(liveActivity.items.contains { $0.id == earlyReasoningID })
+        #expect(liveActivity.items.contains { $0.id == earlyTextID })
+        #expect(liveActivity.items.compactMap { item -> String? in
+            guard case let .reasoning(reasoning) = item else { return nil }
+            return reasoning.body
+        } == ["早期思考", "新思考"])
+        #expect(liveActivity.items.compactMap { item -> String? in
+            guard case let .narration(text) = item else { return nil }
+            return text.body
+        } == ["先读取", "新回答"])
+
+        let authoritativeTimeline = earlyTimeline + [
+            item("new-reasoning", sessionID: sessionA.id, turnID: turn.id, itemOrdinal: 4, kind: "reasoning", body: "新思考"),
+            item("final-text", sessionID: sessionA.id, turnID: turn.id, itemOrdinal: 5, kind: "assistant_text", body: "权威最终回答"),
+        ]
+        await repository.setBundle(
+            AssistantSessionBundle(
+                session: sessionDescriptor(id: sessionA.id),
+                timeline: authoritativeTimeline,
+                activeTurn: nil
+            )
+        )
+        let historyCountBeforeFinish = await repository.historyRequests().count
+        let completedTurn = AssistantTurn(
+            id: turn.id,
+            sessionID: turn.sessionID,
+            model: turn.model,
+            status: .completed
+        )
+        let finishData = try JSONSerialization.data(withJSONObject: [
+            "sessionId": sessionA.id,
+            "turn": try JSONSerialization.jsonObject(with: JSONEncoder().encode(completedTurn)),
+        ])
+        await state.consumeAssistantEvent(
+            EngineEvent(name: "assistant.turn.finished", data: finishData)
+        )
+        await repository.waitUntilHistoryRequestCount(historyCountBeforeFinish + 1)
+        await drainMainActorTasks()
+
+        let reconciledTurn = try #require(firstChatTurn(state.selectedChatTranscript))
+        let reconciledActivity = try #require(reconciledTurn.activity)
+        #expect(reconciledActivity.items.contains { $0.id == earlyReasoningID })
+        #expect(reconciledActivity.items.contains { $0.id == earlyTextID })
+        #expect(reconciledActivity.items.compactMap { item -> String? in
+            guard case let .reasoning(reasoning) = item else { return nil }
+            return reasoning.body
+        } == ["早期思考", "新思考"])
+        #expect(reconciledActivity.items.compactMap { item -> String? in
+            guard case let .narration(text) = item else { return nil }
+            return text.body
+        } == ["先读取"])
+        #expect(reconciledTurn.assistant?.body == "权威最终回答")
+        #expect(Set(reconciledActivity.items.map(\.id)).count == reconciledActivity.items.count)
     }
 
     @Test("background tool events do not retain detailed history")
@@ -661,6 +1443,24 @@ struct AssistantViewStateTests {
         ])
         return EngineEvent(name: "assistant.message.appended", data: data)
     }
+
+    private func firstChatTurn(_ transcript: ChatTranscript) -> ChatTurnItem? {
+        for item in transcript.items {
+            if case let .turn(turn) = item { return turn }
+        }
+        return nil
+    }
+
+    private func chatTurns(_ transcript: ChatTranscript) -> [ChatTurnItem] {
+        transcript.items.compactMap { item in
+            guard case let .turn(turn) = item else { return nil }
+            return turn
+        }
+    }
+
+    private func drainMainActorTasks() async {
+        for _ in 0..<10 { await Task.yield() }
+    }
 }
 
 actor AssistantTestRepository: AppRepository {
@@ -675,6 +1475,9 @@ actor AssistantTestRepository: AppRepository {
     )
     private var bundles: [String: AssistantSessionBundle]
     private var requestedHistorySequences: [Int64] = []
+    private var historyRequestWaiters: [
+        (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
     private var injectedKeys = 0
     private var sentMessages = 0
     private var sentIDs: [UUID] = []
@@ -684,6 +1487,10 @@ actor AssistantTestRepository: AppRepository {
     private var createSessionFailuresRemaining: Int
     private let persistFailedSend: Bool
     private let historyPageSize: Int
+    private let suspendHistoryAfterRequestCount: Int?
+    private var suspendedHistoryResponses: [
+        CheckedContinuation<AssistantSessionBundle, Never>
+    ] = []
     private var shouldSuspendLoad: Bool
     private var loadContinuations: [CheckedContinuation<Void, Never>] = []
     private var loadStartedContinuations: [CheckedContinuation<Void, Never>] = []
@@ -694,13 +1501,15 @@ actor AssistantTestRepository: AppRepository {
         sendFailuresRemaining: Int = 0,
         createSessionFailuresRemaining: Int = 0,
         persistFailedSend: Bool = false,
-        suspendLoad: Bool = false
+        suspendLoad: Bool = false,
+        suspendHistoryAfterRequestCount: Int? = nil
     ) {
         self.bundles = bundles
         self.historyPageSize = historyPageSize
         self.sendFailuresRemaining = sendFailuresRemaining
         self.createSessionFailuresRemaining = createSessionFailuresRemaining
         self.persistFailedSend = persistFailedSend
+        self.suspendHistoryAfterRequestCount = suspendHistoryAfterRequestCount
         shouldSuspendLoad = suspendLoad
     }
 
@@ -769,6 +1578,7 @@ actor AssistantTestRepository: AppRepository {
             session: current.session.updating(title: title),
             messages: current.messages,
             tools: current.tools,
+            timeline: current.timeline,
             activeTurn: current.activeTurn
         )
         bundles[sessionID] = bundle
@@ -781,6 +1591,7 @@ actor AssistantTestRepository: AppRepository {
             session: current.session.updating(archived: true),
             messages: current.messages,
             tools: current.tools,
+            timeline: current.timeline,
             activeTurn: current.activeTurn
         )
         bundles[sessionID] = bundle
@@ -789,6 +1600,19 @@ actor AssistantTestRepository: AppRepository {
 
     func assistantHistory(sessionID: String, after sequence: Int64) async throws -> AssistantSessionBundle {
         requestedHistorySequences.append(sequence)
+        let readyWaiters = historyRequestWaiters.filter {
+            requestedHistorySequences.count >= $0.targetCount
+        }
+        historyRequestWaiters.removeAll {
+            requestedHistorySequences.count >= $0.targetCount
+        }
+        for waiter in readyWaiters { waiter.continuation.resume() }
+        if let suspendHistoryAfterRequestCount,
+           requestedHistorySequences.count > suspendHistoryAfterRequestCount {
+            return await withCheckedContinuation { continuation in
+                suspendedHistoryResponses.append(continuation)
+            }
+        }
         guard let bundle = bundles[sessionID] else { throw AppRepositoryError.assistantSessionNotFound }
         return AssistantSessionBundle(
             session: bundle.session,
@@ -798,6 +1622,7 @@ actor AssistantTestRepository: AppRepository {
                     .prefix(historyPageSize)
             ),
             tools: bundle.tools,
+            timeline: bundle.timeline,
             activeTurn: bundle.activeTurn
         )
     }
@@ -829,6 +1654,7 @@ actor AssistantTestRepository: AppRepository {
                     session: existing.session.updating(lastSequence: sequence, isRunning: true),
                     messages: existing.messages + [message],
                     tools: existing.tools,
+                    timeline: existing.timeline,
                     activeTurn: AssistantTurn(
                         id: "accepted-turn",
                         sessionID: sessionID,
@@ -848,12 +1674,22 @@ actor AssistantTestRepository: AppRepository {
     func shutdown() async {}
 
     func historyRequests() -> [Int64] { requestedHistorySequences }
+    func waitUntilHistoryRequestCount(_ targetCount: Int) async {
+        guard requestedHistorySequences.count < targetCount else { return }
+        await withCheckedContinuation { continuation in
+            historyRequestWaiters.append((targetCount, continuation))
+        }
+    }
     func keyInjectionCount() -> Int { injectedKeys }
     func sendCount() -> Int { sentMessages }
     func sentClientMessageIDs() -> [UUID] { sentIDs }
     func lastSentAttachments() -> [AssistantTextAttachment] { sentAttachments }
     func loadCount() -> Int { loadCallCount }
     func setBundle(_ bundle: AssistantSessionBundle) { bundles[bundle.session.id] = bundle }
+    func releaseSuspendedHistory(with bundle: AssistantSessionBundle) {
+        guard !suspendedHistoryResponses.isEmpty else { return }
+        suspendedHistoryResponses.removeFirst().resume(returning: bundle)
+    }
     func waitUntilLoadStarts() async {
         guard loadCallCount == 0 else { return }
         await withCheckedContinuation { continuation in

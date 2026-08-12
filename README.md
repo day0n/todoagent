@@ -28,8 +28,8 @@ Runtime 状态都保存在本机；SwiftUI/AppKit 前端通过 stdin/stdout 上�
   Runtime 由用户在设置中主动检测和验证；某个 Runtime 未安装或未登录不会影响
   其他 Runtime。
 - 内置 Gemini 任务助手：多会话、流式回复、取消、上下文压缩和崩溃恢复。
-  助手只开放 `create_tasks`、`find_related`、`update_task`、`list_state`、
-  `list_lists` 五个任务工具。
+  助手只开放 `create_tasks`、`find_related`、`update_task`、`delete_task`、
+  `list_state`、`list_lists` 六个任务工具。
 - 助手工具调用按实际 Turn 穿插在对应问答之间，不再集中堆到对话末尾；运行状态
   使用静态文字与图标。右侧对话栏顶部只保留会话选择、“开始新对话”和“隐藏对话”，
   会话记录使用栏内的 TodoAgent 风格下拉卡片，不再弹出覆盖顶部的系统菜单。

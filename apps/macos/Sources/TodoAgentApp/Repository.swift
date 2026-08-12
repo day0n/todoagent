@@ -35,6 +35,17 @@ protocol AppRepository: Sendable {
     func createSession(taskID: UUID, runtime: RuntimeKind, workspace: String) async throws -> SessionBundle
     func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle
     func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle
+    func timeline(sessionID: String, after sequence: Int64) async throws -> SessionTimelinePage?
+    func timeline(
+        sessionID: String,
+        after sequence: Int64,
+        afterCursor: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage?
+    func timelineTurn(
+        sessionID: String,
+        turnID: String,
+        afterCursor: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage?
     func markRead(sessionID: String, through sequence: Int64) async throws
     func cancelTurn(sessionID: String) async throws
     func injectGeminiKey(_ key: String) async throws
@@ -53,6 +64,21 @@ protocol AppRepository: Sendable {
 
 extension AppRepository {
     var requiresExecutionConsent: Bool { false }
+    func timeline(sessionID _: String, after _: Int64) async throws -> SessionTimelinePage? { nil }
+    func timeline(
+        sessionID: String,
+        after sequence: Int64,
+        afterCursor _: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage? {
+        try await timeline(sessionID: sessionID, after: sequence)
+    }
+    func timelineTurn(
+        sessionID _: String,
+        turnID _: String,
+        afterCursor _: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage? {
+        nil
+    }
     func renameList(listID _: UUID, name _: String) async throws -> AppSnapshot {
         throw AppRepositoryError.listNotFound
     }

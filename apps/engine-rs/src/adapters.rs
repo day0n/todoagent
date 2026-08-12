@@ -28,6 +28,9 @@ const ACP_CANCEL_GRACE: Duration = Duration::from_millis(250);
 pub enum ProviderEvent {
     SessionId(String),
     Text(String),
+    /// Reasoning text explicitly exposed by the provider. Token counters and
+    /// encrypted/hidden reasoning never use this variant.
+    Reasoning(String),
     ToolUse {
         name: String,
         call_id: String,
@@ -37,12 +40,30 @@ pub enum ProviderEvent {
         name: String,
         call_id: String,
         output: String,
+        is_error: bool,
     },
     Status(String),
-    Raw {
-        kind: String,
-        payload: Value,
-    },
+}
+
+/// One provider transport frame and every semantic event derived from that
+/// exact frame. The Engine persists the whole value atomically before any UI
+/// event is emitted, so a crash cannot leave a projection without its audit
+/// source (or vice versa).
+#[derive(Debug, Clone)]
+pub struct ProviderFrame {
+    pub raw_kind: Option<String>,
+    pub raw_payload: Option<Value>,
+    pub events: Vec<ProviderEvent>,
+}
+
+impl ProviderFrame {
+    fn raw(kind: impl Into<String>, payload: Value, events: Vec<ProviderEvent>) -> Self {
+        Self {
+            raw_kind: Some(kind.into()),
+            raw_payload: Some(payload),
+            events,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +115,7 @@ impl TurnOutcome {
 pub async fn run_turn(
     request: TurnRequest,
     cancellation: CancellationToken,
-    events: mpsc::Sender<ProviderEvent>,
+    events: mpsc::Sender<ProviderFrame>,
 ) -> TurnOutcome {
     if !request.working_directory.is_dir() {
         return TurnOutcome::failed("directory_missing", "working directory does not exist");
@@ -114,10 +135,40 @@ enum StreamKind {
     Cursor,
 }
 
+/// Replays already-persisted provider frames into the same semantic vocabulary
+/// used by live turns. It intentionally omits Raw events; callers already own
+/// the durable turn_event row they are replaying.
+pub struct RecordedEventParser {
+    runtime: RuntimeKind,
+    stream: Option<StreamParser>,
+}
+
+impl RecordedEventParser {
+    pub fn new(runtime: RuntimeKind) -> Self {
+        let stream = match runtime {
+            RuntimeKind::Codex => Some(StreamParser::new(StreamKind::Codex)),
+            RuntimeKind::Claude => Some(StreamParser::new(StreamKind::Claude)),
+            RuntimeKind::Cursor => Some(StreamParser::new(StreamKind::Cursor)),
+            RuntimeKind::Kiro => None,
+        };
+        Self { runtime, stream }
+    }
+
+    pub fn parse(&mut self, value: Value) -> Vec<ProviderEvent> {
+        if self.runtime == RuntimeKind::Kiro {
+            return parse_kiro_update(value.pointer("/params/update").unwrap_or(&Value::Null));
+        }
+        self.stream
+            .as_mut()
+            .map(|parser| parser.parse(value))
+            .unwrap_or_default()
+    }
+}
+
 async fn run_stream(
     request: TurnRequest,
     cancellation: CancellationToken,
-    events: mpsc::Sender<ProviderEvent>,
+    events: mpsc::Sender<ProviderFrame>,
     kind: StreamKind,
 ) -> TurnOutcome {
     let mut command = Command::new(&request.executable);
@@ -210,10 +261,15 @@ async fn run_stream(
             line = lines.next_line() => match line {
                 Ok(Some(line)) => {
                     if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                        for event in parser.parse(value.clone()) {
-                            let _ = events.send(event).await;
-                        }
-                        let _ = events.send(ProviderEvent::Raw { kind: value.get("type").and_then(Value::as_str).unwrap_or("unknown").to_owned(), payload: value }).await;
+                        let kind = value
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        let semantic_events = parser.parse(value.clone());
+                        let _ = events
+                            .send(ProviderFrame::raw(kind, value, semantic_events))
+                            .await;
                     }
                 }
                 Ok(None) => break,
@@ -280,6 +336,14 @@ impl StreamParser {
                             out.push(ProviderEvent::Text(text));
                         }
                     }
+                    "reasoning" => {
+                        if let Some(text) = string_at(item, &["text"])
+                            .or_else(|| string_at(item, &["summary"]))
+                            .filter(|text| !text.is_empty())
+                        {
+                            out.push(ProviderEvent::Reasoning(text));
+                        }
+                    }
                     "command_execution" | "file_change" | "mcp_tool_call" => {
                         out.push(ProviderEvent::ToolResult {
                             name: item
@@ -289,6 +353,7 @@ impl StreamParser {
                                 .to_owned(),
                             call_id: string_at(item, &["id"]).unwrap_or_default(),
                             output: compact_json(item),
+                            is_error: value_is_error(item),
                         });
                     }
                     _ => {}
@@ -350,6 +415,14 @@ impl StreamParser {
                                 call_id: string_at(block, &["id"]).unwrap_or_default(),
                                 input: block.get("input").cloned().unwrap_or(Value::Null),
                             }),
+                            "thinking" => {
+                                if let Some(text) = string_at(block, &["thinking"])
+                                    .or_else(|| string_at(block, &["text"]))
+                                    .filter(|text| !text.is_empty())
+                                {
+                                    out.push(ProviderEvent::Reasoning(text));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -363,6 +436,7 @@ impl StreamParser {
                                 name: "".to_owned(),
                                 call_id: string_at(block, &["tool_use_id"]).unwrap_or_default(),
                                 output: compact_json(block),
+                                is_error: value_is_error(block),
                             });
                         }
                     }
@@ -420,7 +494,7 @@ impl StreamParser {
                                 if let Some(text) =
                                     string_at(block, &["text"]).filter(|text| !text.is_empty())
                                 {
-                                    out.push(ProviderEvent::Status(format!("thinking: {text}")));
+                                    out.push(ProviderEvent::Reasoning(text));
                                 }
                             }
                             "tool_use" => out.push(ProviderEvent::ToolUse {
@@ -444,7 +518,7 @@ impl StreamParser {
                 if value.get("subtype").and_then(Value::as_str) != Some("delta") {
                     if let Some(text) = string_at(value, &["text"]).filter(|text| !text.is_empty())
                     {
-                        out.push(ProviderEvent::Status(format!("thinking: {text}")));
+                        out.push(ProviderEvent::Reasoning(text));
                     }
                 }
             }
@@ -484,6 +558,7 @@ impl StreamParser {
                             name,
                             call_id,
                             output: cursor_tool_output(&detail),
+                            is_error: cursor_tool_failed(&detail),
                         });
                     }
                 }
@@ -505,6 +580,7 @@ impl StreamParser {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
                     .unwrap_or_else(|| compact_json(value.get("output").unwrap_or(&Value::Null))),
+                is_error: value_is_error(value),
             }),
             "connection" | "retry" => out.push(ProviderEvent::Status(format!(
                 "{}: {}{}",
@@ -615,7 +691,7 @@ struct KiroMetering {
 
 struct AcpWaitContext<'a> {
     phase: AcpPhase,
-    events: &'a mpsc::Sender<ProviderEvent>,
+    events: &'a mpsc::Sender<ProviderFrame>,
     cancellation: &'a CancellationToken,
     cancel_session_id: Option<&'a str>,
     policy: AcpWaitPolicy,
@@ -662,7 +738,7 @@ impl KiroMetering {
 async fn run_kiro(
     request: TurnRequest,
     cancellation: CancellationToken,
-    events: mpsc::Sender<ProviderEvent>,
+    events: mpsc::Sender<ProviderFrame>,
 ) -> TurnOutcome {
     // Keep the official SDK linked and version-pinned while TodoAgent owns the subprocess transport
     // so it can enforce cwd, process groups and the app-wide cancellation contract.
@@ -785,10 +861,7 @@ async fn run_kiro(
         .await
         {
             Ok(value) => match string_at(&value, &["sessionId"]) {
-                Some(id) => {
-                    let _ = events.send(ProviderEvent::SessionId(id.clone())).await;
-                    id
-                }
+                Some(id) => id,
                 None => {
                     return finish_kiro_child(
                         child,
@@ -930,29 +1003,56 @@ where
                     idle_deadline.as_mut().reset(Instant::now() + idle_timeout);
                 }
                 if value.get("id").and_then(Value::as_i64) == Some(request_id) && value.get("method").is_none() {
+                    let semantic_events = value
+                        .pointer("/result/sessionId")
+                        .and_then(Value::as_str)
+                        .filter(|id| !id.is_empty())
+                        .map(|id| vec![ProviderEvent::SessionId(id.to_owned())])
+                        .unwrap_or_default();
+                    let _ = context
+                        .events
+                        .send(ProviderFrame::raw("response", value.clone(), semantic_events))
+                        .await;
                     if let Some(error) = value.get("error") {
                         return Err(TurnOutcome::failed(classify_error(&compact_json(error)), compact_json(error)));
                     }
                     return Ok(value.get("result").cloned().unwrap_or(Value::Null));
                 }
-                let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+                let method = value
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned();
                 if value.get("id").is_some_and(|id| !id.is_null()) && !method.is_empty() {
+                    let _ = context
+                        .events
+                        .send(ProviderFrame::raw(&method, value.clone(), Vec::new()))
+                        .await;
                     if method == "session/request_permission" {
                         answer_permission(stdin, &value).await;
                     } else {
-                        let _ = write_rpc(stdin, &method_not_found_response(&value, method)).await;
+                        let _ = write_rpc(stdin, &method_not_found_response(&value, &method)).await;
                     }
                     continue;
                 }
-                if context.phase == AcpPhase::Live && matches!(method, "session/update" | "session/notification") {
-                    for event in parse_kiro_update(value.pointer("/params/update").unwrap_or(&Value::Null)) {
-                        let _ = context.events.send(event).await;
-                    }
-                }
+                let semantic_events = if context.phase == AcpPhase::Live
+                    && matches!(method.as_str(), "session/update" | "session/notification")
+                {
+                    parse_kiro_update(value.pointer("/params/update").unwrap_or(&Value::Null))
+                } else {
+                    Vec::new()
+                };
                 if context.phase == AcpPhase::Live && method == "_kiro.dev/metadata" {
                     context.metering.observe(value.get("params").unwrap_or(&Value::Null));
                 }
-                let _ = context.events.send(ProviderEvent::Raw { kind: method.to_owned(), payload: value }).await;
+                let _ = context
+                    .events
+                    .send(ProviderFrame::raw(
+                        if method.is_empty() { "unknown" } else { &method },
+                        value,
+                        semantic_events,
+                    ))
+                    .await;
             }
         }
     }
@@ -980,7 +1080,10 @@ fn parse_kiro_update(update: &Value) -> Vec<ProviderEvent> {
             .filter(|value| !value.is_empty())
             .map(|value| vec![ProviderEvent::Text(value)])
             .unwrap_or_default(),
-        "agent_thought_chunk" | "AgentThoughtChunk" => Vec::new(),
+        "agent_thought_chunk" | "AgentThoughtChunk" => string_at(update, &["content", "text"])
+            .filter(|value| !value.is_empty())
+            .map(|value| vec![ProviderEvent::Reasoning(value)])
+            .unwrap_or_default(),
         "tool_call" | "ToolCall" => vec![ProviderEvent::ToolUse {
             name: string_at(update, &["title"])
                 .or_else(|| string_at(update, &["kind"]))
@@ -998,6 +1101,8 @@ fn parse_kiro_update(update: &Value) -> Vec<ProviderEvent> {
                 name: string_at(update, &["title"]).unwrap_or_default(),
                 call_id: string_at(update, &["toolCallId"]).unwrap_or_default(),
                 output: compact_json(update.get("content").unwrap_or(&Value::Null)),
+                is_error: update.get("status").and_then(Value::as_str) == Some("failed")
+                    || value_is_error(update),
             }]
         }
         _ => Vec::new(),
@@ -1126,9 +1231,15 @@ fn string_at(value: &Value, path: &[&str]) -> Option<String> {
 }
 
 fn compact_json(value: &Value) -> String {
-    let mut value = value.to_string();
-    value.truncate(20_000);
-    value
+    let value = value.to_string();
+    if value.len() <= 20_000 {
+        return value;
+    }
+    let mut end = 20_000;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    value[..end].to_owned()
 }
 
 fn apply_cursor_usage(current: &mut Option<Value>, container: &Value) {
@@ -1190,7 +1301,11 @@ fn cursor_usage_number(value: &Value, keys: &[&str]) -> u64 {
 
 fn cursor_tool_output(detail: &Value) -> String {
     let result = detail.get("result").unwrap_or(&Value::Null);
-    if let Some(error) = result.get("error").or_else(|| result.get("failure")) {
+    if let Some(error) = ["error", "failure"]
+        .into_iter()
+        .filter_map(|key| result.get(key))
+        .find(|value| meaningful_failure_value(value))
+    {
         return compact_json(error);
     }
     let success = result.get("success").unwrap_or(result);
@@ -1211,6 +1326,36 @@ fn cursor_tool_output(detail: &Value) -> String {
     compact_json(success)
 }
 
+fn cursor_tool_failed(detail: &Value) -> bool {
+    let result = detail.get("result").unwrap_or(&Value::Null);
+    ["error", "failure"]
+        .into_iter()
+        .filter_map(|key| result.get(key))
+        .any(meaningful_failure_value)
+        || value_is_error(detail)
+}
+
+fn meaningful_failure_value(value: &Value) -> bool {
+    match value {
+        Value::Null | Value::Bool(false) => false,
+        Value::String(value) => !value.trim().is_empty(),
+        Value::Array(values) => !values.is_empty(),
+        Value::Object(values) => !values.is_empty(),
+        Value::Number(value) => value.as_i64() != Some(0),
+        Value::Bool(true) => true,
+    }
+}
+
+fn value_is_error(value: &Value) -> bool {
+    value.get("is_error").and_then(Value::as_bool) == Some(true)
+        || value.get("isError").and_then(Value::as_bool) == Some(true)
+        || value.get("success").and_then(Value::as_bool) == Some(false)
+        || matches!(
+            value.get("status").and_then(Value::as_str),
+            Some("error" | "failed" | "failure" | "cancelled" | "interrupted")
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1229,7 +1374,36 @@ mod tests {
         let value = json!({"type":"tool_call","subtype":"completed","tool_call":{"toolCallId":"nested-c1","editToolCall":{"args":{"path":"a"},"result":{"success":{"message":"Wrote a"}}}}});
         let events = parser.parse(value);
         assert!(
-            matches!(&events[0], ProviderEvent::ToolResult { name, call_id, output } if name == "edit" && call_id == "nested-c1" && output == "Wrote a")
+            matches!(&events[0], ProviderEvent::ToolResult { name, call_id, output, .. } if name == "edit" && call_id == "nested-c1" && output == "Wrote a")
+        );
+    }
+
+    #[test]
+    fn provider_exposed_reasoning_is_normalized_for_codex_claude_and_kiro() {
+        let mut codex = StreamParser::new(StreamKind::Codex);
+        let events = codex.parse(json!({
+            "type":"item.completed",
+            "item":{"type":"reasoning","id":"reason-1","summary":"codex summary"}
+        }));
+        assert!(
+            matches!(&events[..], [ProviderEvent::Reasoning(value)] if value == "codex summary")
+        );
+
+        let mut claude = StreamParser::new(StreamKind::Claude);
+        let events = claude.parse(json!({
+            "type":"assistant",
+            "message":{"content":[{"type":"thinking","thinking":"claude thought"}]}
+        }));
+        assert!(
+            matches!(&events[..], [ProviderEvent::Reasoning(value)] if value == "claude thought")
+        );
+
+        let events = parse_kiro_update(&json!({
+            "sessionUpdate":"AgentThoughtChunk",
+            "content":{"text":"kiro thought"}
+        }));
+        assert!(
+            matches!(&events[..], [ProviderEvent::Reasoning(value)] if value == "kiro thought")
         );
     }
 
@@ -1246,9 +1420,7 @@ mod tests {
                 ]
             }
         }));
-        assert!(
-            matches!(&assistant[0], ProviderEvent::Status(value) if value == "thinking: checking")
-        );
+        assert!(matches!(&assistant[0], ProviderEvent::Reasoning(value) if value == "checking"));
         assert!(
             matches!(&assistant[1], ProviderEvent::ToolUse { name, call_id, .. } if name == "read" && call_id == "tool-1")
         );
@@ -1257,7 +1429,7 @@ mod tests {
             "type":"tool_result","tool_name":"read","tool_id":"tool-1","output":"contents"
         }));
         assert!(
-            matches!(&tool_result[0], ProviderEvent::ToolResult { name, call_id, output } if name == "read" && call_id == "tool-1" && output == "contents")
+            matches!(&tool_result[0], ProviderEvent::ToolResult { name, call_id, output, .. } if name == "read" && call_id == "tool-1" && output == "contents")
         );
 
         assert!(
@@ -1287,6 +1459,22 @@ mod tests {
     }
 
     #[test]
+    fn cursor_null_error_fields_do_not_turn_successful_tools_into_failures() {
+        let detail = json!({
+            "result": {
+                "error": null,
+                "failure": null,
+                "success": {"message":"ok"}
+            }
+        });
+        assert!(!cursor_tool_failed(&detail));
+        assert_eq!(cursor_tool_output(&detail), "ok");
+        assert!(cursor_tool_failed(&json!({
+            "result":{"error":{"message":"denied"}}
+        })));
+    }
+
+    #[test]
     fn kiro_replay_and_live_phases_are_distinct() {
         assert_ne!(AcpPhase::Replay, AcpPhase::Live);
         let events = parse_kiro_update(
@@ -1309,6 +1497,15 @@ mod tests {
                 idle_timeout: Some(Duration::from_secs(90)),
             }
         );
+    }
+
+    #[test]
+    fn compact_json_truncates_multibyte_payloads_on_utf8_boundaries() {
+        let value = json!({"text":"😀".repeat(6_000)});
+        let compact = compact_json(&value);
+        assert!(compact.len() <= 20_000);
+        assert!(compact.is_char_boundary(compact.len()));
+        assert!(std::str::from_utf8(compact.as_bytes()).is_ok());
     }
 
     #[test]

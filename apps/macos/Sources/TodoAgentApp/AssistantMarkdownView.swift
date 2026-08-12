@@ -37,9 +37,37 @@ struct AssistantMarkdownDocument: Equatable, Sendable {
     }
 
     let blocks: [Block]
+    private let inlineValues: [String: AttributedString]
 
     init(markdown: String) {
-        blocks = Self.parse(markdown)
+        let parsedBlocks = Self.parse(markdown)
+        blocks = parsedBlocks
+        inlineValues = Self.prepareInlineValues(in: parsedBlocks)
+    }
+
+    func inlineValue(for source: String) -> AttributedString {
+        inlineValues[source] ?? AttributedString(source)
+    }
+
+    private static func prepareInlineValues(in blocks: [Block]) -> [String: AttributedString] {
+        var values: [String: AttributedString] = [:]
+        func prepare(_ source: String) {
+            guard values[source] == nil else { return }
+            values[source] = AssistantMarkdownInlineParser.parse(source)
+        }
+        for block in blocks {
+            switch block {
+            case let .paragraph(text), let .heading(_, text), let .quote(text):
+                prepare(text)
+            case let .unorderedList(items):
+                for item in items { prepare(item) }
+            case let .orderedList(items):
+                for item in items { prepare(item.text) }
+            case .code, .divider:
+                break
+            }
+        }
+        return values
     }
 
     private static func parse(_ markdown: String) -> [Block] {
@@ -195,8 +223,8 @@ struct AssistantMarkdownDocument: Equatable, Sendable {
 struct AssistantMarkdownView: View {
     let document: AssistantMarkdownDocument
 
-    init(_ markdown: String) {
-        document = AssistantMarkdownDocument(markdown: markdown)
+    init(document: AssistantMarkdownDocument) {
+        self.document = document
     }
 
     var body: some View {
@@ -212,10 +240,10 @@ struct AssistantMarkdownView: View {
     private func blockView(_ block: AssistantMarkdownDocument.Block) -> some View {
         switch block {
         case let .paragraph(text):
-            AssistantInlineMarkdownText(text: text)
+            AssistantInlineMarkdownText(value: document.inlineValue(for: text))
 
         case let .heading(level, text):
-            AssistantInlineMarkdownText(text: text)
+            AssistantInlineMarkdownText(value: document.inlineValue(for: text))
                 .font(headingFont(level: level))
                 .padding(.top, level == 1 ? 4 : 1)
 
@@ -225,7 +253,7 @@ struct AssistantMarkdownView: View {
                     HStack(alignment: .firstTextBaseline, spacing: 7) {
                         Text("•")
                             .foregroundStyle(TodoAgentUI.secondaryText)
-                        AssistantInlineMarkdownText(text: item)
+                        AssistantInlineMarkdownText(value: document.inlineValue(for: item))
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -239,7 +267,7 @@ struct AssistantMarkdownView: View {
                             .monospacedDigit()
                             .foregroundStyle(TodoAgentUI.secondaryText)
                             .frame(minWidth: 20, alignment: .trailing)
-                        AssistantInlineMarkdownText(text: item.text)
+                        AssistantInlineMarkdownText(value: document.inlineValue(for: item.text))
                             .frame(maxWidth: .infinity, alignment: .leading)
                     }
                 }
@@ -250,7 +278,7 @@ struct AssistantMarkdownView: View {
                 RoundedRectangle(cornerRadius: 1)
                     .fill(TodoAgentUI.hairline)
                     .frame(width: 3)
-                AssistantInlineMarkdownText(text: text)
+                AssistantInlineMarkdownText(value: document.inlineValue(for: text))
                     .foregroundStyle(TodoAgentUI.secondaryText)
             }
 
@@ -268,6 +296,7 @@ struct AssistantMarkdownView: View {
                         .fixedSize(horizontal: true, vertical: false)
                         .padding(9)
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .scrollIndicators(.hidden)
                 .background(TodoAgentUI.selectionBackground, in: .rect(cornerRadius: 8))
             }
@@ -300,13 +329,81 @@ enum AssistantMarkdownInlineParser {
 private struct AssistantInlineMarkdownText: View {
     let value: AttributedString
 
-    init(text: String) {
-        value = AssistantMarkdownInlineParser.parse(text)
-    }
-
     var body: some View {
         Text(value)
             .fixedSize(horizontal: false, vertical: true)
             .textSelection(.enabled)
+    }
+}
+
+/// Serializes and bounds expensive block + inline Markdown preparation away
+/// from the MainActor. Cancelled row tasks are discarded before cache insert,
+/// and queued cancelled work exits before parsing.
+actor AssistantMarkdownRenderCache {
+    static let shared = AssistantMarkdownRenderCache()
+
+    private struct Entry: Sendable {
+        let source: String
+        let document: AssistantMarkdownDocument
+        let sourceByteCount: Int
+    }
+
+    private let maximumEntryCount: Int
+    private let maximumSourceBytes: Int
+    private var entries: [String: Entry] = [:]
+    private var leastRecentlyUsedIDs: [String] = []
+    private var cachedSourceBytes = 0
+
+    init(
+        maximumEntryCount: Int = 16,
+        maximumSourceBytes: Int = 4 * 1_048_576
+    ) {
+        self.maximumEntryCount = max(maximumEntryCount, 1)
+        self.maximumSourceBytes = max(maximumSourceBytes, 1)
+    }
+
+    func document(id: String, source: String) -> AssistantMarkdownDocument? {
+        guard !Task.isCancelled else { return nil }
+        if let entry = entries[id], entry.source == source {
+            touch(id)
+            return entry.document
+        }
+
+        let document = AssistantMarkdownDocument(markdown: source)
+        guard !Task.isCancelled else { return nil }
+        insert(document: document, id: id, source: source)
+        return document
+    }
+
+    func cacheMetrics() -> (entryCount: Int, sourceBytes: Int) {
+        (entries.count, cachedSourceBytes)
+    }
+
+    private func insert(document: AssistantMarkdownDocument, id: String, source: String) {
+        if let replaced = entries.removeValue(forKey: id) {
+            cachedSourceBytes -= replaced.sourceByteCount
+        }
+        leastRecentlyUsedIDs.removeAll(where: { $0 == id })
+        let sourceByteCount = source.utf8.count
+        entries[id] = Entry(
+            source: source,
+            document: document,
+            sourceByteCount: sourceByteCount
+        )
+        leastRecentlyUsedIDs.append(id)
+        cachedSourceBytes += sourceByteCount
+
+        while entries.count > maximumEntryCount || cachedSourceBytes > maximumSourceBytes {
+            guard let evictedID = leastRecentlyUsedIDs.first else { break }
+            leastRecentlyUsedIDs.removeFirst()
+            if let evicted = entries.removeValue(forKey: evictedID) {
+                cachedSourceBytes -= evicted.sourceByteCount
+            }
+        }
+    }
+
+    private func touch(_ id: String) {
+        leastRecentlyUsedIDs.removeAll(where: { $0 == id })
+        leastRecentlyUsedIDs.append(id)
     }
 }

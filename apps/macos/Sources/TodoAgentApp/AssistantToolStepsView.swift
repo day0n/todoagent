@@ -65,16 +65,14 @@ struct AssistantToolGroupPresentation: Equatable, Sendable {
 struct AssistantToolGroupDisclosureState: Equatable, Sendable {
     private(set) var manuallyExpanded = false
     private(set) var expandedToolIDs: Set<String> = []
-    private(set) var revealedCompletedStepCount = 0
 
     func isExpanded(isRunning: Bool) -> Bool {
         isRunning || manuallyExpanded
     }
 
-    mutating func toggleGroup(isRunning: Bool, totalStepCount: Int, reduceMotion: Bool) {
+    mutating func toggleGroup(isRunning: Bool) {
         guard !isRunning else { return }
         manuallyExpanded.toggle()
-        revealedCompletedStepCount = manuallyExpanded && reduceMotion ? totalStepCount : 0
         if !manuallyExpanded {
             expandedToolIDs.removeAll()
         }
@@ -88,13 +86,8 @@ struct AssistantToolGroupDisclosureState: Equatable, Sendable {
         }
     }
 
-    mutating func revealNextCompletedStep(totalStepCount: Int) {
-        revealedCompletedStepCount = min(revealedCompletedStepCount + 1, totalStepCount)
-    }
-
     mutating func finishRunningGroup() {
         manuallyExpanded = false
-        revealedCompletedStepCount = 0
         expandedToolIDs.removeAll()
     }
 }
@@ -174,7 +167,6 @@ struct AssistantToolStepsView: View {
     let group: AssistantToolGroup
     let state: AppState
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var disclosure = AssistantToolGroupDisclosureState()
 
     private var presentation: AssistantToolGroupPresentation {
@@ -185,32 +177,10 @@ struct AssistantToolStepsView: View {
         disclosure.isExpanded(isRunning: group.isRunning)
     }
 
-    private var visibleTools: ArraySlice<AssistantToolActivity> {
-        if group.isRunning {
-            return group.tools[...]
-        }
-        return group.tools.prefix(disclosure.revealedCompletedStepCount)
-    }
-
-    private var completedRevealTaskID: String {
-        [
-            group.turnID,
-            group.isRunning.description,
-            disclosure.manuallyExpanded.description,
-            group.tools.map(\.id).joined(separator: ","),
-        ].joined(separator: "|")
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 9) {
             Button {
-                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.20)) {
-                    disclosure.toggleGroup(
-                        isRunning: group.isRunning,
-                        totalStepCount: group.tools.count,
-                        reduceMotion: reduceMotion
-                    )
-                }
+                disclosure.toggleGroup(isRunning: group.isRunning)
             } label: {
                 HStack(spacing: 7) {
                     if group.isRunning {
@@ -234,66 +204,28 @@ struct AssistantToolStepsView: View {
 
             if isExpanded {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(visibleTools) { tool in
+                    ForEach(group.tools) { tool in
                         AssistantToolStepRow(
                             tool: tool,
                             state: state,
                             isExpanded: disclosure.expandedToolIDs.contains(tool.id),
                             toggle: { toggle(tool.id) }
                         )
-                        .transition(
-                            .asymmetric(
-                                insertion: .opacity.combined(with: .move(edge: .top)),
-                                removal: .opacity
-                            )
-                        )
                     }
                 }
-                // Insertion grows naturally from the group heading. Removal
-                // only fades while the stack closes, avoiding the old upward
-                // fly-out above the heading.
-                .transition(
-                    .asymmetric(
-                        insertion: .opacity.combined(with: .move(edge: .top)),
-                        removal: .opacity
-                    )
-                )
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.vertical, 3)
         .onChange(of: group.isRunning) { wasRunning, isRunning in
             if wasRunning, !isRunning {
-                withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.18)) {
-                    disclosure.finishRunningGroup()
-                }
+                disclosure.finishRunningGroup()
             }
-        }
-        .task(id: completedRevealTaskID) {
-            await revealCompletedSteps()
         }
     }
 
     private func toggle(_ toolID: String) {
-        withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.16)) {
-            disclosure.toggleTool(toolID)
-        }
-    }
-
-    private func revealCompletedSteps() async {
-        guard !group.isRunning, disclosure.manuallyExpanded else { return }
-        guard !reduceMotion else { return }
-
-        while disclosure.revealedCompletedStepCount < group.tools.count {
-            do {
-                try await Task.sleep(for: .milliseconds(45))
-            } catch {
-                return
-            }
-            guard !Task.isCancelled, disclosure.manuallyExpanded, !group.isRunning else { return }
-            withAnimation(.easeOut(duration: 0.16)) {
-                disclosure.revealNextCompletedStep(totalStepCount: group.tools.count)
-            }
-        }
+        disclosure.toggleTool(toolID)
     }
 }
 
@@ -392,6 +324,7 @@ private struct AssistantToolTechnicalDetails: View {
         .font(.caption2)
         .foregroundStyle(TodoAgentUI.secondaryText)
         .padding(8)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .background(TodoAgentUI.selectionBackground.opacity(0.56), in: .rect(cornerRadius: 8))
         .textSelection(.enabled)
     }
@@ -467,6 +400,7 @@ struct AssistantFriendlyErrorView: View {
                 .foregroundStyle(TodoAgentUI.secondaryText)
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(10)
         .background(.orange.opacity(0.065), in: .rect(cornerRadius: 9))
         .overlay {

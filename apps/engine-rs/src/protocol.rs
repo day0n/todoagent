@@ -104,6 +104,8 @@ pub fn handshake() -> Event<Handshake> {
                 "session.create",
                 "session.get",
                 "session.history",
+                "session.timeline",
+                "session.timeline.turn",
                 "session.send",
                 "session.mark_read",
                 "session.cancel_turn",
@@ -138,6 +140,8 @@ mod tests {
         assert!(capabilities.contains(&Value::String("list.delete".to_owned())));
         assert!(capabilities.contains(&Value::String("task.create_list".to_owned())));
         assert!(capabilities.contains(&Value::String("task.delete".to_owned())));
+        assert!(capabilities.contains(&Value::String("session.timeline".to_owned())));
+        assert!(capabilities.contains(&Value::String("session.timeline.turn".to_owned())));
     }
 
     #[test]

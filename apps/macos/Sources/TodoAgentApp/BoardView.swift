@@ -626,6 +626,10 @@ struct TaskCard: View {
     @State private var isConfirmingDelete = false
     @State private var contextHighlight = TaskContextHighlightState()
 
+    private var agentStatus: TaskCardAgentStatus {
+        TaskCardAgentStatus(session: state.session(for: task))
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: TodoAgentUI.standardSpacing) {
@@ -634,7 +638,7 @@ struct TaskCard: View {
             }
             .padding(TodoAgentUI.cardPadding)
             .accessibilityElement(children: .contain)
-            .accessibilityLabel("\(task.title)，\(state.session(for: task) == nil ? "尚未创建 Session" : "进入 Session")")
+            .accessibilityLabel(cardAccessibilityLabel)
 
             if case let .failed(message) = state.taskSaveState(taskID: task.id) {
                 Divider()
@@ -644,12 +648,12 @@ struct TaskCard: View {
         .background(taskCardBackground, in: .rect(cornerRadius: TodoAgentUI.cardRadius))
         .overlay {
             RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
-                .stroke(borderColor, lineWidth: state.hasUnreadAgentMessage(for: task) ? 1.5 : 1)
+                .stroke(borderColor, lineWidth: agentStatus.isRunning ? 1.5 : 1)
         }
         .shadow(
-            color: TodoAgentUI.shadowColor.opacity(contextHighlight.isHighlighted ? 0.9 : 0.55),
-            radius: contextHighlight.isHighlighted ? 9 : 5,
-            y: contextHighlight.isHighlighted ? 4 : 2
+            color: cardShadowColor,
+            radius: agentStatus.isRunning ? 10 : (contextHighlight.isHighlighted ? 9 : 5),
+            y: agentStatus.isRunning ? 0 : (contextHighlight.isHighlighted ? 4 : 2)
         )
         .accessibilityIdentifier("task.\(task.id.uuidString).card")
         .contextMenu {
@@ -865,59 +869,78 @@ struct TaskCard: View {
 
     private var sessionButton: some View {
         Button { state.openTask(task) } label: {
-            VStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
-                HStack(alignment: .top, spacing: TodoAgentUI.standardSpacing) {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(task.title)
-                            .font(.body)
-                            .bold()
-                            .strikethrough(task.status == .completed)
+            HStack(alignment: .center, spacing: TodoAgentUI.standardSpacing) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(task.title)
+                        .font(.body)
+                        .bold()
+                        .strikethrough(task.status == .completed)
+                        .lineLimit(1)
 
-                        if let datePresentation = task.cardDatePresentation(on: state.currentDay) {
-                            Label(dateText(datePresentation.day), systemImage: "calendar")
-                                .font(.callout)
-                                .foregroundStyle(datePresentation.isOverdue ? Color.red : Color.secondary)
-                                .accessibilityLabel(dateAccessibilityLabel(datePresentation))
-                                .accessibilityIdentifier(
-                                    "task.\(task.id.uuidString).\(datePresentation.kind.rawValue)-date"
-                                )
-                        }
-
-                        if !task.note.isEmpty {
-                            Text(task.note)
-                                .font(.callout)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(2)
-                        }
-                    }
-                    Spacer(minLength: TodoAgentUI.compactSpacing)
-                    if state.hasUnreadAgentMessage(for: task) {
-                        Circle()
-                            .fill(.red)
-                            .frame(width: 9, height: 9)
-                            .accessibilityLabel("Agent 有新消息")
-                    }
+                    taskMetadata
                 }
 
-                HStack(spacing: TodoAgentUI.standardSpacing) {
-                    if let session = state.session(for: task) {
-                        Label(session.runtimeKind.title, systemImage: "terminal")
-                        Label(session.workingDirectory, systemImage: "folder")
-                            .lineLimit(1)
-                    } else {
-                        Label("进入后选择 Runtime 和执行目录", systemImage: "arrow.right.circle")
-                    }
-                    Spacer()
-                    Image(systemName: "chevron.right")
-                        .foregroundStyle(.tertiary)
-                        .accessibilityHidden(true)
-                }
-                .font(.caption)
-                .foregroundStyle(.secondary)
+                Spacer(minLength: TodoAgentUI.compactSpacing)
+                agentIndicators
             }
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private var taskMetadata: some View {
+        let datePresentation = task.cardDatePresentation(on: state.currentDay)
+        if let datePresentation, datePresentation.isOverdue {
+            taskDateLabel(datePresentation)
+        } else if !task.note.isEmpty {
+            Label(task.note, systemImage: "note.text")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        } else if let datePresentation {
+            taskDateLabel(datePresentation)
+        }
+    }
+
+    private func taskDateLabel(_ presentation: TaskCardDatePresentation) -> some View {
+        Label(dateText(presentation.day), systemImage: "calendar")
+            .font(.caption)
+            .foregroundStyle(presentation.isOverdue ? Color.red : Color.secondary)
+            .accessibilityLabel(dateAccessibilityLabel(presentation))
+            .accessibilityIdentifier(
+                "task.\(task.id.uuidString).\(presentation.kind.rawValue)-date"
+            )
+            .lineLimit(1)
+    }
+
+    private var agentIndicators: some View {
+        HStack(spacing: 7) {
+            if agentStatus.isRunning {
+                ZStack {
+                    Circle()
+                        .fill(Color.green.opacity(0.2))
+                        .frame(width: 18, height: 18)
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: Color.green.opacity(0.9), radius: 5)
+                }
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Agent 正在运行")
+            }
+
+            if agentStatus.hasUnread {
+                Circle()
+                    .fill(Color.red)
+                    .frame(width: 10, height: 10)
+                    .overlay {
+                        Circle().stroke(TodoAgentUI.surfaceBackground, lineWidth: 1.5)
+                    }
+                    .accessibilityLabel("Agent 有新回复")
+            }
+        }
+        .frame(width: 36, alignment: .trailing)
     }
 
     private func dateText(_ day: LocalDay) -> String {
@@ -933,12 +956,41 @@ struct TaskCard: View {
 
     private var borderColor: Color {
         if case .failed = state.taskSaveState(taskID: task.id) { return .red.opacity(0.58) }
-        if state.hasUnreadAgentMessage(for: task) { return .red.opacity(0.58) }
+        if agentStatus.isRunning { return .green.opacity(0.72) }
         return contextHighlight.isHighlighted ? TodoAgentUI.primaryText.opacity(0.2) : TodoAgentUI.hairline
+    }
+
+    private var cardShadowColor: Color {
+        if agentStatus.isRunning { return .green.opacity(0.34) }
+        return TodoAgentUI.shadowColor.opacity(contextHighlight.isHighlighted ? 0.9 : 0.55)
+    }
+
+    private var cardAccessibilityLabel: String {
+        var parts = [task.title]
+        if agentStatus.isRunning { parts.append("Agent 正在运行") }
+        if agentStatus.hasUnread { parts.append("Agent 有新回复") }
+        return parts.joined(separator: "，")
     }
 
     private var taskCardBackground: Color {
         contextHighlight.isHighlighted ? TodoAgentUI.selectionBackground : TodoAgentUI.surfaceBackground
+    }
+}
+
+struct TaskCardAgentStatus: Equatable, Sendable {
+    let isRunning: Bool
+    let hasUnread: Bool
+
+    init(isRunning: Bool, hasUnread: Bool) {
+        self.isRunning = isRunning
+        self.hasUnread = hasUnread
+    }
+
+    init(session: TaskSessionDescriptor?) {
+        self.init(
+            isRunning: session?.state.isBusy == true,
+            hasUnread: session?.hasUnread == true
+        )
     }
 }
 

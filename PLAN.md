@@ -145,13 +145,14 @@ Task → TaskSession → SessionTurn → SessionMessage / TurnEvent
 
 ### 5.2 工具
 
-首版只注册五个任务工具：
+首版只注册六个任务工具：
 
 | 工具 | 能力 |
 |---|---|
 | `create_tasks` | 校验后原子创建 1–10 张任务卡，分别支持执行日期和截止日期 |
 | `find_related` | 按标题和备注查找最多 10 条相关任务 |
 | `update_task` | 修改标题、备注、清单、执行日期和截止日期 |
+| `delete_task` | 按任务 ID 删除任务 |
 | `list_state` | 读取 open/completed、运行中 Session 和未读摘要；可按执行日期、状态和清单分页精确查询 |
 | `list_lists` | 读取未归档清单 |
 

@@ -40,13 +40,19 @@ Provider 使用 Gemini Interactions API 的 SSE 模式，并固定 `store=false`
 从本地 SQLite 重建所需上下文。API Key 通过 IPC 注入内存，以敏感 Header 发送，
 不会写入 Engine 数据库、环境变量或日志，Provider 错误也会脱敏。
 
-助手只注册五个任务工具：
+助手只注册六个任务工具：
 
 - `create_tasks`
 - `find_related`
 - `update_task`
+- `delete_task`
 - `list_state`
 - `list_lists`
+
+`delete_task` 只接受来自查询结果的准确任务 ID。删除全部任务时，助手会先读取
+open 和 completed 首屏的精确总数并确认同一 `taskRevision`。单次请求最多删除
+20 个任务；超过时不会继续分页或删除，而会要求分批。未超过时才收集完整 ID
+并逐个删除；运行中或排队中的本地 Session 会阻止对应任务被删除。
 
 Engine 不向助手开放 shell、任意文件读写、MCP 或本地 CLI 派发。
 

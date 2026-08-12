@@ -737,7 +737,7 @@ private struct TaskConversationPanel: View {
 
     @State private var draft = ""
     @State private var isSubmitting = false
-    @State private var toolResultDisclosure = TaskToolResultDisclosureState()
+    @FocusState private var composerFocused: Bool
 
     var body: some View {
         VStack(spacing: 0) {
@@ -775,12 +775,6 @@ private struct TaskConversationPanel: View {
             Text(sessionStateTitle)
                 .font(.caption.bold())
                 .foregroundStyle(session.state.isBusy ? Color.blue : Color.secondary)
-
-            if session.state.isBusy {
-                Button("停止本轮", role: .destructive) {
-                    Task { await state.cancelTurn(for: task) }
-                }
-            }
 
             closeButton
         }
@@ -825,66 +819,62 @@ private struct TaskConversationPanel: View {
     }
 
     private var transcript: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                LazyVStack(spacing: TodoAgentUI.sectionSpacing) {
-                    ForEach(session.entries) { entry in
-                        TaskConversationEntryRow(
-                            entry: entry,
-                            isToolResultExpanded: toolResultDisclosure.isExpanded(
-                                entryID: entry.id
-                            ),
-                            onToggleToolResult: {
-                                toolResultDisclosure.toggle(entryID: entry.id)
-                            }
-                        )
-                            .id(entry.id)
-                    }
-                }
-                .frame(maxWidth: 820)
-                .padding(.horizontal, 24)
-                .padding(.vertical, 20)
-                .frame(maxWidth: .infinity)
-            }
-            .background(Color(nsColor: .textBackgroundColor).opacity(0.24))
-            .onChange(of: session.entries.count) {
-                guard let lastID = session.entries.last?.id else { return }
-                proxy.scrollTo(lastID, anchor: .bottom)
+        ChatTranscriptView(
+            transcript: session.transcript,
+            taskReferences: chatTaskReferences,
+            maximumContentWidth: 820
+        ) {
+            ContentUnavailableView {
+                Label("开始本地会话", systemImage: "bubble.left.and.bubble.right")
+            } description: {
+                Text("发送一条消息后，思考、工具调用和最终回复会按实际顺序显示在这里。")
             }
         }
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.24))
+    }
+
+    private var chatTaskReferences: ChatTaskReferenceActions {
+        ChatTaskReferenceActions(
+            title: { taskID in state.task(id: taskID)?.title },
+            open: { taskID in
+                guard let task = state.task(id: taskID) else { return }
+                state.openTask(task)
+            }
+        )
     }
 
     private var composer: some View {
-        VStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
+        ChatComposer(
+            text: $draft,
+            focus: $composerFocused,
+            placeholder: "发送消息给 \(session.runtime.title)…",
+            isRunning: session.state.isBusy,
+            canSubmit: canSubmit,
+            accessibilityPrefix: "task.session",
+            onSubmit: submit,
+            onStop: { Task { await state.cancelTurn(for: task) } }
+        ) {
             Label(
                 session.state.isBusy ? "Agent 正在处理本轮消息" : "随时向这个本地 Session 继续发送消息",
                 systemImage: session.state.isBusy ? "hourglass" : "arrow.triangle.2.circlepath"
             )
             .font(.callout)
             .foregroundStyle(session.state.isBusy ? Color.blue : Color.secondary)
-
-            HStack(alignment: .bottom, spacing: TodoAgentUI.standardSpacing) {
-                TextField("发送消息给 \(session.runtime.title)…", text: $draft, axis: .vertical)
-                    .lineLimit(2 ... 6)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit(submit)
-                    .accessibilityIdentifier("task.session.composer")
-
-                Button("发送", action: submit)
-                    .buttonStyle(.borderedProminent)
-                    .disabled(
-                        draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                            || isSubmitting || session.state.isBusy
-                    )
-                    .accessibilityIdentifier("task.session.send")
-            }
+        } accessories: {
+            Label(session.runtime.title, systemImage: "terminal")
+                .font(.caption)
+                .foregroundStyle(TodoAgentUI.secondaryText)
         }
-        .padding(16)
-        .background(.ultraThinMaterial)
         .task { await state.markReadIfCurrent(task) }
         .onChange(of: session.latestSequence) {
             Task { await state.markReadIfCurrent(task) }
         }
+    }
+
+    private var canSubmit: Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !isSubmitting
+            && !session.state.isBusy
     }
 
     private var sessionStateTitle: String {
@@ -959,6 +949,7 @@ private struct TaskSessionSetupView: View {
 
     @State private var runtime = RuntimeKind.codex
     @State private var workspace = ""
+    @State private var isChoosingWorkspace = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1019,8 +1010,14 @@ private struct TaskSessionSetupView: View {
                                         .textFieldStyle(.roundedBorder)
                                         .disabled(true)
                                         .accessibilityIdentifier("task.session.workspace")
-                                    Button("选择…", action: chooseDirectory)
-                                        .accessibilityIdentifier("task.session.choose-workspace")
+                                    Button {
+                                        Task { await chooseDirectory() }
+                                    } label: {
+                                        Text("选择…")
+                                    }
+                                    .disabled(isChoosingWorkspace)
+                                    .frame(minWidth: 64)
+                                    .accessibilityIdentifier("task.session.choose-workspace")
                                 }
                                 Text("Agent 将以这个目录作为工作目录，并在其中读取或修改文件。")
                                     .font(.caption)
@@ -1111,17 +1108,20 @@ private struct TaskSessionSetupView: View {
         .accessibilityIdentifier("task.session.start")
     }
 
-    private func chooseDirectory() {
+    private func chooseDirectory() async {
+        guard !isChoosingWorkspace else { return }
+        isChoosingWorkspace = true
+        defer { isChoosingWorkspace = false }
+
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
         panel.title = "选择 Agent 执行目录"
-        if panel.runModal() == .OK, let url = panel.url {
-            try? WorkspaceAuthorizationStore.save(url)
-            workspace = url.path(percentEncoded: false)
-        }
+        guard await panel.begin() == .OK, let url = panel.url else { return }
+        try? WorkspaceAuthorizationStore.save(url)
+        workspace = url.path(percentEncoded: false)
     }
 
     private func start() {

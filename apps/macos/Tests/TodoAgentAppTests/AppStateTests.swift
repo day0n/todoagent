@@ -14,6 +14,26 @@ struct AppStateTests {
         #expect(object["geminiAPIKey"] == nil)
     }
 
+    @Test("turn timeline request uses the paged Engine contract")
+    func timelineTurnRequestWireNames() throws {
+        let cursor = SessionTimelineCursor(turnOrdinal: 4, itemOrdinal: 9)
+        let data = try JSONEncoder().encode(
+            TimelineTurnRequest(
+                sessionID: "session-1",
+                turnID: "turn-4",
+                afterCursor: cursor,
+                limit: 500
+            )
+        )
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        #expect(object["sessionId"] as? String == "session-1")
+        #expect(object["turnId"] as? String == "turn-4")
+        #expect(object["limit"] as? Int == 500)
+        let encodedCursor = try #require(object["afterCursor"] as? [String: Any])
+        #expect(encodedCursor["turnOrdinal"] as? Int == 4)
+        #expect(encodedCursor["itemOrdinal"] as? Int == 9)
+    }
+
     @Test("TodoAgent starts with its inspector collapsed")
     func assistantStartsCollapsed() {
         let state = AppState(repository: AssistantTestRepository())
@@ -483,6 +503,553 @@ struct AppStateTests {
         #expect(state.errorMessage == nil)
     }
 
+    @Test("legacy turn finish reconciliation is nonblocking coalesced and turn scoped")
+    func legacyTurnFinishReconciliationIsIncremental() async throws {
+        let task = taskFixture()
+        let activeTurn = SessionTurn(
+            id: "turn-5",
+            sessionID: "task-session",
+            ordinal: 5,
+            userMessageID: "user-5",
+            providerSessionIDBefore: nil,
+            providerSessionIDAfter: nil,
+            status: .running,
+            exitCode: nil,
+            finalOutput: nil,
+            errorCode: nil,
+            errorMessage: nil,
+            providerUsageJSON: nil,
+            startedAt: "2026-08-11T00:00:00Z",
+            endedAt: nil,
+            createdAt: "2026-08-11T00:00:00Z"
+        )
+        let runningBundle = sessionBundleFixture(
+            for: task,
+            state: .running,
+            activeTurn: activeTurn
+        )
+        let runningTool = timelineTool(
+            state: "running",
+            sequence: 17,
+            turnOrdinal: 5,
+            itemOrdinal: 1
+        )
+        let initialPage = SessionTimelinePage(
+            session: runningBundle.session,
+            items: [runningTool],
+            activeTurn: activeTurn,
+            nextSequence: 17,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 5, itemOrdinal: 1),
+            fidelity: "exact"
+        )
+        let completedBundle = sessionBundleFixture(for: task)
+        let completedPage = SessionTimelinePage(
+            session: completedBundle.session,
+            items: [
+                timelineTool(
+                    state: "completed",
+                    sequence: 18,
+                    turnOrdinal: 5,
+                    itemOrdinal: 1
+                ),
+            ],
+            activeTurn: nil,
+            nextSequence: 18,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 5, itemOrdinal: 1),
+            fidelity: "committed"
+        )
+        let repository = TaskOpenSpyRepository(
+            task: task,
+            session: runningBundle,
+            timelineResponses: [initialPage],
+            suspendsTimelineWhenResponsesEmpty: true
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(task)
+        await repository.waitUntilTimelineRequestCount(1)
+        await drainMainActorTasks()
+
+        let finish = SessionTimelineTurnFinishedEvent(
+            sessionID: runningBundle.session.id,
+            turnID: activeTurn.id,
+            fidelity: "committed"
+        )
+        let event = EngineEvent(
+            name: "session.timeline.turn.finished",
+            data: try JSONEncoder().encode(finish)
+        )
+
+        // Both reducer calls return even though the eventual repository request
+        // deliberately remains suspended. The second event replaces the first
+        // scheduled reconciliation before either can block event consumption.
+        await state.consume(event)
+        await state.consume(event)
+        await repository.waitUntilTimelineRequestCount(2)
+
+        let requests = await repository.timelineRequestRecords()
+        #expect(requests.count == 2)
+        #expect(requests[1].afterSequence == 0)
+        #expect(
+            requests[1].afterCursor
+                == SessionTimelineCursor(turnOrdinal: 5, itemOrdinal: -1)
+        )
+
+        await repository.releaseTimeline(with: completedPage)
+        await repository.waitUntilTimelineResponseCount(2)
+        await drainMainActorTasks()
+        let transcript = try #require(state.conversation(for: task)?.transcript)
+        #expect(toolStates(in: transcript) == [.completed])
+    }
+
+    @Test("finish payload items upsert immediately and still reconcile the turn")
+    func finishItemsUseFastPath() async throws {
+        let task = taskFixture()
+        let bundle = sessionBundleFixture(for: task)
+        let initialPage = SessionTimelinePage(
+            session: bundle.session,
+            items: [
+                timelineTool(
+                    state: "running",
+                    sequence: 21,
+                    turnOrdinal: 7,
+                    itemOrdinal: 1
+                ),
+            ],
+            activeTurn: nil,
+            nextSequence: 21,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 7, itemOrdinal: 1),
+            fidelity: "exact"
+        )
+        let completedTool = timelineTool(
+            state: "completed",
+            sequence: 22,
+            turnOrdinal: 7,
+            itemOrdinal: 1
+        )
+        let completedPage = SessionTimelinePage(
+            session: bundle.session,
+            items: [completedTool],
+            activeTurn: nil,
+            nextSequence: 22,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 7, itemOrdinal: 1),
+            fidelity: "exact"
+        )
+        let repository = TaskOpenSpyRepository(
+            task: task,
+            session: bundle,
+            timelineResponses: [initialPage],
+            suspendsTimelineWhenResponsesEmpty: true,
+            suspendsTimelineTurnWhenResponsesEmpty: true
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(task)
+        await repository.waitUntilTimelineRequestCount(1)
+        await drainMainActorTasks()
+
+        let finish = SessionTimelineTurnFinishedEvent(
+            sessionID: bundle.session.id,
+            turnID: completedTool.turnID,
+            fidelity: "exact",
+            items: [completedTool]
+        )
+        await state.consume(
+            EngineEvent(
+                name: "session.timeline.turn.finished",
+                data: try JSONEncoder().encode(finish)
+            )
+        )
+
+        // The terminal mutation is visible before the deliberately suspended
+        // authoritative turn request is allowed to return.
+        let immediateTranscript = try #require(state.conversation(for: task)?.transcript)
+        #expect(toolStates(in: immediateTranscript) == [.completed])
+        await repository.waitUntilTimelineTurnRequestCount(1)
+        #expect(await repository.timelineRequestRecords().count == 1)
+        #expect(
+            await repository.timelineTurnRequestRecords()
+                == [
+                    TaskTimelineTurnRequest(
+                        sessionID: bundle.session.id,
+                        turnID: completedTool.turnID,
+                        afterCursor: nil
+                    ),
+                ]
+        )
+
+        await repository.releaseTimelineTurn(with: completedPage)
+        await repository.waitUntilTimelineTurnResponseCount(1)
+        await drainMainActorTasks()
+        let reconciledTranscript = try #require(state.conversation(for: task)?.transcript)
+        #expect(toolStates(in: reconciledTranscript) == [.completed])
+    }
+
+    @Test("explicit empty finish items recover live parts dropped by the event buffer")
+    func emptyFinishItemsStillReconcileTheWholeTurn() async throws {
+        let task = taskFixture()
+        let bundle = sessionBundleFixture(for: task)
+        let turnID = "turn-11"
+        let user = SessionTimelineItem(
+            id: "user-11",
+            sessionID: bundle.session.id,
+            turnID: turnID,
+            sequence: 40,
+            turnOrdinal: 11,
+            itemOrdinal: 0,
+            kind: "user",
+            body: "检查刚才的执行"
+        )
+        let reasoning = SessionTimelineItem(
+            id: "reasoning-11",
+            sessionID: bundle.session.id,
+            turnID: turnID,
+            sequence: 41,
+            turnOrdinal: 11,
+            itemOrdinal: 1,
+            kind: "reasoning",
+            body: "先读取状态"
+        )
+        let tool = timelineTool(
+            state: "completed",
+            sequence: 42,
+            turnOrdinal: 11,
+            itemOrdinal: 2
+        )
+        let answer = SessionTimelineItem(
+            id: "assistant-11",
+            sessionID: bundle.session.id,
+            turnID: turnID,
+            sequence: 43,
+            turnOrdinal: 11,
+            itemOrdinal: 3,
+            kind: "assistant_text",
+            body: "检查完成"
+        )
+        let initialPage = SessionTimelinePage(
+            session: bundle.session,
+            items: [user],
+            activeTurn: nil,
+            nextSequence: 40,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 11, itemOrdinal: 0),
+            fidelity: "exact"
+        )
+        let authoritativeTurnStart = SessionTimelinePage(
+            session: bundle.session,
+            items: [user, reasoning],
+            activeTurn: nil,
+            nextSequence: 41,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 11, itemOrdinal: 1),
+            hasMore: true,
+            fidelity: "exact"
+        )
+        let authoritativeTurnEnd = SessionTimelinePage(
+            session: bundle.session,
+            items: [tool, answer],
+            activeTurn: nil,
+            nextSequence: 43,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 11, itemOrdinal: 3),
+            fidelity: "exact"
+        )
+        let repository = TaskOpenSpyRepository(
+            task: task,
+            session: bundle,
+            timelineResponses: [initialPage],
+            timelineTurnResponses: [authoritativeTurnStart, authoritativeTurnEnd]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(task)
+        await repository.waitUntilTimelineRequestCount(1)
+        await drainMainActorTasks()
+
+        let finish = SessionTimelineTurnFinishedEvent(
+            sessionID: bundle.session.id,
+            turnID: turnID,
+            fidelity: "exact",
+            items: []
+        )
+        await state.consume(
+            EngineEvent(
+                name: "session.timeline.turn.finished",
+                data: try JSONEncoder().encode(finish)
+            )
+        )
+        await repository.waitUntilTimelineTurnResponseCount(2)
+        await drainMainActorTasks()
+
+        #expect(await repository.timelineRequestRecords().count == 1)
+        #expect(
+            await repository.timelineTurnRequestRecords()
+                == [
+                    TaskTimelineTurnRequest(
+                        sessionID: bundle.session.id,
+                        turnID: turnID,
+                        afterCursor: nil
+                    ),
+                    TaskTimelineTurnRequest(
+                        sessionID: bundle.session.id,
+                        turnID: turnID,
+                        afterCursor: SessionTimelineCursor(turnOrdinal: 11, itemOrdinal: 1)
+                    ),
+                ]
+        )
+        let transcript = try #require(state.conversation(for: task)?.transcript)
+        let turn = try #require(transcript.items.compactMap { item -> ChatTurnItem? in
+            guard case let .turn(turn) = item else { return nil }
+            return turn.turnID == turnID ? turn : nil
+        }.first)
+        #expect(turn.userMessages.map(\.body) == ["检查刚才的执行"])
+        #expect(turn.assistant?.body == "检查完成")
+        let activity = try #require(turn.activity)
+        let recoveredReasoning = activity.items.contains { item in
+            guard case let .reasoning(reasoning) = item else { return false }
+            return reasoning.body == "先读取状态"
+        }
+        let recoveredTool = activity.items.contains { item in
+            guard case let .tool(tool) = item else { return false }
+            return tool.state == .completed
+        }
+        #expect(recoveredReasoning)
+        #expect(recoveredTool)
+    }
+
+    @Test("an older finished turn authority cannot clear a newly started task turn")
+    func finishedTurnReconcilePreservesNewActiveTurn() async throws {
+        let task = taskFixture()
+        let idleBundle = sessionBundleFixture(for: task)
+        let turnAUser = SessionTimelineItem(
+            id: "user-a",
+            sessionID: idleBundle.session.id,
+            turnID: "turn-12",
+            sequence: 50,
+            turnOrdinal: 12,
+            itemOrdinal: 0,
+            kind: "user",
+            body: "第一轮"
+        )
+        let initialPage = SessionTimelinePage(
+            session: idleBundle.session,
+            items: [turnAUser],
+            activeTurn: nil,
+            nextSequence: 50,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 12, itemOrdinal: 0),
+            fidelity: "exact"
+        )
+        let repository = TaskOpenSpyRepository(
+            task: task,
+            session: idleBundle,
+            timelineResponses: [initialPage],
+            suspendsTimelineTurnWhenResponsesEmpty: true
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(task)
+        await repository.waitUntilTimelineRequestCount(1)
+        await drainMainActorTasks()
+
+        let finishA = SessionTimelineTurnFinishedEvent(
+            sessionID: idleBundle.session.id,
+            turnID: turnAUser.turnID,
+            fidelity: "exact",
+            items: []
+        )
+        await state.consume(EngineEvent(
+            name: "session.timeline.turn.finished",
+            data: try JSONEncoder().encode(finishA)
+        ))
+        await repository.waitUntilTimelineTurnRequestCount(1)
+
+        let activeTurnB = SessionTurn(
+            id: "turn-13",
+            sessionID: idleBundle.session.id,
+            ordinal: 13,
+            userMessageID: "user-b",
+            providerSessionIDBefore: nil,
+            providerSessionIDAfter: nil,
+            status: .running,
+            exitCode: nil,
+            finalOutput: nil,
+            errorCode: nil,
+            errorMessage: nil,
+            providerUsageJSON: nil,
+            startedAt: "2026-08-11T00:01:00Z",
+            endedAt: nil,
+            createdAt: "2026-08-11T00:01:00Z"
+        )
+        let runningBundle = sessionBundleFixture(
+            for: task,
+            state: .running,
+            activeTurn: activeTurnB
+        )
+        await state.consume(EngineEvent(
+            name: "session.turn.started",
+            data: try JSONEncoder().encode(runningBundle)
+        ))
+        let turnBUser = SessionTimelineItem(
+            id: "user-b",
+            sessionID: idleBundle.session.id,
+            turnID: activeTurnB.id,
+            sequence: 51,
+            turnOrdinal: 13,
+            itemOrdinal: 0,
+            kind: "user",
+            body: "第二轮"
+        )
+        await state.consume(EngineEvent(
+            name: "session.timeline.item.appended",
+            data: try JSONEncoder().encode(turnBUser)
+        ))
+
+        let turnAAnswer = SessionTimelineItem(
+            id: "answer-a",
+            sessionID: idleBundle.session.id,
+            turnID: turnAUser.turnID,
+            sequence: 52,
+            turnOrdinal: 12,
+            itemOrdinal: 1,
+            kind: "assistant_text",
+            body: "第一轮权威结果"
+        )
+        let staleAuthorityA = SessionTimelinePage(
+            session: idleBundle.session,
+            items: [turnAUser, turnAAnswer],
+            activeTurn: nil,
+            nextSequence: 52,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 12, itemOrdinal: 1),
+            fidelity: "exact"
+        )
+        await repository.releaseTimelineTurn(with: staleAuthorityA)
+        await repository.waitUntilTimelineTurnResponseCount(1)
+        await drainMainActorTasks()
+
+        let conversation = try #require(state.conversation(for: task))
+        #expect(conversation.state == .running)
+        #expect(conversation.transcript.isRunning)
+        let turns = conversation.transcript.items.compactMap { item -> ChatTurnItem? in
+            guard case let .turn(turn) = item else { return nil }
+            return turn
+        }
+        #expect(turns.map(\.turnID) == [turnAUser.turnID, activeTurnB.id])
+        #expect(turns.first?.assistant?.body == "第一轮权威结果")
+        #expect(turns.last?.isRunning == true)
+        #expect(turns.last?.userMessages.first?.body == "第二轮")
+    }
+
+    @Test(
+        "degraded or unknown finish fidelity reconciles the current turn",
+        arguments: ["failed", "future-fidelity"]
+    )
+    func nonAuthoritativeFinishFidelityReconciles(fidelity: String) async throws {
+        let task = taskFixture()
+        let bundle = sessionBundleFixture(for: task)
+        let tool = timelineTool(
+            state: "running",
+            sequence: 31,
+            turnOrdinal: 9,
+            itemOrdinal: 1
+        )
+        let initialPage = SessionTimelinePage(
+            session: bundle.session,
+            items: [tool],
+            activeTurn: nil,
+            nextSequence: 31,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 9, itemOrdinal: 1),
+            fidelity: "exact"
+        )
+        let completedTool = timelineTool(
+            state: "completed",
+            sequence: 32,
+            turnOrdinal: 9,
+            itemOrdinal: 1
+        )
+        let completedPage = SessionTimelinePage(
+            session: bundle.session,
+            items: [completedTool],
+            activeTurn: nil,
+            nextSequence: 32,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 9, itemOrdinal: 1),
+            fidelity: "exact"
+        )
+        let repository = TaskOpenSpyRepository(
+            task: task,
+            session: bundle,
+            timelineResponses: [initialPage],
+            suspendsTimelineWhenResponsesEmpty: true,
+            suspendsTimelineTurnWhenResponsesEmpty: true
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(task)
+        await repository.waitUntilTimelineRequestCount(1)
+        await drainMainActorTasks()
+
+        let finish = SessionTimelineTurnFinishedEvent(
+            sessionID: bundle.session.id,
+            turnID: tool.turnID,
+            fidelity: fidelity,
+            items: [completedTool]
+        )
+        await state.consume(
+            EngineEvent(
+                name: "session.timeline.turn.finished",
+                data: try JSONEncoder().encode(finish)
+            )
+        )
+        let immediateTranscript = try #require(state.conversation(for: task)?.transcript)
+        #expect(toolStates(in: immediateTranscript) == [.running])
+        await repository.waitUntilTimelineTurnRequestCount(1)
+        #expect(await repository.timelineRequestRecords().count == 1)
+
+        await repository.releaseTimelineTurn(with: completedPage)
+        await repository.waitUntilTimelineTurnResponseCount(1)
+        await drainMainActorTasks()
+        let reconciledTranscript = try #require(state.conversation(for: task)?.transcript)
+        #expect(toolStates(in: reconciledTranscript) == [.completed])
+    }
+
+    @Test("normal task send hydrates from the cached timeline cursor")
+    func taskSendUsesCachedTimelineCursor() async throws {
+        let task = taskFixture()
+        let bundle = sessionBundleFixture(for: task)
+        let initialPage = SessionTimelinePage(
+            session: bundle.session,
+            items: [],
+            activeTurn: nil,
+            nextSequence: 42,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 3, itemOrdinal: 9),
+            fidelity: "exact"
+        )
+        let incrementalPage = SessionTimelinePage(
+            session: bundle.session,
+            items: [],
+            activeTurn: nil,
+            nextSequence: 43,
+            nextCursor: SessionTimelineCursor(turnOrdinal: 4, itemOrdinal: 0),
+            fidelity: "exact"
+        )
+        let repository = TaskOpenSpyRepository(
+            task: task,
+            session: bundle,
+            timelineResponses: [initialPage, incrementalPage]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+        state.openTask(task)
+        await repository.waitUntilTimelineRequestCount(1)
+        await drainMainActorTasks()
+
+        #expect(await state.sendToSession(task, text: "继续"))
+
+        let requests = await repository.timelineRequestRecords()
+        #expect(requests.count == 2)
+        #expect(requests[1].afterSequence == 42)
+        #expect(
+            requests[1].afterCursor
+                == SessionTimelineCursor(turnOrdinal: 3, itemOrdinal: 9)
+        )
+    }
+
     @Test("Gemini connection test uses the selected model")
     func geminiConnectionTest() async throws {
         let state = AppState(repository: DemoRepository())
@@ -644,7 +1211,11 @@ struct AppStateTests {
         )
     }
 
-    private func sessionBundleFixture(for task: TaskItem) -> SessionBundle {
+    private func sessionBundleFixture(
+        for task: TaskItem,
+        state: SessionState = .idle,
+        activeTurn: SessionTurn? = nil
+    ) -> SessionBundle {
         SessionBundle(
             session: TaskSessionDescriptor(
                 id: "task-session",
@@ -653,7 +1224,7 @@ struct AppStateTests {
                 workingDirectory: "/tmp/project",
                 providerSessionID: "provider-session",
                 providerEngine: nil,
-                state: .idle,
+                state: state,
                 lastAgentSequence: 0,
                 lastReadSequence: 0,
                 lastErrorCode: nil,
@@ -662,8 +1233,40 @@ struct AppStateTests {
                 updatedAt: "2026-08-09T00:00:00Z"
             ),
             messages: [],
-            activeTurn: nil
+            activeTurn: activeTurn
         )
+    }
+
+    private func timelineTool(
+        state: String,
+        sequence: Int64,
+        turnOrdinal: Int64,
+        itemOrdinal: Int64
+    ) -> SessionTimelineItem {
+        SessionTimelineItem(
+            id: "tool-call-1",
+            sessionID: "task-session",
+            turnID: "turn-\(turnOrdinal)",
+            sequence: sequence,
+            turnOrdinal: turnOrdinal,
+            itemOrdinal: itemOrdinal,
+            kind: "tool",
+            callID: "call-1",
+            toolName: "Bash",
+            outputText: state == "running" ? nil : "done",
+            toolState: state,
+            fidelity: state == "running" ? "live" : "committed"
+        )
+    }
+
+    private func toolStates(in transcript: ChatTranscript) -> [ChatToolState] {
+        transcript.items.flatMap { item -> [ChatToolState] in
+            guard case let .turn(turn) = item else { return [] }
+            return turn.activity?.items.compactMap { activity -> ChatToolState? in
+                guard case let .tool(tool) = activity else { return nil }
+                return tool.state
+            } ?? []
+        }
     }
 
     private func emptySnapshot(lists: [TodoList] = []) -> AppSnapshot {
@@ -680,11 +1283,43 @@ private struct TaskCreateCall: Equatable, Sendable {
     let listID: UUID?
 }
 
+private struct TaskTimelineRequest: Equatable, Sendable {
+    let sessionID: String
+    let afterSequence: Int64
+    let afterCursor: SessionTimelineCursor?
+}
+
+private struct TaskTimelineTurnRequest: Equatable, Sendable {
+    let sessionID: String
+    let turnID: String
+    let afterCursor: SessionTimelineCursor?
+}
+
 private actor TaskOpenSpyRepository: AppRepository {
     private var snapshot: AppSnapshot
-    private let sessionBundle: SessionBundle?
+    private var sessionBundle: SessionBundle?
     private let delaysSessionLookup: Bool
     private let lookupFailure: AppRepositoryError?
+    private var timelineResponses: [SessionTimelinePage]
+    private var suspendsTimelineWhenResponsesEmpty: Bool
+    private var timelineRequests: [TaskTimelineRequest] = []
+    private var timelineResponseCount = 0
+    private var timelineTurnResponses: [SessionTimelinePage]
+    private var suspendsTimelineTurnWhenResponsesEmpty: Bool
+    private var timelineTurnRequests: [TaskTimelineTurnRequest] = []
+    private var timelineTurnResponseCount = 0
+    private var timelineRequestWaiters: [
+        (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private var timelineResponseWaiters: [
+        (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private var timelineTurnRequestWaiters: [
+        (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private var timelineTurnResponseWaiters: [
+        (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
     private var sessionLookups = 0
     private var createdListNames: [String] = []
     private var taskCreations: [TaskCreateCall] = []
@@ -695,11 +1330,19 @@ private actor TaskOpenSpyRepository: AppRepository {
         task: TaskItem,
         session: SessionBundle?,
         delaysSessionLookup: Bool = false,
-        lookupFailure: AppRepositoryError? = nil
+        lookupFailure: AppRepositoryError? = nil,
+        timelineResponses: [SessionTimelinePage] = [],
+        suspendsTimelineWhenResponsesEmpty: Bool = false,
+        timelineTurnResponses: [SessionTimelinePage] = [],
+        suspendsTimelineTurnWhenResponsesEmpty: Bool = false
     ) {
         sessionBundle = session
         self.delaysSessionLookup = delaysSessionLookup
         self.lookupFailure = lookupFailure
+        self.timelineResponses = timelineResponses
+        self.suspendsTimelineWhenResponsesEmpty = suspendsTimelineWhenResponsesEmpty
+        self.timelineTurnResponses = timelineTurnResponses
+        self.suspendsTimelineTurnWhenResponsesEmpty = suspendsTimelineTurnWhenResponsesEmpty
         snapshot = AppSnapshot(
             revision: 1,
             lists: [],
@@ -715,6 +1358,10 @@ private actor TaskOpenSpyRepository: AppRepository {
         sessionBundle = nil
         delaysSessionLookup = false
         lookupFailure = nil
+        timelineResponses = []
+        suspendsTimelineWhenResponsesEmpty = false
+        timelineTurnResponses = []
+        suspendsTimelineTurnWhenResponsesEmpty = false
     }
 
     func load() async throws -> AppSnapshot { snapshot }
@@ -809,10 +1456,85 @@ private actor TaskOpenSpyRepository: AppRepository {
         throw AppRepositoryError.sessionNotFound
     }
     func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle {
-        throw AppRepositoryError.sessionNotFound
+        guard let sessionBundle, sessionBundle.session.id == sessionID else {
+            throw AppRepositoryError.sessionNotFound
+        }
+        return sessionBundle
     }
     func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle {
         throw AppRepositoryError.sessionNotFound
+    }
+    func timeline(
+        sessionID: String,
+        after sequence: Int64,
+        afterCursor: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage? {
+        timelineRequests.append(
+            TaskTimelineRequest(
+                sessionID: sessionID,
+                afterSequence: sequence,
+                afterCursor: afterCursor
+            )
+        )
+        let readyWaiters = timelineRequestWaiters.filter {
+            timelineRequests.count >= $0.targetCount
+        }
+        timelineRequestWaiters.removeAll {
+            timelineRequests.count >= $0.targetCount
+        }
+        for waiter in readyWaiters { waiter.continuation.resume() }
+
+        while timelineResponses.isEmpty, suspendsTimelineWhenResponsesEmpty {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        guard !timelineResponses.isEmpty else { return nil }
+        let response = timelineResponses.removeFirst()
+        timelineResponseCount += 1
+        let deliveredWaiters = timelineResponseWaiters.filter {
+            timelineResponseCount >= $0.targetCount
+        }
+        timelineResponseWaiters.removeAll {
+            timelineResponseCount >= $0.targetCount
+        }
+        for waiter in deliveredWaiters { waiter.continuation.resume() }
+        return response
+    }
+    func timelineTurn(
+        sessionID: String,
+        turnID: String,
+        afterCursor: SessionTimelineCursor?
+    ) async throws -> SessionTimelinePage? {
+        timelineTurnRequests.append(
+            TaskTimelineTurnRequest(
+                sessionID: sessionID,
+                turnID: turnID,
+                afterCursor: afterCursor
+            )
+        )
+        let readyWaiters = timelineTurnRequestWaiters.filter {
+            timelineTurnRequests.count >= $0.targetCount
+        }
+        timelineTurnRequestWaiters.removeAll {
+            timelineTurnRequests.count >= $0.targetCount
+        }
+        for waiter in readyWaiters { waiter.continuation.resume() }
+
+        while timelineTurnResponses.isEmpty, suspendsTimelineTurnWhenResponsesEmpty {
+            try Task.checkCancellation()
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        guard !timelineTurnResponses.isEmpty else { return nil }
+        let response = timelineTurnResponses.removeFirst()
+        timelineTurnResponseCount += 1
+        let deliveredWaiters = timelineTurnResponseWaiters.filter {
+            timelineTurnResponseCount >= $0.targetCount
+        }
+        timelineTurnResponseWaiters.removeAll {
+            timelineTurnResponseCount >= $0.targetCount
+        }
+        for waiter in deliveredWaiters { waiter.continuation.resume() }
+        return response
     }
     func markRead(sessionID: String, through sequence: Int64) async throws {}
     func cancelTurn(sessionID: String) async throws {}
@@ -852,6 +1574,46 @@ private actor TaskOpenSpyRepository: AppRepository {
     func sessionLookupCount() -> Int { sessionLookups }
     func taskCreateCalls() -> [TaskCreateCall] { taskCreations }
     func listCreateNames() -> [String] { createdListNames }
+    func timelineRequestRecords() -> [TaskTimelineRequest] { timelineRequests }
+    func timelineTurnRequestRecords() -> [TaskTimelineTurnRequest] { timelineTurnRequests }
+
+    func waitUntilTimelineRequestCount(_ targetCount: Int) async {
+        guard timelineRequests.count < targetCount else { return }
+        await withCheckedContinuation { continuation in
+            timelineRequestWaiters.append((targetCount, continuation))
+        }
+    }
+
+    func waitUntilTimelineResponseCount(_ targetCount: Int) async {
+        guard timelineResponseCount < targetCount else { return }
+        await withCheckedContinuation { continuation in
+            timelineResponseWaiters.append((targetCount, continuation))
+        }
+    }
+
+    func waitUntilTimelineTurnRequestCount(_ targetCount: Int) async {
+        guard timelineTurnRequests.count < targetCount else { return }
+        await withCheckedContinuation { continuation in
+            timelineTurnRequestWaiters.append((targetCount, continuation))
+        }
+    }
+
+    func waitUntilTimelineTurnResponseCount(_ targetCount: Int) async {
+        guard timelineTurnResponseCount < targetCount else { return }
+        await withCheckedContinuation { continuation in
+            timelineTurnResponseWaiters.append((targetCount, continuation))
+        }
+    }
+
+    func releaseTimeline(with response: SessionTimelinePage) {
+        timelineResponses.append(response)
+        suspendsTimelineWhenResponsesEmpty = false
+    }
+
+    func releaseTimelineTurn(with response: SessionTimelinePage) {
+        timelineTurnResponses.append(response)
+        suspendsTimelineTurnWhenResponsesEmpty = false
+    }
 
     func completeDelayedSessionLookup() {
         guard let delayedSessionLookup else { return }
