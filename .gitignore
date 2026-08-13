@@ -9,6 +9,11 @@ dist/
 .env
 .env.local
 
+# Local agent instructions. Keep machine- and assistant-specific guidance out
+# of the public repository.
+AGENTS.md
+CLAUDE.md
+
 # TypeScript incremental build state — machine-local, churns on every typecheck.
 *.tsbuildinfo
 

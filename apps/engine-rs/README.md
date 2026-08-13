@@ -1,16 +1,22 @@
 # TodoAgent Rust Engine
 
 `apps/engine-rs` 是原生 macOS TodoAgent 随 App 打包的 Rust sidecar。它负责 SQLite
-持久化、四个本地 CLI Runtime、Gemini 助手内核和进程生命周期。Engine 只通过
-stdin/stdout 上的版本化 NDJSON 通信，不监听 TCP 端口。
+持久化、四个本地 CLI Runtime 的启动描述、Gemini 助手内核和终端生命周期元数据。
+Engine 只通过 stdin/stdout 上的版本化 NDJSON 通信，不监听 TCP 端口。
+
+完整系统图与本地 Runtime 规则分别见
+[`../../docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md) 和
+[`../../docs/RUNTIMES.md`](../../docs/RUNTIMES.md)。本文只记录 Engine 子工程细节。
 
 ## 模块
 
-- `main.rs` / `protocol.rs`：IPC v3 握手、请求分发、事件输出和 Engine 生命周期。
-- `store.rs` / `store_worker.rs` / `schema.sql`：SQLite v4 schema、事务和串行
+- `main.rs` / `protocol.rs`：IPC v4 握手、请求分发、事件输出和 Engine 生命周期。
+- `store.rs` / `store_worker.rs` / `schema.sql`：SQLite v5 schema、事务和串行
   数据访问。
-- `runtime.rs` / `adapters.rs`：Codex、Claude Code、Cursor Agent、Kiro CLI 的
-  检测、验证、首轮启动、续聊、取消和进程组回收。
+- `runtime.rs` / `terminal.rs`：Codex、Claude Code、Cursor Agent、Kiro CLI 的
+  检测、验证、fresh/resume launch plan、Provider ID 候选扫描和安全 descriptor。
+- `bin/todoagent-terminal-runner.rs`：不经 shell 启动 Agent，管理独立进程组、宿主
+  存活监控和经过 token 验证的生命周期/Hook 事件。
 - `assistant/` / `assistant_service.rs`：极简 ReAct Runner、Gemini Interactions SSE、
   本地上下文、压缩、工具 receipt 和流式事件。
 
@@ -19,20 +25,28 @@ Swift 和 Rust 共用的 NDJSON 契约 fixture 位于仓库根目录
 
 ## 数据模型与并发
 
-SQLite 是唯一事实来源，schema version 为 4。Engine 保存任务、清单、任务附件、
-`TaskSession`、每轮 CLI 执行、稳定消息投影、原始事件，以及助手 Session、Turn、
-模型步骤、工具执行和上下文摘要。
+SQLite 是 Session 元数据的唯一事实来源，schema version 为 5。Engine 保存任务、
+清单、任务附件、`terminal_session`、每次 App 内启动对应的 `terminal_run`，以及助手
+Session、Turn、模型步骤、工具执行和上下文摘要。终端 PTY 字节和滚屏不写入 SQLite。
 
-- 同一个 CLI Session 同时只允许一个活动 Turn；不同 Session 最多并行 2 个 Turn。
+- 每个 Terminal Session 同时只允许一个活动 Run；不同任务的 Run 不设 Engine
+  semaphore 上限，App 在启动第 4 个活跃终端前提示资源消耗。
 - 同一个 Assistant Session 同时只允许一个活动 Turn；不同 Assistant Session 最多
   并行 2 个 Turn。
 - `clientMessageId` 和持久化工具 receipt 用于防止超时重试产生重复消息或重复任务。
 - `task.attachment.add/remove` 要求稳定的 `clientMutationId`；SQLite receipt 使响应丢失
   后的同参数重放直接成功且不会重复复制或删除，复用同一 UUID 发送不同参数会返回冲突。
-- `session.create` 只持久化空的 `idle` Task Session；同任务、Runtime 和规范化工作目录
-  的空 Session 可安全重放。首条可见用户消息和 CLI Turn 只由后续 `session.send` 创建。
-- Engine 重启时，遗留的运行中 Turn 会被标记为 `interrupted`，不会自动重放有副作用
-  的工具。
+- `terminal.session.create` 将任务永久绑定到 Runtime 和规范化工作目录；
+  原目录移动后可通过 `terminal.session.rebind_workspace` 显式重新授权和绑定，
+  保留原 Runtime、Provider Session ID 和 Run 历史；
+  `terminal.session.prepare_launch` 以 Swift 生成的 `runId` 幂等创建 fresh/resume Run。
+- Provider Session ID 只能从空值绑定一次；Codex/Kiro 找不到唯一候选时必须由用户选择。
+- Engine 重启时，遗留的活动 Terminal Run 会标记为 `interrupted`；App 同时终止旧 PTY
+  与进程组，用户随后显式恢复 Provider 对话。
+
+从 v4 打开时会先建立权限为 `0600` 的数据库备份，再保留任务、附件、Runtime、设置
+和 Gemini 助手数据迁移到 v5；上一代结构化 CLI 历史不迁移。更旧、未知或未来 schema
+会原样保留并拒绝打开。
 
 ## Gemini 助手边界
 

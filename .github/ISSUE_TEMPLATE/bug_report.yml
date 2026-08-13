@@ -1,0 +1,95 @@
+name: Bug report
+description: Report a reproducible problem in the native macOS app or Rust Engine.
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve TodoAgent. Search existing issues first and remove credentials, tokens, private terminal content, and unrelated personal paths from every attachment.
+        Security vulnerabilities must be reported through the private security link instead of this form.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - Native task UI
+        - Task workbench / embedded terminal
+        - Codex integration
+        - Claude Code integration
+        - Cursor Agent integration
+        - Kiro CLI integration
+        - Gemini task assistant
+        - Rust Engine / storage / IPC
+        - Build or packaging
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: TodoAgent revision
+      description: Commit SHA or exact build source. TodoAgent has no formal release tag yet.
+      placeholder: 1f74f0d or a full commit SHA
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include macOS version, Mac model/architecture, and Xcode version when relevant.
+      placeholder: macOS 26.x, Apple Silicon arm64, Xcode 26.x
+    validations:
+      required: true
+  - type: input
+    id: runtime
+    attributes:
+      label: Runtime and version
+      description: If this involves a local Agent, include its name, version, and whether Settings reports ready/auth_required/missing.
+      placeholder: Codex 0.x, verified ready; or Not applicable
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction steps
+      description: Give the smallest deterministic sequence that reproduces the problem.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Note whether the failure happens during detection, launch, interaction, status, shutdown, or resume.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Redacted logs or screenshots
+      description: Remove API keys, auth tokens, private terminal text, and unrelated user data. Attach only what is needed.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I reproduced this on the native `master` product, not `legacy/web`.
+          required: true
+        - label: I removed credentials, private terminal content, and unrelated personal data.
+          required: true
+        - label: This report does not disclose a security vulnerability.
+          required: true

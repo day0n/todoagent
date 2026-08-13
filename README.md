@@ -1,117 +1,177 @@
 # TodoAgent
 
-TodoAgent 是一款原生 macOS 待办与本地 Agent 工作台。任务、清单、对话和
-Runtime 状态都保存在本机；SwiftUI/AppKit 前端通过 stdin/stdout 上的 IPC v3
-与随 App 打包的 Rust Engine 通信，不启动 Web 服务或本地 TCP 端口。
+![Status](https://img.shields.io/badge/status-developer_preview-orange)
+![Platform](https://img.shields.io/badge/platform-macOS_26%2B-black)
+![Architecture](https://img.shields.io/badge/architecture-Apple_Silicon_arm64-black)
+![Swift](https://img.shields.io/badge/Swift-6.2-F05138?logo=swift&logoColor=white)
+![Rust](https://img.shields.io/badge/Rust-1.88.0-000000?logo=rust&logoColor=white)
 
-## 分支定位
+TodoAgent 是一款本地优先的原生 macOS 待办与 Agent 工作台。它把任务、工作目录和
+你已经安装的 Coding Agent CLI 放在同一个桌面界面中：每个任务都有独立工作台，
+左侧管理任务，右侧直接操作 Agent 自己的真实终端界面。
 
-- `master`：当前主产品，原生 macOS App 与 Rust Engine 的发布基线。
-- `legacy/web`：旧 Web/Node.js 前后端基线；维护旧产品时使用这个分支。
+> **项目状态：开发预览。** 当前只支持 macOS 26+ 与 Apple Silicon arm64；本地
+> DMG 使用 ad-hoc 签名，尚未经过 Developer ID 签名和 Apple 公证，不是面向公众的
+> 正式发行包。
 
-原生版本不会读取旧版 `~/.todoagent` 数据库，也不会自动导入 Web 数据。
+[快速开始](#本地构建与运行) · [公开 TODO](TODO.md) ·
+[架构](docs/ARCHITECTURE.md) · [Runtime 集成](docs/RUNTIMES.md) ·
+[贡献指南](CONTRIBUTING.md) · [安全策略](SECURITY.md)
+
+## 为什么是 TodoAgent
+
+Coding Agent 已经能在终端里工作，但任务管理、工作目录、会话恢复和日常进度通常
+散落在不同工具中。TodoAgent 的目标是提供一个可见、可恢复、由用户掌控的本地工作台，
+同时保留 Codex、Claude Code、Cursor Agent 和 Kiro CLI 各自原生的交互体验。
 
 ## 当前能力
 
-- 管理任务、清单、执行日期、截止日期、附件和未完成/已完成状态。
-- 时间线、总任务和自定义清单统一将未完成任务直接排在上方；已完成任务只在存在时
-  显示于下方“已完成”分组。未完成任务的截止日或执行日已经过去时，统一以红色
-  显示需要处理的日期和星期。
-- 任务卡支持原生右键菜单，可完成/重新打开、设置两个日期、移动清单、根据任务创建清单和安全删除；菜单打开期间任务卡保持选中阴影，清楚标示当前操作目标。
-- 时间线固定显示所选日期起连续四天，只按执行日期排期；每列的快速添加栏固定在
-  底部，任务较多时只滚动中间任务区。菜单栏显示今天全部任务。
-- 任务详情与本地 Session 按当前主窗口尺寸展示为紧凑双栏，窄窗自动切换上下布局，不再用接近全屏的固定 Sheet 遮住主界面。
-- 任务启动本地 Agent 后会先建立一个空的长期逻辑 Session，不会自动发送任务信息；
-  用户主动发送消息后才启动一轮 CLI，历史和供应商 Session ID 持久化到 SQLite，
-  较长的工具结果默认折叠并可点击展开。
-- 支持四个本地 Runtime：Codex、Claude Code、Cursor Agent、Kiro CLI。
-  Runtime 由用户在设置中主动检测和验证；某个 Runtime 未安装或未登录不会影响
-  其他 Runtime。
-- 内置 Gemini 任务助手：多会话、流式回复、取消、上下文压缩和崩溃恢复。
-  助手只开放 `create_tasks`、`find_related`、`update_task`、`delete_task`、
-  `list_state`、`list_lists` 六个任务工具。
-- 助手工具调用按实际 Turn 穿插在对应问答之间，不再集中堆到对话末尾；运行状态
-  使用静态文字与图标。右侧对话栏顶部只保留会话选择、“开始新对话”和“隐藏对话”，
-  会话记录使用栏内的 TodoAgent 风格下拉卡片，不再弹出覆盖顶部的系统菜单。
-- 主窗口首次以 1120×720 左右的居中中等尺寸出现；TodoAgent 始终按类似 Notion
-  的比例停靠在任务板右侧，窄窗或左右分屏时也保留任务区、左侧日历与导航。
-- 助手对话可读取 UTF-8 `.txt` 和 `.md` 附件；任务附件是独立的本地备忘，名称、
-  路径和内容都不会进入助手或本地 CLI Session。
+- 管理任务、清单、执行日期、截止日期、状态和本地附件；支持四日时间线、逾期提示、
+  菜单栏今日任务和原生右键操作。
+- 为每个任务打开独立工作台窗口，在嵌入式 Ghostty PTY 中直接运行 Coding Agent
+  自己的 TUI。
+- 检测并验证 Codex、Claude Code、Cursor Agent、Kiro CLI；单个 Runtime 未安装或
+  未登录时不会阻塞其他功能。
+- 将一个任务绑定到一个 Runtime 和一个工作目录，管理 Agent 的启动、精确恢复、
+  Provider Session ID、状态和进程组生命周期。
+- 使用 Gemini 任务助手创建、查找、更新和删除 TodoAgent 中的任务；支持多会话、
+  流式回复、取消、崩溃恢复和会话内上下文压缩。
+- 任务、会话元数据和助手上下文保存在本机 SQLite；Engine 通过 stdin/stdout 上的
+  NDJSON IPC v4 与 App 通信，不启动 Web 服务或本地 TCP 端口。
 
-## 架构
+### 能力边界
 
-```text
-SwiftUI / AppKit
-       │  IPC v3 · NDJSON · stdin/stdout
-       ▼
-Rust Engine
-  ├─ SQLite v4：任务双日期、任务附件、Session、消息、事件和助手上下文
-  ├─ CLI adapters：Codex / Claude Code / Cursor Agent / Kiro CLI
-  └─ Gemini Interactions API：store=false，持久化上下文仅保存在本机
-```
+| 能力 | 当前状态 |
+|---|---|
+| 用户在 TodoAgent 内直接操作四家 CLI TUI | 已实现，发布验收仍在进行 |
+| TodoAgent 助手管理任务与清单 | 已实现 |
+| TodoAgent 自动向 Coding Agent 派发任务并收集结果 | 计划中 |
+| 不同 Agent 之间接力或协作 | 计划中 |
+| 跨任务、跨会话的长期语义记忆 | 调研中 |
 
-`DemoRepository` 仅用于 SwiftUI 预览和确定性的 UI 测试。普通启动始终使用共享的
-`EngineRepository` 和随 App 打包的 Rust sidecar。
+当前的“直接操作 CLI”指用户在内嵌终端中操作原生 TUI。TodoAgent 不解析四家 CLI 的
+对话输出，不会自动发送任务标题、备注或附件，也不保存旧终端滚屏。Gemini 任务助手
+没有 shell、任意文件读写或 CLI 派发权限。自动派发、结果回收和跨 Agent 编排是独立的
+[后续路线](TODO.md)，不能与现有终端能力混为一谈。
 
-## 本地构建
+## 支持的本地 Runtime
 
-要求：
+| Runtime | 新会话 | 恢复 | 当前集成方式 |
+|---|---|---|---|
+| Codex | 支持 | 支持 | 原生 TUI + 工作目录绑定 |
+| Claude Code | 支持 | 支持 | 原生 TUI + 预分配 Session ID |
+| Cursor Agent | 支持 | 支持 | 原生 TUI + Workspace/Chat 绑定 |
+| Kiro CLI | 支持 | 支持 | `chat --tui` + Session ID |
+
+这些 CLI 不随 TodoAgent 分发，用户需要自行安装并完成登录。上游命令行参数、会话存储
+和 Hook 能力可能变化；TodoAgent 会在启动前探测当前安装是否具备所需能力。具体的
+fresh/resume 规则、状态 Hook 和兼容性边界见
+[`docs/RUNTIMES.md`](docs/RUNTIMES.md)。
+
+## 本地构建与运行
+
+### 要求
 
 - macOS 26+
-- Apple Silicon
-- Xcode 26+
-- Rust 1.88
-- Swift 6.2（由 Xcode 提供）
+- Apple Silicon arm64
+- Xcode 26+，包含 Swift 6.2
+- Rust 1.88.0（仓库由 `rust-toolchain.toml` 固定）
+- 首次构建 Ghostty：Zig 0.15.2、Xcode Metal Toolchain、`curl`、Xcode Command
+  Line Tools 和网络访问
 
-在仓库根目录运行：
+如尚未安装 Metal Toolchain：
 
 ```bash
+xcodebuild -downloadComponent MetalToolchain
+```
+
+在仓库根目录初始化固定版本的 GhosttyKit，然后构建：
+
+```bash
+./scripts/setup-ghostty.sh
 ./scripts/build-macos-preview.sh
 open dist/TodoAgent.app
 ```
 
-构建产物：
+`build-macos-preview.sh` 会在缺少 GhosttyKit 时自动执行初始化；显式先运行 setup
+更容易单独定位工具链或网络问题。脚本会校验固定源码、SHA-256 和第三方许可，构建
+Swift App、Rust Engine 与 Terminal Runner，并生成：
 
-- `dist/TodoAgent.app`：可直接打开的日常调试版本，不需要反复复制到
-  `/Applications`。
-- `dist/TodoAgent-0.1.0-arm64.dmg`：Apple Silicon 本地预览 DMG。
+- `dist/TodoAgent.app`：指向临时目录内日常预览 App 的便捷链接；
+- `dist/TodoAgent-0.1.0-arm64.dmg`：仅用于本地测试的 ad-hoc 签名 DMG。
 
-脚本会构建并 strip arm64 Rust sidecar，将其嵌入 App Resources，再对 sidecar 和
-App 做 ad-hoc 签名。
+首次打开后，在“设置 → 本机 CLI”中检测并验证已安装的 Runtime；创建任务工作台时，
+再由用户明确选择并授权工作目录。
 
-## 验证
+完整依赖、开发流程和验证命令见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。目前没有可供
+普通用户直接下载的已签名、公证版本。
 
-```bash
-cargo fmt --manifest-path apps/engine-rs/Cargo.toml --all -- --check
-cargo clippy --manifest-path apps/engine-rs/Cargo.toml --locked --all-targets -- -D warnings
-cargo test --manifest-path apps/engine-rs/Cargo.toml --locked
+## 架构概览
 
-DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
-  swift test --disable-sandbox --package-path apps/macos \
-  -Xswiftc -strict-concurrency=complete \
-  -Xswiftc -warnings-as-errors
+```text
+SwiftUI / AppKit
+  ├─ 任务、清单、时间线与菜单栏
+  ├─ 每任务独立工作台
+  │    └─ Ghostty PTY ── Codex / Claude Code / Cursor Agent / Kiro CLI
+  └─ Gemini 任务助手
+          │
+          │ NDJSON · stdin/stdout · IPC v4
+          ▼
+Rust Engine
+  ├─ SQLite schema v5
+  ├─ Runtime 探测、launch plan 与 Terminal Session 元数据
+  └─ Gemini Interactions API（store=false）
 ```
 
-Swift 和 Rust 共用的 IPC 契约 fixture 位于 `protocol/fixtures/contract.ndjson`。
+TodoAgent 的 App、Engine、Terminal Runner、状态 Hook 与数据迁移边界见
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
-## 本地数据与密钥
+## 本地数据与隐私
 
-| 内容 | 路径 |
+| 内容 | 默认路径 |
 |---|---|
 | SQLite | `~/Library/Application Support/TodoAgent/todoagent.sqlite3` |
+| 任务附件 | `~/Library/Application Support/TodoAgent/Attachments` |
 | Gemini API Key | `~/Library/Application Support/TodoAgent/credentials.json` |
-| Engine 附件目录 | `~/Library/Application Support/TodoAgent/Attachments` |
 | Engine 日志 | `~/Library/Logs/TodoAgent/engine-stderr.log` |
 
 TodoAgent 将 Application Support 数据目录设置为 `0700`，SQLite 与凭据文件设置为
-`0600`。Gemini Key 不写入 SQLite、环境变量或日志；它是当前 macOS 账户下的普通
-权限隔离文件，并非 Keychain 加密项。同一登录账户下的其他进程仍可能读取，建议
-开启 FileVault。
+`0600`。Gemini Key 不写入 SQLite、环境变量或日志，但当前凭据文件不是 Keychain
+加密项；同一 macOS 登录账户下的其他进程和系统备份仍可能读取，建议启用 FileVault。
 
-## 分发边界
+Codex/Cursor 的可选状态 Hook 会在用户确认后备份并合并用户配置；Claude 使用
+run-scoped settings；Kiro 当前只有进程级状态监督。TodoAgent 不通过这些 Hook 读取
+终端内容。完整说明见 [`docs/DATA_AND_PRIVACY.md`](docs/DATA_AND_PRIVACY.md) 和
+[`SECURITY.md`](SECURITY.md)。
 
-当前 App 只有 ad-hoc 签名，不含 Developer ID 签名和苹果公证，适合本机开发与
-预览，不是面向公众的正式安装包。公开下载仍需单独完成 Developer ID 签名、
-notarization、Gatekeeper 验收；Universal 构建和自动更新也不在当前版本范围内。
+## 文档
 
-更详细的实现状态与后续事项见 [`PLAN.md`](PLAN.md)。
+- [`TODO.md`](TODO.md)：公开路线、状态和验收标准
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)：当前原生架构与持久化模型
+- [`docs/RUNTIMES.md`](docs/RUNTIMES.md)：四个本地 Runtime 的集成边界
+- [`docs/DATA_AND_PRIVACY.md`](docs/DATA_AND_PRIVACY.md)：数据、凭据、Hook 与隐私
+- [`CONTRIBUTING.md`](CONTRIBUTING.md)：环境准备、测试和 Pull Request 约定
+- [`SECURITY.md`](SECURITY.md)：漏洞报告与安全边界
+- [`CHANGELOG.md`](CHANGELOG.md)：未发布变更与后续发布记录
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)：社区行为准则
+- [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)：第三方组件和许可
+
+## 分支
+
+- `master`：原生 macOS App 与 Rust Engine 的主产品基线。
+- `legacy/web`：保留旧 Web + Node.js 实现；原生版本不会读取或导入旧 Web 数据。
+
+## 参与贡献
+
+欢迎通过 Issue 反馈可复现问题、产品建议和文档改进。准备代码改动前，请先阅读
+[`CONTRIBUTING.md`](CONTRIBUTING.md) 和 [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)；
+安全问题请不要公开披露，按 [`SECURITY.md`](SECURITY.md) 报告。
+
+## 许可证状态
+
+仓库当前尚未包含 TodoAgent 第一方代码的项目级 `LICENSE`。在维护者明确并提交许可
+之前，不应把本仓库视为已经完成开源许可授予；这也是公开发布前的阻塞项。
+`Cargo.toml` 中单个 Rust package 的 metadata 不能替代仓库根许可证。
+
+第三方组件继续受各自许可证约束，详见
+[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。

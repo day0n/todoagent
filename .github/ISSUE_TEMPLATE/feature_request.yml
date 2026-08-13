@@ -1,0 +1,68 @@
+name: Feature request
+description: Propose a focused product, runtime, or documentation improvement.
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check TODO.md before proposing long-term memory, cross-agent collaboration, or automatic CLI dispatch. A useful proposal explains the user problem, permission boundary, and how success can be verified.
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem
+      description: Who has this problem, and what do they currently have to do?
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired outcome
+      description: Describe observable behavior, not only an implementation choice.
+    validations:
+      required: true
+  - type: textarea
+    id: current_workaround
+    attributes:
+      label: Current workaround
+  - type: dropdown
+    id: roadmap
+    attributes:
+      label: Existing roadmap area
+      options:
+        - Four-runtime preview stabilization
+        - Public preview and release engineering
+        - Core task experience
+        - TodoAgent-driven Coding Agents
+        - Cross-agent handoff and collaboration
+        - Long-term memory
+        - New direction
+    validations:
+      required: true
+  - type: textarea
+    id: safety
+    attributes:
+      label: Permissions, privacy, and failure modes
+      description: Explain file, shell, network, credential, memory, or multi-agent risks and how users stay in control.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: List concrete checks that would prove the feature works and fails safely.
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+    validations:
+      required: true
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I searched existing issues and read TODO.md.
+          required: true
+        - label: I clearly separated current capabilities from the proposed behavior.
+          required: true

@@ -5,10 +5,14 @@
 `apps/engine-rs` 中随 App 打包的 Rust sidecar 配合运行。旧 Web/Node.js 产品基线
 保存在 `legacy/web` 分支。
 
+项目级介绍、环境初始化和安全边界分别见 [`../../README.md`](../../README.md)、
+[`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) 与
+[`../../SECURITY.md`](../../SECURITY.md)。本文只记录 macOS 子工程职责。
+
 ## 运行结构
 
 - 普通启动使用一个共享 `EngineRepository`。任务、四个本地 CLI Runtime 和
-  TodoAgent Gemini 助手都通过 IPC v3 访问同一份原生 SQLite 数据。
+  TodoAgent Gemini 助手都通过 IPC v4 访问同一份原生 SQLite 数据。
 - `EngineClient` 是 sidecar 进程及其 stdin/stdout/stderr 的唯一所有者，负责握手、
   请求超时、事件流、重连和异步退出。
 - `AppState` 管理任务与导航状态；`AssistantViewState` 独立管理助手会话、历史、
@@ -24,13 +28,15 @@
   以红色显示对应日期和星期。
 - 时间线每列与任务/清单视图都将快速添加栏固定在底部；时间线任务较多时只滚动
   中间任务区，输入位置不会随任务数量跳动。
-- 任务详情与本地 Session Sheet 会读取当前主窗口尺寸：标准窗口使用有上限的紧凑
-  双栏，窄窗切换上下布局，表单内容可滚动且启动按钮保持可用。
+- 每个任务使用独立的原生工作台窗口（默认 `1180×760`，最小 `900×600`）：左侧
+  保留任务详情，右侧是可缩放的 Ghostty PTY/TUI。关闭窗口只收起界面，不结束 Agent；
+  显式“结束 Session”、删除任务或退出 App 才终止对应进程组。
 
 本地 CLI 支持 Codex、Claude Code、Cursor Agent、Kiro CLI。安装与登录状态由用户
 在“本机 CLI”设置中主动检测和验证，单个 Runtime 不可用不会阻塞其他功能。
-创建任务 Session 只进入空的 `idle` 会话；用户主动发送第一条消息后才启动 CLI。
-聊天中的 `tool_result` 默认折叠，点击摘要卡片后展开完整内容。
+创建任务 Session 后直接在真实 PTY 中运行 Agent 自己的 TUI；TodoAgent 不解析四家
+消息格式，也不自动发送任务标题、备注或附件。App 重启后通过各 CLI 的精确 resume
+参数恢复 Provider 对话语义，不保存旧终端滚屏。
 
 ## TodoAgent 助手
 
@@ -69,6 +75,8 @@ DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer \
 ```
 
 完整构建需要 Xcode 26+、macOS 26+、Apple Silicon 和 Rust 1.88。
+干净检出还需先按 [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) 准备 Zig 0.15.2、
+Metal Toolchain 与固定版本 GhosttyKit。
 
 ## 数据与凭据
 
