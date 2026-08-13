@@ -80,6 +80,8 @@ final class AppState {
     private var localDayRefreshTask: Task<Void, Never>?
     private var calendarObservers: [NSObjectProtocol] = []
     private var workspaceCalendarObserver: NSObjectProtocol?
+    @ObservationIgnored weak var taskWorkspacePresenter: (any TaskWorkspacePresenting)?
+    @ObservationIgnored var terminalSessions: TerminalSessionRegistry?
 
     private(set) var revision: Int64 = 0
     private(set) var lists: [TodoList] = []
@@ -200,13 +202,21 @@ final class AppState {
     /// visible failure state remain intact so the user can retry.
     @discardableResult
     func shutdown() async -> Bool {
+        // AppKit commits marked text synchronously through the title/note
+        // bindings. Do this before freezing mutations or the final CJK
+        // composition would be rejected by their termination guard.
+        taskWorkspacePresenter?.commitTaskWorkspaceInput()
         isPreparingToTerminate = true
+        terminalSessions?.beginShutdown()
+        await Task.yield()
         guard await flushAllTaskEditsForShutdown() else {
+            terminalSessions?.cancelShutdown()
             isPreparingToTerminate = false
             errorMessage = "还有任务修改未能保存。已取消退出，修改仍保留在当前界面，请重试保存。"
             return false
         }
         await waitForActiveTaskCommands()
+        await terminalSessions?.endAll(reason: .appShutdown)
 
         loadGeneration &+= 1
         loadTask?.cancel()
@@ -437,6 +447,15 @@ final class AppState {
         }
         taskSaveStates[taskID] = .saving
 
+        // A terminal process belongs to the task lifecycle. End it and await
+        // the authenticated runner exit before asking the Engine to delete the
+        // task, but retain its registered controller until deletion succeeds.
+        // If the delete fails, the existing workbench can safely resume the
+        // ended provider conversation and Quit still owns the controller.
+        if terminalSessions?.controller(for: taskID) != nil {
+            await terminalSessions?.endRetaining(taskID: taskID, reason: .userEnded)
+        }
+
         do {
             let snapshot = try await repository.deleteTask(taskID: taskID)
             apply(snapshot, acceptingEqualMutationRevision: true)
@@ -466,6 +485,7 @@ final class AppState {
             errorMessage = message
             return false
         }
+        taskWorkspacePresenter?.destroyTaskWorkspace(taskID: taskID)
         errorMessage = nil
         return true
     }
@@ -550,7 +570,9 @@ final class AppState {
     /// registered, so consecutive DatePicker/Toggle callbacks cannot race as
     /// independent fire-and-forget tasks.
     func enqueueImmediateTaskUpdate(taskID: UUID, patch: TaskPatch) {
-        guard isTaskCommandInFlight(taskID: taskID) == false else { return }
+        guard !isPreparingToTerminate,
+              isTaskCommandInFlight(taskID: taskID) == false
+        else { return }
         guard let patch = changedTaskPatch(taskID: taskID, patch: patch) else { return }
         queueTaskPatch(taskID: taskID, patch: patch)
         beginImmediateTaskFlush(taskID: taskID)
@@ -559,7 +581,9 @@ final class AppState {
     /// Queues a title/note patch for the 800 ms trailing autosave window.
     /// The draft is projected immediately and remains visible if persistence fails.
     func scheduleTaskUpdate(taskID: UUID, patch: TaskPatch) {
-        guard isTaskCommandInFlight(taskID: taskID) == false else { return }
+        guard !isPreparingToTerminate,
+              isTaskCommandInFlight(taskID: taskID) == false
+        else { return }
         guard let patch = changedTaskPatch(taskID: taskID, patch: patch) else { return }
         queueTaskPatch(taskID: taskID, patch: patch)
         taskSaveStates[taskID] = activeTaskFlushes[taskID] == nil ? .debouncing : .saving
@@ -582,7 +606,9 @@ final class AppState {
         patch: TaskPatch,
         debounce: Bool = false
     ) async -> Bool {
-        guard isTaskCommandInFlight(taskID: taskID) == false else { return false }
+        guard !isPreparingToTerminate,
+              isTaskCommandInFlight(taskID: taskID) == false
+        else { return false }
         guard task(id: taskID) != nil else {
             taskSaveStates[taskID] = .failed("找不到这个任务。")
             return false
@@ -657,7 +683,7 @@ final class AppState {
     }
 
     func enqueueTaskAttachmentAdd(taskID: UUID, sourcePaths: [String]) {
-        guard sourcePaths.isEmpty == false else { return }
+        guard !isPreparingToTerminate, sourcePaths.isEmpty == false else { return }
         enqueueTaskAttachmentMutation(
             taskID: taskID,
             mutation: .add(
@@ -668,6 +694,7 @@ final class AppState {
     }
 
     func enqueueTaskAttachmentRemoval(taskID: UUID, attachmentID: UUID) {
+        guard !isPreparingToTerminate else { return }
         enqueueTaskAttachmentMutation(
             taskID: taskID,
             mutation: .remove(
@@ -700,6 +727,10 @@ final class AppState {
 
     func openTask(_ task: TaskItem) {
         guard self.task(id: task.id) != nil else { return }
+        if let taskWorkspacePresenter {
+            taskWorkspacePresenter.showTaskWorkspace(taskID: task.id)
+            return
+        }
         cancelSessionLoad()
         presentedSheet = .taskSession(task.id)
         // `app.bootstrap` already tells us whether this task owns a Session.
@@ -1001,9 +1032,17 @@ final class AppState {
 
     @discardableResult
     func startSession(_ task: TaskItem, runtime: RuntimeKind, workspace: String) async -> Bool {
+        guard
+            !isPreparingToTerminate,
+            self.task(id: task.id) != nil,
+            activeTaskCommands.insert(task.id).inserted
+        else {
+            return false
+        }
+        defer { finishTaskCommand(taskID: task.id) }
         taskSessionErrorMessage = nil
-        guard self.task(id: task.id) != nil else { return false }
         guard await flushTaskEdits(taskID: task.id) else {
+            guard !isPreparingToTerminate else { return false }
             guard self.task(id: task.id) != nil else {
                 taskSessionErrorMessage = nil
                 return false
@@ -1011,7 +1050,7 @@ final class AppState {
             taskSessionErrorMessage = "任务修改尚未保存，请重试后再启动 Session。"
             return false
         }
-        guard self.task(id: task.id) != nil else {
+        guard !isPreparingToTerminate, self.task(id: task.id) != nil else {
             taskSessionErrorMessage = nil
             return false
         }
@@ -1023,19 +1062,43 @@ final class AppState {
         }
         if repository.requiresExecutionConsent {
             guard ExecutionSafety.authorize(runtime: runtime) else { return false }
+            TerminalStatusAuthorization.requestIfNeeded(for: runtime)
+        }
+        if let terminalSessions {
+            do {
+                _ = try await terminalSessions.create(
+                    task: task,
+                    runtime: runtime,
+                    workspace: directory
+                )
+                guard !isPreparingToTerminate else { return false }
+                if let snapshot = try? await repository.sync() { apply(snapshot) }
+                guard !isPreparingToTerminate else { return false }
+                taskSessionErrorMessage = nil
+                return self.task(id: task.id) != nil
+            } catch {
+                guard !isPreparingToTerminate else { return false }
+                guard self.task(id: task.id) != nil else {
+                    taskSessionErrorMessage = nil
+                    return false
+                }
+                taskSessionErrorMessage = error.localizedDescription
+                return false
+            }
         }
         do {
             let bundle = try await repository.createSession(taskID: task.id, runtime: runtime, workspace: directory)
-            guard self.task(id: task.id) != nil else {
+            guard !isPreparingToTerminate, self.task(id: task.id) != nil else {
                 taskSessionErrorMessage = nil
                 return false
             }
             merge(bundle, taskID: task.id)
             await refreshTimeline(taskID: task.id, sessionID: bundle.session.id)
+            guard !isPreparingToTerminate else { return false }
             if let snapshot = try? await repository.sync() {
                 apply(snapshot)
             }
-            guard self.task(id: task.id) != nil else {
+            guard !isPreparingToTerminate, self.task(id: task.id) != nil else {
                 taskSessionErrorMessage = nil
                 return false
             }
@@ -1158,6 +1221,18 @@ final class AppState {
             return
         } else if event.name == "engine.ready" {
             recoverSnapshotAfterEngineReadyIfNeeded()
+        } else if event.name.hasPrefix("terminal.") {
+            if let bundle = try? JSONDecoder.engineDecoder.decode(
+                TerminalSessionBundle.self,
+                from: event.data
+            ) {
+                mergeTerminal(bundle)
+            } else if let session = try? JSONDecoder.engineDecoder.decode(
+                TerminalSessionDescriptor.self,
+                from: event.data
+            ) {
+                mergeTerminalSessionDescriptor(session)
+            }
         } else if event.name.hasPrefix("session.") {
             if event.name == "session.timeline.turn.finished",
                let payload = try? JSONDecoder.engineDecoder.decode(
@@ -1235,6 +1310,10 @@ final class AppState {
         let recovery = Task { @MainActor [weak self] in
             guard let self else { return }
             do {
+                // Store startup reconciles active Runs to `interrupted`. Stop
+                // the matching old runner/PTY generation before applying that
+                // snapshot so UI, Engine, and OS processes cannot split-brain.
+                await self.terminalSessions?.reconcileEngineRestart()
                 let snapshot = try await self.repository.sync()
                 self.apply(snapshot)
             } catch is CancellationError {
@@ -1796,6 +1875,12 @@ final class AppState {
     }
 
     private func cleanUpDeletedTask(taskID: UUID) {
+        taskWorkspacePresenter?.destroyTaskWorkspace(taskID: taskID)
+        if terminalSessions?.controller(for: taskID) != nil {
+            Task { @MainActor [weak self] in
+                await self?.terminalSessions?.remove(taskID: taskID, reason: .userEnded)
+            }
+        }
         taskDebounceTasks[taskID]?.cancel()
         taskDebounceTasks[taskID] = nil
         pendingTaskPatches[taskID] = nil
@@ -1816,6 +1901,19 @@ final class AppState {
         if presentedSheet == .taskSession(taskID) || loadingSessionTaskID == taskID {
             finishDismissingTaskSession(taskID: taskID)
         }
+    }
+
+    private func mergeTerminal(_ incoming: TerminalSessionBundle) {
+        sessions.removeAll(where: { $0.id == incoming.session.id })
+        sessions.append(incoming.session)
+        _ = terminalSessions?.restore(incoming)
+    }
+
+    private func mergeTerminalSessionDescriptor(_ incoming: TerminalSessionDescriptor) {
+        sessions.removeAll(where: { $0.id == incoming.id })
+        sessions.append(incoming)
+        guard let controller = terminalSessions?.controller(for: incoming.taskID) else { return }
+        controller.applyAuthoritativeSessionDescriptor(incoming)
     }
 
     private func clearRetriableTaskCommandFailure(taskID: UUID) {
@@ -1894,6 +1992,13 @@ final class AppState {
         tasks = snapshot.tasks
         runtimes = snapshot.runtimes
         sessions = snapshot.sessions
+        // Bootstrap carries Session descriptors rather than Run bundles. Keep
+        // already-realized controllers synchronized so task-card lifecycle and
+        // the workbench cannot diverge after an unrelated task mutation/sync.
+        for session in snapshot.sessions {
+            guard let controller = terminalSessions?.controller(for: session.taskID) else { continue }
+            controller.applyAuthoritativeSessionDescriptor(session)
+        }
         messages = snapshot.messages
         for taskID in removedTaskIDs {
             cleanUpDeletedTask(taskID: taskID)

@@ -1,249 +1,6 @@
 import AppKit
 import SwiftUI
 
-extension Notification.Name {
-    static let todoAgentRequestTaskSheetClose = Notification.Name("TodoAgent.requestTaskSheetClose")
-}
-
-struct TaskConversationSheet: View {
-    let taskID: UUID
-    let state: AppState
-    let availableSize: CGSize
-
-    @State private var detailDraft: TaskDetailDraft
-    @State private var isClosing = false
-    @State private var isStartingSession = false
-    @FocusState private var focusedTextField: TaskDetailTextField?
-
-    init(
-        task: TaskItem,
-        state: AppState,
-        availableSize: CGSize = TodoAgentMainWindowPlacement.preferredContentSize
-    ) {
-        taskID = task.id
-        self.state = state
-        self.availableSize = availableSize
-        _detailDraft = State(initialValue: TaskDetailDraft(task: task))
-    }
-
-    var body: some View {
-        let layout = TaskConversationSheetLayoutPolicy.resolve(
-            availableSize: availableSize
-        )
-
-        Group {
-            if let task = state.task(id: taskID) {
-                taskLayout(task, layout: layout)
-                .onChange(of: task) { _, authoritativeTask in
-                    reconcileDetailDraft(
-                        with: authoritativeTask,
-                        saveState: state.taskSaveState(taskID: taskID)
-                    )
-                }
-                .onChange(of: state.taskSaveState(taskID: taskID)) { _, saveState in
-                    guard let authoritativeTask = state.task(id: taskID) else { return }
-                    reconcileDetailDraft(with: authoritativeTask, saveState: saveState)
-                }
-                .onChange(of: focusedTextField) { _, field in
-                    Task { @MainActor in
-                        // AppKit can publish focus loss before NSTextView has
-                        // committed its final marked text. Let that binding
-                        // update land before flushing or reconciling the draft.
-                        await Task.yield()
-                        guard focusedTextField == field else { return }
-
-                        if field == nil {
-                            _ = await state.flushTaskEdits(taskID: taskID)
-                        }
-
-                        guard let authoritativeTask = state.task(id: taskID) else { return }
-                        reconcileDetailDraft(
-                            with: authoritativeTask,
-                            saveState: state.taskSaveState(taskID: taskID)
-                        )
-                    }
-                }
-            } else {
-                ContentUnavailableView(
-                    "任务已不存在",
-                    systemImage: "questionmark.folder",
-                    description: Text("关闭窗口后刷新任务列表。")
-                )
-            }
-        }
-        .frame(width: layout.size.width, height: layout.size.height)
-        .interactiveDismissDisabled(true)
-        .accessibilityIdentifier("task.session.\(taskID.uuidString)")
-        .onReceive(NotificationCenter.default.publisher(for: .todoAgentRequestTaskSheetClose)) { _ in
-            close()
-        }
-    }
-
-    @ViewBuilder
-    private func taskLayout(
-        _ task: TaskItem,
-        layout: TaskConversationSheetLayout
-    ) -> some View {
-        switch layout {
-        case let .sideBySide(_, detailsWidth):
-            HStack(spacing: 0) {
-                detailsPane(task)
-                    .frame(width: detailsWidth)
-                Divider()
-                taskSessionPane(task)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-        case let .stacked(_, detailsHeight):
-            VStack(spacing: 0) {
-                taskSessionPane(task)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                Divider()
-                detailsPane(task)
-                    .frame(height: detailsHeight)
-            }
-        }
-    }
-
-    private func detailsPane(_ task: TaskItem) -> some View {
-        TaskDetailsPane(
-            task: task,
-            draft: $detailDraft,
-            focusedTextField: $focusedTextField,
-            state: state
-        )
-        .disabled(isClosing || isStartingSession)
-    }
-
-    @ViewBuilder
-    private func taskSessionPane(_ task: TaskItem) -> some View {
-        if state.isLoadingSession(for: task) {
-            TaskSessionLoadingView(task: task, isClosing: isClosing, onClose: close)
-        } else if let session = state.conversation(for: task) {
-            TaskConversationPanel(
-                task: task,
-                session: session,
-                state: state,
-                isClosing: isClosing,
-                onClose: close
-            )
-        } else {
-            TaskSessionSetupView(
-                task: task,
-                state: state,
-                isClosing: isClosing,
-                isStarting: $isStartingSession,
-                flushTaskEdits: flushTaskEdits,
-                onClose: close
-            )
-        }
-    }
-
-    private func flushTaskEdits() async -> Bool {
-        await state.flushTaskEdits(taskID: taskID)
-    }
-
-    private func reconcileDetailDraft(
-        with task: TaskItem,
-        saveState: TaskSaveState
-    ) {
-        let reconciled = detailDraft.reconciled(
-            with: task,
-            saveState: saveState,
-            preserving: focusedTextField
-        )
-        guard reconciled != detailDraft else { return }
-        detailDraft = reconciled
-    }
-
-    private func close() {
-        guard !isClosing, !isStartingSession else { return }
-        isClosing = true
-        Task { @MainActor in
-            if await state.flushAndDismissTaskSession(taskID: taskID) == false {
-                isClosing = false
-            }
-        }
-    }
-}
-
-enum TaskConversationSheetLayout: Equatable, Sendable {
-    case sideBySide(size: CGSize, detailsWidth: CGFloat)
-    case stacked(size: CGSize, detailsHeight: CGFloat)
-
-    var size: CGSize {
-        switch self {
-        case let .sideBySide(size, _), let .stacked(size, _): size
-        }
-    }
-}
-
-enum TaskConversationSheetLayoutPolicy {
-    static let sideBySideThreshold: CGFloat = 900
-    static let maximumWidth: CGFloat = 960
-    static let maximumHeight: CGFloat = 680
-
-    static func resolve(availableSize: CGSize) -> TaskConversationSheetLayout {
-        let available = normalized(availableSize)
-
-        if available.width >= sideBySideThreshold {
-            let size = CGSize(
-                width: bounded(
-                    available.width * 0.78,
-                    minimum: 800,
-                    maximum: min(maximumWidth, available.width - 48)
-                ),
-                height: bounded(
-                    available.height * 0.78,
-                    minimum: 520,
-                    maximum: min(maximumHeight, available.height - 40)
-                )
-            )
-            let detailsWidth = bounded(
-                size.width * 0.38,
-                minimum: 300,
-                maximum: 350
-            )
-            return .sideBySide(size: size, detailsWidth: detailsWidth)
-        }
-
-        let size = CGSize(
-            width: bounded(
-                available.width * 0.90,
-                minimum: 520,
-                maximum: min(720, available.width - 32)
-            ),
-            height: bounded(
-                available.height * 0.86,
-                minimum: 500,
-                maximum: min(680, available.height - 40)
-            )
-        )
-        let detailsHeight = bounded(
-            size.height * 0.42,
-            minimum: 200,
-            maximum: 260
-        )
-        return .stacked(size: size, detailsHeight: detailsHeight)
-    }
-
-    private static func normalized(_ size: CGSize) -> CGSize {
-        guard size.width > 0, size.height > 0 else {
-            return TodoAgentMainWindowPlacement.preferredContentSize
-        }
-        return size
-    }
-
-    private static func bounded(
-        _ value: CGFloat,
-        minimum: CGFloat,
-        maximum: CGFloat
-    ) -> CGFloat {
-        let upperBound = max(maximum, 0)
-        guard upperBound >= minimum else { return upperBound }
-        return min(max(value, minimum), upperBound)
-    }
-}
-
 enum TaskDetailTextField: Hashable {
     case title
     case note
@@ -277,7 +34,7 @@ struct TaskDetailDraft: Equatable {
     }
 }
 
-private struct TaskDetailsPane: View {
+struct TaskDetailsPane: View {
     let task: TaskItem
     @Binding var draft: TaskDetailDraft
     var focusedTextField: FocusState<TaskDetailTextField?>.Binding
@@ -289,34 +46,30 @@ private struct TaskDetailsPane: View {
             Divider()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 22) {
+                VStack(alignment: .leading, spacing: 16) {
                     titleAndCompletion
                     dateSection
                     attachmentSection
                     noteSection
                     saveFeedback
                 }
-                .padding(22)
+                .padding(16)
             }
         }
         .background(TodoAgentUI.surfaceBackground)
+        .disabled(state.isPreparingToTerminate)
         .accessibilityIdentifier("task.details.\(task.id.uuidString)")
     }
 
     private var detailsHeader: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text("任务详情")
-                    .font(.headline)
-                Text("所有修改自动保存")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
+            Text("任务详情")
+                .font(.headline)
             Spacer()
             saveStateLabel
         }
-        .padding(.horizontal, 22)
-        .frame(height: 64)
+        .padding(.horizontal, 16)
+        .frame(height: 54)
     }
 
     @ViewBuilder
@@ -364,9 +117,9 @@ private struct TaskDetailsPane: View {
             .accessibilityIdentifier("task.details.completed")
 
             TextField("任务标题", text: titleBinding, axis: .vertical)
-                .font(.title2.bold())
+                .font(.title3.weight(.semibold))
                 .textFieldStyle(.plain)
-                .lineLimit(1 ... 3)
+                .lineLimit(1 ... 2)
                 .strikethrough(draft.status == .completed)
                 .focused(focusedTextField, equals: .title)
                 .accessibilityIdentifier("task.details.title")
@@ -380,25 +133,34 @@ private struct TaskDetailsPane: View {
                 .foregroundStyle(.secondary)
                 .textCase(.uppercase)
 
-            OptionalLocalDayRow(
-                title: "执行日期",
-                systemImage: "sun.max",
-                day: executionDateBinding,
-                today: state.currentDay,
-                tint: isDraftDateOverdue(draft.executionDate) ? .red : .primary,
-                accessibilityIdentifier: "task.details.execution-date"
-            )
+            VStack(spacing: 0) {
+                OptionalLocalDayRow(
+                    title: "执行日期",
+                    systemImage: "sun.max",
+                    day: executionDateBinding,
+                    today: state.currentDay,
+                    tint: isDraftDateOverdue(draft.executionDate) ? .red : .primary,
+                    accessibilityIdentifier: "task.details.execution-date"
+                )
+                .padding(10)
 
-            Divider()
+                Divider().padding(.leading, 38)
 
-            OptionalLocalDayRow(
-                title: "截止日期",
-                systemImage: "calendar",
-                day: dueDateBinding,
-                today: state.currentDay,
-                tint: isDraftDateOverdue(draft.dueDate) ? .red : .primary,
-                accessibilityIdentifier: "task.details.due-date"
-            )
+                OptionalLocalDayRow(
+                    title: "截止日期",
+                    systemImage: "calendar",
+                    day: dueDateBinding,
+                    today: state.currentDay,
+                    tint: isDraftDateOverdue(draft.dueDate) ? .red : .primary,
+                    accessibilityIdentifier: "task.details.due-date"
+                )
+                .padding(10)
+            }
+            .background(TodoAgentUI.selectionBackground.opacity(0.48), in: .rect(cornerRadius: 10))
+            .overlay {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(TodoAgentUI.hairline, lineWidth: 1)
+            }
         }
     }
 
@@ -413,6 +175,14 @@ private struct TaskDetailsPane: View {
                     .font(.caption.bold())
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
+                if !task.attachments.isEmpty {
+                    Text("\(task.attachments.count)")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(TodoAgentUI.selectionBackground, in: .capsule)
+                }
                 Spacer()
                 Button("添加文件", systemImage: "paperclip", action: chooseAttachments)
                     .controlSize(.small)
@@ -446,24 +216,36 @@ private struct TaskDetailsPane: View {
                     .foregroundStyle(.secondary)
                     .textCase(.uppercase)
                 Spacer()
-                Text("\(draft.note.count)/4000")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                if focusedTextField.wrappedValue == .note || !draft.note.isEmpty {
+                    Text("\(draft.note.count)/4000")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.tertiary)
+                }
             }
 
-            TextEditor(text: noteBinding)
-                .font(.body)
-                .scrollContentBackground(.hidden)
-                .padding(8)
-                .frame(minHeight: 150)
-                .focused(focusedTextField, equals: .note)
-                .background(Color(nsColor: .textBackgroundColor), in: .rect(cornerRadius: 9))
-                .overlay {
-                    RoundedRectangle(cornerRadius: 9)
-                        .stroke(TodoAgentUI.hairline, lineWidth: 1)
+            ZStack(alignment: .topLeading) {
+                if draft.note.isEmpty {
+                    Text("添加备注…")
+                        .font(.body)
+                        .foregroundStyle(.tertiary)
+                        .padding(.horizontal, 13)
+                        .padding(.vertical, 12)
+                        .allowsHitTesting(false)
                 }
-                .accessibilityLabel("任务备注")
-                .accessibilityIdentifier("task.details.note")
+                TextEditor(text: noteBinding)
+                    .font(.body)
+                    .scrollContentBackground(.hidden)
+                    .padding(8)
+                    .focused(focusedTextField, equals: .note)
+                    .accessibilityLabel("任务备注")
+                    .accessibilityIdentifier("task.details.note")
+            }
+            .frame(minHeight: 120, idealHeight: 150, maxHeight: 220)
+            .background(Color(nsColor: .textBackgroundColor), in: .rect(cornerRadius: 9))
+            .overlay {
+                RoundedRectangle(cornerRadius: 9)
+                    .stroke(TodoAgentUI.hairline, lineWidth: 1)
+            }
         }
     }
 
@@ -494,6 +276,7 @@ private struct TaskDetailsPane: View {
         Binding(
             get: { draft.title },
             set: { value in
+                guard !state.isPreparingToTerminate else { return }
                 let limited = String(value.prefix(500))
                 guard limited != draft.title else { return }
                 draft.title = limited
@@ -509,6 +292,7 @@ private struct TaskDetailsPane: View {
         Binding(
             get: { draft.note },
             set: { value in
+                guard !state.isPreparingToTerminate else { return }
                 let limited = String(value.prefix(4_000))
                 guard limited != draft.note else { return }
                 draft.note = limited
@@ -524,6 +308,7 @@ private struct TaskDetailsPane: View {
         Binding(
             get: { draft.executionDate },
             set: { value in
+                guard !state.isPreparingToTerminate else { return }
                 guard value != draft.executionDate else { return }
                 draft.executionDate = value
                 saveImmediately(
@@ -537,6 +322,7 @@ private struct TaskDetailsPane: View {
         Binding(
             get: { draft.dueDate },
             set: { value in
+                guard !state.isPreparingToTerminate else { return }
                 guard value != draft.dueDate else { return }
                 draft.dueDate = value
                 saveImmediately(TaskPatch(dueDate: value.map(TaskPatchField.set) ?? .clear))
@@ -545,6 +331,7 @@ private struct TaskDetailsPane: View {
     }
 
     private func setStatus(_ status: TaskStatus) {
+        guard !state.isPreparingToTerminate else { return }
         guard status != draft.status else { return }
         draft.status = status
         saveImmediately(TaskPatch(status: status))
@@ -555,6 +342,7 @@ private struct TaskDetailsPane: View {
     }
 
     private func chooseAttachments() {
+        guard !state.isPreparingToTerminate else { return }
         let panel = NSOpenPanel()
         panel.title = "添加任务附件"
         panel.prompt = "添加"
@@ -580,6 +368,7 @@ private struct TaskDetailsPane: View {
     }
 
     private func remove(_ attachment: TaskAttachment) {
+        guard !state.isPreparingToTerminate else { return }
         state.enqueueTaskAttachmentRemoval(
             taskID: task.id,
             attachmentID: attachment.id
@@ -600,12 +389,20 @@ private struct OptionalLocalDayRow: View {
     private static var calendar: Calendar { .todoAgentLocal }
 
     var body: some View {
-        HStack(spacing: 10) {
-            Label(title, systemImage: systemImage)
-                .foregroundStyle(tint)
-                .frame(width: 100, alignment: .leading)
-
-            Spacer(minLength: 8)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(tint)
+                    .frame(width: 18)
+                    .accessibilityHidden(true)
+                Text(title)
+                    .foregroundStyle(.primary)
+                Spacer(minLength: 8)
+                Toggle(isOn: isEnabledBinding) { EmptyView() }
+                    .toggleStyle(TodoAgentCompactSwitchStyle())
+                    .accessibilityLabel("启用\(title)")
+                    .accessibilityValue(day == nil ? "已关闭" : "已开启")
+            }
 
             if let day {
                 Button {
@@ -614,6 +411,7 @@ private struct OptionalLocalDayRow: View {
                     HStack(spacing: 6) {
                         Text(dateLabel(day))
                             .monospacedDigit()
+                        Spacer(minLength: 6)
                         Image(systemName: "chevron.down")
                             .font(.caption2.weight(.semibold))
                             .foregroundStyle(TodoAgentUI.secondaryText)
@@ -621,15 +419,17 @@ private struct OptionalLocalDayRow: View {
                     }
                     .font(.callout.weight(.medium))
                     .foregroundStyle(tint)
-                    .padding(.horizontal, 9)
-                    .frame(height: 28)
-                    .background(TodoAgentUI.selectionBackground.opacity(0.6), in: .capsule)
+                    .padding(.horizontal, 10)
+                    .frame(maxWidth: .infinity, minHeight: 28, alignment: .leading)
+                    .background(TodoAgentUI.surfaceBackground.opacity(0.72), in: .rect(cornerRadius: 7))
                     .overlay {
-                        Capsule().stroke(TodoAgentUI.hairline, lineWidth: 1)
+                        RoundedRectangle(cornerRadius: 7)
+                            .stroke(TodoAgentUI.hairline, lineWidth: 1)
                     }
                 }
                 .buttonStyle(.plain)
                 .help("选择\(title)")
+                .accessibilityLabel("\(title)，\(dateLabel(day))")
                 .popover(isPresented: $datePickerPresented) {
                     TodoAgentDatePickerPanel(
                         title: "选择\(title)",
@@ -642,12 +442,12 @@ private struct OptionalLocalDayRow: View {
                         }
                     )
                 }
+            } else {
+                Text("未设置；开启后默认为今天")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .padding(.leading, 28)
             }
-
-            Toggle(title, isOn: isEnabledBinding)
-                .labelsHidden()
-                .toggleStyle(TodoAgentCompactSwitchStyle())
-                .accessibilityLabel("启用\(title)")
         }
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier(accessibilityIdentifier)
@@ -728,218 +528,7 @@ private struct TaskAttachmentRow: View {
     }
 }
 
-private struct TaskConversationPanel: View {
-    let task: TaskItem
-    let session: TaskConversationSnapshot
-    let state: AppState
-    let isClosing: Bool
-    let onClose: () -> Void
-
-    @State private var draft = ""
-    @State private var isSubmitting = false
-    @FocusState private var composerFocused: Bool
-
-    var body: some View {
-        VStack(spacing: 0) {
-            header
-            Divider()
-            sessionMetadata
-            Divider()
-            transcript
-            Divider()
-            composer
-        }
-    }
-
-    private var header: some View {
-        HStack(spacing: TodoAgentUI.standardSpacing) {
-            Image(systemName: "terminal.fill")
-                .font(.title2)
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 40, height: 40)
-                .background(Color.accentColor.opacity(0.1), in: .circle)
-                .accessibilityHidden(true)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Text(task.title)
-                    .font(.title2)
-                    .bold()
-                    .lineLimit(1)
-                Text("\(session.runtime.title) 本地会话")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            Text(sessionStateTitle)
-                .font(.caption.bold())
-                .foregroundStyle(session.state.isBusy ? Color.blue : Color.secondary)
-
-            closeButton
-        }
-        .padding(.horizontal, 20)
-        .frame(height: 64)
-    }
-
-    private var closeButton: some View {
-        Button(action: onClose) {
-            if isClosing {
-                ProgressView().controlSize(.small)
-            } else {
-                Image(systemName: "xmark")
-            }
-        }
-        .buttonStyle(.borderless)
-        .disabled(isClosing)
-        .help("保存并关闭")
-        .accessibilityLabel("保存并关闭")
-        .accessibilityIdentifier("task.session.close")
-    }
-
-    private var sessionMetadata: some View {
-        HStack(spacing: 20) {
-            Label(session.runtime.title, systemImage: "cpu")
-            Label(session.workspace, systemImage: "folder")
-            Label(session.sessionID, systemImage: "number")
-                .fontDesign(.monospaced)
-            Spacer()
-            Label("本机直连", systemImage: "checkmark.shield")
-                .foregroundStyle(.green)
-        }
-        .font(.caption)
-        .foregroundStyle(.secondary)
-        .padding(.horizontal, 20)
-        .padding(.vertical, 9)
-        .background(.bar)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(
-            "\(session.runtime.title) 本地会话，工作目录 \(session.workspace)，Session \(session.sessionID)"
-        )
-    }
-
-    private var transcript: some View {
-        ChatTranscriptView(
-            transcript: session.transcript,
-            taskReferences: chatTaskReferences,
-            maximumContentWidth: 820
-        ) {
-            ContentUnavailableView {
-                Label("开始本地会话", systemImage: "bubble.left.and.bubble.right")
-            } description: {
-                Text("发送一条消息后，思考、工具调用和最终回复会按实际顺序显示在这里。")
-            }
-        }
-        .background(Color(nsColor: .textBackgroundColor).opacity(0.24))
-    }
-
-    private var chatTaskReferences: ChatTaskReferenceActions {
-        ChatTaskReferenceActions(
-            title: { taskID in state.task(id: taskID)?.title },
-            open: { taskID in
-                guard let task = state.task(id: taskID) else { return }
-                state.openTask(task)
-            }
-        )
-    }
-
-    private var composer: some View {
-        ChatComposer(
-            text: $draft,
-            focus: $composerFocused,
-            placeholder: "发送消息给 \(session.runtime.title)…",
-            isRunning: session.state.isBusy,
-            canSubmit: canSubmit,
-            accessibilityPrefix: "task.session",
-            onSubmit: submit,
-            onStop: { Task { await state.cancelTurn(for: task) } }
-        ) {
-            Label(
-                session.state.isBusy ? "Agent 正在处理本轮消息" : "随时向这个本地 Session 继续发送消息",
-                systemImage: session.state.isBusy ? "hourglass" : "arrow.triangle.2.circlepath"
-            )
-            .font(.callout)
-            .foregroundStyle(session.state.isBusy ? Color.blue : Color.secondary)
-        } accessories: {
-            Label(session.runtime.title, systemImage: "terminal")
-                .font(.caption)
-                .foregroundStyle(TodoAgentUI.secondaryText)
-        }
-        .task { await state.markReadIfCurrent(task) }
-        .onChange(of: session.latestSequence) {
-            Task { await state.markReadIfCurrent(task) }
-        }
-    }
-
-    private var canSubmit: Bool {
-        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !isSubmitting
-            && !session.state.isBusy
-    }
-
-    private var sessionStateTitle: String {
-        switch session.state {
-        case .running: "运行中"
-        case .queued: "排队中"
-        case .failed: "失败"
-        default: "可继续"
-        }
-    }
-
-    private func submit() {
-        let value = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !value.isEmpty, !isSubmitting else { return }
-        isSubmitting = true
-
-        Task {
-            if await state.sendToSession(task, text: value) {
-                draft = ""
-            }
-            isSubmitting = false
-        }
-    }
-}
-
-private struct TaskSessionLoadingView: View {
-    let task: TaskItem
-    let isClosing: Bool
-    let onClose: () -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(task.title)
-                        .font(.title2.bold())
-                    Text("正在载入本地 Agent Session")
-                        .foregroundStyle(.secondary)
-                }
-                Spacer()
-                Button(action: onClose) {
-                    if isClosing {
-                        ProgressView().controlSize(.small)
-                    } else {
-                        Image(systemName: "xmark")
-                    }
-                }
-                .buttonStyle(.borderless)
-                .disabled(isClosing)
-                .accessibilityLabel("保存并关闭")
-                .accessibilityIdentifier("task.session.close")
-            }
-            .padding(.horizontal, 24)
-            .frame(height: 64)
-
-            Divider()
-
-            ProgressView("正在恢复完整聊天记录…")
-                .controlSize(.large)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-        }
-    }
-}
-
-private struct TaskSessionSetupView: View {
+struct TaskSessionSetupView: View {
     let task: TaskItem
     let state: AppState
     let isClosing: Bool
@@ -981,7 +570,7 @@ private struct TaskSessionSetupView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
-                    Label("选择由哪个本地 Agent 执行，以及它可以操作的目录。启动后会直接进入完整聊天记录。", systemImage: "terminal")
+                    Label("选择由哪个本地 Agent 执行，以及它可以操作的目录。启动后会直接进入 Agent 自己的终端界面。", systemImage: "terminal")
                         .font(.headline)
 
                     Grid(alignment: .leading, horizontalSpacing: 20, verticalSpacing: 18) {
@@ -991,7 +580,7 @@ private struct TaskSessionSetupView: View {
                             Picker("Runtime", selection: $runtime) {
                                 ForEach(RuntimeKind.allCases) { kind in
                                     let info = state.runtime(kind)
-                                    Text(runtimeTitle(kind, info: info))
+                                    Text(RuntimePickerPresentation.title(kind, info: info))
                                         .tag(kind)
                                         .disabled(info?.isSelectable != true)
                                 }
@@ -1096,7 +685,7 @@ private struct TaskSessionSetupView: View {
             if isStarting {
                 Label("正在启动…", systemImage: "hourglass")
             } else {
-                Text("启动并进入 Session")
+                Text("启动终端 Session")
             }
         }
         .buttonStyle(.borderedProminent)
@@ -1140,193 +729,17 @@ private struct TaskSessionSetupView: View {
         }
     }
 
-    private func runtimeTitle(_ kind: RuntimeKind, info: RuntimeInfo?) -> String {
+}
+
+enum RuntimePickerPresentation {
+    static func title(_ kind: RuntimeKind, info: RuntimeInfo?) -> String {
         guard let info else { return "\(kind.title)（检测中）" }
         switch info.status {
-        case .ready: return "\(kind.title) · \(info.version ?? "已验证")"
+        case .ready: return kind.title
         case .authRequired: return "\(kind.title)（需要登录）"
         case .missing: return "\(kind.title)（未安装）"
         case .detected: return "\(kind.title)（待验证）"
         case .error: return "\(kind.title)（不可用）"
         }
-    }
-}
-
-struct TaskConversationEntryRow: View {
-    let entry: TaskConversationEntry
-    let isToolResultExpanded: Bool
-    let onToggleToolResult: () -> Void
-
-    init(
-        entry: TaskConversationEntry,
-        isToolResultExpanded: Bool = false,
-        onToggleToolResult: @escaping () -> Void = {}
-    ) {
-        self.entry = entry
-        self.isToolResultExpanded = isToolResultExpanded
-        self.onToggleToolResult = onToggleToolResult
-    }
-
-    @ViewBuilder
-    var body: some View {
-        if entry.isToolResult {
-            TaskToolResultRow(
-                entry: entry,
-                isExpanded: isToolResultExpanded,
-                onToggle: onToggleToolResult
-            )
-        } else {
-            switch entry.role {
-            case .system:
-                systemEntry
-            case .tool:
-                toolEntry
-            case .agent, .user:
-                messageEntry
-            }
-        }
-    }
-
-    private var systemEntry: some View {
-        Label(entry.body, systemImage: "link")
-            .font(.caption)
-            .foregroundStyle(.secondary)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 6)
-            .background(Color(nsColor: .controlBackgroundColor), in: .capsule)
-            .frame(maxWidth: .infinity)
-            .accessibilityLabel("系统：\(entry.body)")
-    }
-
-    private var toolEntry: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Label(entry.title ?? "工具调用", systemImage: "terminal")
-                .font(.callout)
-                .bold()
-                .foregroundStyle(.secondary)
-            Text(entry.body)
-                .font(.system(.callout, design: .monospaced))
-                .textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(TodoAgentUI.cardPadding)
-        .background(Color(nsColor: .controlBackgroundColor), in: .rect(cornerRadius: TodoAgentUI.cardRadius))
-        .overlay {
-            RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
-                .stroke(Color(nsColor: .separatorColor).opacity(0.4))
-        }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("工具调用，\(entry.title ?? "")：\(entry.body)")
-    }
-
-    private var messageEntry: some View {
-        HStack(alignment: .top) {
-            if entry.role == .user { Spacer(minLength: 120) }
-
-            VStack(alignment: .leading, spacing: TodoAgentUI.compactSpacing) {
-                if let title = entry.title {
-                    Text(title)
-                        .font(.callout)
-                        .bold()
-                }
-                Text(entry.body)
-                    .font(.body)
-                    .textSelection(.enabled)
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 11)
-            .foregroundStyle(entry.role == .user ? Color.white : Color.primary)
-            .background(
-                entry.role == .user ? Color.accentColor : Color(nsColor: .controlBackgroundColor),
-                in: .rect(cornerRadius: TodoAgentUI.panelRadius)
-            )
-
-            if entry.role == .agent { Spacer(minLength: 120) }
-        }
-        .frame(maxWidth: .infinity)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(entry.role == .user ? "你" : "CLI")：\(entry.body)")
-    }
-}
-
-struct TaskToolResultRow: View {
-    let entry: TaskConversationEntry
-    let isExpanded: Bool
-    let onToggle: () -> Void
-
-    private var presentation: TaskToolResultPresentation {
-        entry.toolResultPresentation ?? TaskToolResultPresentation(entry: entry)
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button(action: onToggle) {
-                HStack(spacing: 10) {
-                    Image(
-                        systemName: presentation.isFailure
-                            ? "xmark.octagon.fill"
-                            : "checkmark.circle.fill"
-                    )
-                    .font(.title3)
-                    .foregroundStyle(presentation.isFailure ? Color.red : Color.green)
-                    .accessibilityHidden(true)
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(presentation.title)
-                            .font(.callout.bold())
-                            .foregroundStyle(presentation.isFailure ? Color.red : Color.primary)
-                            .lineLimit(1)
-                        Text(presentation.subtitle(isExpanded: isExpanded))
-                            .font(.caption)
-                            .foregroundStyle(presentation.isFailure ? Color.red : Color.secondary)
-                    }
-
-                    Spacer(minLength: 12)
-
-                    Image(systemName: "chevron.right")
-                        .font(.caption.bold())
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                        .accessibilityHidden(true)
-                }
-                .padding(TodoAgentUI.cardPadding)
-                .contentShape(.rect)
-            }
-            .buttonStyle(.plain)
-            .accessibilityLabel(
-                "\(presentation.title)，\(presentation.statusTitle)，\(presentation.contentSizeTitle)"
-            )
-            .accessibilityValue(presentation.accessibilityValue(isExpanded: isExpanded))
-            .accessibilityHint(isExpanded ? "点击收起完整结果" : "点击展开完整结果")
-            .accessibilityIdentifier("task.session.tool-result.\(entry.id).toggle")
-
-            if isExpanded {
-                Divider()
-                    .padding(.horizontal, TodoAgentUI.cardPadding)
-
-                Text(entry.body.isEmpty ? "（无输出）" : entry.body)
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(TodoAgentUI.cardPadding)
-                    .accessibilityLabel("完整工具结果：\(entry.body)")
-                    .accessibilityIdentifier("task.session.tool-result.\(entry.id).body")
-            }
-        }
-        .background(
-            presentation.isFailure
-                ? Color.red.opacity(0.07)
-                : Color(nsColor: .controlBackgroundColor),
-            in: .rect(cornerRadius: TodoAgentUI.cardRadius)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
-                .stroke(
-                    presentation.isFailure
-                        ? Color.red.opacity(0.45)
-                        : Color(nsColor: .separatorColor).opacity(0.4)
-                )
-        }
-        .accessibilityIdentifier("task.session.tool-result.\(entry.id)")
     }
 }

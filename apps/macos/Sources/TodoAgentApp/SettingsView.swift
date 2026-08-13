@@ -129,6 +129,7 @@ private struct RuntimeSettingsPane: View {
     @State private var refreshingKinds: Set<RuntimeKind> = []
     @State private var isRefreshingAll = false
     @State private var actionMessage: String?
+    @State private var statusAuthorizationRevision = 0
 
     var body: some View {
         settingsForm {
@@ -164,7 +165,16 @@ private struct RuntimeSettingsPane: View {
                         .textSelection(.enabled)
                 }
             }
+            Section("状态集成") {
+                ForEach(RuntimeKind.allCases) { kind in
+                    statusAuthorizationRow(kind)
+                }
+                Text("Runner 的启动和退出始终由 0600 本机 Socket 监督。Provider Hook 仅在你授权后启用：Codex/Cursor 会安全合并用户级 hooks.json 并先备份，Claude 仅按 Session 注入临时 --settings；完整卸载只移除 TodoAgent 自己的条目。所有 Hook 都不读取终端输出。")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
+        .id(statusAuthorizationRevision)
     }
 
     private func runtimeRow(_ kind: RuntimeKind) -> some View {
@@ -231,6 +241,72 @@ private struct RuntimeSettingsPane: View {
         }
         .padding(.vertical, 3)
         .accessibilityElement(children: .contain)
+    }
+
+    private func statusAuthorizationRow(_ kind: RuntimeKind) -> some View {
+        let authorization = TerminalStatusAuthorization.state(for: kind)
+        let presentation = TerminalStatusAuthorization.presentation(for: kind)
+        return HStack(alignment: .top, spacing: 12) {
+            RuntimeIconView(kind: kind, fallbackSymbol: runtimeSymbol(kind))
+                .frame(width: 22, height: 22)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(kind.title)
+                Text(presentation.title)
+                    .font(.caption)
+                    .foregroundStyle(presentation.isHealthy ? .green : .secondary)
+                Text(presentation.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer()
+            if presentation.canInstall {
+                Button(authorization == .enabled ? "重新安装" : authorization == .skipped ? "启用" : "授权…") {
+                    enableStatusIntegration(kind)
+                }
+            }
+            if presentation.canUninstall {
+                Button("完全卸载…", role: .destructive) {
+                    confirmStatusUninstall(kind)
+                }
+            }
+        }
+    }
+
+    private func enableStatusIntegration(_ kind: RuntimeKind) {
+        do {
+            try TerminalStatusAuthorization.enable(for: kind)
+            actionMessage = kind == .codex
+                ? "Codex Hook 已写入。请在 Codex 中打开 /hooks，检查并信任 TodoAgent Hook。"
+                : "已启用 \(kind.title) 状态集成。"
+        } catch {
+            actionMessage = "无法启用 \(kind.title)：\(error.localizedDescription)"
+        }
+        statusAuthorizationRevision &+= 1
+    }
+
+    private func confirmStatusUninstall(_ kind: RuntimeKind) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "卸载 \(kind.title) 状态集成？"
+        alert.informativeText = switch kind {
+        case .codex, .cursor:
+            "会先备份当前配置，再只删除 TodoAgent 安装的 Hook 和启动器；不会删除或恢复覆盖你后来修改的其他 Hook。"
+        case .claude:
+            "会撤销授权；之后启动的 Claude Session 不再注入 TodoAgent 临时 --settings。没有修改 ~/.claude/settings.json。"
+        case .kiro:
+            "会清除 TodoAgent 保存的跳过状态。Kiro 没有安装外部 Hook。"
+        }
+        alert.addButton(withTitle: "卸载")
+        alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        do {
+            try TerminalStatusAuthorization.uninstall(for: kind)
+            actionMessage = "已完整卸载 \(kind.title) 状态集成。"
+        } catch {
+            actionMessage = "无法完整卸载 \(kind.title)：\(error.localizedDescription)"
+        }
+        statusAuthorizationRevision &+= 1
     }
 
     private func refreshAll() {
@@ -729,7 +805,7 @@ private struct AboutSettingsPane: View {
             }
             Section("架构") {
                 LabeledContent("界面", value: "SwiftUI + AppKit")
-                LabeledContent("Engine", value: "Rust sidecar · IPC v3")
+                LabeledContent("Engine", value: "Rust sidecar · IPC v4")
                 LabeledContent("系统", value: "macOS 26+")
             }
         }

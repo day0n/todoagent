@@ -637,8 +637,8 @@ struct TaskTimeSystemTests {
         #expect(state.taskSaveState(taskID: item.id) == .idle)
     }
 
-    @Test("shutdown waits for a late active task mutation after its first flush snapshot")
-    func shutdownWaitsForLateActiveMutation() async throws {
+    @Test("shutdown freezes task edits after its input commit barrier")
+    func shutdownFreezesLateTaskMutation() async throws {
         let first = task("A")
         let second = task("B")
         let repository = TaskMutationSpyRepository(
@@ -660,15 +660,11 @@ struct TaskTimeSystemTests {
             taskID: second.id,
             patch: TaskPatch(note: "B 晚到修改")
         )
-        await repository.waitUntilUpdateStarted(2)
 
         await repository.releaseUpdate(1)
-        for _ in 0 ..< 20 { await Task.yield() }
-        #expect(await repository.shutdownCallCount() == 0)
-
-        await repository.releaseUpdate(2)
         #expect(await shutdown.value)
-        #expect(await repository.persistedTask(id: second.id)?.note == "B 晚到修改")
+        #expect(await repository.updateCallCount() == 1)
+        #expect(await repository.persistedTask(id: second.id)?.note != "B 晚到修改")
         #expect(await repository.shutdownCallCount() == 1)
     }
 
@@ -686,6 +682,27 @@ struct TaskTimeSystemTests {
         #expect(await state.shutdown())
 
         #expect(await repository.persistedTask(id: item.id)?.status == .completed)
+        #expect(await repository.shutdownCallCount() == 1)
+    }
+
+    @Test("shutdown accepts the final input commit before freezing mutations")
+    func shutdownCommitsMarkedTextBeforeFreeze() async throws {
+        let item = task("原始")
+        let repository = TaskMutationSpyRepository(snapshot: snapshot(tasks: [item]))
+        let state = AppState(repository: repository)
+        await state.load()
+        let presenter = TaskWorkspaceInputCommitSpy {
+            state.scheduleTaskUpdate(
+                taskID: item.id,
+                patch: TaskPatch(title: "中文输入完成")
+            )
+        }
+        state.taskWorkspacePresenter = presenter
+
+        #expect(await state.shutdown())
+
+        #expect(presenter.commitCount == 1)
+        #expect(await repository.persistedTask(id: item.id)?.title == "中文输入完成")
         #expect(await repository.shutdownCallCount() == 1)
     }
 
@@ -1514,6 +1531,36 @@ struct TaskTimeSystemTests {
         #expect(await repository.shutdownCallCount() == 1)
     }
 
+    @Test("shutdown waits for an in-flight Session start and rejects its late result")
+    func shutdownWaitsForSessionStart() async {
+        let item = task("启动时退出")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item], runtimes: [readyRuntime()]),
+            gatedSessionCreateCalls: [1]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        let creation = Task {
+            await state.startSession(
+                item,
+                runtime: .codex,
+                workspace: "/tmp/todoagent-project"
+            )
+        }
+        await repository.waitUntilSessionCreateStarted(1)
+
+        let shutdown = Task { await state.shutdown() }
+        await Task.yield()
+        #expect(await repository.shutdownCallCount() == 0)
+
+        await repository.releaseSessionCreate(1)
+        #expect(await creation.value == false)
+        #expect(await shutdown.value)
+        #expect(state.sessions.isEmpty)
+        #expect(await repository.shutdownCallCount() == 1)
+    }
+
     private func day(_ value: String) throws -> LocalDay {
         try #require(LocalDay(rawValue: value))
     }
@@ -1648,6 +1695,25 @@ struct TaskTimeSystemTests {
         let host = NSHostingView(rootView: TaskCard(task: task, state: state).frame(width: 520))
         host.layoutSubtreeIfNeeded()
         return host.fittingSize.height
+    }
+}
+
+@MainActor
+private final class TaskWorkspaceInputCommitSpy: TaskWorkspacePresenting {
+    private let commit: () -> Void
+    private(set) var commitCount = 0
+
+    init(commit: @escaping () -> Void) {
+        self.commit = commit
+    }
+
+    func showTaskWorkspace(taskID _: UUID) {}
+    func closeTaskWorkspace(taskID _: UUID) {}
+    func destroyTaskWorkspace(taskID _: UUID) {}
+
+    func commitTaskWorkspaceInput() {
+        commitCount += 1
+        commit()
     }
 }
 

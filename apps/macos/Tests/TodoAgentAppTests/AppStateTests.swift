@@ -6,7 +6,7 @@ import Testing
 @Suite("Native task and session state")
 @MainActor
 struct AppStateTests {
-    @Test("Gemini secret uses the IPC v3 field spelling")
+    @Test("Gemini secret uses the IPC v4 field spelling")
     func geminiSecretWireName() throws {
         let data = try JSONEncoder().encode(SecretRequest(geminiAPIKey: "test-secret"))
         let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: String])
@@ -1108,7 +1108,7 @@ struct AppStateTests {
         let session = try #require(state.session(for: task))
         #expect(session.runtimeKind == .kiro)
         #expect(session.workingDirectory == "/tmp/project")
-        #expect(session.providerEngine == "v2")
+        #expect(session.providerEngine == nil)
     }
 
     @Test("starting a task Session stays empty until the user sends")

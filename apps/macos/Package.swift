@@ -9,10 +9,39 @@ let package = Package(
         .executable(name: "TodoAgent", targets: ["TodoAgentApp"]),
     ],
     targets: [
+        .binaryTarget(
+            name: "GhosttyKit",
+            path: "Vendor/GhosttyKit.xcframework"
+        ),
         .executableTarget(
             name: "TodoAgentApp",
+            dependencies: ["GhosttyKit"],
             path: "Sources/TodoAgentApp",
-            resources: [.process("Resources")]
+            exclude: ["TerminalResources/README.md"],
+            resources: [
+                .process("Resources"),
+                .copy("TerminalResources/ghostty"),
+                .copy("TerminalResources/terminfo"),
+                .copy("TerminalResources/THIRD_PARTY_NOTICES.md"),
+                .copy("TerminalResources/ThirdPartyLicenses"),
+                .copy("TerminalResources/GPL-3.0.txt"),
+                .copy("TerminalResources/todoagent-ghostty.conf"),
+            ],
+            swiftSettings: [
+                .unsafeFlags(["-Xcc", "-Wno-incomplete-umbrella"]),
+            ],
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("Carbon"),
+                .linkedFramework("CoreGraphics"),
+                .linkedFramework("CoreText"),
+                .linkedFramework("Foundation"),
+                .linkedFramework("IOKit"),
+                .linkedFramework("Metal"),
+                .linkedFramework("MetalKit"),
+                .linkedFramework("QuartzCore"),
+                .linkedLibrary("c++"),
+            ]
         ),
         .testTarget(
             name: "TodoAgentAppTests",

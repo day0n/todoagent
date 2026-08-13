@@ -138,6 +138,97 @@ struct CreateSessionRequest: Encodable, Sendable {
         case runtimeKind, workingDirectory
     }
 }
+struct RebindTerminalWorkspaceRequest: Encodable, Sendable {
+    let sessionID: String
+    let workingDirectory: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case workingDirectory
+    }
+}
+struct PrepareTerminalLaunchRequest: Encodable, Sendable {
+    let sessionID: String
+    let runID: String
+    let taskTitle: String?
+    let statusSocket: String
+    let lifecycleToken: String
+    let hookToken: String
+    let providerHooksEnabled: Bool
+    let hostPID: Int32
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case runID = "runId"
+        case taskTitle, statusSocket, lifecycleToken, hookToken, providerHooksEnabled
+        case hostPID = "hostPid"
+    }
+}
+struct TerminalRunIdentityRequest: Encodable, Sendable {
+    let sessionID: String
+    let runID: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case runID = "runId"
+    }
+}
+struct TerminalResumeCandidatesRequest: Encodable, Sendable {
+    let sessionID: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+    }
+}
+struct BindTerminalProviderRequest: Encodable, Sendable {
+    let sessionID: String
+    let runID: String
+    let providerSessionID: String
+    let source: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case runID = "runId"
+        case providerSessionID = "providerSessionId"
+        case source
+    }
+}
+struct ReportTerminalStatusRequest: Encodable, Sendable {
+    let sessionID: String
+    let runID: String
+    let status: TerminalAgentStatus
+    let eventID: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case runID = "runId"
+        case status
+        case eventID = "eventId"
+    }
+}
+struct ReportTerminalRunExitedRequest: Encodable, Sendable {
+    let sessionID: String
+    let runID: String
+    let exitCode: Int32?
+    let reason: TerminalRunExitReason
+    let errorCode: String?
+    let errorMessage: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case runID = "runId"
+        case exitCode, reason, errorCode, errorMessage
+    }
+}
+struct MarkTerminalSeenRequest: Encodable, Sendable {
+    let sessionID: String
+    let throughStatusSequence: Int64
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case throughStatusSequence
+    }
+}
 struct SendSessionRequest: Encodable, Sendable {
     let sessionID: String
     let clientMessageID: UUID
@@ -210,7 +301,10 @@ private struct EmptyResult: Decodable, Sendable { let ok: Bool }
 
 actor EngineRepository: AppRepository {
     nonisolated let requiresExecutionConsent = true
-    private static let runtimeVerificationTimeout: Duration = .seconds(30)
+    private static let runtimeVerificationTimeout: Duration = .seconds(60)
+    // A stale self-updating CLI is re-verified here (version, two capability
+    // probes, and auth) before Cursor may also create its provider chat.
+    private static let terminalLaunchPreparationTimeout: Duration = .seconds(90)
     private static let attachmentMutationTimeout: Duration = .seconds(300)
     private let client: EngineClient
     private var snapshot = AppSnapshot(revision: 0, lists: [], tasks: [], runtimes: [], sessions: [], messages: [])
@@ -335,6 +429,188 @@ actor EngineRepository: AppRepository {
             timeout: Self.runtimeVerificationTimeout
         )
         return try await sync()
+    }
+
+    func terminalSession(taskID: UUID) async throws -> TerminalSessionBundle? {
+        do {
+            return try await client.request(
+                method: "terminal.session.get",
+                params: SessionLookup(sessionID: nil, taskID: taskID),
+                as: TerminalSessionBundle.self
+            )
+        } catch let error as EngineClientError {
+            if case let .requestFailed(code, _) = error, code == "not_found" { return nil }
+            throw error
+        }
+    }
+
+    func createTerminalSession(
+        taskID: UUID,
+        runtime: RuntimeKind,
+        workspace: String
+    ) async throws -> TerminalSessionBundle {
+        _ = try await client.request(
+            method: "workspace.authorize",
+            params: WorkspaceRequest(path: workspace),
+            as: WorkspaceResult.self
+        )
+        return try await client.request(
+            method: "terminal.session.create",
+            params: CreateSessionRequest(
+                taskID: taskID,
+                runtimeKind: runtime,
+                workingDirectory: workspace
+            ),
+            as: TerminalSessionBundle.self
+        )
+    }
+
+    func rebindTerminalWorkspace(
+        sessionID: String,
+        workspace: String
+    ) async throws -> TerminalSessionBundle {
+        let authorized = try await client.request(
+            method: "workspace.authorize",
+            params: WorkspaceRequest(path: workspace),
+            as: WorkspaceResult.self
+        )
+        return try await client.request(
+            method: "terminal.session.rebind_workspace",
+            params: RebindTerminalWorkspaceRequest(
+                sessionID: sessionID,
+                workingDirectory: authorized.path
+            ),
+            as: TerminalSessionBundle.self
+        )
+    }
+
+    func prepareTerminalLaunch(
+        sessionID: String,
+        runID: String,
+        taskTitle: String?,
+        statusSocket: String,
+        lifecycleToken: String,
+        hookToken: String,
+        providerHooksEnabled: Bool,
+        hostPID: Int32
+    ) async throws -> TerminalLaunchPlan {
+        try await client.request(
+            method: "terminal.session.prepare_launch",
+            params: PrepareTerminalLaunchRequest(
+                sessionID: sessionID,
+                runID: runID,
+                taskTitle: taskTitle,
+                statusSocket: statusSocket,
+                lifecycleToken: lifecycleToken,
+                hookToken: hookToken,
+                providerHooksEnabled: providerHooksEnabled,
+                hostPID: hostPID
+            ),
+            as: TerminalLaunchPlan.self,
+            timeout: Self.terminalLaunchPreparationTimeout
+        )
+    }
+
+    func markTerminalRunStarted(
+        sessionID: String,
+        runID: String
+    ) async throws -> TerminalSessionBundle {
+        try await client.request(
+            method: "terminal.run.started",
+            params: TerminalRunIdentityRequest(sessionID: sessionID, runID: runID),
+            as: TerminalSessionBundle.self
+        )
+    }
+
+    func markTerminalRunStopping(
+        sessionID: String,
+        runID: String
+    ) async throws -> TerminalSessionBundle {
+        try await client.request(
+            method: "terminal.run.stopping",
+            params: TerminalRunIdentityRequest(sessionID: sessionID, runID: runID),
+            as: TerminalSessionBundle.self
+        )
+    }
+
+    func terminalResumeCandidates(sessionID: String) async throws -> TerminalResumeCandidates {
+        try await client.request(
+            method: "terminal.session.resume_candidates",
+            params: TerminalResumeCandidatesRequest(sessionID: sessionID),
+            as: TerminalResumeCandidates.self
+        )
+    }
+
+    func bindTerminalProvider(
+        sessionID: String,
+        runID: String,
+        providerSessionID: String,
+        source: String
+    ) async throws -> TerminalSessionBundle {
+        try await client.request(
+            method: "terminal.run.bind_provider",
+            params: BindTerminalProviderRequest(
+                sessionID: sessionID,
+                runID: runID,
+                providerSessionID: providerSessionID,
+                source: source
+            ),
+            as: TerminalSessionBundle.self
+        )
+    }
+
+    func reportTerminalStatus(
+        sessionID: String,
+        runID: String,
+        status: TerminalAgentStatus,
+        eventID: String
+    ) async throws -> TerminalSessionBundle {
+        try await client.request(
+            method: "terminal.run.report_status",
+            params: ReportTerminalStatusRequest(
+                sessionID: sessionID,
+                runID: runID,
+                status: status,
+                eventID: eventID
+            ),
+            as: TerminalSessionBundle.self
+        )
+    }
+
+    func reportTerminalRunExited(
+        sessionID: String,
+        runID: String,
+        exitCode: Int32?,
+        reason: TerminalRunExitReason,
+        errorCode: String?,
+        errorMessage: String?
+    ) async throws -> TerminalSessionBundle {
+        try await client.request(
+            method: "terminal.run.exited",
+            params: ReportTerminalRunExitedRequest(
+                sessionID: sessionID,
+                runID: runID,
+                exitCode: exitCode,
+                reason: reason,
+                errorCode: errorCode,
+                errorMessage: errorMessage
+            ),
+            as: TerminalSessionBundle.self
+        )
+    }
+
+    func markTerminalSessionSeen(
+        sessionID: String,
+        through sequence: Int64
+    ) async throws -> TerminalSessionDescriptor {
+        try await client.request(
+            method: "terminal.session.mark_seen",
+            params: MarkTerminalSeenRequest(
+                sessionID: sessionID,
+                throughStatusSequence: sequence
+            ),
+            as: TerminalSessionDescriptor.self
+        )
     }
 
     func session(taskID: UUID) async throws -> SessionBundle? {

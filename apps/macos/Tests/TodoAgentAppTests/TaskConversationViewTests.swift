@@ -6,6 +6,44 @@ import Testing
 @Suite("Task conversation presentation")
 @MainActor
 struct TaskConversationViewTests {
+    @Test("runtime picker names the Agent without pinning its detected version")
+    func runtimePickerUsesCurrentInstallation() {
+        let readyClaude = RuntimeInfo(
+            kind: .claude,
+            launchPath: "/Users/test/.local/bin/claude",
+            resolvedPath: "/Users/test/.local/share/claude/versions/2.1.228",
+            version: "2.1.228 (Claude Code)",
+            status: .ready,
+            authStatus: "authenticated",
+            capabilities: [:],
+            providerEngine: nil,
+            detectedAt: nil,
+            verifiedAt: "2026-08-13T00:00:00Z",
+            verifyError: nil
+        )
+        let cursorNeedsLogin = RuntimeInfo(
+            kind: .cursor,
+            launchPath: "/usr/local/bin/cursor-agent",
+            resolvedPath: "/usr/local/bin/cursor-agent",
+            version: "2026.07.23",
+            status: .authRequired,
+            authStatus: "unauthenticated",
+            capabilities: [:],
+            providerEngine: nil,
+            detectedAt: nil,
+            verifiedAt: nil,
+            verifyError: nil
+        )
+
+        let claudeTitle = RuntimePickerPresentation.title(.claude, info: readyClaude)
+        #expect(claudeTitle == "Claude Code")
+        #expect(claudeTitle.contains("2.1.228") == false)
+        #expect(
+            RuntimePickerPresentation.title(.cursor, info: cursorNeedsLogin)
+                == "Cursor Agent（需要登录）"
+        )
+    }
+
     @Test("assistant tools use friendly actions and collapse into one turn summary")
     func assistantToolStepPresentation() {
         let completed = assistantTool(name: "create_tasks", state: .completed, callID: "create")
@@ -170,65 +208,6 @@ struct TaskConversationViewTests {
         #expect(disclosure.isExpanded(isRunning: true))
     }
 
-    @Test("tool results are collapsed by default and toggle their complete body")
-    func toolResultDisclosureState() throws {
-        let rawResult = #"{"error":"provider failed","detail":"RAW_RESULT_SENTINEL"}"#
-        let entry = toolResultEntry(
-            body: rawResult,
-            payloadJSON: #"{"tool":"javascript","callId":"call-1"}"#
-        )
-        let presentation = try #require(entry.toolResultPresentation)
-        var disclosure = TaskToolResultDisclosureState()
-
-        #expect(presentation.title == "tool_result · javascript")
-        #expect(presentation.isFailure == true)
-        #expect(presentation.accessibilityValue(isExpanded: false) == "已折叠")
-        #expect(disclosure.visibleBody(for: entry) == nil)
-
-        disclosure.toggle(entryID: entry.id)
-
-        #expect(disclosure.visibleBody(for: entry) == rawResult)
-        #expect(presentation.accessibilityValue(isExpanded: true) == "已展开")
-
-        disclosure.toggle(entryID: entry.id)
-        #expect(disclosure.visibleBody(for: entry) == nil)
-    }
-
-    @Test("tool name metadata accepts name, tool, and tool_name")
-    func toolNameMetadataVariants() {
-        let payloads = [
-            (#"{"name":"read"}"#, "tool_result · read"),
-            (#"{"tool":"shell"}"#, "tool_result · shell"),
-            (#"{"tool_name":"write_file"}"#, "tool_result · write_file"),
-        ]
-
-        for (payload, expectedTitle) in payloads {
-            let entry = toolResultEntry(body: "ok", payloadJSON: payload)
-            #expect(entry.toolResultPresentation?.title == expectedTitle)
-            #expect(entry.toolResultPresentation?.isFailure == false)
-        }
-    }
-
-    @Test("long JSON does not expand the initial transcript row")
-    func collapsedLongResultHasBoundedHeight() {
-        let longJSON = #"{"result":""#
-            + String(repeating: "RAW_RESULT_SENTINEL-0123456789\n", count: 500)
-            + #""}"#
-        let entry = toolResultEntry(
-            body: longJSON,
-            payloadJSON: #"{"tool_name":"read_large_json"}"#
-        )
-
-        let collapsedHeight = hostedHeight(entry: entry, isExpanded: false)
-        let expandedHeight = hostedHeight(entry: entry, isExpanded: true)
-
-        #expect(collapsedHeight > 0)
-        #expect(collapsedHeight < 120)
-        #expect(expandedHeight > collapsedHeight * 4)
-        #expect(entry.toolResultPresentation?.subtitle(isExpanded: false).contains("点击展开") == true)
-        #expect(entry.toolResultPresentation?.subtitle(isExpanded: false).contains("RAW_RESULT_SENTINEL") == false)
-    }
-
     @Test("conversation history uses a bounded in-pane card")
     func conversationSwitcherCardStaysCompact() {
         let compactHeight = hostedSwitcherHeight(sessionCount: 2)
@@ -273,55 +252,62 @@ struct TaskConversationViewTests {
         #expect(hostedToolbarHeight(isSwitcherPresented: true) == TodoAgentToolbar.height)
     }
 
-    @Test("task detail sheet follows the parent window instead of covering it")
-    func taskDetailSheetAdaptsToWindowSize() {
-        let standard = TaskConversationSheetLayoutPolicy.resolve(
-            availableSize: CGSize(width: 1_120, height: 720)
-        )
-        switch standard {
-        case let .sideBySide(size, detailsWidth):
-            #expect(size.width < 1_120)
-            #expect(size.height < 720)
-            #expect(size.width <= TaskConversationSheetLayoutPolicy.maximumWidth)
-            #expect(size.height <= TaskConversationSheetLayoutPolicy.maximumHeight)
-            #expect(detailsWidth >= 300)
-            #expect(size.width - detailsWidth >= 460)
-        case .stacked:
-            Issue.record("标准窗口应使用紧凑双栏")
-        }
-
-        let compact = TaskConversationSheetLayoutPolicy.resolve(
-            availableSize: CGSize(width: 760, height: 560)
-        )
-        switch compact {
-        case .sideBySide:
-            Issue.record("窄窗口应切换为上下布局")
-        case let .stacked(size, detailsHeight):
-            #expect(size.width < 760)
-            #expect(size.height <= 520)
-            #expect(detailsHeight >= 200)
-            #expect(size.height - detailsHeight >= 280)
-        }
-
-        let large = TaskConversationSheetLayoutPolicy.resolve(
-            availableSize: CGSize(width: 2_000, height: 1_200)
-        )
-        #expect(large.size == CGSize(width: 960, height: 680))
+    @Test("task workbench uses the terminal-first window dimensions")
+    func taskWorkbenchWindowDimensions() {
+        #expect(TaskWorkbenchWindowController.defaultContentSize == CGSize(width: 1_180, height: 760))
+        #expect(TaskWorkbenchWindowController.minimumContentSize == CGSize(width: 900, height: 600))
     }
 
-    private func toolResultEntry(
-        body: String,
-        payloadJSON: String?
-    ) -> TaskConversationEntry {
-        TaskConversationEntry(
-            id: "tool-result-1",
-            sequence: 1,
-            role: .tool,
-            kind: "tool_result",
-            title: "tool_result",
-            body: body,
-            payloadJSON: payloadJSON
-        )
+    @Test("task workbench details start expanded at the ideal width")
+    func taskWorkbenchDetailsDefaultLayout() {
+        let layout = TaskWorkbenchLayoutState()
+
+        #expect(layout.detailsPresented)
+        #expect(layout.detailsWidth == TaskWorkbenchLayoutState.idealDetailsWidth)
+    }
+
+    @Test("task workbench details width stays inside its usable range")
+    func taskWorkbenchDetailsWidthClamping() {
+        let layout = TaskWorkbenchLayoutState()
+
+        layout.recordDetailsWidth(TaskWorkbenchLayoutState.minimumDetailsWidth - 100)
+        #expect(layout.detailsWidth == TaskWorkbenchLayoutState.minimumDetailsWidth)
+
+        layout.recordDetailsWidth(TaskWorkbenchLayoutState.maximumDetailsWidth + 100)
+        #expect(layout.detailsWidth == TaskWorkbenchLayoutState.maximumDetailsWidth)
+
+        let customWidth = TaskWorkbenchLayoutState.idealDetailsWidth + 24
+        layout.recordDetailsWidth(customWidth)
+        #expect(layout.detailsWidth == customWidth)
+    }
+
+    @Test("collapsing and reopening task details preserves the user's width")
+    func taskWorkbenchDetailsPreserveWidthAcrossDisclosure() {
+        let layout = TaskWorkbenchLayoutState()
+        let customWidth = TaskWorkbenchLayoutState.maximumDetailsWidth - 18
+        layout.recordDetailsWidth(customWidth)
+
+        layout.toggleDetails()
+        #expect(layout.detailsPresented == false)
+        #expect(layout.detailsWidth == customWidth)
+
+        layout.toggleDetails()
+        #expect(layout.detailsPresented)
+        #expect(layout.detailsWidth == customWidth)
+    }
+
+    @Test("task workbench detail disclosure is isolated per window")
+    func taskWorkbenchDetailsAreWindowLocal() {
+        let firstWindow = TaskWorkbenchLayoutState()
+        let secondWindow = TaskWorkbenchLayoutState()
+
+        firstWindow.recordDetailsWidth(TaskWorkbenchLayoutState.maximumDetailsWidth)
+        firstWindow.toggleDetails()
+
+        #expect(firstWindow.detailsPresented == false)
+        #expect(firstWindow.detailsWidth == TaskWorkbenchLayoutState.maximumDetailsWidth)
+        #expect(secondWindow.detailsPresented)
+        #expect(secondWindow.detailsWidth == TaskWorkbenchLayoutState.idealDetailsWidth)
     }
 
     private func assistantTool(
@@ -370,21 +356,6 @@ struct TaskConversationViewTests {
         )
         host.layoutSubtreeIfNeeded()
         return host.fittingSize.width
-    }
-
-    private func hostedHeight(
-        entry: TaskConversationEntry,
-        isExpanded: Bool
-    ) -> CGFloat {
-        let host = NSHostingView(
-            rootView: TaskConversationEntryRow(
-                entry: entry,
-                isToolResultExpanded: isExpanded
-            )
-            .frame(width: 560)
-        )
-        host.layoutSubtreeIfNeeded()
-        return host.fittingSize.height
     }
 
     private func hostedSwitcherHeight(sessionCount: Int) -> CGFloat {

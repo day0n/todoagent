@@ -58,7 +58,7 @@ struct EngineClientTests {
             try EngineWireMessage.decode(Data($0.utf8))
         }
 
-        try #require(messages.count == 24)
+        try #require(messages.count == 26)
 
         guard case let .event(ready) = messages[0] else {
             Issue.record("The first contract line must be engine.ready.")
@@ -68,7 +68,7 @@ struct EngineClientTests {
         let handshake = try #require(
             JSONSerialization.jsonObject(with: ready.data) as? [String: Any]
         )
-        #expect(handshake["protocolVersion"] as? Int == 3)
+        #expect(handshake["protocolVersion"] as? Int == 4)
         #expect(handshake["engineVersion"] as? String == "0.1.0")
 
         guard case let .request(id, method, params) = messages[1] else {
@@ -90,6 +90,26 @@ struct EngineClientTests {
         #expect((snapshot["lists"] as? [Any])?.isEmpty == true)
         #expect((snapshot["tasks"] as? [Any])?.isEmpty == true)
         #expect((snapshot["taskAttachments"] as? [Any])?.isEmpty == true)
+
+        guard case let .request(_, rebindMethod, rebindParams) = messages[24] else {
+            Issue.record("The rebind contract line must be a request.")
+            return
+        }
+        #expect(rebindMethod == "terminal.session.rebind_workspace")
+        let rebindObject = try #require(
+            JSONSerialization.jsonObject(with: rebindParams) as? [String: Any]
+        )
+        #expect(rebindObject["sessionId"] as? String == "00000000-0000-4000-8000-000000000301")
+        #expect(rebindObject["workingDirectory"] as? String == "/tmp/rebound-project")
+
+        guard case let .response(_, rebindResult) = messages[25] else {
+            Issue.record("The rebind contract must include its response.")
+            return
+        }
+        let rebindBundle = try JSONDecoder().decode(TerminalSessionBundle.self, from: rebindResult)
+        #expect(rebindBundle.session.workingDirectory == "/tmp/rebound-project")
+        #expect(rebindBundle.session.providerSessionID == "00000000-0000-4000-8000-000000000302")
+        #expect(rebindBundle.activeRun == nil)
 
         guard case let .request(_, createMethod, createParams) = messages[3] else {
             Issue.record("The fourth contract line must create a task.")
@@ -472,7 +492,10 @@ struct EngineClientTests {
         let client = try EngineClient(
             executableURL: URL(fileURLWithPath: "/bin/zsh"),
             executableArguments: [fake.executable.path],
-            requestTimeout: .milliseconds(100),
+            // Keep the generic timeout below the fake 350 ms mutations while
+            // leaving enough headroom for an immediate app.sync response on a
+            // busy parallel Swift Testing run.
+            requestTimeout: .milliseconds(250),
             handshakeTimeout: .seconds(2)
         )
         let repository = EngineRepository(client: client)
@@ -564,7 +587,7 @@ struct EngineClientTests {
             try await client.start()
             Issue.record("The first handshake should have been rejected.")
         } catch let error as EngineClientError {
-            #expect(error == .protocolMismatch(expected: 3, received: 999))
+            #expect(error == .protocolMismatch(expected: 4, received: 999))
         }
 
         do {
@@ -657,7 +680,7 @@ struct EngineClientTests {
 
         var script = #"""
         #!/bin/zsh
-        protocol_version=3
+        protocol_version=4
         __FIRST_LAUNCH_BLOCK__
         printf '{"event":"engine.ready","data":{"protocolVersion":%s,"engineVersion":"fake-1.0.0","capabilities":["engine.shutdown"]}}\n' "$protocol_version"
 
@@ -696,7 +719,7 @@ struct EngineClientTests {
         #!/bin/zsh
         request_log="$0.requests.ndjson"
         : > "$request_log"
-        printf '{"event":"engine.ready","data":{"protocolVersion":3,"engineVersion":"fake-runtime-1.0.0","capabilities":["engine.shutdown"]}}\n'
+        printf '{"event":"engine.ready","data":{"protocolVersion":4,"engineVersion":"fake-runtime-1.0.0","capabilities":["engine.shutdown"]}}\n'
 
         runtime='{"kind":"codex","launchPath":"/usr/local/bin/codex","resolvedPath":"/opt/codex/bin/codex","version":"codex-cli 1.2.3","status":"ready","authStatus":"authenticated","capabilities":{},"providerEngine":null,"detectedAt":"2026-08-09T00:01:00Z","verifiedAt":"2026-08-09T00:02:00Z","verifyError":null}'
         verified_bootstrap='{"revision":0,"lists":[],"tasks":[],"taskAttachments":[],"runtimes":['"$runtime"'],"sessions":[]}'

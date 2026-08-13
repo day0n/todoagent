@@ -4,21 +4,28 @@ import SwiftUI
 enum TodoAgentResourceBundle {
     private static let bundleName = "TodoAgentNative_TodoAgentApp"
 
+    static var bundle: Bundle {
+        if let resources = Bundle.main.resourceURL,
+           let packagedBundle = Bundle(
+               url: resources.appendingPathComponent(bundleName + ".bundle")
+           )
+        {
+            return packagedBundle
+        }
+
+        // This branch is for `swift run` and tests. In a packaged app the
+        // lookup above must win, because SwiftPM's generated accessor also
+        // contains a build-machine absolute path that disappears after the
+        // release staging directory is removed.
+        return Bundle.module
+    }
+
     /// SwiftPM's generated `Bundle.module` accessor looks beside the app
     /// bundle, while a valid signed macOS app must keep resources under
     /// Contents/Resources. Prefer that packaged location and only evaluate the
     /// generated accessor for `swift run` and tests.
     static func url(forResource name: String, withExtension extensionName: String) -> URL? {
-        if let resources = Bundle.main.resourceURL,
-           let packagedBundle = Bundle(
-               url: resources.appendingPathComponent(bundleName + ".bundle")
-           ),
-           let url = packagedBundle.url(forResource: name, withExtension: extensionName)
-        {
-            return url
-        }
-
-        return Bundle.module.url(forResource: name, withExtension: extensionName)
+        bundle.url(forResource: name, withExtension: extensionName)
     }
 }
 

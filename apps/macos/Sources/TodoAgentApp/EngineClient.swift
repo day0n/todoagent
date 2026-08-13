@@ -115,7 +115,7 @@ private struct EngineSession {
 
 /// The only owner of the Rust sidecar process and its NDJSON streams.
 actor EngineClient {
-    static let protocolVersion = 3
+    static let protocolVersion = 4
 
     private static let eventBufferSize = 512
     private static let gracefulStopDuration: Duration = .seconds(1)

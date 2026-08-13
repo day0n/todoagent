@@ -3,7 +3,6 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var state: AppState
-    @State private var availableContentSize = TodoAgentMainWindowPlacement.preferredContentSize
     @State private var assistantResizeStartWidth: CGFloat?
     @State private var assistantLiveWidth: CGFloat?
     @AppStorage(AssistantPanePreferences.widthKey) private var storedAssistantWidth = 0.0
@@ -88,34 +87,12 @@ struct ContentView: View {
         .navigationSplitViewStyle(.balanced)
         .tint(TodoAgentUI.primaryText)
         .disabled(state.loadState == .loading || state.isPreparingToTerminate)
-        .background {
-            GeometryReader { proxy in
-                Color.clear.preference(
-                    key: ContentSizePreferenceKey.self,
-                    value: proxy.size
-                )
-            }
-        }
-        .onPreferenceChange(ContentSizePreferenceKey.self) { size in
-            guard size.width > 0, size.height > 0 else { return }
-            availableContentSize = size
-        }
         .task { await state.load() }
-        .sheet(item: $state.presentedSheet) { destination in
-            sheet(destination, availableSize: availableContentSize)
-        }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentToggleInspector)) { _ in
             Task { await state.toggleAssistant() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewAssistantConversation)) { _ in
             Task { await state.openNewAssistantConversation() }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .todoAgentCancelCurrent)) { _ in
-            if case .taskSession = state.presentedSheet {
-                NotificationCenter.default.post(name: .todoAgentRequestTaskSheetClose, object: nil)
-            } else {
-                state.presentedSheet = nil
-            }
         }
         .overlay {
             if state.isPreparingToTerminate {
@@ -213,18 +190,6 @@ struct ContentView: View {
         storedAssistantWidth = Double(width)
         assistantResizeStartWidth = nil
         assistantLiveWidth = nil
-    }
-
-    @ViewBuilder
-    private func sheet(_ destination: AppSheet, availableSize: CGSize) -> some View {
-        switch destination {
-        case let .taskSession(taskID):
-            TaskDestinationSheet(
-                taskID: taskID,
-                state: state,
-                availableSize: availableSize
-            )
-        }
     }
 
     private var errorPresented: Binding<Bool> {
@@ -396,40 +361,6 @@ private struct AssistantFloatingButton: View {
         .accessibilityLabel("打开 TodoAgent")
         .accessibilityHint("打开 TodoAgent 对话面板")
         .accessibilityIdentifier("assistant.floating-button")
-    }
-}
-
-private struct TaskDestinationSheet: View {
-    let taskID: UUID
-    let state: AppState
-    let availableSize: CGSize
-
-    var body: some View {
-        if let task = state.task(id: taskID) {
-            TaskConversationSheet(
-                task: task,
-                state: state,
-                availableSize: availableSize
-            )
-        } else {
-            ContentUnavailableView(
-                "任务已不存在",
-                systemImage: "questionmark.folder",
-                description: Text("关闭窗口后刷新任务列表。")
-            )
-            .frame(width: 420, height: 260)
-        }
-    }
-}
-
-private struct ContentSizePreferenceKey: PreferenceKey {
-    static let defaultValue = CGSize.zero
-
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
-        let next = nextValue()
-        if next.width > 0, next.height > 0 {
-            value = next
-        }
     }
 }
 

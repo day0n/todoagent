@@ -31,6 +31,53 @@ protocol AppRepository: Sendable {
     func setCompleted(taskID: UUID, completed: Bool) async throws -> AppSnapshot
     func detectRuntimes() async throws -> AppSnapshot
     func verifyRuntime(_ kind: RuntimeKind) async throws -> AppSnapshot
+    func terminalSession(taskID: UUID) async throws -> TerminalSessionBundle?
+    func createTerminalSession(
+        taskID: UUID,
+        runtime: RuntimeKind,
+        workspace: String
+    ) async throws -> TerminalSessionBundle
+    func rebindTerminalWorkspace(
+        sessionID: String,
+        workspace: String
+    ) async throws -> TerminalSessionBundle
+    func prepareTerminalLaunch(
+        sessionID: String,
+        runID: String,
+        taskTitle: String?,
+        statusSocket: String,
+        lifecycleToken: String,
+        hookToken: String,
+        providerHooksEnabled: Bool,
+        hostPID: Int32
+    ) async throws -> TerminalLaunchPlan
+    func markTerminalRunStarted(sessionID: String, runID: String) async throws -> TerminalSessionBundle
+    func markTerminalRunStopping(sessionID: String, runID: String) async throws -> TerminalSessionBundle
+    func terminalResumeCandidates(sessionID: String) async throws -> TerminalResumeCandidates
+    func bindTerminalProvider(
+        sessionID: String,
+        runID: String,
+        providerSessionID: String,
+        source: String
+    ) async throws -> TerminalSessionBundle
+    func reportTerminalStatus(
+        sessionID: String,
+        runID: String,
+        status: TerminalAgentStatus,
+        eventID: String
+    ) async throws -> TerminalSessionBundle
+    func reportTerminalRunExited(
+        sessionID: String,
+        runID: String,
+        exitCode: Int32?,
+        reason: TerminalRunExitReason,
+        errorCode: String?,
+        errorMessage: String?
+    ) async throws -> TerminalSessionBundle
+    func markTerminalSessionSeen(sessionID: String, through sequence: Int64) async throws -> TerminalSessionDescriptor
+
+    // Legacy structured-chat access stays as an additive compatibility surface
+    // while old tests and persisted histories are retired.
     func session(taskID: UUID) async throws -> SessionBundle?
     func createSession(taskID: UUID, runtime: RuntimeKind, workspace: String) async throws -> SessionBundle
     func send(sessionID: String, text: String, clientMessageID: UUID) async throws -> SessionBundle
@@ -84,6 +131,73 @@ extension AppRepository {
     }
     func deleteList(listID _: UUID) async throws -> AppSnapshot {
         throw AppRepositoryError.listNotFound
+    }
+    func terminalSession(taskID _: UUID) async throws -> TerminalSessionBundle? { nil }
+    func createTerminalSession(
+        taskID _: UUID,
+        runtime _: RuntimeKind,
+        workspace _: String
+    ) async throws -> TerminalSessionBundle {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func rebindTerminalWorkspace(
+        sessionID _: String,
+        workspace _: String
+    ) async throws -> TerminalSessionBundle {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func prepareTerminalLaunch(
+        sessionID _: String,
+        runID _: String,
+        taskTitle _: String?,
+        statusSocket _: String,
+        lifecycleToken _: String,
+        hookToken _: String,
+        providerHooksEnabled _: Bool,
+        hostPID _: Int32
+    ) async throws -> TerminalLaunchPlan {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func markTerminalRunStarted(sessionID _: String, runID _: String) async throws -> TerminalSessionBundle {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func markTerminalRunStopping(sessionID _: String, runID _: String) async throws -> TerminalSessionBundle {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func terminalResumeCandidates(sessionID _: String) async throws -> TerminalResumeCandidates {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func bindTerminalProvider(
+        sessionID _: String,
+        runID _: String,
+        providerSessionID _: String,
+        source _: String
+    ) async throws -> TerminalSessionBundle {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func reportTerminalStatus(
+        sessionID _: String,
+        runID _: String,
+        status _: TerminalAgentStatus,
+        eventID _: String
+    ) async throws -> TerminalSessionBundle {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func reportTerminalRunExited(
+        sessionID _: String,
+        runID _: String,
+        exitCode _: Int32?,
+        reason _: TerminalRunExitReason,
+        errorCode _: String?,
+        errorMessage _: String?
+    ) async throws -> TerminalSessionBundle {
+        throw AppRepositoryError.sessionNotFound
+    }
+    func markTerminalSessionSeen(
+        sessionID _: String,
+        through _: Int64
+    ) async throws -> TerminalSessionDescriptor {
+        throw AppRepositoryError.sessionNotFound
     }
 }
 

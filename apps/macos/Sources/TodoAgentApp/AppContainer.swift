@@ -7,6 +7,8 @@ final class AppContainer {
     let client: EngineClient?
     let repository: any AppRepository
     let state: AppState
+    let terminalSessions: TerminalSessionRegistry
+    let taskWorkbenches: TaskWorkbenchWindowRegistry
 
     private init() {
         do {
@@ -18,6 +20,16 @@ final class AppContainer {
                 repository: repository,
                 inspectorPresented: UserDefaults.standard.bool(forKey: "showAssistantAtLaunch")
             )
+            terminalSessions = TerminalSessionRegistry(
+                repository: repository,
+                surfaceFactory: GhosttyTerminalSurfaceFactory()
+            )
+            taskWorkbenches = TaskWorkbenchWindowRegistry(
+                state: state,
+                terminalSessions: terminalSessions
+            )
+            state.taskWorkspacePresenter = taskWorkbenches
+            state.terminalSessions = terminalSessions
         } catch {
             client = nil
             let repository = FailedRepository(message: error.localizedDescription)
@@ -26,6 +38,13 @@ final class AppContainer {
                 repository: repository,
                 inspectorPresented: UserDefaults.standard.bool(forKey: "showAssistantAtLaunch")
             )
+            terminalSessions = TerminalSessionRegistry(repository: repository)
+            taskWorkbenches = TaskWorkbenchWindowRegistry(
+                state: state,
+                terminalSessions: terminalSessions
+            )
+            state.taskWorkspacePresenter = taskWorkbenches
+            state.terminalSessions = terminalSessions
         }
     }
 }
@@ -75,6 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let inputFocusMonitor = WindowInputFocusMonitor()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
         inputFocusMonitor.start()
     }
 
@@ -84,6 +104,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard terminationTask == nil else { return .terminateLater }
+
+        let activeSessions = AppContainer.shared.terminalSessions.activeCount
+        if activeSessions > 0 {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "退出 TodoAgent？"
+            alert.informativeText = "退出会结束 \(activeSessions) 个正在运行的本地 Session。"
+            alert.addButton(withTitle: "退出并结束 Session")
+            alert.addButton(withTitle: "取消")
+            guard alert.runModal() == .alertFirstButtonReturn else { return .terminateCancel }
+        }
 
         terminationTask = Task { @MainActor [weak self] in
             let canTerminate = await AppContainer.shared.state.shutdown()

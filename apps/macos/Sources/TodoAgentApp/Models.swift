@@ -859,6 +859,54 @@ enum SessionState: String, Codable, Sendable {
     var isBusy: Bool { self == .queued || self == .running }
 }
 
+enum TerminalProviderBindingState: String, Codable, Sendable {
+    case unbound
+    case bound
+    case captureFailed = "capture_failed"
+}
+
+enum TerminalAgentStatus: String, Codable, CaseIterable, Sendable {
+    case unknown
+    case idle
+    case active
+    case blocked
+    case completed
+
+    var isRunning: Bool { self == .active || self == .blocked }
+    var needsAttention: Bool { self == .blocked || self == .completed }
+}
+
+enum TerminalRunLaunchMode: String, Codable, Sendable {
+    case fresh
+    case resume
+}
+
+enum TerminalRunState: String, Codable, Sendable {
+    case starting
+    case running
+    case stopping
+    case exited
+    case failed
+    case interrupted
+
+    var isActive: Bool { self == .starting || self == .running || self == .stopping }
+}
+
+enum TerminalRunExitReason: String, Codable, Sendable {
+    case processExit = "process_exit"
+    case userEnded = "user_ended"
+    case appShutdown = "app_shutdown"
+    case launchFailed = "launch_failed"
+}
+
+enum TerminalProviderCaptureStrategy: String, Codable, Sendable {
+    case sessionStartHook = "session_start_hook"
+    case preallocated
+    case createChat = "create_chat"
+    case sessionStoreScan = "session_store_scan"
+    case alreadyBound = "already_bound"
+}
+
 enum TurnStatus: String, Codable, Sendable {
     case queued, running, completed, failed, cancelled, interrupted
 }
@@ -867,31 +915,226 @@ enum SessionMessageRole: String, Codable, Sendable {
     case user, agent, system, tool
 }
 
-struct TaskSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
+struct TerminalSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
     let id: String
     let taskID: UUID
     let runtimeKind: RuntimeKind
     let workingDirectory: String
     let providerSessionID: String?
-    let providerEngine: String?
-    let state: SessionState
-    let lastAgentSequence: Int64
-    let lastReadSequence: Int64
+    let providerBindingState: TerminalProviderBindingState
+    let providerBindingSource: String?
+    let agentStatus: TerminalAgentStatus
+    let hasActiveRun: Bool
+    let statusSequence: Int64
+    let seenStatusSequence: Int64
     let lastErrorCode: String?
     let lastErrorMessage: String?
+    let lastStartedAt: String?
+    let lastExitedAt: String?
     let createdAt: String
     let updatedAt: String
 
-    var hasUnread: Bool { lastAgentSequence > lastReadSequence }
+    var hasUnread: Bool { statusSequence > seenStatusSequence }
+    var state: SessionState { hasActiveRun ? .running : .idle }
+    var lastAgentSequence: Int64 { statusSequence }
+    var lastReadSequence: Int64 { seenStatusSequence }
+    var providerEngine: String? { nil }
+
+    init(
+        id: String,
+        taskID: UUID,
+        runtimeKind: RuntimeKind,
+        workingDirectory: String,
+        providerSessionID: String? = nil,
+        providerBindingState: TerminalProviderBindingState = .unbound,
+        providerBindingSource: String? = nil,
+        agentStatus: TerminalAgentStatus = .unknown,
+        hasActiveRun: Bool = false,
+        statusSequence: Int64 = 0,
+        seenStatusSequence: Int64 = 0,
+        lastErrorCode: String? = nil,
+        lastErrorMessage: String? = nil,
+        lastStartedAt: String? = nil,
+        lastExitedAt: String? = nil,
+        createdAt: String = "",
+        updatedAt: String = ""
+    ) {
+        self.id = id
+        self.taskID = taskID
+        self.runtimeKind = runtimeKind
+        self.workingDirectory = workingDirectory
+        self.providerSessionID = providerSessionID
+        self.providerBindingState = providerBindingState
+        self.providerBindingSource = providerBindingSource
+        self.agentStatus = agentStatus
+        self.hasActiveRun = hasActiveRun
+        self.statusSequence = statusSequence
+        self.seenStatusSequence = seenStatusSequence
+        self.lastErrorCode = lastErrorCode
+        self.lastErrorMessage = lastErrorMessage
+        self.lastStartedAt = lastStartedAt
+        self.lastExitedAt = lastExitedAt
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    /// Source compatibility for fixtures from the pre-terminal message renderer.
+    init(
+        id: String,
+        taskID: UUID,
+        runtimeKind: RuntimeKind,
+        workingDirectory: String,
+        providerSessionID: String?,
+        providerEngine _: String?,
+        state: SessionState,
+        lastAgentSequence: Int64,
+        lastReadSequence: Int64,
+        lastErrorCode: String?,
+        lastErrorMessage: String?,
+        createdAt: String,
+        updatedAt: String
+    ) {
+        self.init(
+            id: id,
+            taskID: taskID,
+            runtimeKind: runtimeKind,
+            workingDirectory: workingDirectory,
+            providerSessionID: providerSessionID,
+            providerBindingState: providerSessionID == nil ? .unbound : .bound,
+            agentStatus: state.isBusy ? .active : .idle,
+            hasActiveRun: state.isBusy,
+            statusSequence: lastAgentSequence,
+            seenStatusSequence: lastReadSequence,
+            lastErrorCode: lastErrorCode,
+            lastErrorMessage: lastErrorMessage,
+            createdAt: createdAt,
+            updatedAt: updatedAt
+        )
+    }
 
     private enum CodingKeys: String, CodingKey {
         case id
         case taskID = "taskId"
         case runtimeKind, workingDirectory
         case providerSessionID = "providerSessionId"
+        case providerBindingState, providerBindingSource, agentStatus, hasActiveRun
+        case statusSequence, seenStatusSequence
+        case lastErrorCode, lastErrorMessage, lastStartedAt, lastExitedAt
+        case createdAt, updatedAt
         case providerEngine, state, lastAgentSequence, lastReadSequence
-        case lastErrorCode, lastErrorMessage, createdAt, updatedAt
     }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        id = try values.decode(String.self, forKey: .id)
+        taskID = try values.decode(UUID.self, forKey: .taskID)
+        runtimeKind = try values.decode(RuntimeKind.self, forKey: .runtimeKind)
+        workingDirectory = try values.decode(String.self, forKey: .workingDirectory)
+        providerSessionID = try values.decodeIfPresent(String.self, forKey: .providerSessionID)
+        providerBindingState = try values.decodeIfPresent(
+            TerminalProviderBindingState.self,
+            forKey: .providerBindingState
+        ) ?? (providerSessionID == nil ? .unbound : .bound)
+        providerBindingSource = try values.decodeIfPresent(String.self, forKey: .providerBindingSource)
+        let legacyState = try values.decodeIfPresent(SessionState.self, forKey: .state)
+        agentStatus = try values.decodeIfPresent(TerminalAgentStatus.self, forKey: .agentStatus)
+            ?? (legacyState?.isBusy == true ? .active : .idle)
+        hasActiveRun = try values.decodeIfPresent(Bool.self, forKey: .hasActiveRun)
+            ?? legacyState?.isBusy
+            ?? false
+        statusSequence = try values.decodeIfPresent(Int64.self, forKey: .statusSequence)
+            ?? values.decodeIfPresent(Int64.self, forKey: .lastAgentSequence)
+            ?? 0
+        seenStatusSequence = try values.decodeIfPresent(Int64.self, forKey: .seenStatusSequence)
+            ?? values.decodeIfPresent(Int64.self, forKey: .lastReadSequence)
+            ?? 0
+        lastErrorCode = try values.decodeIfPresent(String.self, forKey: .lastErrorCode)
+        lastErrorMessage = try values.decodeIfPresent(String.self, forKey: .lastErrorMessage)
+        lastStartedAt = try values.decodeIfPresent(String.self, forKey: .lastStartedAt)
+        lastExitedAt = try values.decodeIfPresent(String.self, forKey: .lastExitedAt)
+        createdAt = try values.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
+        updatedAt = try values.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(id, forKey: .id)
+        try values.encode(taskID, forKey: .taskID)
+        try values.encode(runtimeKind, forKey: .runtimeKind)
+        try values.encode(workingDirectory, forKey: .workingDirectory)
+        try values.encodeIfPresent(providerSessionID, forKey: .providerSessionID)
+        try values.encode(providerBindingState, forKey: .providerBindingState)
+        try values.encodeIfPresent(providerBindingSource, forKey: .providerBindingSource)
+        try values.encode(agentStatus, forKey: .agentStatus)
+        try values.encode(hasActiveRun, forKey: .hasActiveRun)
+        try values.encode(statusSequence, forKey: .statusSequence)
+        try values.encode(seenStatusSequence, forKey: .seenStatusSequence)
+        try values.encodeIfPresent(lastErrorCode, forKey: .lastErrorCode)
+        try values.encodeIfPresent(lastErrorMessage, forKey: .lastErrorMessage)
+        try values.encodeIfPresent(lastStartedAt, forKey: .lastStartedAt)
+        try values.encodeIfPresent(lastExitedAt, forKey: .lastExitedAt)
+        try values.encode(createdAt, forKey: .createdAt)
+        try values.encode(updatedAt, forKey: .updatedAt)
+    }
+}
+
+typealias TaskSessionDescriptor = TerminalSessionDescriptor
+
+struct TerminalRun: Identifiable, Codable, Equatable, Sendable {
+    let id: String
+    let sessionID: String
+    let ordinal: Int64
+    let launchMode: TerminalRunLaunchMode
+    let state: TerminalRunState
+    let providerSessionIDAtLaunch: String?
+    let exitCode: Int32?
+    let exitReason: TerminalRunExitReason?
+    let errorCode: String?
+    let errorMessage: String?
+    let startedAt: String?
+    let exitedAt: String?
+    let createdAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case id
+        case sessionID = "sessionId"
+        case ordinal, launchMode, state
+        case providerSessionIDAtLaunch = "providerSessionIdAtLaunch"
+        case exitCode, exitReason, errorCode, errorMessage, startedAt, exitedAt, createdAt
+    }
+}
+
+struct TerminalSessionBundle: Codable, Equatable, Sendable {
+    let session: TerminalSessionDescriptor
+    let activeRun: TerminalRun?
+}
+
+struct TerminalResumeCandidate: Identifiable, Codable, Equatable, Sendable {
+    let providerSessionID: String
+    let source: String
+    let createdAt: String?
+
+    var id: String { providerSessionID }
+
+    private enum CodingKeys: String, CodingKey {
+        case providerSessionID = "providerSessionId"
+        case source, createdAt
+    }
+}
+
+struct TerminalResumeCandidates: Codable, Equatable, Sendable {
+    let session: TerminalSessionDescriptor
+    let candidates: [TerminalResumeCandidate]
+}
+
+struct TerminalLaunchPlan: Codable, Equatable, Sendable {
+    let session: TerminalSessionDescriptor
+    let run: TerminalRun
+    let executable: String
+    let arguments: [String]
+    let workingDirectory: String
+    let environment: [String: String]
+    let captureStrategy: TerminalProviderCaptureStrategy
 }
 
 struct SessionTurn: Identifiable, Codable, Equatable, Sendable {
@@ -1185,7 +1428,7 @@ enum TaskPatchField<Value: Equatable & Sendable>: Equatable, Sendable {
 }
 
 /// A tri-state task patch. `.unchanged` omits a key from JSON while `.clear`
-/// emits an explicit `null`; this distinction is part of IPC v3.
+/// emits an explicit `null`; this distinction is part of IPC v4.
 struct TaskPatch: Encodable, Equatable, Sendable {
     var title: String?
     var note: String?

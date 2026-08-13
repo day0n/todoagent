@@ -1,16 +1,33 @@
 import AppKit
+import Darwin
 import SwiftUI
 
 extension Notification.Name {
     static let todoAgentNewTask = Notification.Name("TodoAgent.newTask")
     static let todoAgentNewAssistantConversation = Notification.Name("TodoAgent.newAssistantConversation")
     static let todoAgentToggleInspector = Notification.Name("TodoAgent.toggleInspector")
-    static let todoAgentCancelCurrent = Notification.Name("TodoAgent.cancelCurrent")
 }
 
 @main
 struct TodoAgentApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
+    init() {
+        guard CommandLine.arguments.dropFirst() == ["--verify-packaged-resources"] else { return }
+        do {
+            guard GhosttyBundledResources.resolve() != nil else {
+                throw GhosttyTerminalError.resourcesMissing
+            }
+            _ = try GhosttyRuntime.shared.requireApp()
+            FileHandle.standardOutput.write(Data("TodoAgent packaged Ghostty resources OK\n".utf8))
+            Darwin.exit(EXIT_SUCCESS)
+        } catch {
+            FileHandle.standardError.write(
+                Data("TodoAgent packaged resource verification failed: \(error.localizedDescription)\n".utf8)
+            )
+            Darwin.exit(EXIT_FAILURE)
+        }
+    }
 
     var body: some Scene {
         Window("TodoAgent", id: TodoAgentMainWindow.sceneID) {
@@ -52,12 +69,36 @@ struct TodoAgentApp: App {
                 }
                 .keyboardShortcut("i", modifiers: [.command, .option])
 
+                Button("显示或隐藏任务详情") {
+                    AppContainer.shared.taskWorkbenches.toggleActiveTaskDetails()
+                }
+                .keyboardShortcut("s", modifiers: [.command, .control])
+
+            }
+
+            CommandMenu("终端") {
+                Button("聚焦终端") {
+                    AppContainer.shared.taskWorkbenches.focusActiveTerminal()
+                }
+                .keyboardShortcut("t", modifiers: [.command, .shift])
+
                 Divider()
 
-                Button("取消当前操作") {
-                    NotificationCenter.default.post(name: .todoAgentCancelCurrent, object: nil)
-                }
-                .keyboardShortcut(.escape, modifiers: [])
+                Button("查找…") { NSApp.sendAction(#selector(NSTextView.performFindPanelAction(_:)), to: nil, from: NSFindPanelAction.showFindPanel.rawValue) }
+                    .keyboardShortcut("f", modifiers: .command)
+                Button("复制") { NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("粘贴") { NSApp.sendAction(#selector(NSText.paste(_:)), to: nil, from: nil) }
+                    .keyboardShortcut("v", modifiers: .command)
+
+                Divider()
+
+                Button("放大字体") { AppContainer.shared.taskWorkbenches.performTerminalAction("increase_font_size:1") }
+                    .keyboardShortcut("+", modifiers: .command)
+                Button("缩小字体") { AppContainer.shared.taskWorkbenches.performTerminalAction("decrease_font_size:1") }
+                    .keyboardShortcut("-", modifiers: .command)
+                Button("还原字体大小") { AppContainer.shared.taskWorkbenches.performTerminalAction("reset_font_size") }
+                    .keyboardShortcut("0", modifiers: .command)
             }
         }
 
