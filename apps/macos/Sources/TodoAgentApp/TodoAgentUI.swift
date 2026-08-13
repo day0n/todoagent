@@ -245,6 +245,7 @@ struct TodoAgentDatePickerPanel: View {
             )
             .labelsHidden()
             .datePickerStyle(.graphical)
+            .frame(maxWidth: .infinity)
 
             HStack {
                 Spacer()
@@ -254,7 +255,7 @@ struct TodoAgentDatePickerPanel: View {
             }
         }
         .padding(TodoAgentUI.sectionSpacing)
-        .frame(width: 334)
+        .frame(width: 350)
         .environment(\.calendar, Calendar.todoAgentLocal)
     }
 

@@ -258,11 +258,11 @@ struct TaskConversationViewTests {
         #expect(TaskWorkbenchWindowController.minimumContentSize == CGSize(width: 900, height: 600))
     }
 
-    @Test("task workbench details start expanded at the ideal width")
+    @Test("task workbench details start collapsed with the ideal reveal width")
     func taskWorkbenchDetailsDefaultLayout() {
         let layout = TaskWorkbenchLayoutState()
 
-        #expect(layout.detailsPresented)
+        #expect(layout.detailsPresented == false)
         #expect(layout.detailsWidth == TaskWorkbenchLayoutState.idealDetailsWidth)
     }
 
@@ -281,11 +281,15 @@ struct TaskConversationViewTests {
         #expect(layout.detailsWidth == customWidth)
     }
 
-    @Test("collapsing and reopening task details preserves the user's width")
+    @Test("opening, recollapsing, and reopening task details preserves the user's width")
     func taskWorkbenchDetailsPreserveWidthAcrossDisclosure() {
         let layout = TaskWorkbenchLayoutState()
         let customWidth = TaskWorkbenchLayoutState.maximumDetailsWidth - 18
         layout.recordDetailsWidth(customWidth)
+
+        layout.toggleDetails()
+        #expect(layout.detailsPresented)
+        #expect(layout.detailsWidth == customWidth)
 
         layout.toggleDetails()
         #expect(layout.detailsPresented == false)
@@ -304,9 +308,9 @@ struct TaskConversationViewTests {
         firstWindow.recordDetailsWidth(TaskWorkbenchLayoutState.maximumDetailsWidth)
         firstWindow.toggleDetails()
 
-        #expect(firstWindow.detailsPresented == false)
+        #expect(firstWindow.detailsPresented)
         #expect(firstWindow.detailsWidth == TaskWorkbenchLayoutState.maximumDetailsWidth)
-        #expect(secondWindow.detailsPresented)
+        #expect(secondWindow.detailsPresented == false)
         #expect(secondWindow.detailsWidth == TaskWorkbenchLayoutState.idealDetailsWidth)
     }
 

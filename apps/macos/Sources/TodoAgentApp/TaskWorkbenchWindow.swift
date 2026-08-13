@@ -17,7 +17,7 @@ final class TaskWorkbenchLayoutState {
     static let idealDetailsWidth: CGFloat = 330
     static let maximumDetailsWidth: CGFloat = 420
 
-    private(set) var detailsPresented = true
+    private(set) var detailsPresented = false
     private(set) var detailsWidth = idealDetailsWidth
 
     func toggleDetails() {
