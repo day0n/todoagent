@@ -1,4 +1,3 @@
-mod adapters;
 mod assistant;
 mod assistant_service;
 mod models;
@@ -6,110 +5,44 @@ mod protocol;
 mod runtime;
 mod store;
 mod store_worker;
+mod terminal;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
-use adapters::{ProviderEvent, ProviderFrame, TurnOutcome, TurnRequest};
-use models::{MessageRole, QueuedTurn, RuntimeKind, TaskAttachment, TurnStatus, UpdateTaskInput};
+use models::{RuntimeKind, TaskAttachment, TerminalAgentStatus, UpdateTaskInput};
 use protocol::{Request, Response};
 use serde::Serialize;
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
-use store::{AppliedProviderFrame, AppliedTimelineMutation, StoreError};
+use store::StoreError;
 use store_worker::{StoreWorker, StoreWorkerError};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Mutex, Semaphore, mpsc};
-use tokio::time::{Instant, interval, sleep};
-use tokio_util::sync::CancellationToken;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::sync::Mutex;
 use zeroize::Zeroizing;
 
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_TASK_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
-const PROVIDER_FRAME_BATCH_INTERVAL: Duration = Duration::from_millis(100);
-const PROVIDER_FRAME_BATCH_MAX_FRAMES: usize = 32;
-const PROVIDER_FRAME_BATCH_MAX_BYTES: usize = 256 * 1024;
+const CURSOR_CREATE_CHAT_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone)]
 struct Engine {
     store: StoreWorker,
     writer: SyncSender<Value>,
-    turns: Arc<Mutex<HashMap<String, ActiveCliTurn>>>,
-    concurrency: Arc<Semaphore>,
     authorized_directories: Arc<Mutex<HashSet<PathBuf>>>,
     gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
     assistant: assistant_service::AssistantService,
     data_directory: Arc<PathBuf>,
     task_file_mutation: Arc<Mutex<()>>,
-}
-
-#[derive(Clone)]
-struct ActiveCliTurn {
-    turn_id: String,
-    cancellation: CancellationToken,
-}
-
-#[derive(Default)]
-struct PendingProviderMutations {
-    messages: Vec<models::SessionMessage>,
-    timeline: Vec<AppliedTimelineMutation>,
-}
-
-impl PendingProviderMutations {
-    fn merge(&mut self, applied: AppliedProviderFrame) {
-        for message in applied.messages {
-            if let Some(existing) = self.messages.iter_mut().find(|item| item.id == message.id) {
-                *existing = message;
-            } else {
-                self.messages.push(message);
-            }
-        }
-        for mutation in applied.timeline {
-            if let Some(existing) = self
-                .timeline
-                .iter_mut()
-                .find(|item| item.item.id == mutation.item.id)
-            {
-                // If creation has not been published yet, keep this as one
-                // appended event carrying the newest committed snapshot.
-                let first_is_update = existing.is_update;
-                *existing = mutation;
-                existing.is_update = first_is_update;
-            } else {
-                self.timeline.push(mutation);
-            }
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.messages.is_empty() && self.timeline.is_empty()
-    }
-}
-
-fn provider_frame_bytes(frame: &ProviderFrame) -> usize {
-    frame
-        .raw_payload
-        .as_ref()
-        .map_or(0, |payload| payload.to_string().len())
-        .saturating_add(frame.raw_kind.as_ref().map_or(0, String::len))
-}
-
-fn enqueue_provider_frame(
-    batch: &mut Vec<ProviderFrame>,
-    batch_bytes: &mut usize,
-    frame: ProviderFrame,
-) -> bool {
-    *batch_bytes = batch_bytes.saturating_add(provider_frame_bytes(&frame));
-    batch.push(frame);
-    batch.len() >= PROVIDER_FRAME_BATCH_MAX_FRAMES || *batch_bytes >= PROVIDER_FRAME_BATCH_MAX_BYTES
 }
 
 #[derive(Debug, Error)]
@@ -210,8 +143,8 @@ struct VerifyRuntimeParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CreateSessionParams {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateTerminalSessionParams {
     #[serde(deserialize_with = "deserialize_canonical_uuid")]
     task_id: String,
     runtime_kind: String,
@@ -219,15 +152,8 @@ struct CreateSessionParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionIDParams {
-    #[serde(deserialize_with = "deserialize_canonical_uuid")]
-    session_id: String,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SessionLookupParams {
+struct TerminalSessionLookupParams {
     #[serde(default, deserialize_with = "deserialize_optional_canonical_uuid")]
     session_id: Option<String>,
     #[serde(default, deserialize_with = "deserialize_optional_canonical_uuid")]
@@ -235,53 +161,92 @@ struct SessionLookupParams {
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionHistoryParams {
-    #[serde(deserialize_with = "deserialize_canonical_uuid")]
-    session_id: String,
-    #[serde(default)]
-    after_sequence: i64,
-    #[serde(default)]
-    after_cursor: Option<models::SessionTimelineCursor>,
-    #[serde(default = "default_history_limit")]
-    limit: i64,
-}
-
-#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SessionTimelineTurnParams {
+struct RebindTerminalWorkspaceParams {
     #[serde(deserialize_with = "deserialize_canonical_uuid")]
     session_id: String,
-    #[serde(deserialize_with = "deserialize_canonical_uuid")]
-    turn_id: String,
-    #[serde(default)]
-    after_cursor: Option<models::SessionTimelineCursor>,
-    #[serde(default = "default_history_limit")]
-    limit: i64,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SendSessionParams {
-    #[serde(deserialize_with = "deserialize_canonical_uuid")]
-    session_id: String,
-    #[serde(deserialize_with = "deserialize_canonical_uuid")]
-    client_message_id: String,
-    text: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MarkReadParams {
-    #[serde(deserialize_with = "deserialize_canonical_uuid")]
-    session_id: String,
-    through_sequence: i64,
+    working_directory: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceAuthorizationParams {
     path: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct PrepareTerminalLaunchParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    run_id: String,
+    task_title: Option<String>,
+    status_socket: String,
+    lifecycle_token: String,
+    hook_token: String,
+    host_pid: u32,
+    provider_hooks_enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalRunIDParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TerminalSessionIDParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BindTerminalProviderParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    run_id: String,
+    provider_session_id: String,
+    source: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReportTerminalStatusParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    event_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    run_id: String,
+    status: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExitTerminalRunParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    run_id: String,
+    exit_code: Option<i32>,
+    reason: String,
+    error_code: Option<String>,
+    error_message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct MarkTerminalSeenParams {
+    #[serde(deserialize_with = "deserialize_canonical_uuid")]
+    session_id: String,
+    through_status_sequence: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,10 +299,6 @@ struct GoogleErrorBody {
 fn default_color() -> String {
     "blue".to_owned()
 }
-fn default_history_limit() -> i64 {
-    500
-}
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
@@ -354,6 +315,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     store::prepare_database_files(&database_path, &attachments_path)?;
     secure_directory(&attachments_path)?;
     let store = StoreWorker::open(&database_path)?;
+    terminal::cleanup_stale_descriptors(&paths.data.join("TerminalRuns"))?;
     let recovery_attachments = attachments_path.clone();
     store
         .call(move |store| store.reconcile_task_attachment_files(&recovery_attachments))
@@ -387,8 +349,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let engine = Engine {
         store,
         writer: writer_tx,
-        turns: Arc::new(Mutex::new(HashMap::new())),
-        concurrency: Arc::new(Semaphore::new(2)),
         authorized_directories: Arc::new(Mutex::new(HashSet::new())),
         gemini_key,
         assistant,
@@ -650,8 +610,8 @@ impl Engine {
                 self.assistant.cancel_turn(&params.session_id).await?;
                 Ok(json!({"ok":true}))
             }
-            "session.create" => {
-                let params: CreateSessionParams = parse(&request.params)?;
+            "terminal.session.create" => {
+                let params: CreateTerminalSessionParams = parse(&request.params)?;
                 let kind = RuntimeKind::parse(&params.runtime_kind)
                     .ok_or_else(|| EngineError::Invalid("unknown runtime kind".to_owned()))?;
                 let directory = canonical_directory(&params.working_directory)?;
@@ -670,7 +630,11 @@ impl Engine {
                 let replayed = self
                     .store
                     .call(move |store| {
-                        store.prepare_session_create(&prepare_task_id, kind, &prepare_directory)
+                        store.prepare_terminal_session_create(
+                            &prepare_task_id,
+                            kind,
+                            &prepare_directory,
+                        )
                     })
                     .await?;
                 let session = if let Some(session) = replayed {
@@ -682,19 +646,21 @@ impl Engine {
                         .or(runtime.launch_path)
                         .ok_or(EngineError::Runtime("runtime_missing"))?;
                     self.store
-                        .call(move |store| store.create_session(&task_id, kind, &working_directory))
+                        .call(move |store| {
+                            store.create_terminal_session(&task_id, kind, &working_directory)
+                        })
                         .await?
                 };
                 let session_id = session.id.clone();
                 let bundle = self
                     .store
-                    .call(move |store| store.session_bundle(&session_id, 0, 500))
+                    .call(move |store| store.terminal_session_bundle(&session_id))
                     .await?;
-                self.emit("session.created", &bundle).await;
+                self.emit("terminal.session.created", &bundle).await;
                 to_value(bundle)
             }
-            "session.get" => {
-                let params: SessionLookupParams = parse(&request.params)?;
+            "terminal.session.get" => {
+                let params: TerminalSessionLookupParams = parse(&request.params)?;
                 if params.session_id.is_none() && params.task_id.is_none() {
                     return Err(EngineError::Invalid(
                         "sessionId or taskId is required".to_owned(),
@@ -707,94 +673,148 @@ impl Engine {
                             id
                         } else {
                             store
-                                .session_for_task(params.task_id.as_deref().unwrap_or_default())?
+                                .terminal_session_for_task(
+                                    params.task_id.as_deref().unwrap_or_default(),
+                                )?
                                 .ok_or(StoreError::NotFound)?
                                 .id
                         };
-                        store.session_bundle(&session_id, 0, 500)
+                        store.terminal_session_bundle(&session_id)
                     })
                     .await?;
                 to_value(bundle)
             }
-            "session.history" => {
-                let params: SessionHistoryParams = parse(&request.params)?;
-                to_value(
-                    self.store
-                        .call(move |store| {
-                            store.session_bundle(
-                                &params.session_id,
-                                params.after_sequence,
-                                params.limit,
-                            )
-                        })
-                        .await?,
-                )
-            }
-            "session.timeline" => {
-                let params: SessionHistoryParams = parse(&request.params)?;
-                to_value(
-                    self.store
-                        .call(move |store| {
-                            store.session_timeline_page(
-                                &params.session_id,
-                                params.after_sequence,
-                                params.after_cursor.as_ref(),
-                                params.limit,
-                            )
-                        })
-                        .await?,
-                )
-            }
-            "session.timeline.turn" => {
-                let params: SessionTimelineTurnParams = parse(&request.params)?;
-                to_value(
-                    self.store
-                        .call(move |store| {
-                            store.session_timeline_turn_page(
-                                &params.session_id,
-                                &params.turn_id,
-                                params.after_cursor.as_ref(),
-                                params.limit,
-                            )
-                        })
-                        .await?,
-                )
-            }
-            "session.send" => {
-                let params: SendSessionParams = parse(&request.params)?;
-                validate_text(&params.text, 200_000, "text")?;
-                let session_id = params.session_id.clone();
-                let (queued, executable) = self.prepare_session_send(params).await?;
-                let bundle = self
-                    .store
-                    .call(move |store| store.session_bundle(&session_id, 0, 500))
-                    .await?;
-                self.emit("session.state_changed", &bundle).await;
-                if let Some(executable) = executable {
-                    self.schedule(queued, executable).await;
-                }
-                to_value(bundle)
-            }
-            "session.mark_read" => {
-                let params: MarkReadParams = parse(&request.params)?;
-                let session = self
-                    .store
-                    .call(move |store| store.mark_read(&params.session_id, params.through_sequence))
-                    .await?;
-                self.emit("session.unread_changed", &session).await;
-                to_value(session)
-            }
-            "session.cancel_turn" => {
-                let params: SessionIDParams = parse(&request.params)?;
-                let token = self
-                    .turns
+            "terminal.session.rebind_workspace" => {
+                let params: RebindTerminalWorkspaceParams = parse(&request.params)?;
+                let directory = canonical_directory(&params.working_directory)?;
+                if !self
+                    .authorized_directories
                     .lock()
                     .await
-                    .get(&params.session_id)
-                    .map(|active| active.cancellation.clone())
-                    .ok_or(EngineError::Conflict("session_not_running"))?;
-                token.cancel();
-                Ok(json!({"ok":true}))
+                    .contains(&directory)
+                {
+                    return Err(EngineError::Conflict("workspace_not_authorized"));
+                }
+                let working_directory = directory.display().to_string();
+                let bundle = self
+                    .store
+                    .call(move |store| {
+                        store.rebind_terminal_session_workspace(
+                            &params.session_id,
+                            &working_directory,
+                        )
+                    })
+                    .await?;
+                self.emit("terminal.session.changed", &bundle).await;
+                to_value(bundle)
+            }
+            "terminal.session.resume_candidates" => {
+                let params: TerminalSessionIDParams = parse(&request.params)?;
+                to_value(self.resume_candidates(&params.session_id).await?)
+            }
+            "terminal.session.prepare_launch" => {
+                let params: PrepareTerminalLaunchParams = parse(&request.params)?;
+                let plan = self.prepare_terminal_launch(params).await?;
+                self.emit(
+                    "terminal.run.changed",
+                    &models::TerminalSessionBundle {
+                        session: plan.session.clone(),
+                        active_run: Some(plan.run.clone()),
+                    },
+                )
+                .await;
+                to_value(plan)
+            }
+            "terminal.run.started" => {
+                let params: TerminalRunIDParams = parse(&request.params)?;
+                let bundle = self
+                    .store
+                    .call(move |store| {
+                        store.mark_terminal_run_started(&params.session_id, &params.run_id)
+                    })
+                    .await?;
+                self.emit("terminal.run.changed", &bundle).await;
+                to_value(bundle)
+            }
+            "terminal.run.stopping" => {
+                let params: TerminalRunIDParams = parse(&request.params)?;
+                let bundle = self
+                    .store
+                    .call(move |store| {
+                        store.mark_terminal_run_stopping(&params.session_id, &params.run_id)
+                    })
+                    .await?;
+                self.emit("terminal.run.changed", &bundle).await;
+                to_value(bundle)
+            }
+            "terminal.run.bind_provider" => {
+                let params: BindTerminalProviderParams = parse(&request.params)?;
+                let bundle = self
+                    .store
+                    .call(move |store| {
+                        store.bind_terminal_provider(
+                            &params.session_id,
+                            &params.run_id,
+                            &params.provider_session_id,
+                            &params.source,
+                        )
+                    })
+                    .await?;
+                self.emit("terminal.session.changed", &bundle).await;
+                to_value(bundle)
+            }
+            "terminal.run.report_status" => {
+                let params: ReportTerminalStatusParams = parse(&request.params)?;
+                let status = TerminalAgentStatus::parse(&params.status).ok_or_else(|| {
+                    EngineError::Invalid("unknown terminal agent status".to_owned())
+                })?;
+                let bundle = self
+                    .store
+                    .call(move |store| {
+                        store.report_terminal_status(
+                            &params.event_id,
+                            &params.session_id,
+                            &params.run_id,
+                            status,
+                        )
+                    })
+                    .await?;
+                self.emit("terminal.session.changed", &bundle).await;
+                to_value(bundle)
+            }
+            "terminal.run.exited" => {
+                let params: ExitTerminalRunParams = parse(&request.params)?;
+                let cleanup_run_id = params.run_id.clone();
+                let bundle = self
+                    .store
+                    .call(move |store| {
+                        store.finish_terminal_run(
+                            &params.session_id,
+                            &params.run_id,
+                            params.exit_code,
+                            &params.reason,
+                            params.error_code.as_deref(),
+                            params.error_message.as_deref(),
+                        )
+                    })
+                    .await?;
+                terminal::cleanup_run_artifacts(
+                    &self.data_directory.join("TerminalRuns"),
+                    &cleanup_run_id,
+                );
+                self.emit("terminal.run.changed", &bundle).await;
+                to_value(bundle)
+            }
+            "terminal.session.mark_seen" => {
+                let params: MarkTerminalSeenParams = parse(&request.params)?;
+                let session = self
+                    .store
+                    .call(move |store| {
+                        store.mark_terminal_seen(&params.session_id, params.through_status_sequence)
+                    })
+                    .await?;
+                self.emit("terminal.session.changed", &session).await;
+                to_value(session)
             }
             "engine.shutdown" => Ok(json!({"ok":true})),
             _ => Err(EngineError::Invalid(format!(
@@ -817,48 +837,248 @@ impl Engine {
         }
     }
 
-    async fn prepare_session_send(
+    async fn ready_runtime_for_launch(
         &self,
-        params: SendSessionParams,
-    ) -> Result<(QueuedTurn, Option<String>), EngineError> {
-        let SendSessionParams {
-            session_id,
-            client_message_id,
-            text,
-        } = params;
-        let lookup_session_id = session_id.clone();
-        let lookup_client_message_id = client_message_id.clone();
-        if let Some(existing) = self
-            .store
-            .call(move |store| {
-                store.session_turn_for_client_message(&lookup_session_id, &lookup_client_message_id)
-            })
-            .await?
-        {
-            return Ok((existing, None));
+        kind: RuntimeKind,
+    ) -> Result<models::Runtime, EngineError> {
+        let cached = self.ready_runtime(kind).await?;
+        match runtime::resolve_launch_executable(&cached) {
+            Ok(runtime::LaunchExecutableResolution::Cached(_)) => Ok(cached),
+            Ok(runtime::LaunchExecutableResolution::RefreshRequired {
+                launch_path,
+                resolved_path,
+            }) => {
+                tracing::info!(
+                    runtime = kind.as_str(),
+                    launch_path = %launch_path.display(),
+                    resolved_path = %resolved_path.display(),
+                    "runtime stable path moved; verifying the current target before launch"
+                );
+                let launch_path = launch_path
+                    .to_str()
+                    .ok_or(EngineError::Runtime("runtime_executable_invalid"))?;
+                let refreshed = runtime::verify(kind, Some(launch_path)).await;
+                let persisted = refreshed.clone();
+                self.store
+                    .call(move |store| store.save_runtime(&persisted))
+                    .await?;
+                let runtimes = self.store.call(|store| store.runtimes()).await?;
+                self.emit("runtime.changed", runtimes).await;
+                match refreshed.status.as_str() {
+                    "ready" => Ok(refreshed),
+                    "auth_required" => Err(EngineError::Runtime("auth_required")),
+                    _ => Err(EngineError::Runtime("runtime_not_verified")),
+                }
+            }
+            Err(code) => Err(EngineError::Runtime(code)),
         }
+    }
 
-        let runtime_session_id = session_id.clone();
-        let runtime_kind = self
+    async fn prepare_terminal_launch(
+        &self,
+        params: PrepareTerminalLaunchParams,
+    ) -> Result<models::TerminalLaunchPlan, EngineError> {
+        for (name, token) in [
+            ("lifecycleToken", params.lifecycle_token.as_str()),
+            ("hookToken", params.hook_token.as_str()),
+        ] {
+            if token.is_empty() || token.len() > 512 {
+                return Err(EngineError::Invalid(format!("{name} is invalid")));
+            }
+        }
+        if params.lifecycle_token == params.hook_token {
+            return Err(EngineError::Invalid(
+                "terminal status tokens must be distinct".to_owned(),
+            ));
+        }
+        let lookup_id = params.session_id.clone();
+        let session = self
             .store
             .call(move |store| {
                 store
-                    .session(&runtime_session_id)?
-                    .map(|session| session.runtime_kind)
+                    .terminal_session(&lookup_id)?
                     .ok_or(StoreError::NotFound)
             })
             .await?;
-        let runtime = self.ready_runtime(runtime_kind).await?;
-        let executable = runtime
+        // A Session keeps the original canonical cwd permanently, but that
+        // directory can be moved or deleted later. Reject it before scanning
+        // provider state or durably inserting a `starting` Run; otherwise the
+        // runner is launched only to print an error and immediately exit.
+        terminal::validate_launch_working_directory(&session.working_directory)
+            .map_err(|_| EngineError::Runtime("terminal_working_directory_unavailable"))?;
+        let status_socket = PathBuf::from(&params.status_socket);
+        validate_status_socket(&status_socket, params.host_pid)?;
+        let provider_session_is_resumable = if session.runtime_kind == RuntimeKind::Claude {
+            let provider_session_id = session
+                .provider_session_id
+                .as_deref()
+                .ok_or(EngineError::Runtime("provider_session_unbound"))?
+                .to_owned();
+            let working_directory = PathBuf::from(&session.working_directory);
+            let resume_state = tokio::task::spawn_blocking(move || {
+                terminal::claude_resume_state(&provider_session_id, &working_directory)
+            })
+            .await
+            .map_err(|_| EngineError::Runtime("claude_session_scan_failed"))?;
+            match resume_state {
+                Ok(terminal::ClaudeResumeState::Absent) => false,
+                Ok(terminal::ClaudeResumeState::Resumable) => true,
+                Ok(terminal::ClaudeResumeState::Unusable) => {
+                    return Err(EngineError::Runtime("claude_session_not_resumable"));
+                }
+                Err(_) => return Err(EngineError::Runtime("claude_session_scan_failed")),
+            }
+        } else {
+            true
+        };
+        let runtime = self.ready_runtime_for_launch(session.runtime_kind).await?;
+        let agent_executable = runtime
             .resolved_path
             .or(runtime.launch_path)
             .ok_or(EngineError::Runtime("runtime_missing"))?;
-        let queued = self
+        validate_launch_executable(Path::new(&agent_executable), "agent executable")?;
+        let current_executable =
+            std::env::current_exe().map_err(|_| EngineError::Runtime("terminal_runner_missing"))?;
+        let runner = current_executable.with_file_name(terminal::RUNNER_BINARY_NAME);
+        validate_launch_executable(&runner, "terminal runner")?;
+
+        if session.runtime_kind == RuntimeKind::Cursor && session.provider_session_id.is_none() {
+            let mut command = tokio::process::Command::new(&agent_executable);
+            command
+                .arg("create-chat")
+                .current_dir(&session.working_directory)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            let mut child = command
+                .spawn()
+                .map_err(|_| EngineError::Runtime("cursor_create_chat_failed"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or(EngineError::Runtime("cursor_create_chat_failed"))?;
+            let stdout_task = tokio::spawn(async move {
+                let mut output = Vec::new();
+                stdout
+                    .take(64 * 1024 + 1)
+                    .read_to_end(&mut output)
+                    .await
+                    .map(|_| output)
+            });
+            let status = match tokio::time::timeout(CURSOR_CREATE_CHAT_TIMEOUT, child.wait()).await
+            {
+                Ok(result) => {
+                    result.map_err(|_| EngineError::Runtime("cursor_create_chat_failed"))?
+                }
+                Err(_) => {
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                    stdout_task.abort();
+                    return Err(EngineError::Runtime("cursor_create_chat_timeout"));
+                }
+            };
+            let stdout = stdout_task
+                .await
+                .map_err(|_| EngineError::Runtime("cursor_create_chat_failed"))?
+                .map_err(|_| EngineError::Runtime("cursor_create_chat_failed"))?;
+            if stdout.len() > 64 * 1024 {
+                return Err(EngineError::Runtime("cursor_create_chat_invalid"));
+            }
+            if !status.success() {
+                return Err(EngineError::Runtime("cursor_create_chat_failed"));
+            }
+            let id = parse_single_uuid(&stdout)
+                .ok_or(EngineError::Runtime("cursor_create_chat_invalid"))?;
+            // Cursor obtains its identity before the terminal starts. Persist
+            // the binding and first run in one transaction before exposing the
+            // launch plan.
+            let prepare_session_id = params.session_id.clone();
+            let prepare_run_id = params.run_id.clone();
+            let bundle = self
+                .store
+                .call(move |store| {
+                    store.prepare_terminal_run_with_provider(
+                        &prepare_session_id,
+                        &prepare_run_id,
+                        &id,
+                        "create_chat",
+                    )
+                })
+                .await?;
+            return self.build_terminal_plan(params, bundle, runner, agent_executable);
+        }
+
+        let prepare_session_id = params.session_id.clone();
+        let prepare_run_id = params.run_id.clone();
+        let is_claude = session.runtime_kind == RuntimeKind::Claude;
+        let bundle = self
             .store
-            .call(move |store| store.send_message(&session_id, &client_message_id, &text))
+            .call(move |store| {
+                if is_claude {
+                    store.prepare_terminal_run_with_resume_readiness(
+                        &prepare_session_id,
+                        &prepare_run_id,
+                        provider_session_is_resumable,
+                    )
+                } else {
+                    store.prepare_terminal_run(&prepare_session_id, &prepare_run_id)
+                }
+            })
             .await?;
-        let executable = queued.is_new.then_some(executable);
-        Ok((queued, executable))
+        self.build_terminal_plan(params, bundle, runner, agent_executable)
+    }
+
+    async fn resume_candidates(
+        &self,
+        session_id: &str,
+    ) -> Result<models::TerminalResumeCandidates, EngineError> {
+        let lookup = session_id.to_owned();
+        let session = self
+            .store
+            .call(move |store| store.terminal_session(&lookup)?.ok_or(StoreError::NotFound))
+            .await?;
+        if session.provider_session_id.is_some() {
+            return Ok(models::TerminalResumeCandidates {
+                session,
+                candidates: Vec::new(),
+            });
+        }
+        let scan_session = session.clone();
+        let candidates =
+            tokio::task::spawn_blocking(move || terminal::resume_candidates(&scan_session))
+                .await
+                .map_err(|_| EngineError::Runtime("resume_candidate_scan_failed"))??;
+        Ok(models::TerminalResumeCandidates {
+            session,
+            candidates,
+        })
+    }
+
+    fn build_terminal_plan(
+        &self,
+        params: PrepareTerminalLaunchParams,
+        bundle: models::TerminalSessionBundle,
+        runner: PathBuf,
+        agent_executable: String,
+    ) -> Result<models::TerminalLaunchPlan, EngineError> {
+        let run = bundle
+            .active_run
+            .ok_or(EngineError::Conflict("terminal_run_not_active"))?;
+        let descriptor_directory = self.data_directory.join("TerminalRuns");
+        terminal::build_launch_plan(
+            bundle.session,
+            run,
+            runner.display().to_string(),
+            agent_executable,
+            params.task_title.as_deref(),
+            &params.status_socket,
+            &params.lifecycle_token,
+            &params.hook_token,
+            params.host_pid,
+            params.provider_hooks_enabled,
+            &descriptor_directory,
+        )
+        .map_err(|_| EngineError::Runtime("terminal_descriptor_failed"))
     }
 
     async fn test_gemini_connection(&self, model: &str) -> Result<GeminiTestResult, EngineError> {
@@ -949,394 +1169,6 @@ impl Engine {
             version: metadata.version,
             input_token_limit: metadata.input_token_limit,
         })
-    }
-
-    async fn schedule(&self, queued: QueuedTurn, executable: String) {
-        let token = CancellationToken::new();
-        self.turns.lock().await.insert(
-            queued.session.id.clone(),
-            ActiveCliTurn {
-                turn_id: queued.turn.id.clone(),
-                cancellation: token.clone(),
-            },
-        );
-        let engine = self.clone();
-        tokio::spawn(async move {
-            let permit = match engine.concurrency.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => {
-                    engine
-                        .remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
-                        .await;
-                    return;
-                }
-            };
-            let _permit = permit;
-            if token.is_cancelled() {
-                engine.finish_cancelled(&queued).await;
-                return;
-            }
-            let turn_id = queued.turn.id.clone();
-            let running = match engine
-                .store
-                .call(move |store| store.mark_turn_running(&turn_id))
-                .await
-            {
-                Ok(turn) => turn,
-                Err(error) => {
-                    tracing::error!("failed to mark turn running: {error}");
-                    engine
-                        .remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
-                        .await;
-                    return;
-                }
-            };
-            engine.emit("session.turn.started", &running).await;
-            let session_id = queued.session.id.clone();
-            if let Ok(bundle) = engine
-                .store
-                .call(move |store| store.session_bundle(&session_id, 0, 500))
-                .await
-            {
-                engine.emit("session.state_changed", &bundle).await;
-            }
-            let request = TurnRequest {
-                runtime: queued.session.runtime_kind,
-                executable: PathBuf::from(executable),
-                working_directory: PathBuf::from(&queued.session.working_directory),
-                prompt: queued.prompt.clone(),
-                provider_session_id: queued.session.provider_session_id.clone(),
-            };
-            let outcome = engine.execute_once(&queued, request, token.clone()).await;
-            let outcome = if outcome.error_code.as_deref() == Some("provider_session_invalid")
-                && !token.is_cancelled()
-            {
-                engine.cold_recover(&queued, outcome, token.clone()).await
-            } else {
-                outcome
-            };
-            engine.persist_outcome(&queued, outcome).await;
-            engine
-                .remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
-                .await;
-        });
-    }
-
-    async fn execute_once(
-        &self,
-        queued: &QueuedTurn,
-        request: TurnRequest,
-        token: CancellationToken,
-    ) -> TurnOutcome {
-        let (event_tx, mut event_rx) = mpsc::channel(256);
-        let runner = tokio::spawn(adapters::run_turn(request, token, event_tx));
-        tokio::pin!(runner);
-        let mut pending = PendingProviderMutations::default();
-        let mut frame_batch = Vec::<ProviderFrame>::new();
-        let mut frame_batch_bytes = 0_usize;
-        let mut store_clock = interval(PROVIDER_FRAME_BATCH_INTERVAL);
-        let mut emit_clock = interval(Duration::from_millis(400));
-        store_clock.tick().await;
-        emit_clock.tick().await;
-        let outcome = loop {
-            tokio::select! {
-                result = &mut runner => break result.unwrap_or_else(|error| TurnOutcome {
-                    status:"failed",exit_code:None,final_output:String::new(),provider_session_id:None,
-                    error_code:Some("engine_error".to_owned()),error_message:Some(error.to_string()),usage:None,
-                }),
-                _ = store_clock.tick() => {
-                    self.persist_provider_batch(queued, &mut frame_batch, &mut pending).await;
-                    frame_batch_bytes = 0;
-                }
-                _ = emit_clock.tick() => {
-                    self.flush_provider_mutations(&mut pending).await;
-                }
-                frame = event_rx.recv() => {
-                    if let Some(frame) = frame {
-                        if enqueue_provider_frame(&mut frame_batch, &mut frame_batch_bytes, frame) {
-                            self.persist_provider_batch(queued, &mut frame_batch, &mut pending).await;
-                            frame_batch_bytes = 0;
-                        }
-                    }
-                }
-            }
-        };
-        while let Ok(frame) = event_rx.try_recv() {
-            if enqueue_provider_frame(&mut frame_batch, &mut frame_batch_bytes, frame) {
-                self.persist_provider_batch(queued, &mut frame_batch, &mut pending)
-                    .await;
-                frame_batch_bytes = 0;
-            }
-        }
-        self.persist_provider_batch(queued, &mut frame_batch, &mut pending)
-            .await;
-        self.flush_provider_mutations(&mut pending).await;
-        outcome
-    }
-
-    async fn cold_recover(
-        &self,
-        queued: &QueuedTurn,
-        original: TurnOutcome,
-        token: CancellationToken,
-    ) -> TurnOutcome {
-        let session_id = queued.session.id.clone();
-        let context = match self
-            .store
-            .call(move |store| store.recovery_context(&session_id, 64 * 1024))
-            .await
-        {
-            Ok(context) => context,
-            Err(_) => return original,
-        };
-        let session_id = queued.session.id.clone();
-        let _ = self
-            .store
-            .call(move |store| store.clear_provider_session(&session_id))
-            .await;
-        let turn_id = queued.turn.id.clone();
-        if let Ok(message) = self
-            .store
-            .call(move |store| {
-                store.append_message(
-                    &turn_id,
-                    MessageRole::System,
-                    "status",
-                    "原供应商 Session 已失效，TodoAgent 正在用最近对话重建上下文。",
-                    None,
-                )
-            })
-            .await
-        {
-            self.emit("session.message.appended", &message).await;
-        }
-        let runtime = match self.ready_runtime(queued.session.runtime_kind).await {
-            Ok(runtime) => runtime,
-            Err(_) => return original,
-        };
-        self.execute_once(
-            queued,
-            TurnRequest {
-                runtime: queued.session.runtime_kind,
-                executable: PathBuf::from(
-                    runtime
-                        .resolved_path
-                        .or(runtime.launch_path)
-                        .unwrap_or_default(),
-                ),
-                working_directory: PathBuf::from(&queued.session.working_directory),
-                prompt: context,
-                provider_session_id: None,
-            },
-            token,
-        )
-        .await
-    }
-
-    async fn flush_provider_mutations(&self, pending: &mut PendingProviderMutations) {
-        if pending.is_empty() {
-            return;
-        }
-        let committed = std::mem::take(pending);
-        for message in committed.messages {
-            self.emit(
-                if message.role == MessageRole::Agent && message.kind == "text" {
-                    "session.message.delta"
-                } else {
-                    "session.message.appended"
-                },
-                &message,
-            )
-            .await;
-        }
-        for mutation in committed.timeline {
-            self.emit_timeline_mutation(&mutation).await;
-        }
-    }
-
-    async fn emit_timeline_mutation(&self, mutation: &AppliedTimelineMutation) {
-        let event = if mutation.is_update {
-            "session.timeline.item.updated"
-        } else {
-            "session.timeline.item.appended"
-        };
-        self.emit(event, &mutation.item).await;
-    }
-
-    async fn persist_provider_batch(
-        &self,
-        queued: &QueuedTurn,
-        frames: &mut Vec<ProviderFrame>,
-        pending: &mut PendingProviderMutations,
-    ) {
-        if frames.is_empty() {
-            return;
-        }
-        let frames = std::mem::take(frames);
-        let retry_frames = frames.clone();
-        let turn_id = queued.turn.id.clone();
-        match self
-            .store
-            .call(move |store| store.apply_provider_frames(&turn_id, frames))
-            .await
-        {
-            Ok(applied) => pending.merge(applied),
-            Err(error) => {
-                tracing::error!("failed to atomically persist provider frame batch: {error}");
-                // A malformed provider frame must not discard other valid
-                // frames in the bounded batch. Retry individually only on this
-                // rare path; if semantics are invalid, retain its raw audit
-                // frame without a UI projection.
-                for frame in retry_frames {
-                    let turn_id = queued.turn.id.clone();
-                    let raw_fallback = ProviderFrame {
-                        raw_kind: frame.raw_kind.clone(),
-                        raw_payload: frame.raw_payload.clone(),
-                        events: Vec::new(),
-                    };
-                    match self
-                        .store
-                        .call(move |store| store.apply_provider_frame(&turn_id, frame))
-                        .await
-                    {
-                        Ok(applied) => pending.merge(applied),
-                        Err(frame_error) => {
-                            let semantic_error =
-                                format!("provider frame semantic projection failed: {frame_error}");
-                            tracing::error!("{semantic_error}");
-                            let turn_id = queued.turn.id.clone();
-                            let raw_result = self
-                                .store
-                                .call(move |store| {
-                                    store.apply_provider_frame(&turn_id, raw_fallback)
-                                })
-                                .await;
-                            let (fidelity, degradation_error) = match raw_result {
-                                Ok(_) => ("partial", semantic_error),
-                                Err(raw_error) => {
-                                    let error = format!(
-                                        "{semantic_error}; provider raw audit persistence failed: {raw_error}"
-                                    );
-                                    tracing::error!("{error}");
-                                    ("failed", error)
-                                }
-                            };
-                            let turn_id = queued.turn.id.clone();
-                            let degradation_error_for_store = degradation_error.clone();
-                            if let Err(mark_error) = self
-                                .store
-                                .call(move |store| {
-                                    store.mark_timeline_projection_degraded(
-                                        &turn_id,
-                                        fidelity,
-                                        &degradation_error_for_store,
-                                    )
-                                })
-                                .await
-                            {
-                                tracing::error!(
-                                    "failed to mark degraded timeline projection: {mark_error}; original: {degradation_error}"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    async fn persist_outcome(&self, queued: &QueuedTurn, outcome: TurnOutcome) {
-        let status = match outcome.status {
-            "completed" => TurnStatus::Completed,
-            "cancelled" => TurnStatus::Cancelled,
-            _ => TurnStatus::Failed,
-        };
-        // Some providers only expose final text in their terminal event.
-        if status == TurnStatus::Completed && !outcome.final_output.is_empty() {
-            let turn_id = queued.turn.id.clone();
-            let has_agent = self
-                .store
-                .call(move |store| store.turn_has_agent_text(&turn_id))
-                .await
-                .unwrap_or(false);
-            if !has_agent {
-                let fallback_text = outcome.final_output.clone();
-                let fallback_frame = ProviderFrame {
-                    raw_kind: Some("todoagent.final_output_fallback".to_owned()),
-                    raw_payload: Some(json!({"text":fallback_text})),
-                    events: vec![ProviderEvent::Text(outcome.final_output.clone())],
-                };
-                let mut frames = vec![fallback_frame];
-                let mut pending = PendingProviderMutations::default();
-                self.persist_provider_batch(queued, &mut frames, &mut pending)
-                    .await;
-                self.flush_provider_mutations(&mut pending).await;
-            }
-        }
-        let usage = outcome.usage.as_ref().map(Value::to_string);
-        let turn_id = queued.turn.id.clone();
-        match self
-            .store
-            .call(move |store| {
-                store.finish_turn(
-                    &turn_id,
-                    status,
-                    outcome.exit_code,
-                    Some(&outcome.final_output),
-                    outcome.provider_session_id.as_deref(),
-                    outcome.error_code.as_deref(),
-                    outcome.error_message.as_deref(),
-                    usage.as_deref(),
-                )
-            })
-            .await
-        {
-            Ok(finished) => {
-                self.remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
-                    .await;
-                let bundle = finished.bundle;
-                self.emit("session.turn.finished", &bundle).await;
-                self.emit("session.unread_changed", &bundle.session).await;
-                self.emit(
-                    "session.timeline.turn.finished",
-                    &json!({
-                        "sessionId": bundle.session.id,
-                        "turnId": queued.turn.id,
-                        "fidelity": finished.timeline_fidelity,
-                        "items": finished.timeline_mutations
-                    }),
-                )
-                .await;
-            }
-            Err(error) => {
-                self.remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
-                    .await;
-                tracing::error!("failed to finish turn: {error}");
-            }
-        }
-    }
-
-    async fn finish_cancelled(&self, queued: &QueuedTurn) {
-        self.persist_outcome(
-            queued,
-            TurnOutcome {
-                status: "cancelled",
-                exit_code: None,
-                final_output: String::new(),
-                provider_session_id: queued.session.provider_session_id.clone(),
-                error_code: Some("cancelled".to_owned()),
-                error_message: Some("cancelled".to_owned()),
-                usage: None,
-            },
-        )
-        .await;
-        self.remove_cli_turn_if_matches(&queued.session.id, &queued.turn.id)
-            .await;
-    }
-
-    async fn remove_cli_turn_if_matches(&self, session_id: &str, turn_id: &str) -> bool {
-        let mut turns = self.turns.lock().await;
-        remove_matching_cli_turn(&mut turns, session_id, turn_id)
     }
 
     async fn publish_task_snapshot(
@@ -1535,14 +1367,6 @@ impl Engine {
     async fn shutdown(&self) {
         self.assistant.shutdown().await;
         *self.gemini_key.lock().await = None;
-        let tokens: Vec<_> = self.turns.lock().await.values().cloned().collect();
-        for active in tokens {
-            active.cancellation.cancel();
-        }
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !self.turns.lock().await.is_empty() && Instant::now() < deadline {
-            sleep(Duration::from_millis(50)).await;
-        }
         if let Err(error) = self.store.shutdown().await {
             tracing::error!("failed to stop database worker: {error}");
         }
@@ -1557,6 +1381,70 @@ impl Engine {
             let _ = self.writer.send(value);
         }
     }
+}
+
+fn validate_launch_executable(path: &Path, label: &str) -> Result<(), EngineError> {
+    if !path.is_absolute() {
+        return Err(EngineError::Invalid(format!("{label} must be absolute")));
+    }
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err(EngineError::Invalid(format!(
+            "{label} must be a regular executable file"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_status_socket(path: &Path, host_pid: u32) -> Result<(), EngineError> {
+    validate_status_socket_under(path, host_pid, Path::new("/tmp"))
+}
+
+fn validate_status_socket_under(
+    path: &Path,
+    host_pid: u32,
+    temporary_root: &Path,
+) -> Result<(), EngineError> {
+    if !path.is_absolute() || host_pid == 0 {
+        return Err(EngineError::Invalid("statusSocket is invalid".to_owned()));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| EngineError::Invalid("statusSocket has no parent".to_owned()))?;
+    let expected_parent = temporary_root.join(format!("todoagent-{host_pid}"));
+    if parent != expected_parent {
+        return Err(EngineError::Invalid(
+            "statusSocket must be inside the TodoAgent host directory".to_owned(),
+        ));
+    }
+    let uid = unsafe { nix::libc::geteuid() };
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.is_dir()
+        || parent_metadata.uid() != uid
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(EngineError::Invalid(
+            "statusSocket parent must be current-user mode 0700".to_owned(),
+        ));
+    }
+    validate_status_socket_file(path, uid)
+}
+
+fn validate_status_socket_file(path: &Path, uid: u32) -> Result<(), EngineError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(EngineError::Invalid(
+            "statusSocket must be a current-user mode 0600 Unix socket".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn stage_task_attachment_batch(
@@ -1828,22 +1716,6 @@ fn prepare_managed_attachment_deletion(
     Ok((Some(final_path.to_owned()), Some(quarantine.to_owned())))
 }
 
-fn remove_matching_cli_turn(
-    turns: &mut HashMap<String, ActiveCliTurn>,
-    session_id: &str,
-    turn_id: &str,
-) -> bool {
-    if turns
-        .get(session_id)
-        .is_some_and(|active| active.turn_id == turn_id)
-    {
-        turns.remove(session_id);
-        true
-    } else {
-        false
-    }
-}
-
 fn response_for_error(id: String, error: EngineError) -> Response {
     match error {
         EngineError::Store(StoreWorkerError::Store(StoreError::NotFound)) => {
@@ -1859,7 +1731,21 @@ fn response_for_error(id: String, error: EngineError) -> Response {
                 Response::err(id, "invalid_params", message)
             }
         }
-        EngineError::Runtime(code) => Response::err(id, code, code.replace('_', " ")),
+        EngineError::Runtime(code) => {
+            let message = match code {
+                "claude_session_not_resumable" => {
+                    "Claude 的会话记录已存在，但还没有可恢复的对话内容。请先在 Claude Code 中处理或移走这条不完整记录，再重试。"
+                }
+                "claude_session_scan_failed" => {
+                    "无法安全检查 Claude 的本地会话记录，请确认 ~/.claude（或 CLAUDE_CONFIG_DIR）可以读取后重试。"
+                }
+                "terminal_working_directory_unavailable" => {
+                    "这个 Session 绑定的工作目录已不存在或不再是真实目录。请在 TodoAgent 中重新定位项目当前目录后重试。"
+                }
+                _ => return Response::err(id, code, code.replace('_', " ")),
+            };
+            Response::err(id, code, message)
+        }
         EngineError::Gemini { code, message } => Response::err(id, code, message),
         EngineError::Assistant(assistant_service::AssistantServiceError::Store(
             StoreWorkerError::Store(StoreError::NotFound),
@@ -1953,6 +1839,16 @@ fn validate_text(value: &str, maximum: usize, name: &str) -> Result<(), EngineEr
     Ok(())
 }
 
+fn parse_single_uuid(bytes: &[u8]) -> Option<String> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut values = text
+        .split(|character: char| character.is_whitespace() || matches!(character, '"' | '\''))
+        .filter_map(|candidate| uuid::Uuid::parse_str(candidate.trim()).ok())
+        .map(|value| value.to_string());
+    let first = values.next()?;
+    values.next().is_none().then_some(first)
+}
+
 fn canonical_directory(value: &str) -> Result<PathBuf, EngineError> {
     let path = fs::canonicalize(value)
         .map_err(|_| EngineError::Invalid("working directory does not exist".to_owned()))?;
@@ -2027,59 +1923,9 @@ mod tests {
     use std::os::unix::fs::symlink;
     use uuid::Uuid;
 
-    #[test]
-    fn provider_tail_drain_uses_the_same_bounded_batches_as_live_streaming() {
-        let mut batch = Vec::new();
-        let mut batch_bytes = 0;
-        let mut flushed_batches = 0;
-        let mut maximum_frames = 0;
-        for index in 0..256 {
-            let frame = ProviderFrame {
-                raw_kind: Some("tail".to_owned()),
-                raw_payload: Some(json!({
-                    "index":index,
-                    "payload":"x".repeat(32 * 1024)
-                })),
-                events: Vec::new(),
-            };
-            if enqueue_provider_frame(&mut batch, &mut batch_bytes, frame) {
-                maximum_frames = maximum_frames.max(batch.len());
-                assert!(batch.len() <= PROVIDER_FRAME_BATCH_MAX_FRAMES);
-                flushed_batches += 1;
-                batch.clear();
-                batch_bytes = 0;
-            }
-        }
-        if !batch.is_empty() {
-            flushed_batches += 1;
-        }
-        assert!(flushed_batches > 1);
-        assert!(maximum_frames <= PROVIDER_FRAME_BATCH_MAX_FRAMES);
-    }
-
-    fn test_runtime(kind: RuntimeKind, status: &str) -> models::Runtime {
-        models::Runtime {
-            kind,
-            launch_path: Some("/usr/bin/true".to_owned()),
-            resolved_path: Some("/usr/bin/true".to_owned()),
-            version: Some("test".to_owned()),
-            status: status.to_owned(),
-            auth_status: if status == "auth_required" {
-                "required".to_owned()
-            } else {
-                "authenticated".to_owned()
-            },
-            capabilities: json!({}),
-            provider_engine: None,
-            detected_at: None,
-            verified_at: None,
-            verify_error: None,
-        }
-    }
-
     fn test_engine(
         store: StoreWorker,
-        concurrency: usize,
+        _concurrency: usize,
         data_directory: PathBuf,
     ) -> (Engine, std::sync::mpsc::Receiver<Value>) {
         let (writer, receiver) = sync_channel(512);
@@ -2097,8 +1943,6 @@ mod tests {
             Engine {
                 store,
                 writer,
-                turns: Arc::new(Mutex::new(HashMap::new())),
-                concurrency: Arc::new(Semaphore::new(concurrency)),
                 authorized_directories: Arc::new(Mutex::new(HashSet::new())),
                 gemini_key,
                 assistant,
@@ -2112,6 +1956,249 @@ mod tests {
     #[test]
     fn request_size_is_bounded() {
         assert_eq!(MAX_REQUEST_BYTES, 1024 * 1024);
+    }
+
+    fn write_fake_claude(path: &Path, version: &str) {
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  --version) echo '{version} (Claude Code)' ;;\n  --help) echo '--session-id --resume --name --settings' ;;\n  auth) echo '{{\"authenticated\":true}}' ;;\n  *) exit 1 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    async fn assert_claude_version_symlink_rollover(delete_old_target: bool) {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let versions = directory.path().join("versions");
+        fs::create_dir_all(&versions).unwrap();
+        let old_target = versions.join("2.1.224");
+        let new_target = versions.join("2.1.228");
+        write_fake_claude(&old_target, "2.1.224");
+        write_fake_claude(&new_target, "2.1.228");
+        let old_resolved = fs::canonicalize(&old_target).unwrap();
+        let new_resolved = fs::canonicalize(&new_target).unwrap();
+        let stable_launch = directory.path().join("claude");
+        symlink(&old_target, &stable_launch).unwrap();
+
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let verified = models::Runtime {
+            kind: RuntimeKind::Claude,
+            launch_path: Some(stable_launch.to_string_lossy().into_owned()),
+            resolved_path: Some(old_resolved.to_string_lossy().into_owned()),
+            version: Some("2.1.224 (Claude Code)".to_owned()),
+            status: "ready".to_owned(),
+            auth_status: "authenticated".to_owned(),
+            capabilities: json!({"capabilityProbe":"passed","oldTarget":true}),
+            provider_engine: None,
+            detected_at: Some("2026-08-09T00:00:00Z".to_owned()),
+            verified_at: Some("2026-08-09T00:00:00Z".to_owned()),
+            verify_error: None,
+        };
+        worker
+            .call(move |store| store.save_runtime(&verified))
+            .await
+            .unwrap();
+
+        fs::remove_file(&stable_launch).unwrap();
+        symlink(&new_target, &stable_launch).unwrap();
+        if delete_old_target {
+            fs::remove_file(&old_target).unwrap();
+        }
+
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        let refreshed = engine
+            .ready_runtime_for_launch(RuntimeKind::Claude)
+            .await
+            .unwrap();
+        assert_eq!(
+            refreshed.resolved_path.as_deref(),
+            Some(new_resolved.to_string_lossy().as_ref())
+        );
+        assert_eq!(refreshed.version.as_deref(), Some("2.1.228 (Claude Code)"));
+        assert_eq!(refreshed.status, "ready");
+        assert_eq!(refreshed.capabilities["capabilityProbe"], "passed");
+        assert!(refreshed.capabilities.get("oldTarget").is_none());
+        assert_eq!(old_target.exists(), !delete_old_target);
+
+        let persisted = worker
+            .call(|store| store.runtime(RuntimeKind::Claude))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted, refreshed);
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "runtime.changed");
+        assert_eq!(
+            event["data"][0]["resolvedPath"],
+            new_resolved.to_string_lossy().as_ref()
+        );
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn launch_refreshes_claude_when_stable_symlink_moves_and_old_target_remains() {
+        assert_claude_version_symlink_rollover(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn launch_refreshes_claude_when_stable_symlink_moves_and_old_target_is_deleted() {
+        assert_claude_version_symlink_rollover(true).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn prepare_launch_rejects_a_removed_session_directory_without_creating_a_run() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let missing = directory.path().join("removed-project");
+        let task = worker
+            .call(|store| store.create_task("Removed cwd", "", None, None, None))
+            .await
+            .unwrap();
+        let task_id = task.id.clone();
+        let missing_path = missing.to_string_lossy().into_owned();
+        let session = worker
+            .call(move |store| {
+                store.create_terminal_session(&task_id, RuntimeKind::Claude, &missing_path)
+            })
+            .await
+            .unwrap();
+        let session_id = session.id.clone();
+        let run_id = Uuid::new_v4().to_string();
+        let (engine, _receiver) = test_engine(worker.clone(), 0, data);
+
+        let result = engine
+            .prepare_terminal_launch(PrepareTerminalLaunchParams {
+                session_id: session_id.clone(),
+                run_id,
+                task_title: Some("Removed cwd".to_owned()),
+                // cwd validation must happen before this deliberately invalid
+                // socket can affect the result.
+                status_socket: "/not/a/status.sock".to_owned(),
+                lifecycle_token: "lifecycle-token".to_owned(),
+                hook_token: "hook-token".to_owned(),
+                host_pid: std::process::id(),
+                provider_hooks_enabled: false,
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::Runtime(
+                "terminal_working_directory_unavailable"
+            ))
+        ));
+        assert!(
+            worker
+                .call(move |store| store.latest_terminal_run(&session_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale working directory must not create a durable starting Run"
+        );
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rebind_workspace_requires_authorization_and_preserves_the_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let replacement = directory.path().join("replacement");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir(&replacement).unwrap();
+        let replacement = fs::canonicalize(replacement).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| store.create_task("Moved cwd", "", None, None, None))
+            .await
+            .unwrap();
+        let task_id = task.id;
+        let session = worker
+            .call(move |store| {
+                store.create_terminal_session(&task_id, RuntimeKind::Claude, "/old/project")
+            })
+            .await
+            .unwrap();
+        let provider_id = session.provider_session_id.clone();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        let request = || Request {
+            id: "rebind".to_owned(),
+            method: "terminal.session.rebind_workspace".to_owned(),
+            params: json!({
+                "sessionId": session.id,
+                "workingDirectory": replacement,
+            }),
+        };
+
+        let unauthorized = engine.handle(request()).await;
+        assert_eq!(unauthorized.error.unwrap().code, "workspace_not_authorized");
+        engine
+            .authorized_directories
+            .lock()
+            .await
+            .insert(replacement.clone());
+        let rebound = engine.handle(request()).await.result.unwrap();
+        assert_eq!(
+            rebound["session"]["workingDirectory"],
+            replacement.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            rebound["session"]["providerSessionId"],
+            provider_id.as_deref().unwrap()
+        );
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "terminal.session.changed");
+        assert_eq!(event["data"], rebound);
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn missing_terminal_working_directory_has_actionable_protocol_error() {
+        let response = response_for_error(
+            "resume".to_owned(),
+            EngineError::Runtime("terminal_working_directory_unavailable"),
+        );
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "terminal_working_directory_unavailable");
+        assert!(error.message.contains("重新定位"));
+    }
+
+    #[test]
+    fn status_socket_must_be_host_scoped_secure_and_a_datagram_socket() {
+        let host_pid = std::process::id();
+        assert_eq!(
+            Path::new("/tmp").join(format!("todoagent-{host_pid}")),
+            PathBuf::from(format!("/tmp/todoagent-{host_pid}"))
+        );
+        let temporary_root = tempfile::Builder::new()
+            .prefix("ta-")
+            .tempdir_in("/private/tmp")
+            .unwrap();
+        let directory = temporary_root.path().join(format!("todoagent-{host_pid}"));
+        fs::create_dir_all(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.join(format!("engine-test-{}.sock", Uuid::new_v4()));
+        fs::write(&path, b"not a socket").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        // The sandbox cannot bind AF_UNIX paths, but parent provenance is
+        // independently accepted and a same-mode regular file is rejected.
+        assert!(validate_status_socket_file(&path, unsafe { nix::libc::geteuid() }).is_err());
+        assert!(validate_status_socket_under(&path, host_pid, temporary_root.path()).is_err());
+        assert!(
+            validate_status_socket_under(&path, host_pid.saturating_add(1), temporary_root.path())
+                .is_err()
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -2470,7 +2557,7 @@ mod tests {
         });
         let started = std::time::Instant::now();
 
-        sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         assert!(
             started.elapsed() < Duration::from_millis(500),
@@ -2489,40 +2576,16 @@ mod tests {
     }
 
     #[test]
-    fn session_lookup_requires_protocol_camel_case_ids() {
+    fn terminal_session_lookup_requires_protocol_camel_case_ids() {
         let task_id = Uuid::new_v4().to_string();
-        let task: SessionLookupParams = parse(&json!({"taskId":task_id.to_uppercase()})).unwrap();
+        let task: TerminalSessionLookupParams =
+            parse(&json!({"taskId":task_id.to_uppercase()})).unwrap();
         assert_eq!(task.task_id.as_deref(), Some(task_id.as_str()));
         assert!(task.session_id.is_none());
 
-        let error =
-            parse::<SessionLookupParams>(&json!({"taskID":task_id.to_uppercase()})).unwrap_err();
+        let error = parse::<TerminalSessionLookupParams>(&json!({"taskID":task_id.to_uppercase()}))
+            .unwrap_err();
         assert!(error.to_string().contains("unknown field `taskID`"));
-    }
-
-    #[test]
-    fn stale_cli_turn_cleanup_never_removes_the_next_turn_token() {
-        let mut turns = HashMap::new();
-        turns.insert(
-            "session-1".to_owned(),
-            ActiveCliTurn {
-                turn_id: "turn-new".to_owned(),
-                cancellation: CancellationToken::new(),
-            },
-        );
-
-        assert!(!remove_matching_cli_turn(
-            &mut turns,
-            "session-1",
-            "turn-old"
-        ));
-        assert_eq!(turns["session-1"].turn_id, "turn-new");
-        assert!(remove_matching_cli_turn(
-            &mut turns,
-            "session-1",
-            "turn-new"
-        ));
-        assert!(turns.is_empty());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2799,8 +2862,9 @@ mod tests {
         let task_id = task.id.clone();
         worker
             .call(move |store| {
-                let session = store.create_session(&task_id, RuntimeKind::Codex, "/tmp")?;
-                store.send_message(&session.id, &Uuid::new_v4().to_string(), "执行中")?;
+                let session =
+                    store.create_terminal_session(&task_id, RuntimeKind::Codex, "/tmp")?;
+                store.prepare_terminal_run(&session.id, &Uuid::new_v4().to_string())?;
                 Ok(())
             })
             .await
@@ -2828,306 +2892,6 @@ mod tests {
         engine.assistant.shutdown().await;
         worker.shutdown().await.unwrap();
     }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn session_create_checks_executable_before_persisting_the_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let worker = StoreWorker::open(&directory.path().join("session-create.sqlite3")).unwrap();
-        let task_id = worker
-            .call(|store| Ok(store.create_task("任务", "", None, None, None)?.id))
-            .await
-            .unwrap();
-        let mut pathless = test_runtime(RuntimeKind::Codex, "ready");
-        pathless.launch_path = None;
-        pathless.resolved_path = None;
-        worker
-            .call(move |store| store.save_runtime(&pathless))
-            .await
-            .unwrap();
-        let (engine, _receiver) = test_engine(worker.clone(), 0, directory.path().to_owned());
-        let workspace = fs::canonicalize(directory.path()).unwrap();
-        engine
-            .authorized_directories
-            .lock()
-            .await
-            .insert(workspace.clone());
-
-        let error = engine
-            .handle_inner(&Request {
-                id: "create".to_owned(),
-                method: "session.create".to_owned(),
-                params: json!({
-                    "taskId": task_id,
-                    "runtimeKind": "codex",
-                    "workingDirectory": workspace.display().to_string(),
-                }),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(error, EngineError::Runtime("runtime_missing")));
-        let session = worker
-            .call(move |store| store.session_for_task(&task_id))
-            .await
-            .unwrap();
-        assert!(session.is_none());
-
-        engine.assistant.shutdown().await;
-        worker.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn session_create_returns_an_empty_idle_bundle_and_replays_without_scheduling() {
-        let directory = tempfile::tempdir().unwrap();
-        let data = directory.path().join("data");
-        let workspace = directory.path().join("workspace");
-        fs::create_dir_all(data.join("Attachments")).unwrap();
-        fs::create_dir_all(&workspace).unwrap();
-        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
-        let task = worker
-            .call(|store| {
-                store.create_task(
-                    "任务标题",
-                    "任务备注",
-                    None,
-                    Some("2026-08-10"),
-                    Some("2026-08-12"),
-                )
-            })
-            .await
-            .unwrap();
-        let ready = test_runtime(RuntimeKind::Codex, "ready");
-        worker
-            .call(move |store| store.save_runtime(&ready))
-            .await
-            .unwrap();
-        let (engine, receiver) = test_engine(worker.clone(), 0, data);
-        let workspace = fs::canonicalize(workspace).unwrap();
-        engine
-            .authorized_directories
-            .lock()
-            .await
-            .insert(workspace.clone());
-        let params = json!({
-            "taskId":task.id.to_uppercase(),
-            "runtimeKind":"codex",
-            "workingDirectory":workspace.display().to_string(),
-        });
-
-        let first = engine
-            .handle(Request {
-                id: "session-create-first".to_owned(),
-                method: "session.create".to_owned(),
-                params: params.clone(),
-            })
-            .await
-            .result
-            .unwrap();
-        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert_eq!(event["event"], "session.created");
-        assert_eq!(event["data"], first);
-        assert_eq!(first["session"]["state"], "idle");
-        assert!(first["messages"].as_array().unwrap().is_empty());
-        assert!(first["activeTurn"].is_null());
-        assert!(engine.turns.lock().await.is_empty());
-        let session_id = first["session"]["id"].as_str().unwrap().to_owned();
-        let revision = worker.call(|store| store.revision()).await.unwrap();
-        let turn_count = worker
-            .call({
-                let session_id = session_id.clone();
-                move |store| store.session_turn_count(&session_id)
-            })
-            .await
-            .unwrap();
-        assert_eq!(turn_count, 0);
-
-        let unavailable = test_runtime(RuntimeKind::Codex, "auth_required");
-        worker
-            .call(move |store| store.save_runtime(&unavailable))
-            .await
-            .unwrap();
-        let replay_revision = worker.call(|store| store.revision()).await.unwrap();
-        let replayed = engine
-            .handle(Request {
-                id: "session-create-replay".to_owned(),
-                method: "session.create".to_owned(),
-                params,
-            })
-            .await
-            .result
-            .unwrap();
-        assert_eq!(
-            receiver.recv_timeout(Duration::from_secs(1)).unwrap()["data"],
-            replayed
-        );
-        assert_eq!(replayed["session"]["id"], session_id);
-        assert!(replayed["messages"].as_array().unwrap().is_empty());
-        assert!(replayed["activeTurn"].is_null());
-        assert!(replay_revision > revision);
-        assert_eq!(
-            worker.call(|store| store.revision()).await.unwrap(),
-            replay_revision
-        );
-        assert!(engine.turns.lock().await.is_empty());
-
-        engine.assistant.shutdown().await;
-        worker.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn session_send_checks_runtime_before_queue_and_keeps_retries_idempotent() {
-        let directory = tempfile::tempdir().unwrap();
-        let worker = StoreWorker::open(&directory.path().join("session-send.sqlite3")).unwrap();
-        let session_id = worker
-            .call(|store| {
-                let task = store.create_task("任务", "", None, None, None)?;
-                Ok(store
-                    .create_session(&task.id, RuntimeKind::Codex, "/tmp")?
-                    .id)
-            })
-            .await
-            .unwrap();
-        let (engine, _receiver) = test_engine(worker.clone(), 0, directory.path().to_owned());
-        let initial_turn_count = worker
-            .call({
-                let session_id = session_id.clone();
-                move |store| store.session_turn_count(&session_id)
-            })
-            .await
-            .unwrap();
-
-        let missing_error = engine
-            .prepare_session_send(SendSessionParams {
-                session_id: session_id.clone(),
-                client_message_id: Uuid::new_v4().to_string(),
-                text: "runtime missing".to_owned(),
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            missing_error,
-            EngineError::Runtime("runtime_missing")
-        ));
-
-        for (status, expected_error) in [
-            ("auth_required", "auth_required"),
-            ("error", "runtime_not_verified"),
-        ] {
-            let runtime = test_runtime(RuntimeKind::Codex, status);
-            worker
-                .call(move |store| store.save_runtime(&runtime))
-                .await
-                .unwrap();
-            let error = engine
-                .prepare_session_send(SendSessionParams {
-                    session_id: session_id.clone(),
-                    client_message_id: Uuid::new_v4().to_string(),
-                    text: format!("runtime {status}"),
-                })
-                .await
-                .unwrap_err();
-            assert!(matches!(
-                error,
-                EngineError::Runtime(code) if code == expected_error
-            ));
-        }
-
-        let unchanged_turn_count = worker
-            .call({
-                let session_id = session_id.clone();
-                move |store| store.session_turn_count(&session_id)
-            })
-            .await
-            .unwrap();
-        assert_eq!(unchanged_turn_count, initial_turn_count);
-        let unchanged_bundle = worker
-            .call({
-                let session_id = session_id.clone();
-                move |store| store.session_bundle(&session_id, 0, 100)
-            })
-            .await
-            .unwrap();
-        assert!(unchanged_bundle.active_turn.is_none());
-        assert!(unchanged_bundle.messages.is_empty());
-
-        let ready = test_runtime(RuntimeKind::Codex, "ready");
-        worker
-            .call(move |store| store.save_runtime(&ready))
-            .await
-            .unwrap();
-        let client_message_id = Uuid::new_v4().to_string();
-        let params = SendSessionParams {
-            session_id: session_id.clone(),
-            client_message_id: client_message_id.clone(),
-            text: "正常发送".to_owned(),
-        };
-        let (queued, executable) = engine.prepare_session_send(params).await.unwrap();
-        assert!(queued.is_new);
-        assert_eq!(queued.turn.status, TurnStatus::Queued);
-        assert_eq!(queued.prompt, "正常发送");
-        assert_eq!(executable.as_deref(), Some("/usr/bin/true"));
-        let queued_turn_count = worker
-            .call({
-                let session_id = session_id.clone();
-                move |store| store.session_turn_count(&session_id)
-            })
-            .await
-            .unwrap();
-        assert_eq!(queued_turn_count, initial_turn_count + 1);
-
-        let unavailable = test_runtime(RuntimeKind::Codex, "auth_required");
-        worker
-            .call(move |store| store.save_runtime(&unavailable))
-            .await
-            .unwrap();
-        let (duplicate, duplicate_executable) = engine
-            .prepare_session_send(SendSessionParams {
-                session_id: session_id.clone(),
-                client_message_id,
-                text: "正常发送".to_owned(),
-            })
-            .await
-            .unwrap();
-        assert!(!duplicate.is_new);
-        assert_eq!(duplicate.turn.id, queued.turn.id);
-        assert!(duplicate_executable.is_none());
-        let duplicate_turn_count = worker
-            .call({
-                let session_id = session_id.clone();
-                move |store| store.session_turn_count(&session_id)
-            })
-            .await
-            .unwrap();
-        assert_eq!(duplicate_turn_count, queued_turn_count);
-
-        engine.schedule(queued.clone(), executable.unwrap()).await;
-        let cancellation = engine
-            .turns
-            .lock()
-            .await
-            .get(&session_id)
-            .expect("ready send should be scheduled")
-            .cancellation
-            .clone();
-        cancellation.cancel();
-        engine.concurrency.add_permits(1);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !engine.turns.lock().await.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let finished = worker
-            .call(move |store| store.turn(&queued.turn.id))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(finished.status, TurnStatus::Cancelled);
-
-        engine.assistant.shutdown().await;
-        worker.shutdown().await.unwrap();
-    }
-
     #[test]
     fn gemini_model_metadata_requires_generation_support() {
         let metadata: GeminiModelMetadata = serde_json::from_str(

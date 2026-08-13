@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -101,14 +101,17 @@ pub fn handshake() -> Event<Handshake> {
                 "assistant.history",
                 "assistant.send",
                 "assistant.cancel_turn",
-                "session.create",
-                "session.get",
-                "session.history",
-                "session.timeline",
-                "session.timeline.turn",
-                "session.send",
-                "session.mark_read",
-                "session.cancel_turn",
+                "terminal.session.create",
+                "terminal.session.get",
+                "terminal.session.rebind_workspace",
+                "terminal.session.resume_candidates",
+                "terminal.session.prepare_launch",
+                "terminal.run.started",
+                "terminal.run.stopping",
+                "terminal.run.bind_provider",
+                "terminal.run.report_status",
+                "terminal.run.exited",
+                "terminal.session.mark_seen",
                 "engine.shutdown",
             ],
             runtimes: &["codex", "claude", "cursor", "kiro"],
@@ -131,17 +134,22 @@ mod tests {
     }
 
     #[test]
-    fn handshake_is_v3_and_lists_four_runtimes() {
+    fn handshake_is_v4_and_lists_four_runtimes() {
         let value = serde_json::to_value(handshake()).unwrap();
-        assert_eq!(value["data"]["protocolVersion"], 3);
+        assert_eq!(value["data"]["protocolVersion"], 4);
         assert_eq!(value["data"]["runtimes"].as_array().unwrap().len(), 4);
         let capabilities = value["data"]["capabilities"].as_array().unwrap();
         assert!(capabilities.contains(&Value::String("list.rename".to_owned())));
         assert!(capabilities.contains(&Value::String("list.delete".to_owned())));
         assert!(capabilities.contains(&Value::String("task.create_list".to_owned())));
         assert!(capabilities.contains(&Value::String("task.delete".to_owned())));
-        assert!(capabilities.contains(&Value::String("session.timeline".to_owned())));
-        assert!(capabilities.contains(&Value::String("session.timeline.turn".to_owned())));
+        assert!(
+            capabilities.contains(&Value::String("terminal.session.prepare_launch".to_owned()))
+        );
+        assert!(capabilities.contains(&Value::String(
+            "terminal.session.rebind_workspace".to_owned()
+        )));
+        assert!(capabilities.contains(&Value::String("terminal.run.stopping".to_owned())));
     }
 
     #[test]
@@ -152,7 +160,7 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(values.len(), 24);
+        assert_eq!(values.len(), 26);
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("assistant.send")
         }));
@@ -169,6 +177,11 @@ mod tests {
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("task.create_list")
                 && value["params"]["taskId"] == "ABCDEFAB-CDEF-4ABC-8DEF-ABCDEFABC101"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("terminal.session.rebind_workspace")
+                && value["params"]["sessionId"] == "00000000-0000-4000-8000-000000000301"
+                && value["params"]["workingDirectory"] == "/tmp/rebound-project"
         }));
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("task.delete")

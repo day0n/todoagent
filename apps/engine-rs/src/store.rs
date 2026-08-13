@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Component, Path};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use chrono::{Datelike, NaiveDate, Utc};
@@ -14,27 +14,22 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::adapters::{ProviderEvent, ProviderFrame, RecordedEventParser};
 use crate::models::{
     AssistantCompaction, AssistantContextHistory, AssistantHistory, AssistantMessage,
     AssistantSession, AssistantStep, AssistantToolExecution, AssistantToolResult,
     AssistantToolSummary, AssistantTurn, AssistantTurnStatus, Bootstrap, CreateTaskInput, List,
-    MessageRole, QueuedAssistantTurn, QueuedTurn, Runtime, RuntimeKind, SessionBundle,
-    SessionMessage, SessionState, SessionTimelineCursor, SessionTimelineItem, SessionTimelinePage,
-    SessionTurn, Task, TaskAttachment, TaskSession, TaskState, TaskStatus, TurnStatus,
-    UpdateTaskInput,
+    ProviderBindingState, QueuedAssistantTurn, Runtime, RuntimeKind, SessionTimelineItem, Task,
+    TaskAttachment, TaskState, TaskStatus, TerminalAgentStatus, TerminalLaunchMode, TerminalRun,
+    TerminalRunState, TerminalSession, TerminalSessionBundle, UpdateTaskInput,
 };
 
-pub const SCHEMA_VERSION: i64 = 4;
-const SCHEMA_CHECKSUM: &str = "todoagent-native-v4-unified-task-time-and-attachments";
+pub const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_CHECKSUM: &str = "todoagent-native-v5-terminal-sessions-receipts";
 const ASSISTANT_TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
 const ASSISTANT_FILTERED_TASK_PAGE_SIZE: usize = 50;
-const SESSION_TIMELINE_PARSER_VERSION: i64 = 2;
-const SESSION_TIMELINE_BACKFILL_TURN_BATCH: i64 = 32;
 const SESSION_TIMELINE_PAYLOAD_MAX_BYTES: usize = 256 * 1024;
 const SESSION_TIMELINE_TEXT_MAX_BYTES: usize = 1024 * 1024;
 const SESSION_TIMELINE_REASONING_MAX_BYTES: usize = 256 * 1024;
-const SESSION_TIMELINE_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ASSISTANT_HISTORY_MESSAGE_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ASSISTANT_HISTORY_DETAIL_PAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ASSISTANT_HISTORY_PARTIAL_NOTICE_RESERVE_BYTES: usize = 4 * 1024;
@@ -70,25 +65,6 @@ pub enum StoreError {
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
-#[derive(Debug, Clone)]
-pub struct AppliedTimelineMutation {
-    pub item: SessionTimelineItem,
-    pub is_update: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct AppliedProviderFrame {
-    pub messages: Vec<SessionMessage>,
-    pub timeline: Vec<AppliedTimelineMutation>,
-}
-
-#[derive(Debug, Clone)]
-pub struct FinishedSessionTurn {
-    pub bundle: SessionBundle,
-    pub timeline_mutations: Vec<SessionTimelineItem>,
-    pub timeline_fidelity: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttachmentMutationOutcome {
     Applied,
@@ -120,7 +96,7 @@ impl Store {
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         migrate(&connection)?;
         let store = Self { connection };
-        store.reconcile_interrupted_turns()?;
+        store.reconcile_interrupted_terminal_runs()?;
         store.reconcile_interrupted_assistant_turns()?;
         store.repair_terminal_assistant_turns()?;
         Ok(store)
@@ -840,7 +816,7 @@ impl Store {
     }
 
     /// Repairs TodoAgent's private attachment directory after SQLite has
-    /// successfully opened at schema v4. Operations are limited to direct
+    /// successfully opened at the supported schema. Operations are limited to direct
     /// children and symbolic links are never followed.
     pub fn reconcile_task_attachment_files(&self, attachments: &Path) -> StoreResult<()> {
         ensure_real_directory(attachments)?;
@@ -2348,27 +2324,25 @@ impl Store {
         ).optional()?)
     }
 
-    /// Returns an already-created empty session for an exact replay, rejects a
+    /// Returns an already-created session for an exact replay, rejects a
     /// conflicting configuration for the task, or returns `None` when a new
     /// session may be created. Engine performs this read before runtime
     /// validation so a lost successful response remains replayable even if the
     /// runtime later becomes unavailable.
-    pub fn prepare_session_create(
+    pub fn prepare_terminal_session_create(
         &self,
         task_id: &str,
         runtime_kind: RuntimeKind,
         working_directory: &str,
-    ) -> StoreResult<Option<TaskSession>> {
+    ) -> StoreResult<Option<TerminalSession>> {
         let task_id = canonical_uuid(task_id, "taskId")?;
-        if let Some(existing) = self.session_for_task(&task_id)? {
-            let is_empty_replay = existing.runtime_kind == runtime_kind
+        if let Some(existing) = self.terminal_session_for_task(&task_id)? {
+            if existing.runtime_kind == runtime_kind
                 && existing.working_directory == working_directory
-                && existing.state == SessionState::Idle
-                && self.session_turn_count(&existing.id)? == 0;
-            if is_empty_replay {
+            {
                 return Ok(Some(existing));
             }
-            return Err(StoreError::Conflict("session_exists"));
+            return Err(StoreError::Conflict("terminal_session_exists"));
         }
         if self.task(&task_id)?.is_none() {
             return Err(StoreError::NotFound);
@@ -2376,1532 +2350,629 @@ impl Store {
         Ok(None)
     }
 
-    pub fn create_session(
+    pub fn create_terminal_session(
         &self,
         task_id: &str,
         runtime_kind: RuntimeKind,
         working_directory: &str,
-    ) -> StoreResult<TaskSession> {
-        let task_id = canonical_uuid(task_id, "taskId")?;
+    ) -> StoreResult<TerminalSession> {
         if let Some(existing) =
-            self.prepare_session_create(&task_id, runtime_kind, working_directory)?
+            self.prepare_terminal_session_create(task_id, runtime_kind, working_directory)?
         {
             return Ok(existing);
         }
+        let task_id = canonical_uuid(task_id, "taskId")?;
+        let id = Uuid::new_v4().to_string();
         let timestamp = now();
-        let session_id = Uuid::new_v4().to_string();
+        let (provider_id, binding_state, binding_source) = if runtime_kind == RuntimeKind::Claude {
+            (
+                Some(id.as_str()),
+                ProviderBindingState::Bound.as_str(),
+                Some("preallocated"),
+            )
+        } else {
+            (None, ProviderBindingState::Unbound.as_str(), None)
+        };
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
-            "INSERT INTO task_session(id,task_id,runtime_kind,working_directory,provider_engine,state,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,'idle',?6,?6)",
-            params![session_id, task_id, runtime_kind.as_str(), working_directory,
-                (runtime_kind == RuntimeKind::Kiro).then_some("v2"), timestamp],
+            "INSERT INTO terminal_session(
+               id,task_id,runtime_kind,working_directory,provider_session_id,
+               provider_binding_state,provider_binding_source,created_at,updated_at
+             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+            params![
+                id,
+                task_id,
+                runtime_kind.as_str(),
+                working_directory,
+                provider_id,
+                binding_state,
+                binding_source,
+                timestamp
+            ],
         )?;
         bump_revision(&transaction)?;
         transaction.commit()?;
-        self.session(&session_id)?.ok_or(StoreError::NotFound)
+        self.terminal_session(&id)?.ok_or(StoreError::NotFound)
     }
 
-    pub fn send_message(
+    /// Permanently rebinds an inactive Session to a replacement workspace.
+    /// Provider identity and all historical Runs remain unchanged so the next
+    /// launch resumes the exact same conversation in the user-selected path.
+    pub fn rebind_terminal_session_workspace(
         &self,
         session_id: &str,
-        client_message_id: &str,
-        prompt: &str,
-    ) -> StoreResult<QueuedTurn> {
+        working_directory: &str,
+    ) -> StoreResult<TerminalSessionBundle> {
         let session_id = canonical_uuid(session_id, "sessionId")?;
-        let client_message_id = canonical_uuid(client_message_id, "clientMessageId")?;
-        if let Some(queued) =
-            self.session_turn_for_client_message(&session_id, &client_message_id)?
-        {
-            return Ok(queued);
+        let working_directory = Path::new(working_directory);
+        if !working_directory.is_absolute() {
+            return Err(StoreError::Invalid(
+                "workingDirectory must be absolute".to_owned(),
+            ));
         }
-        let session = self.session(&session_id)?.ok_or(StoreError::NotFound)?;
-        if matches!(session.state, SessionState::Queued | SessionState::Running) {
-            return Err(StoreError::Conflict("session_busy"));
+        let working_directory = working_directory
+            .to_str()
+            .ok_or_else(|| StoreError::Invalid("workingDirectory must be UTF-8".to_owned()))?;
+        let session = self
+            .terminal_session(&session_id)?
+            .ok_or(StoreError::NotFound)?;
+        if self.active_terminal_run(&session_id)?.is_some() {
+            return Err(StoreError::Conflict("terminal_session_active"));
         }
-        if session.state == SessionState::Closed {
-            return Err(StoreError::Conflict("session_closed"));
+        if session.working_directory == working_directory {
+            return self.terminal_session_bundle(&session_id);
         }
-        let timestamp = now();
-        let turn_id = Uuid::new_v4().to_string();
         let transaction = self.connection.unchecked_transaction()?;
-        let ordinal: i64 = transaction.query_row(
-            "SELECT coalesce(max(ordinal),0)+1 FROM session_turn WHERE session_id=?1",
+        transaction.execute(
+            "UPDATE terminal_session SET working_directory=?1,last_error_code=NULL,
+             last_error_message=NULL,updated_at=?2 WHERE id=?3",
+            params![working_directory, now(), session_id],
+        )?;
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        self.terminal_session_bundle(&session_id)
+    }
+
+    pub fn prepare_terminal_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> StoreResult<TerminalSessionBundle> {
+        self.prepare_terminal_run_with_resume_readiness(session_id, run_id, true)
+    }
+
+    pub fn prepare_terminal_run_with_resume_readiness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        provider_session_is_resumable: bool,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        if let Some(existing) = self.terminal_run(&run_id)? {
+            if existing.session_id != session_id {
+                return Err(StoreError::Conflict("terminal_run_id_reused"));
+            }
+            return self.terminal_session_bundle(&session_id);
+        }
+        let session = self
+            .terminal_session(&session_id)?
+            .ok_or(StoreError::NotFound)?;
+        if self.active_terminal_run(&session_id)?.is_some() {
+            return Err(StoreError::Conflict("terminal_session_active"));
+        }
+        let ordinal: i64 = self.connection.query_row(
+            "SELECT coalesce(max(ordinal),0)+1 FROM terminal_run WHERE session_id=?1",
             [&session_id],
             |row| row.get(0),
         )?;
-        let sequence = next_message_sequence(&transaction, &session_id)?;
-        let message_id = Uuid::new_v4().to_string();
-        transaction.execute(
-            "INSERT INTO session_turn(id,session_id,ordinal,user_message_id,provider_session_id_before,status,created_at)
-             VALUES(?1,?2,?3,?4,?5,'queued',?6)",
-            params![turn_id, session_id, ordinal, client_message_id, session.provider_session_id, timestamp],
-        )?;
-        transaction.execute(
-            "INSERT INTO session_message(id,session_id,turn_id,sequence,client_message_id,role,kind,body,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,'user','text',?6,?7,?7)",
-            params![message_id, session_id, turn_id, sequence, client_message_id, prompt, timestamp],
-        )?;
-        insert_timeline_item(
-            &transaction,
-            NewTimelineItem {
-                id: format!("timeline-{message_id}"),
-                session_id: &session_id,
-                turn_id: &turn_id,
-                turn_ordinal: ordinal,
-                kind: "user",
-                body: prompt,
-                call_id: None,
-                tool_name: None,
-                input_json: None,
-                output_text: None,
-                tool_state: None,
-                is_error: false,
-                source_event_sequence: None,
-                source_block_index: None,
-                fidelity: "exact",
-                metadata_json: None,
-                timestamp: &timestamp,
-            },
-        )?;
-        transaction.execute(
-            "UPDATE task_session SET state='queued',last_error_code=NULL,last_error_message=NULL,updated_at=?1 WHERE id=?2",
-            params![timestamp, session_id],
-        )?;
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        Ok(QueuedTurn {
-            session: self.session(&session_id)?.ok_or(StoreError::NotFound)?,
-            turn: self.turn(&turn_id)?.ok_or(StoreError::NotFound)?,
-            prompt: prompt.to_owned(),
-            is_new: true,
-        })
-    }
-
-    /// Looks up an already accepted client message without changing session state.
-    /// Engine preflight uses this to preserve idempotent retries even when the
-    /// configured runtime becomes unavailable after the original request.
-    pub fn session_turn_for_client_message(
-        &self,
-        session_id: &str,
-        client_message_id: &str,
-    ) -> StoreResult<Option<QueuedTurn>> {
-        let session_id = canonical_uuid(session_id, "sessionId")?;
-        let client_message_id = canonical_uuid(client_message_id, "clientMessageId")?;
-        let existing = self.connection.query_row(
-            "SELECT turn_id,body FROM session_message WHERE session_id=?1 AND client_message_id=?2",
-            params![session_id, client_message_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        ).optional()?;
-        existing
-            .map(|(turn_id, body)| {
-                Ok(QueuedTurn {
-                    session: self.session(&session_id)?.ok_or(StoreError::NotFound)?,
-                    turn: self.turn(&turn_id)?.ok_or(StoreError::NotFound)?,
-                    prompt: body,
-                    is_new: false,
-                })
-            })
-            .transpose()
-    }
-
-    pub fn mark_turn_running(&self, turn_id: &str) -> StoreResult<SessionTurn> {
+        let prior_started: bool = self.connection.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM terminal_run
+               WHERE session_id=?1 AND started_at IS NOT NULL
+             )",
+            [&session_id],
+            |row| row.get::<_, i64>(0),
+        )? != 0;
+        if prior_started && session.provider_session_id.is_none() {
+            return Err(StoreError::Conflict("provider_binding_required"));
+        }
+        if session.runtime_kind == RuntimeKind::Cursor && session.provider_session_id.is_none() {
+            return Err(StoreError::Conflict("provider_session_unbound"));
+        }
         let timestamp = now();
+        let launch_mode = if session.provider_session_id.is_some()
+            && prior_started
+            && provider_session_is_resumable
+        {
+            TerminalLaunchMode::Resume
+        } else {
+            TerminalLaunchMode::Fresh
+        };
         let transaction = self.connection.unchecked_transaction()?;
-        let session_id: String = transaction
-            .query_row(
-                "SELECT session_id FROM session_turn WHERE id=?1 AND status='queued'",
-                [turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)?;
         transaction.execute(
-            "UPDATE session_turn SET status='running',started_at=?1 WHERE id=?2",
-            params![timestamp, turn_id],
-        )?;
-        transaction.execute(
-            "UPDATE task_session SET state='running',updated_at=?1 WHERE id=?2",
-            params![timestamp, session_id],
-        )?;
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        self.turn(turn_id)?.ok_or(StoreError::NotFound)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn set_provider_session(
-        &self,
-        session_id: &str,
-        provider_session_id: &str,
-    ) -> StoreResult<()> {
-        let session_id = canonical_uuid(session_id, "sessionId")?;
-        let transaction = self.connection.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "UPDATE task_session SET provider_session_id=?1,updated_at=?2 WHERE id=?3",
-            params![provider_session_id, now(), session_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound);
-        }
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn clear_provider_session(&self, session_id: &str) -> StoreResult<()> {
-        let session_id = canonical_uuid(session_id, "sessionId")?;
-        let transaction = self.connection.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "UPDATE task_session SET provider_session_id=NULL,updated_at=?1 WHERE id=?2",
-            params![now(), session_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound);
-        }
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    pub fn recovery_context(&self, session_id: &str, max_bytes: usize) -> StoreResult<String> {
-        let task: Task = self.connection.query_row(
-            "SELECT t.id,t.list_id,t.title,t.note,t.status,t.execution_date,t.due_date,t.completed_at,t.created_at,t.updated_at
-             FROM task t JOIN task_session s ON s.task_id=t.id WHERE s.id=?1",
-            [session_id],
-            row_to_task,
-        ).optional()?.ok_or(StoreError::NotFound)?;
-        let mut statement = self.connection.prepare(
-            "SELECT role,body FROM session_message WHERE session_id=?1 AND role IN ('user','agent') ORDER BY sequence DESC",
-        )?;
-        let rows = statement
-            .query_map([session_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut selected = Vec::new();
-        let mut size = 0usize;
-        for (role, body) in rows {
-            let entry = format!("{role}: {body}");
-            if size + entry.len() > max_bytes {
-                break;
-            }
-            size += entry.len();
-            selected.push(entry);
-        }
-        selected.reverse();
-        Ok(format!(
-            "TodoAgent 正在重建一个失效的本地 Agent Session。\n任务：{}\n说明：{}\n\n最近对话：\n{}\n\n请保持上下文连续，继续处理最后一条用户消息。",
-            task.title,
-            task.note,
-            selected.join("\n\n")
-        ))
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn append_agent_text(&self, turn_id: &str, chunk: &str) -> StoreResult<SessionMessage> {
-        if chunk.is_empty() {
-            return Err(StoreError::Invalid("message chunk is empty".to_owned()));
-        }
-        let transaction = self.connection.unchecked_transaction()?;
-        let (session_id, turn_ordinal): (String, i64) = transaction
-            .query_row(
-                "SELECT session_id,ordinal FROM session_turn WHERE id=?1",
-                [turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)?;
-        let timestamp = now();
-        let (id, _, _) = append_agent_text_in_transaction(
-            &transaction,
-            &session_id,
-            turn_id,
-            turn_ordinal,
-            chunk,
-            None,
-            None,
-            &timestamp,
-        )?;
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        self.message(&id)?.ok_or(StoreError::NotFound)
-    }
-
-    pub fn append_message(
-        &self,
-        turn_id: &str,
-        role: MessageRole,
-        kind: &str,
-        body: &str,
-        payload_json: Option<&str>,
-    ) -> StoreResult<SessionMessage> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let session_id: String = transaction
-            .query_row(
-                "SELECT session_id FROM session_turn WHERE id=?1",
-                [turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)?;
-        let sequence = next_message_sequence(&transaction, &session_id)?;
-        let id = Uuid::new_v4().to_string();
-        let timestamp = now();
-        transaction.execute(
-            "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at)
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
-            params![id, session_id, turn_id, sequence, role.as_str(), kind, body, payload_json, timestamp],
-        )?;
-        mirror_legacy_message_to_timeline(
-            &transaction,
-            &id,
-            &session_id,
-            turn_id,
-            role,
-            kind,
-            body,
-            payload_json,
-            &timestamp,
-        )?;
-        if role == MessageRole::Agent && kind == "text" {
-            transaction.execute(
-                "UPDATE task_session SET last_agent_sequence=?1,updated_at=?2 WHERE id=?3",
-                params![sequence, timestamp, session_id],
-            )?;
-        }
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        self.message(&id)?.ok_or(StoreError::NotFound)
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn append_turn_event(
-        &self,
-        turn_id: &str,
-        event_type: &str,
-        payload: &Value,
-    ) -> StoreResult<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        insert_turn_event(&transaction, turn_id, event_type, payload, &now())?;
-        transaction.commit()?;
-        Ok(())
-    }
-
-    /// Atomically stores a provider transport frame, its legacy projection and
-    /// the Chat V2 timeline projection. Callers must not publish returned UI
-    /// mutations until this method commits successfully.
-    pub fn apply_provider_frame(
-        &self,
-        turn_id: &str,
-        frame: ProviderFrame,
-    ) -> StoreResult<AppliedProviderFrame> {
-        self.apply_provider_frames(turn_id, vec![frame])
-    }
-
-    /// Persists a bounded ordered batch in one transaction. Each frame keeps
-    /// its own raw sequence and semantic block indices while the batch removes
-    /// per-token SQLite transaction overhead.
-    pub fn apply_provider_frames(
-        &self,
-        turn_id: &str,
-        frames: Vec<ProviderFrame>,
-    ) -> StoreResult<AppliedProviderFrame> {
-        if frames.is_empty() {
-            return Ok(AppliedProviderFrame {
-                messages: Vec::new(),
-                timeline: Vec::new(),
-            });
-        }
-        let transaction = self.connection.unchecked_transaction()?;
-        let (session_id, turn_ordinal): (String, i64) = transaction
-            .query_row(
-                "SELECT session_id,ordinal FROM session_turn WHERE id=?1",
-                [turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)?;
-        let timestamp = now();
-        let mut has_semantic_events = false;
-        let mut message_ids = Vec::<String>::new();
-        let mut timeline_mutations = Vec::<(String, bool)>::new();
-        for frame in frames {
-            let (source_event_sequence, raw_truncated) =
-                match (frame.raw_kind.as_deref(), frame.raw_payload.as_ref()) {
-                    (Some(kind), Some(payload)) => {
-                        let (sequence, truncated) =
-                            insert_turn_event(&transaction, turn_id, kind, payload, &timestamp)?;
-                        (Some(sequence), truncated)
-                    }
-                    (None, None) => (None, false),
-                    _ => {
-                        return Err(StoreError::Invalid(
-                            "provider frame raw kind and payload must be paired".to_owned(),
-                        ));
-                    }
-                };
-            has_semantic_events |= !frame.events.is_empty();
-            for (block_index, event) in frame.events.into_iter().enumerate() {
-                let block_index = i64::try_from(block_index).unwrap_or(i64::MAX);
-                match event {
-                    ProviderEvent::SessionId(provider_session_id) => {
-                        transaction.execute(
-                        "UPDATE task_session SET provider_session_id=?1,updated_at=?2 WHERE id=?3",
-                        params![provider_session_id, timestamp, session_id],
-                    )?;
-                    }
-                    ProviderEvent::Text(text) => {
-                        if text.is_empty() {
-                            continue;
-                        }
-                        let (message_id, timeline_id, is_update) =
-                            append_agent_text_in_transaction(
-                                &transaction,
-                                &session_id,
-                                turn_id,
-                                turn_ordinal,
-                                &text,
-                                source_event_sequence,
-                                Some(block_index),
-                                &timestamp,
-                            )?;
-                        record_once(&mut message_ids, message_id);
-                        record_timeline_mutation(&mut timeline_mutations, timeline_id, is_update);
-                    }
-                    ProviderEvent::Reasoning(reasoning) => {
-                        if reasoning.is_empty() {
-                            continue;
-                        }
-                        let (timeline_id, is_update) = append_reasoning_in_transaction(
-                            &transaction,
-                            &session_id,
-                            turn_id,
-                            turn_ordinal,
-                            &reasoning,
-                            source_event_sequence,
-                            Some(block_index),
-                            &timestamp,
-                        )?;
-                        record_timeline_mutation(&mut timeline_mutations, timeline_id, is_update);
-                    }
-                    ProviderEvent::ToolUse {
-                        name,
-                        call_id,
-                        input,
-                    } => {
-                        if name.trim().is_empty() || call_id.trim().is_empty() {
-                            return Err(StoreError::Invalid(
-                                "provider tool call requires name and callId".to_owned(),
-                            ));
-                        }
-                        let input_encoded = input.to_string();
-                        let input_truncated =
-                            input_encoded.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES;
-                        let bounded_input = if input_truncated {
-                            json!({
-                                "_todoagentTruncated": {
-                                    "originalBytes": input_encoded.len(),
-                                    "truncated": true
-                                }
-                            })
-                        } else {
-                            input
-                        };
-                        let payload = json!({
-                            "name":name,
-                            "callId":call_id,
-                            "input":bounded_input,
-                            "inputOriginalBytes":input_encoded.len(),
-                            "inputTruncated":input_truncated
-                        });
-                        let (message_id, timeline) = append_legacy_message_in_transaction(
-                            &transaction,
-                            &session_id,
-                            turn_id,
-                            MessageRole::Tool,
-                            "tool_call",
-                            &name,
-                            Some(&payload.to_string()),
-                            source_event_sequence,
-                            Some(block_index),
-                            &timestamp,
-                        )?;
-                        record_once(&mut message_ids, message_id);
-                        if let Some((timeline_id, is_update)) = timeline {
-                            record_timeline_mutation(
-                                &mut timeline_mutations,
-                                timeline_id,
-                                is_update,
-                            );
-                        }
-                    }
-                    ProviderEvent::ToolResult {
-                        name,
-                        call_id,
-                        output,
-                        is_error,
-                    } => {
-                        if call_id.trim().is_empty() {
-                            return Err(StoreError::Invalid(
-                                "provider tool result requires callId".to_owned(),
-                            ));
-                        }
-                        let output_original_bytes = output.len();
-                        let output_truncated =
-                            output_original_bytes > SESSION_TIMELINE_PAYLOAD_MAX_BYTES;
-                        let bounded_output =
-                            bounded_utf8(&output, SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
-                        let payload = json!({
-                            "name":name,
-                            "callId":call_id,
-                            "isError":is_error,
-                            "outputOriginalBytes":output_original_bytes,
-                            "outputTruncated":output_truncated
-                        });
-                        let (message_id, timeline) = append_legacy_message_in_transaction(
-                            &transaction,
-                            &session_id,
-                            turn_id,
-                            MessageRole::Tool,
-                            "tool_result",
-                            &bounded_output,
-                            Some(&payload.to_string()),
-                            source_event_sequence,
-                            Some(block_index),
-                            &timestamp,
-                        )?;
-                        record_once(&mut message_ids, message_id);
-                        if let Some((timeline_id, is_update)) = timeline {
-                            record_timeline_mutation(
-                                &mut timeline_mutations,
-                                timeline_id,
-                                is_update,
-                            );
-                        }
-                    }
-                    ProviderEvent::Status(status) => {
-                        if status.is_empty() {
-                            continue;
-                        }
-                        let (message_id, timeline) = append_legacy_message_in_transaction(
-                            &transaction,
-                            &session_id,
-                            turn_id,
-                            MessageRole::System,
-                            "status",
-                            &status,
-                            None,
-                            source_event_sequence,
-                            Some(block_index),
-                            &timestamp,
-                        )?;
-                        record_once(&mut message_ids, message_id);
-                        if let Some((timeline_id, is_update)) = timeline {
-                            record_timeline_mutation(
-                                &mut timeline_mutations,
-                                timeline_id,
-                                is_update,
-                            );
-                        }
-                    }
-                }
-            }
-            if let Some(raw_through_sequence) = source_event_sequence {
-                transaction.execute(
-                "INSERT INTO session_timeline_projection(turn_id,parser_version,raw_through_sequence,fidelity,updated_at)
-                 VALUES(?1,?2,?3,?4,?5)
-                 ON CONFLICT(turn_id) DO UPDATE SET parser_version=excluded.parser_version,
-                 raw_through_sequence=max(session_timeline_projection.raw_through_sequence,excluded.raw_through_sequence),
-                 fidelity=CASE
-                   WHEN session_timeline_projection.fidelity='failed' OR excluded.fidelity='failed'
-                   THEN 'failed'
-                   WHEN session_timeline_projection.fidelity='partial' OR excluded.fidelity='partial'
-                   THEN 'partial'
-                   ELSE 'exact'
-                 END,
-                 last_error=CASE
-                   WHEN session_timeline_projection.fidelity IN ('partial','failed')
-                   THEN session_timeline_projection.last_error
-                   ELSE NULL
-                 END,
-                 updated_at=excluded.updated_at",
-                params![
-                    turn_id,
-                    SESSION_TIMELINE_PARSER_VERSION,
-                    raw_through_sequence,
-                    if raw_truncated { "partial" } else { "exact" },
-                    timestamp
-                ],
-                )?;
-            }
-        }
-        if has_semantic_events {
-            bump_revision(&transaction)?;
-        }
-        let mut messages = Vec::with_capacity(message_ids.len());
-        for id in &message_ids {
-            messages.push(transaction.query_row(
-                "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
-                 FROM session_message WHERE id=?1",
-                [id],
-                row_to_message,
-            )?);
-        }
-        let mut timeline = Vec::with_capacity(timeline_mutations.len());
-        for (id, is_update) in &timeline_mutations {
-            let item = transaction.query_row(
-                &format!("{} WHERE id=?1", timeline_select()),
-                [id],
-                row_to_timeline_item,
-            )?;
-            timeline.push(AppliedTimelineMutation {
-                item,
-                is_update: *is_update,
-            });
-        }
-        transaction.commit()?;
-        Ok(AppliedProviderFrame { messages, timeline })
-    }
-
-    pub fn mark_timeline_projection_degraded(
-        &self,
-        turn_id: &str,
-        fidelity: &str,
-        error: &str,
-    ) -> StoreResult<()> {
-        if !matches!(fidelity, "partial" | "failed") {
-            return Err(StoreError::Invalid(
-                "timeline degradation fidelity must be partial or failed".to_owned(),
-            ));
-        }
-        let transaction = self.connection.unchecked_transaction()?;
-        let raw_through_sequence: i64 = transaction.query_row(
-            "SELECT coalesce(max(sequence),0) FROM turn_event WHERE turn_id=?1",
-            [turn_id],
-            |row| row.get(0),
-        )?;
-        transaction.execute(
-            "INSERT INTO session_timeline_projection(
-               turn_id,parser_version,raw_through_sequence,fidelity,last_error,updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(turn_id) DO UPDATE SET
-               parser_version=excluded.parser_version,
-               raw_through_sequence=max(session_timeline_projection.raw_through_sequence,excluded.raw_through_sequence),
-               fidelity=CASE
-                 WHEN session_timeline_projection.fidelity='failed' OR excluded.fidelity='failed'
-                 THEN 'failed' ELSE 'partial' END,
-               last_error=excluded.last_error,
-               updated_at=excluded.updated_at",
+            "INSERT INTO terminal_run(id,session_id,ordinal,launch_mode,state,provider_session_id_at_launch,created_at)
+             VALUES(?1,?2,?3,?4,'starting',?5,?6)",
             params![
-                turn_id,
-                SESSION_TIMELINE_PARSER_VERSION,
-                raw_through_sequence,
-                fidelity,
-                bounded_utf8(error, 4096),
-                now(),
+                run_id,
+                session_id,
+                ordinal,
+                launch_mode.as_str(),
+                session.provider_session_id,
+                timestamp
             ],
         )?;
+        transaction.execute(
+            "UPDATE terminal_session SET agent_status='unknown',last_error_code=NULL,
+             last_error_message=NULL,updated_at=?1 WHERE id=?2",
+            params![timestamp, session_id],
+        )?;
+        bump_revision(&transaction)?;
         transaction.commit()?;
-        Ok(())
+        self.terminal_session_bundle(&session_id)
+    }
+
+    pub fn prepare_terminal_run_with_provider(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        provider_session_id: &str,
+        source: &str,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        validate_provider_session_id(provider_session_id)?;
+        validate_binding_source(source)?;
+        if self.terminal_run(&run_id)?.is_some() {
+            return Err(StoreError::Conflict("terminal_run_id_reused"));
+        }
+        let session = self
+            .terminal_session(&session_id)?
+            .ok_or(StoreError::NotFound)?;
+        if self.active_terminal_run(&session_id)?.is_some() {
+            return Err(StoreError::Conflict("terminal_session_active"));
+        }
+        if let Some(existing) = session.provider_session_id.as_deref()
+            && existing != provider_session_id
+        {
+            return Err(StoreError::Conflict("provider_session_conflict"));
+        }
+        let ordinal: i64 = self.connection.query_row(
+            "SELECT coalesce(max(ordinal),0)+1 FROM terminal_run WHERE session_id=?1",
+            [&session_id],
+            |row| row.get(0),
+        )?;
+        let timestamp = now();
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "UPDATE terminal_session SET provider_session_id=?1,provider_binding_state='bound',
+             provider_binding_source=?2,agent_status='unknown',last_error_code=NULL,
+             last_error_message=NULL,updated_at=?3 WHERE id=?4",
+            params![provider_session_id, source, timestamp, session_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO terminal_run(id,session_id,ordinal,launch_mode,state,provider_session_id_at_launch,created_at)
+             VALUES(?1,?2,?3,?4,'starting',?5,?6)",
+            params![
+                run_id,
+                session_id,
+                ordinal,
+                if ordinal == 1 { "fresh" } else { "resume" },
+                provider_session_id,
+                timestamp
+            ],
+        )?;
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        self.terminal_session_bundle(&session_id)
+    }
+
+    pub fn latest_terminal_run(&self, session_id: &str) -> StoreResult<Option<TerminalRun>> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        Ok(self
+            .connection
+            .query_row(
+                &terminal_run_select("WHERE session_id=?1 ORDER BY ordinal DESC LIMIT 1"),
+                [&session_id],
+                row_to_terminal_run,
+            )
+            .optional()?)
+    }
+
+    pub fn mark_terminal_run_started(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        let run = self.terminal_run(&run_id)?.ok_or(StoreError::NotFound)?;
+        if run.session_id != session_id {
+            return Err(StoreError::Conflict("terminal_run_id_reused"));
+        }
+        if run.started_at.is_some()
+            && matches!(
+                run.state,
+                TerminalRunState::Running | TerminalRunState::Stopping
+            )
+        {
+            return self.terminal_session_bundle(&session_id);
+        }
+        if run.state == TerminalRunState::Stopping && run.started_at.is_none() {
+            let timestamp = now();
+            let transaction = self.connection.unchecked_transaction()?;
+            let changed = transaction.execute(
+                "UPDATE terminal_run SET started_at=?1
+                 WHERE id=?2 AND session_id=?3 AND state='stopping' AND started_at IS NULL",
+                params![timestamp, run_id, session_id],
+            )?;
+            if changed == 0 {
+                return Err(StoreError::Conflict("terminal_run_result_conflict"));
+            }
+            transaction.execute(
+                "UPDATE terminal_session SET last_started_at=?1,updated_at=?1 WHERE id=?2",
+                params![timestamp, session_id],
+            )?;
+            bump_revision(&transaction)?;
+            transaction.commit()?;
+            return self.terminal_session_bundle(&session_id);
+        }
+        if run.state != TerminalRunState::Starting {
+            return Err(StoreError::Conflict("terminal_run_result_conflict"));
+        }
+        self.transition_terminal_run(
+            &session_id,
+            &run_id,
+            "starting",
+            "running",
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    pub fn mark_terminal_run_stopping(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        let run = self.terminal_run(&run_id)?.ok_or(StoreError::NotFound)?;
+        if run.session_id != session_id {
+            return Err(StoreError::Conflict("terminal_run_id_reused"));
+        }
+        if run.state == TerminalRunState::Stopping {
+            return self.terminal_session_bundle(&session_id);
+        }
+        if !matches!(
+            run.state,
+            TerminalRunState::Starting | TerminalRunState::Running
+        ) {
+            return Err(StoreError::Conflict("terminal_run_result_conflict"));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE terminal_run SET state='stopping'
+             WHERE id=?1 AND session_id=?2 AND state IN ('starting','running')",
+            params![run_id, session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Conflict("terminal_run_not_active"));
+        }
+        transaction.execute(
+            "UPDATE terminal_session SET updated_at=?1 WHERE id=?2",
+            params![now(), session_id],
+        )?;
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        self.terminal_session_bundle(&session_id)
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn finish_turn(
+    pub fn finish_terminal_run(
         &self,
-        turn_id: &str,
-        status: TurnStatus,
+        session_id: &str,
+        run_id: &str,
         exit_code: Option<i32>,
-        final_output: Option<&str>,
-        provider_session_id: Option<&str>,
+        reason: &str,
         error_code: Option<&str>,
         error_message: Option<&str>,
-        provider_usage_json: Option<&str>,
-    ) -> StoreResult<FinishedSessionTurn> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let session_id: String = transaction
-            .query_row(
-                "SELECT session_id FROM session_turn WHERE id=?1",
-                [turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)?;
-        let timestamp = now();
-        let mut terminal_timeline_ids = {
-            let mut statement = transaction.prepare(
-                "SELECT id FROM session_timeline_item
-                 WHERE turn_id=?1 AND kind='tool' AND tool_state='running'
-                 ORDER BY item_ordinal",
-            )?;
-            statement
-                .query_map([turn_id], |row| row.get::<_, String>(0))?
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        transaction.execute(
-            "UPDATE session_turn SET status=?1,exit_code=?2,final_output=?3,provider_session_id_after=?4,
-             error_code=?5,error_message=?6,provider_usage_json=?7,ended_at=?8 WHERE id=?9",
-            params![status.as_str(), exit_code, final_output, provider_session_id, error_code,
-                error_message, provider_usage_json, timestamp, turn_id],
-        )?;
-        let session_state = if status == TurnStatus::Completed || status == TurnStatus::Cancelled {
-            SessionState::Idle
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        if !matches!(
+            reason,
+            "process_exit" | "user_ended" | "app_shutdown" | "launch_failed"
+        ) {
+            return Err(StoreError::Invalid(
+                "invalid terminal exit reason".to_owned(),
+            ));
+        }
+        let state = if reason == "launch_failed" || error_code.is_some() {
+            TerminalRunState::Failed
         } else {
-            SessionState::Failed
+            TerminalRunState::Exited
         };
-        transaction.execute(
-            "UPDATE task_session SET state=?1,provider_session_id=coalesce(?2,provider_session_id),
-             last_error_code=?3,last_error_message=?4,updated_at=?5 WHERE id=?6",
+        let run = self.terminal_run(&run_id)?.ok_or(StoreError::NotFound)?;
+        if run.session_id != session_id {
+            return Err(StoreError::Conflict("terminal_run_id_reused"));
+        }
+        if !run.state.is_active() {
+            let exact_replay = run.state == state
+                && run.exit_code == exit_code
+                && run.exit_reason.as_deref() == Some(reason)
+                && run.error_code.as_deref() == error_code
+                && run.error_message.as_deref() == error_message;
+            return if exact_replay {
+                self.terminal_session_bundle(&session_id)
+            } else {
+                Err(StoreError::Conflict("terminal_run_result_conflict"))
+            };
+        }
+        self.transition_terminal_run(
+            &session_id,
+            &run_id,
+            "active",
+            state.as_str(),
+            exit_code,
+            Some(reason),
+            error_code,
+            error_message,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn transition_terminal_run(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        from: &str,
+        to: &str,
+        exit_code: Option<i32>,
+        exit_reason: Option<&str>,
+        error_code: Option<&str>,
+        error_message: Option<&str>,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        let timestamp = now();
+        let predicate = if from == "active" {
+            "state IN ('starting','running','stopping')"
+        } else {
+            "state='starting'"
+        };
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            &format!(
+                "UPDATE terminal_run SET state=?1,exit_code=?2,exit_reason=?3,error_code=?4,
+                 error_message=?5,started_at=CASE WHEN ?1='running' THEN ?6 ELSE started_at END,
+                 exited_at=CASE WHEN ?1 IN ('exited','failed','interrupted') THEN ?6 ELSE exited_at END
+                 WHERE id=?7 AND session_id=?8 AND {predicate}"
+            ),
             params![
-                session_state.as_str(),
-                provider_session_id,
+                to,
+                exit_code,
+                exit_reason,
                 error_code,
                 error_message,
                 timestamp,
+                run_id,
                 session_id
             ],
         )?;
-        transaction.execute(
-            "UPDATE session_timeline_item
-             SET tool_state=?1,is_error=?2,updated_at=?3
-             WHERE turn_id=?4 AND kind='tool' AND tool_state='running'",
-            params![
-                if status == TurnStatus::Failed {
-                    "failed"
-                } else {
-                    "interrupted"
-                },
-                i64::from(status == TurnStatus::Failed),
-                timestamp,
-                turn_id,
-            ],
-        )?;
-        if status != TurnStatus::Completed {
-            let (kind, default_body) = if status == TurnStatus::Failed {
-                ("error", "本轮执行失败。")
-            } else {
-                ("status", "已取消本轮执行。")
-            };
-            let original_body = error_message.unwrap_or(default_body);
-            let body = bounded_utf8(original_body, SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
-            let payload = json!({
-                "terminal": true,
-                "turnStatus": status.as_str(),
-                "originalBytes": original_body.len(),
-                "truncated": original_body.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES,
-            })
-            .to_string();
-            let message_id = format!("terminal-{turn_id}");
-            let existing: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM session_message WHERE id=?1)",
-                [&message_id],
-                |row| row.get::<_, i64>(0).map(|value| value != 0),
-            )?;
-            if existing {
-                transaction.execute(
-                    "UPDATE session_message
-                     SET role='system',kind=?1,body=?2,payload_json=?3,updated_at=?4
-                     WHERE id=?5",
-                    params![kind, body, payload, timestamp, message_id],
-                )?;
-            } else {
-                let sequence = next_message_sequence(&transaction, &session_id)?;
-                transaction.execute(
-                    "INSERT INTO session_message(
-                       id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at
-                     ) VALUES(?1,?2,?3,?4,'system',?5,?6,?7,?8,?8)",
-                    params![
-                        message_id,
-                        session_id,
-                        turn_id,
-                        sequence,
-                        kind,
-                        body,
-                        payload,
-                        timestamp,
-                    ],
-                )?;
-            }
-            mirror_legacy_message_to_timeline(
-                &transaction,
-                &message_id,
-                &session_id,
-                turn_id,
-                MessageRole::System,
-                kind,
-                &body,
-                Some(&payload),
-                &timestamp,
-            )?;
-            terminal_timeline_ids.push(format!("timeline-{message_id}"));
+        if changed == 0 {
+            return Err(StoreError::Conflict("terminal_run_not_active"));
         }
+        transaction.execute(
+            "UPDATE terminal_session SET
+               last_started_at=CASE WHEN ?1='running' THEN ?2 ELSE last_started_at END,
+               last_exited_at=CASE WHEN ?1 IN ('exited','failed','interrupted') THEN ?2 ELSE last_exited_at END,
+               last_error_code=?3,last_error_message=?4,updated_at=?2 WHERE id=?5",
+            params![to, timestamp, error_code, error_message, session_id],
+        )?;
         bump_revision(&transaction)?;
-        // Build the terminal DTOs from the same transaction before commit. If
-        // any authoritative read fails, dropping the transaction rolls the
-        // terminal state back instead of committing a state the caller cannot
-        // publish or reconcile.
-        let bundle = session_bundle_for_turn_connection(&transaction, &session_id, turn_id, 1000)?;
-        let timeline_mutations = terminal_timeline_ids
-            .iter()
-            .map(|id| timeline_item_connection(&transaction, id)?.ok_or(StoreError::NotFound))
-            .collect::<StoreResult<Vec<_>>>()?;
-        let timeline_fidelity = transaction
-            .query_row(
-                "SELECT fidelity FROM session_timeline_projection WHERE turn_id=?1",
-                [turn_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or_else(|| "partial".to_owned());
         transaction.commit()?;
-        Ok(FinishedSessionTurn {
-            bundle,
-            timeline_mutations,
-            timeline_fidelity,
-        })
+        self.terminal_session_bundle(&session_id)
     }
 
-    pub fn turn_has_agent_text(&self, turn_id: &str) -> StoreResult<bool> {
-        Ok(self.connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM session_message
-               WHERE turn_id=?1 AND role='agent' AND kind='text'
-             )",
-            [turn_id],
-            |row| row.get::<_, i64>(0).map(|value| value != 0),
-        )?)
-    }
-
-    pub fn session_bundle(
+    pub fn bind_terminal_provider(
         &self,
         session_id: &str,
-        after_sequence: i64,
-        limit: i64,
-    ) -> StoreResult<SessionBundle> {
-        let session = self.session(session_id)?.ok_or(StoreError::NotFound)?;
-        let mut statement = self.connection.prepare(
-            "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
-             FROM session_message WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
-        )?;
-        let messages = statement
-            .query_map(
-                params![session_id, after_sequence, limit.clamp(1, 2000)],
-                row_to_message,
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        let active_turn = self.connection.query_row(
-            "SELECT id,session_id,ordinal,user_message_id,provider_session_id_before,provider_session_id_after,status,
-             exit_code,final_output,error_code,error_message,provider_usage_json,started_at,ended_at,created_at
-             FROM session_turn WHERE session_id=?1 AND status IN ('queued','running') ORDER BY ordinal DESC LIMIT 1",
-            [session_id],
-            row_to_turn,
-        ).optional()?;
-        Ok(SessionBundle {
-            session,
-            messages,
-            active_turn,
-        })
-    }
-
-    /// Persists provider-exposed reasoning without forcing it through the
-    /// legacy session_message CHECK constraint. Adjacent reasoning chunks share
-    /// one stable timeline item; any intervening semantic item starts a new one.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn append_reasoning(&self, turn_id: &str, chunk: &str) -> StoreResult<SessionTimelineItem> {
-        if chunk.is_empty() {
-            return Err(StoreError::Invalid("reasoning chunk is empty".to_owned()));
+        run_id: &str,
+        provider_session_id: &str,
+        source: &str,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        validate_provider_session_id(provider_session_id)?;
+        validate_binding_source(source)?;
+        let run = self.terminal_run(&run_id)?.ok_or(StoreError::NotFound)?;
+        let manual_latest = source == "manual"
+            && self
+                .connection
+                .query_row(
+                    "SELECT id=?1 FROM terminal_run WHERE session_id=?2 ORDER BY ordinal DESC LIMIT 1",
+                    params![run_id, session_id],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+        if run.session_id != session_id || !(run.state.is_active() || manual_latest) {
+            return Err(StoreError::Conflict("terminal_run_not_active"));
+        }
+        let session = self
+            .terminal_session(&session_id)?
+            .ok_or(StoreError::NotFound)?;
+        if let Some(existing) = session.provider_session_id {
+            if existing != provider_session_id {
+                return Err(StoreError::Conflict("provider_session_conflict"));
+            }
+            return self.terminal_session_bundle(&session_id);
         }
         let transaction = self.connection.unchecked_transaction()?;
-        let (session_id, turn_ordinal): (String, i64) = transaction
-            .query_row(
-                "SELECT session_id,ordinal FROM session_turn WHERE id=?1",
-                [turn_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?
-            .ok_or(StoreError::NotFound)?;
-        let timestamp = now();
-        let (id, _) = append_reasoning_in_transaction(
-            &transaction,
-            &session_id,
-            turn_id,
-            turn_ordinal,
-            chunk,
-            None,
-            None,
-            &timestamp,
+        transaction.execute(
+            "UPDATE terminal_session SET provider_session_id=?1,provider_binding_state='bound',
+             provider_binding_source=?2,updated_at=?3 WHERE id=?4 AND provider_session_id IS NULL",
+            params![provider_session_id, source, now(), session_id],
         )?;
+        bump_revision(&transaction)?;
         transaction.commit()?;
-        self.timeline_item(&id)?.ok_or(StoreError::NotFound)
+        self.terminal_session_bundle(&session_id)
     }
 
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn session_timeline(
+    pub fn report_terminal_status(
         &self,
+        event_id: &str,
         session_id: &str,
-        after_sequence: i64,
-        limit: i64,
-    ) -> StoreResult<SessionTimelinePage> {
-        self.session_timeline_page(session_id, after_sequence, None, limit)
-    }
-
-    pub fn session_timeline_page(
-        &self,
-        session_id: &str,
-        after_sequence: i64,
-        after_cursor: Option<&SessionTimelineCursor>,
-        limit: i64,
-    ) -> StoreResult<SessionTimelinePage> {
+        run_id: &str,
+        status: TerminalAgentStatus,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let event_id = canonical_uuid(event_id, "eventId")?;
         let session_id = canonical_uuid(session_id, "sessionId")?;
-        self.backfill_legacy_timeline(
-            &session_id,
-            after_cursor.map(|cursor| cursor.turn_ordinal),
-            SESSION_TIMELINE_BACKFILL_TURN_BATCH,
-        )?;
-        let session = self.session(&session_id)?.ok_or(StoreError::NotFound)?;
-        let items = if let Some(cursor) = after_cursor {
-            let mut statement = self.connection.prepare(&format!(
-                "{} WHERE session_id=?1 AND
-                 (turn_ordinal>?2 OR (turn_ordinal=?2 AND item_ordinal>?3))
-                 ORDER BY turn_ordinal,item_ordinal LIMIT ?4",
-                timeline_select()
-            ))?;
-            let mut rows = statement.query(params![
-                session_id,
-                cursor.turn_ordinal,
-                cursor.item_ordinal,
-                limit.clamp(1, 2000)
-            ])?;
-            collect_bounded_timeline_rows(&mut rows)?
-        } else if after_sequence > 0 {
-            let mut statement = self.connection.prepare(&format!(
-                "{} WHERE session_id=?1 AND sequence>?2 ORDER BY sequence LIMIT ?3",
-                timeline_select()
-            ))?;
-            let mut rows =
-                statement.query(params![session_id, after_sequence, limit.clamp(1, 2000)])?;
-            collect_bounded_timeline_rows(&mut rows)?
-        } else {
-            // Chat V2 pages are authoritative in turn/item order from the
-            // first page onward. Sequence remains accepted only as an explicit
-            // legacy continuation cursor, because repairing an early turn can
-            // allocate a high sequence that must not jump behind later turns.
-            let mut statement = self.connection.prepare(&format!(
-                "{} WHERE session_id=?1 ORDER BY turn_ordinal,item_ordinal LIMIT ?2",
-                timeline_select()
-            ))?;
-            let mut rows = statement.query(params![session_id, limit.clamp(1, 2000)])?;
-            collect_bounded_timeline_rows(&mut rows)?
-        };
-        let next_sequence = items
-            .iter()
-            .map(|item| item.sequence)
-            .max()
-            .unwrap_or(after_sequence);
-        let next_cursor = items.last().map(|item| SessionTimelineCursor {
-            turn_ordinal: item.turn_ordinal,
-            item_ordinal: item.item_ordinal,
-        });
-        let active_turn = self.connection.query_row(
-            "SELECT id,session_id,ordinal,user_message_id,provider_session_id_before,provider_session_id_after,status,
-             exit_code,final_output,error_code,error_message,provider_usage_json,started_at,ended_at,created_at
-             FROM session_turn WHERE session_id=?1 AND status IN ('queued','running') ORDER BY ordinal DESC LIMIT 1",
-            [&session_id],
-            row_to_turn,
-        ).optional()?;
-        let pending_backfill: bool = self.connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM session_turn turn_row
-               WHERE turn_row.session_id=?1
-                 AND turn_row.status NOT IN ('queued','running')
-                 AND NOT EXISTS(
-                   SELECT 1 FROM session_timeline_projection projection
-                   WHERE projection.turn_id=turn_row.id
-                     AND projection.parser_version=?2
-                     AND (projection.last_error IS NULL
-                          OR projection.last_error='preserved_unreplayable')
-                     AND projection.raw_through_sequence>=(
-                       SELECT coalesce(max(raw.sequence),0) FROM turn_event raw WHERE raw.turn_id=turn_row.id
-                     )
-                     AND EXISTS(SELECT 1 FROM session_timeline_item item WHERE item.turn_id=turn_row.id)
-                 )
-             )",
-            params![session_id, SESSION_TIMELINE_PARSER_VERSION],
-            |row| row.get::<_, i64>(0).map(|value| value != 0),
-        )?;
-        let degraded_projection: bool = self.connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM session_timeline_projection projection
-               JOIN session_turn turn_row ON turn_row.id=projection.turn_id
-               WHERE turn_row.session_id=?1 AND projection.fidelity IN ('partial','failed')
-             )",
-            [&session_id],
-            |row| row.get::<_, i64>(0).map(|value| value != 0),
-        )?;
-        let has_more_items: bool = if let Some(cursor) = next_cursor.as_ref() {
-            self.connection.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM session_timeline_item
-                   WHERE session_id=?1 AND
-                     (turn_ordinal>?2 OR (turn_ordinal=?2 AND item_ordinal>?3))
-                 )",
-                params![session_id, cursor.turn_ordinal, cursor.item_ordinal],
-                |row| row.get::<_, i64>(0).map(|value| value != 0),
-            )?
-        } else {
-            false
-        };
-        let fidelity = if pending_backfill || degraded_projection {
-            "partial"
-        } else if items.iter().all(|item| item.fidelity == "exact") {
-            "exact"
-        } else if items.iter().all(|item| item.fidelity == "legacy") {
-            "legacy"
-        } else {
-            "mixed"
-        };
-        Ok(SessionTimelinePage {
-            session,
-            items,
-            active_turn,
-            next_sequence,
-            next_cursor,
-            has_more: pending_backfill || has_more_items,
-            fidelity: fidelity.to_owned(),
-        })
-    }
-
-    pub fn session_timeline_turn_page(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        after_cursor: Option<&SessionTimelineCursor>,
-        limit: i64,
-    ) -> StoreResult<SessionTimelinePage> {
-        let session_id = canonical_uuid(session_id, "sessionId")?;
-        let turn_id = canonical_uuid(turn_id, "turnId")?;
-        let session = self.session(&session_id)?.ok_or(StoreError::NotFound)?;
-        let turn = self.turn(&turn_id)?.ok_or(StoreError::NotFound)?;
-        if turn.session_id != session_id {
-            return Err(StoreError::NotFound);
-        }
-        if after_cursor.is_some_and(|cursor| cursor.turn_ordinal != turn.ordinal) {
-            return Err(StoreError::Invalid(
-                "timeline cursor does not belong to the requested turn".to_owned(),
-            ));
-        }
-        if !matches!(turn.status, TurnStatus::Queued | TurnStatus::Running) {
-            let needs_backfill: bool = self.connection.query_row(
-                "SELECT NOT EXISTS(
-                   SELECT 1 FROM session_timeline_projection projection
-                   WHERE projection.turn_id=?1
-                     AND projection.parser_version=?2
-                     AND (projection.last_error IS NULL
-                          OR projection.last_error='preserved_unreplayable')
-                     AND projection.raw_through_sequence>=(
-                       SELECT coalesce(max(raw.sequence),0) FROM turn_event raw WHERE raw.turn_id=?1
-                     )
-                     AND EXISTS(SELECT 1 FROM session_timeline_item item WHERE item.turn_id=?1)
-                 )",
-                params![turn_id, SESSION_TIMELINE_PARSER_VERSION],
-                |row| row.get::<_, i64>(0).map(|value| value != 0),
-            )?;
-            if needs_backfill {
-                self.backfill_legacy_timeline(&session_id, Some(turn.ordinal), 1)?;
-            }
-        }
-        let mut statement = self.connection.prepare(&format!(
-            "{} WHERE session_id=?1 AND turn_id=?2 AND item_ordinal>?3
-             ORDER BY item_ordinal LIMIT ?4",
-            timeline_select()
-        ))?;
-        let mut rows = statement.query(params![
-            session_id,
-            turn_id,
-            after_cursor.map_or(-1, |cursor| cursor.item_ordinal),
-            limit.clamp(1, 500)
-        ])?;
-        let items = collect_bounded_timeline_rows(&mut rows)?;
-        let next_sequence = items.iter().map(|item| item.sequence).max().unwrap_or(0);
-        let next_cursor = items.last().map(|item| SessionTimelineCursor {
-            turn_ordinal: item.turn_ordinal,
-            item_ordinal: item.item_ordinal,
-        });
-        let fidelity = self
+        let run_id = canonical_uuid(run_id, "runId")?;
+        if let Some((existing_session, existing_run, existing_status)) = self
             .connection
             .query_row(
-                "SELECT fidelity FROM session_timeline_projection WHERE turn_id=?1",
-                [&turn_id],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .unwrap_or_else(|| {
-                if items.iter().all(|item| item.fidelity == "exact") {
-                    "exact".to_owned()
-                } else {
-                    "partial".to_owned()
-                }
-            });
-        let active_turn =
-            matches!(turn.status, TurnStatus::Queued | TurnStatus::Running).then_some(turn);
-        let has_more = if let Some(cursor) = next_cursor.as_ref() {
-            self.connection.query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM session_timeline_item
-                   WHERE session_id=?1 AND turn_id=?2 AND item_ordinal>?3
-                 )",
-                params![session_id, turn_id, cursor.item_ordinal],
-                |row| row.get::<_, i64>(0).map(|value| value != 0),
-            )?
-        } else {
-            false
-        };
-        Ok(SessionTimelinePage {
-            session,
-            items,
-            active_turn,
-            next_sequence,
-            next_cursor,
-            has_more,
-            fidelity,
-        })
-    }
-
-    fn timeline_item(&self, id: &str) -> StoreResult<Option<SessionTimelineItem>> {
-        timeline_item_connection(&self.connection, id)
-    }
-
-    fn backfill_legacy_timeline(
-        &self,
-        session_id: &str,
-        minimum_turn_ordinal: Option<i64>,
-        turn_limit: i64,
-    ) -> StoreResult<()> {
-        let transaction = self.connection.unchecked_transaction()?;
-        let runtime_value: String = transaction.query_row(
-            "SELECT runtime_kind FROM task_session WHERE id=?1",
-            [session_id],
-            |row| row.get(0),
-        )?;
-        let runtime = RuntimeKind::parse(&runtime_value).ok_or(rusqlite::Error::InvalidQuery)?;
-        let mut turn_statement = transaction.prepare(
-            "SELECT turn_row.id,turn_row.ordinal,turn_row.status FROM session_turn turn_row
-             WHERE turn_row.session_id=?1 AND turn_row.ordinal>=?2
-               AND turn_row.status NOT IN ('queued','running')
-               AND NOT EXISTS(
-                 SELECT 1 FROM session_timeline_projection projection
-                 WHERE projection.turn_id=turn_row.id
-                   AND projection.parser_version=?4
-                   AND (projection.last_error IS NULL
-                        OR projection.last_error='preserved_unreplayable')
-                   AND projection.raw_through_sequence>=(
-                     SELECT coalesce(max(raw.sequence),0) FROM turn_event raw WHERE raw.turn_id=turn_row.id
-                   )
-                   AND EXISTS(SELECT 1 FROM session_timeline_item item WHERE item.turn_id=turn_row.id)
-               )
-             ORDER BY turn_row.ordinal LIMIT ?3",
-        )?;
-        let turns = turn_statement
-            .query_map(
-                params![
-                    session_id,
-                    minimum_turn_ordinal.unwrap_or(0),
-                    turn_limit.clamp(1, SESSION_TIMELINE_BACKFILL_TURN_BATCH),
-                    SESSION_TIMELINE_PARSER_VERSION,
-                ],
+                "SELECT session_id,run_id,status FROM terminal_status_receipt WHERE event_id=?1",
+                [&event_id],
                 |row| {
                     Ok((
                         row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )?
-            .collect::<Result<Vec<_>, _>>()?;
-        drop(turn_statement);
-
-        for (turn_id, turn_ordinal, turn_status) in turns {
-            let mut message_statement = transaction.prepare(
-                "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
-                 FROM session_message WHERE turn_id=?1 ORDER BY sequence",
-            )?;
-            let messages = message_statement
-                .query_map([&turn_id], row_to_message)?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(message_statement);
-
-            let mut raw_statement = transaction.prepare(
-                "SELECT sequence,payload,created_at FROM turn_event WHERE turn_id=?1 ORDER BY sequence",
-            )?;
-            let raw_events = raw_statement
-                .query_map([&turn_id], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
                     ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            drop(raw_statement);
-
-            let existing_non_user_count: i64 = transaction.query_row(
-                "SELECT count(*) FROM session_timeline_item WHERE turn_id=?1 AND kind<>'user'",
-                [&turn_id],
-                |row| row.get(0),
-            )?;
-            let existing_items_are_legacy: bool = transaction.query_row(
-                "SELECT NOT EXISTS(
-                   SELECT 1 FROM session_timeline_item
-                   WHERE turn_id=?1 AND kind<>'user'
-                     AND (fidelity<>'legacy' OR source_event_sequence IS NOT NULL)
-                 )",
-                [&turn_id],
-                |row| row.get::<_, i64>(0).map(|value| value != 0),
-            )?;
-            let (existing_requires_text, existing_requires_reasoning): (bool, bool) = transaction
-                .query_row(
-                    "SELECT
-                       EXISTS(SELECT 1 FROM session_timeline_item WHERE turn_id=?1 AND kind='assistant_text'),
-                       EXISTS(SELECT 1 FROM session_timeline_item WHERE turn_id=?1 AND kind='reasoning')",
-                    [&turn_id],
-                    |row| {
-                        Ok((
-                            row.get::<_, i64>(0)? != 0,
-                            row.get::<_, i64>(1)? != 0,
-                        ))
-                    },
-                )?;
-            let existing_projection_parser: Option<i64> = transaction
-                .query_row(
-                    "SELECT parser_version FROM session_timeline_projection WHERE turn_id=?1",
-                    [&turn_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let mut replay_parser = RecordedEventParser::new(runtime);
-            let mut raw_replayable = !raw_events.is_empty();
-            let mut replayed_raw_events = Vec::with_capacity(raw_events.len());
-            for (event_sequence, payload, timestamp) in &raw_events {
-                let value = match serde_json::from_str::<Value>(payload) {
-                    Ok(value) if value.get("_todoagentRaw").is_none() => value,
-                    _ => {
-                        raw_replayable = false;
-                        continue;
-                    }
-                };
-                replayed_raw_events.push((
-                    *event_sequence,
-                    timestamp.clone(),
-                    replay_parser.parse(value),
-                ));
+                },
+            )
+            .optional()?
+        {
+            if existing_session == session_id
+                && existing_run == run_id
+                && existing_status == status.as_str()
+            {
+                return self.terminal_session_bundle(&session_id);
             }
-            let replayed_events = replayed_raw_events
-                .iter()
-                .flat_map(|(_, _, events)| events.iter())
-                .collect::<Vec<_>>();
-            let candidate_has_semantics = replayed_events
-                .iter()
-                .any(|event| !matches!(event, ProviderEvent::SessionId(_)));
-            let candidate_has_text = replayed_events
-                .iter()
-                .any(|event| matches!(event, ProviderEvent::Text(_)));
-            let candidate_has_reasoning = replayed_events
-                .iter()
-                .any(|event| matches!(event, ProviderEvent::Reasoning(_)));
-            let unwatermarked_candidate_preserves_semantic_kinds = candidate_has_semantics
-                && (!existing_requires_text || candidate_has_text)
-                && (!existing_requires_reasoning || candidate_has_reasoning);
-            // A read must never destroy semantic items that may be the only
-            // surviving copy of provider-exposed reasoning. Replace an old
-            // projection only when every raw frame can be replayed, or when
-            // there is no non-user projection to preserve.
-            let replace_projection = existing_non_user_count == 0
-                || (!raw_events.is_empty()
-                    && raw_replayable
-                    && (existing_projection_parser == Some(SESSION_TIMELINE_PARSER_VERSION)
-                        || existing_items_are_legacy
-                        || (existing_projection_parser.is_none()
-                            && unwatermarked_candidate_preserves_semantic_kinds)));
-            if replace_projection && !raw_events.is_empty() {
-                transaction.execute(
-                    "DELETE FROM session_timeline_item WHERE turn_id=?1 AND kind<>'user'",
-                    [&turn_id],
-                )?;
-            }
-
-            let user_message = messages
-                .iter()
-                .find(|message| message.role == MessageRole::User && message.kind == "text");
-            if let Some(message) = user_message {
-                let user_id = format!("timeline-{}", message.id);
-                let user_exists: bool = transaction.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM session_timeline_item WHERE id=?1)",
-                    [&user_id],
-                    |row| row.get::<_, i64>(0).map(|value| value != 0),
-                )?;
-                if !user_exists {
-                    insert_timeline_item(
-                        &transaction,
-                        NewTimelineItem {
-                            id: user_id,
-                            session_id,
-                            turn_id: &turn_id,
-                            turn_ordinal,
-                            kind: "user",
-                            body: &message.body,
-                            call_id: None,
-                            tool_name: None,
-                            input_json: None,
-                            output_text: None,
-                            tool_state: None,
-                            is_error: false,
-                            source_event_sequence: None,
-                            source_block_index: None,
-                            fidelity: if raw_events.is_empty() {
-                                "legacy"
-                            } else {
-                                "exact"
-                            },
-                            metadata_json: message.payload_json.as_deref(),
-                            timestamp: &message.created_at,
-                        },
-                    )?;
-                }
-            }
-
-            let (raw_through_sequence, mut fidelity) = if raw_events.is_empty() {
-                for message in &messages {
-                    if message.role == MessageRole::User && message.kind == "text" {
-                        continue;
-                    }
-                    match (message.role, message.kind.as_str()) {
-                        (MessageRole::Agent, "text") => {
-                            insert_legacy_agent_text_if_missing(
-                                &transaction,
-                                session_id,
-                                &turn_id,
-                                turn_ordinal,
-                                message,
-                            )?;
-                        }
-                        _ => mirror_legacy_message_to_timeline(
-                            &transaction,
-                            &message.id,
-                            session_id,
-                            &turn_id,
-                            message.role,
-                            &message.kind,
-                            &message.body,
-                            message.payload_json.as_deref(),
-                            &message.created_at,
-                        )?,
-                    }
-                }
-                (
-                    0,
-                    if existing_non_user_count == 0 {
-                        "legacy"
-                    } else {
-                        "partial"
-                    },
-                )
-            } else if replace_projection {
-                let raw_through = raw_events.last().map_or(0, |event| event.0);
-                for (event_sequence, timestamp, events) in replayed_raw_events {
-                    for (block_index, event) in events.into_iter().enumerate() {
-                        mirror_replayed_provider_event(
-                            &transaction,
-                            session_id,
-                            &turn_id,
-                            turn_ordinal,
-                            event_sequence,
-                            i64::try_from(block_index).unwrap_or(i64::MAX),
-                            event,
-                            &timestamp,
-                        )?;
-                    }
-                }
-                (
-                    raw_through,
-                    if raw_replayable { "exact" } else { "partial" },
-                )
-            } else {
-                (raw_events.last().map_or(0, |event| event.0), "partial")
-            };
-
-            let assistant_text_count: i64 = transaction.query_row(
-                "SELECT count(*) FROM session_timeline_item
-                 WHERE turn_id=?1 AND kind='assistant_text'",
-                [&turn_id],
-                |row| row.get(0),
-            )?;
-            if !raw_events.is_empty() && (fidelity != "exact" || assistant_text_count == 0) {
-                // A partially understood raw stream may still contain a valid
-                // tool frame. Merge missing legacy assistant text by stable
-                // message ID instead of treating any visible item as proof the
-                // textual projection is complete.
-                let mut inserted_legacy_text = false;
-                for message in &messages {
-                    if message.role == MessageRole::Agent && message.kind == "text" {
-                        inserted_legacy_text |= insert_legacy_agent_text_if_missing(
-                            &transaction,
-                            session_id,
-                            &turn_id,
-                            turn_ordinal,
-                            message,
-                        )?;
-                    }
-                }
-                if inserted_legacy_text && fidelity == "exact" {
-                    fidelity = "partial";
-                }
-            }
-            if !raw_events.is_empty() {
-                // Raw frames are authoritative for text/reasoning order. Legacy
-                // tool and terminal status/error rows fill gaps left by older
-                // non-atomic writers and are idempotent by call/message ID.
-                for message in &messages {
-                    if matches!(message.role, MessageRole::Tool | MessageRole::System) {
-                        mirror_legacy_message_to_timeline(
-                            &transaction,
-                            &message.id,
-                            session_id,
-                            &turn_id,
-                            message.role,
-                            &message.kind,
-                            &message.body,
-                            message.payload_json.as_deref(),
-                            &message.created_at,
-                        )?;
-                    }
-                }
-            }
-            if matches!(
-                turn_status.as_str(),
-                "completed" | "cancelled" | "interrupted" | "failed"
-            ) {
-                transaction.execute(
-                    "UPDATE session_timeline_item
-                     SET tool_state=?1,is_error=?2,updated_at=?3
-                     WHERE turn_id=?4 AND kind='tool' AND tool_state='running'",
-                    params![
-                        if turn_status == "failed" {
-                            "failed"
-                        } else {
-                            "interrupted"
-                        },
-                        i64::from(turn_status == "failed"),
-                        now(),
-                        turn_id,
-                    ],
-                )?;
-            }
-            // The preserved marker records that the current parser was attempted
-            // without claiming raw replay. This also lets a v1 projection converge
-            // under v2 while a future v3 can retry.
-            let projected_parser_version = SESSION_TIMELINE_PARSER_VERSION;
-            let projection_last_error = (!(replace_projection
-                || raw_events.is_empty() && existing_non_user_count == 0))
-                .then_some("preserved_unreplayable");
-            transaction.execute(
-                "INSERT INTO session_timeline_projection(turn_id,parser_version,raw_through_sequence,fidelity,last_error,updated_at)
-                 VALUES(?1,?2,?3,?4,?5,?6)
-                 ON CONFLICT(turn_id) DO UPDATE SET parser_version=excluded.parser_version,
-                 raw_through_sequence=excluded.raw_through_sequence,
-                 fidelity=excluded.fidelity,last_error=excluded.last_error,updated_at=excluded.updated_at",
-                params![
-                    turn_id,
-                    projected_parser_version,
-                    raw_through_sequence,
-                    fidelity,
-                    projection_last_error,
-                    now()
-                ],
-            )?;
+            return Err(StoreError::Conflict("terminal_status_event_id_reused"));
         }
+        let run = self.terminal_run(&run_id)?.ok_or(StoreError::NotFound)?;
+        if run.session_id != session_id || !run.state.is_active() {
+            return Err(StoreError::Conflict("terminal_run_not_active"));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        transaction.execute(
+            "INSERT INTO terminal_status_receipt(event_id,session_id,run_id,status,created_at)
+             VALUES(?1,?2,?3,?4,?5)",
+            params![event_id, session_id, run_id, status.as_str(), now()],
+        )?;
+        transaction.execute(
+            "UPDATE terminal_session SET agent_status=?1,
+             status_sequence=status_sequence+CASE WHEN ?2 THEN 1 ELSE 0 END,
+             updated_at=?3 WHERE id=?4",
+            params![
+                status.as_str(),
+                status.creates_attention(),
+                now(),
+                session_id
+            ],
+        )?;
+        bump_revision(&transaction)?;
         transaction.commit()?;
-        Ok(())
+        self.terminal_session_bundle(&session_id)
     }
 
-    pub fn session_for_task(&self, task_id: &str) -> StoreResult<Option<TaskSession>> {
+    pub fn mark_terminal_seen(
+        &self,
+        session_id: &str,
+        through: i64,
+    ) -> StoreResult<TerminalSession> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE terminal_session SET seen_status_sequence=min(max(seen_status_sequence,?1),status_sequence),
+             updated_at=?2 WHERE id=?3",
+            params![through.max(0), now(), session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        self.terminal_session(&session_id)?
+            .ok_or(StoreError::NotFound)
+    }
+
+    pub fn terminal_session_for_task(&self, task_id: &str) -> StoreResult<Option<TerminalSession>> {
         let task_id = canonical_uuid(task_id, "taskId")?;
         Ok(self
             .connection
             .query_row(
-                &session_select("WHERE task_id=?1"),
+                &terminal_session_select("WHERE task_id=?1"),
                 [&task_id],
-                row_to_session,
+                row_to_terminal_session,
             )
             .optional()?)
     }
 
-    pub fn session(&self, id: &str) -> StoreResult<Option<TaskSession>> {
+    pub fn terminal_session(&self, id: &str) -> StoreResult<Option<TerminalSession>> {
         let id = canonical_uuid(id, "sessionId")?;
         Ok(self
             .connection
-            .query_row(&session_select("WHERE id=?1"), [&id], row_to_session)
+            .query_row(
+                &terminal_session_select("WHERE id=?1"),
+                [&id],
+                row_to_terminal_session,
+            )
             .optional()?)
     }
 
-    pub fn mark_read(&self, session_id: &str, through_sequence: i64) -> StoreResult<TaskSession> {
+    pub fn terminal_run(&self, id: &str) -> StoreResult<Option<TerminalRun>> {
+        let id = canonical_uuid(id, "runId")?;
+        Ok(self
+            .connection
+            .query_row(
+                &terminal_run_select("WHERE id=?1"),
+                [&id],
+                row_to_terminal_run,
+            )
+            .optional()?)
+    }
+
+    pub fn active_terminal_run(&self, session_id: &str) -> StoreResult<Option<TerminalRun>> {
         let session_id = canonical_uuid(session_id, "sessionId")?;
-        let transaction = self.connection.unchecked_transaction()?;
-        let changed = transaction.execute(
-            "UPDATE task_session SET last_read_sequence=min(max(last_read_sequence,?1),last_agent_sequence),updated_at=?2 WHERE id=?3",
-            params![through_sequence, now(), session_id],
-        )?;
-        if changed == 0 {
-            return Err(StoreError::NotFound);
-        }
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        self.session(&session_id)?.ok_or(StoreError::NotFound)
+        Ok(self
+            .connection
+            .query_row(
+                &terminal_run_select(
+                    "WHERE session_id=?1 AND state IN ('starting','running','stopping')",
+                ),
+                [&session_id],
+                row_to_terminal_run,
+            )
+            .optional()?)
     }
 
-    pub fn turn(&self, id: &str) -> StoreResult<Option<SessionTurn>> {
-        Ok(self.connection.query_row(
-            "SELECT id,session_id,ordinal,user_message_id,provider_session_id_before,provider_session_id_after,status,
-             exit_code,final_output,error_code,error_message,provider_usage_json,started_at,ended_at,created_at
-             FROM session_turn WHERE id=?1",
-            [id],
-            row_to_turn,
-        ).optional()?)
-    }
-
-    pub fn session_turn_count(&self, session_id: &str) -> StoreResult<i64> {
-        let session_id = canonical_uuid(session_id, "sessionId")?;
-        Ok(self.connection.query_row(
-            "SELECT count(*) FROM session_turn WHERE session_id=?1",
-            [&session_id],
-            |row| row.get(0),
-        )?)
-    }
-
-    fn message(&self, id: &str) -> StoreResult<Option<SessionMessage>> {
-        Ok(self.connection.query_row(
-            "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
-             FROM session_message WHERE id=?1",
-            [id],
-            row_to_message,
-        ).optional()?)
+    pub fn terminal_session_bundle(&self, session_id: &str) -> StoreResult<TerminalSessionBundle> {
+        let session = self
+            .terminal_session(session_id)?
+            .ok_or(StoreError::NotFound)?;
+        let active_run = match self.active_terminal_run(&session.id)? {
+            Some(run) => Some(run),
+            None => self.latest_terminal_run(&session.id)?,
+        };
+        Ok(TerminalSessionBundle {
+            session,
+            active_run,
+        })
     }
 
     fn lists(&self) -> StoreResult<Vec<List>> {
         let mut statement = self.connection.prepare(
-            "SELECT id,name,color,repository_path,archived_at,created_at,updated_at FROM list WHERE archived_at IS NULL ORDER BY created_at",
+            "SELECT id,name,color,repository_path,archived_at,created_at,updated_at
+             FROM list WHERE archived_at IS NULL ORDER BY created_at",
         )?;
         Ok(statement
-            .query_map([], |row| {
-                Ok(List {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    color: row.get(2)?,
-                    repository_path: row.get(3)?,
-                    archived_at: row.get(4)?,
-                    created_at: row.get(5)?,
-                    updated_at: row.get(6)?,
-                })
-            })?
+            .query_map([], row_to_list)?
             .collect::<Result<Vec<_>, _>>()?)
     }
 
@@ -3924,20 +2995,20 @@ impl Store {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
-    fn sessions(&self) -> StoreResult<Vec<TaskSession>> {
+    fn sessions(&self) -> StoreResult<Vec<TerminalSession>> {
         let mut statement = self
             .connection
-            .prepare(&session_select("ORDER BY updated_at DESC"))?;
+            .prepare(&terminal_session_select("ORDER BY updated_at DESC"))?;
         Ok(statement
-            .query_map([], row_to_session)?
+            .query_map([], row_to_terminal_session)?
             .collect::<Result<Vec<_>, _>>()?)
     }
 
-    fn reconcile_interrupted_turns(&self) -> StoreResult<()> {
+    fn reconcile_interrupted_terminal_runs(&self) -> StoreResult<()> {
         let transaction = self.connection.unchecked_transaction()?;
         let timestamp = now();
         let mut statement = transaction.prepare(
-            "SELECT id,session_id FROM session_turn WHERE status IN ('queued','running')",
+            "SELECT id,session_id FROM terminal_run WHERE state IN ('starting','running','stopping')",
         )?;
         let interrupted = statement
             .query_map([], |row| {
@@ -3945,40 +3016,16 @@ impl Store {
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(statement);
-        for (turn_id, session_id) in &interrupted {
+        for (run_id, session_id) in &interrupted {
             transaction.execute(
-                "UPDATE session_turn SET status='interrupted',error_code='engine_interrupted',
-                 error_message='TodoAgent 上次退出时本轮仍在运行',ended_at=?1 WHERE id=?2",
-                params![timestamp, turn_id],
-            )?;
-            let sequence = next_message_sequence(&transaction, session_id)?;
-            let message_id = Uuid::new_v4().to_string();
-            let body = "TodoAgent 上次退出时本轮仍在运行，请重新发送消息继续。";
-            transaction.execute(
-                "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,created_at,updated_at)
-                 VALUES(?1,?2,?3,?4,'system','error','TodoAgent 上次退出时本轮仍在运行，请重新发送消息继续。',?5,?5)",
-                params![message_id, session_id, turn_id, sequence, timestamp],
-            )?;
-            mirror_legacy_message_to_timeline(
-                &transaction,
-                &message_id,
-                session_id,
-                turn_id,
-                MessageRole::System,
-                "error",
-                body,
-                None,
-                &timestamp,
+                "UPDATE terminal_run SET state='interrupted',error_code='engine_interrupted',
+                 error_message='TodoAgent exited while this terminal was active',exited_at=?1 WHERE id=?2",
+                params![timestamp, run_id],
             )?;
             transaction.execute(
-                "UPDATE session_timeline_item
-                 SET tool_state='interrupted',is_error=0,updated_at=?1
-                 WHERE turn_id=?2 AND kind='tool' AND tool_state='running'",
-                params![timestamp, turn_id],
-            )?;
-            transaction.execute(
-                "UPDATE task_session SET state='failed',last_error_code='engine_interrupted',
-                 last_error_message='TodoAgent 上次退出时本轮仍在运行',updated_at=?1 WHERE id=?2",
+                "UPDATE terminal_session SET agent_status='unknown',last_error_code='engine_interrupted',
+                 last_error_message='TodoAgent exited while this terminal was active',last_exited_at=?1,
+                 updated_at=?1 WHERE id=?2",
                 params![timestamp, session_id],
             )?;
         }
@@ -4097,15 +3144,13 @@ impl Store {
     }
 }
 
-/// Removes a pre-v4 development database and its managed task attachments.
-/// Credentials, settings files and logs live outside these exact targets and are
-/// deliberately left untouched. A future schema is never silently destroyed.
+/// Performs only non-destructive preflight. v4 is migrated by `Store::open`;
+/// unsupported legacy and future schemas are preserved and rejected.
 pub fn prepare_database_files(database: &Path, attachments: &Path) -> StoreResult<()> {
     if !database.exists() {
         ensure_real_directory(attachments)?;
         remove_file_if_present(&sqlite_sidecar_path(database, "-wal"))?;
         remove_file_if_present(&sqlite_sidecar_path(database, "-shm"))?;
-        reset_managed_attachments(attachments)?;
         return Ok(());
     }
     let connection = Connection::open(database)?;
@@ -4117,23 +3162,13 @@ pub fn prepare_database_files(database: &Path, attachments: &Path) -> StoreResul
             version.unwrap_or_default()
         )));
     }
-    if version == Some(SCHEMA_VERSION) {
+    if matches!(version, Some(4 | SCHEMA_VERSION)) {
         return Ok(());
     }
-
-    // Validate the exact managed root before deleting an old database. A
-    // symlink must never redirect cleanup into an external directory.
-    ensure_real_directory(attachments)?;
-
-    for path in [
-        database.to_owned(),
-        sqlite_sidecar_path(database, "-wal"),
-        sqlite_sidecar_path(database, "-shm"),
-    ] {
-        remove_file_if_present(&path)?;
-    }
-    reset_managed_attachments(attachments)?;
-    Ok(())
+    Err(StoreError::Invalid(format!(
+        "database schema version {} cannot be upgraded directly; the original database was preserved",
+        version.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
+    )))
 }
 
 fn remove_file_if_present(path: &Path) -> StoreResult<()> {
@@ -4142,18 +3177,6 @@ fn remove_file_if_present(path: &Path) -> StoreResult<()> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
-}
-
-fn reset_managed_attachments(attachments: &Path) -> StoreResult<()> {
-    ensure_real_directory(attachments)?;
-    match fs::remove_dir_all(attachments) {
-        Ok(()) => {}
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    fs::create_dir_all(attachments)?;
-    ensure_real_directory(attachments)?;
-    Ok(())
 }
 
 fn ensure_real_directory(path: &Path) -> StoreResult<()> {
@@ -4240,17 +3263,149 @@ fn migrate(connection: &Connection) -> StoreResult<()> {
             version.unwrap_or_default()
         )));
     }
-    if version.is_some_and(|version| version < SCHEMA_VERSION)
+    if version == Some(4) {
+        create_v4_backup(connection)?;
+        migrate_v4_to_v5(connection)?;
+    } else if version.is_some_and(|version| version < 4)
         || (version.is_none() && has_application_tables(connection)?)
     {
-        reset_schema(connection)?;
+        return Err(StoreError::Invalid(
+            "legacy database cannot be upgraded directly; the original database was preserved"
+                .to_owned(),
+        ));
     }
     connection.execute_batch(include_str!("schema.sql"))?;
     connection.execute(
         "INSERT OR IGNORE INTO schema_migration(version,name,checksum,applied_at)
-         VALUES(?1,'unified task time and attachments',?2,?3)",
+         VALUES(?1,'terminal sessions',?2,?3)",
         params![SCHEMA_VERSION, SCHEMA_CHECKSUM, now()],
     )?;
+    let checksum: String = connection.query_row(
+        "SELECT checksum FROM schema_migration WHERE version=?1",
+        [SCHEMA_VERSION],
+        |row| row.get(0),
+    )?;
+    if checksum != SCHEMA_CHECKSUM {
+        return Err(StoreError::Invalid(
+            "database schema v5 checksum does not match this Engine".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn create_v4_backup(connection: &Connection) -> StoreResult<PathBuf> {
+    use rusqlite::backup::Backup;
+
+    connection.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
+    let source = connection
+        .path()
+        .ok_or_else(|| StoreError::Invalid("database path is unavailable".to_owned()))?;
+    let source = Path::new(source);
+    let parent = source
+        .parent()
+        .ok_or_else(|| StoreError::Invalid("database parent is unavailable".to_owned()))?;
+    let file_name = source
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| StoreError::Invalid("database file name is invalid".to_owned()))?;
+    let stamp = Utc::now().format("%Y%m%dT%H%M%S%.fZ");
+    let backup_path = parent.join(format!("{file_name}.v4-backup-{stamp}"));
+    let backup_file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(&backup_path)?;
+    let metadata = backup_file.metadata()?;
+    let uid = unsafe { nix::libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.nlink() != 1
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        drop(backup_file);
+        let _ = fs::remove_file(&backup_path);
+        return Err(StoreError::Invalid(
+            "v4 backup must be a current-user unlinked mode 0600 file".to_owned(),
+        ));
+    }
+    drop(backup_file);
+    let mut destination = Connection::open(&backup_path)?;
+    {
+        let backup = Backup::new(connection, &mut destination)?;
+        backup.run_to_completion(128, Duration::from_millis(5), None)?;
+    }
+    drop(destination);
+    Ok(backup_path)
+}
+
+fn migrate_v4_to_v5(connection: &Connection) -> StoreResult<()> {
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch("PRAGMA defer_foreign_keys=ON;")?;
+    // The product intentionally drops only the old structured Agent history.
+    // Tasks, managed attachments, runtimes, settings and Assistant chat tables
+    // stay in the same database and transaction.
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS session_timeline_projection;
+         DROP TABLE IF EXISTS session_timeline_item;
+         DROP TABLE IF EXISTS turn_event;
+         DROP TABLE IF EXISTS session_message;
+         DROP TABLE IF EXISTS session_turn;
+         DROP TABLE IF EXISTS task_session;",
+    )?;
+    transaction.execute_batch(
+        "CREATE TABLE terminal_session (
+           id TEXT PRIMARY KEY,
+           task_id TEXT NOT NULL UNIQUE REFERENCES task(id) ON DELETE CASCADE,
+           runtime_kind TEXT NOT NULL CHECK(runtime_kind IN ('codex','claude','cursor','kiro')),
+           working_directory TEXT NOT NULL,
+           provider_session_id TEXT CHECK(provider_session_id IS NULL OR length(provider_session_id) BETWEEN 1 AND 512),
+           provider_binding_state TEXT NOT NULL DEFAULT 'unbound' CHECK(provider_binding_state IN ('unbound','bound','capture_failed')),
+           provider_binding_source TEXT,
+           agent_status TEXT NOT NULL DEFAULT 'unknown' CHECK(agent_status IN ('unknown','idle','active','blocked','completed')),
+           status_sequence INTEGER NOT NULL DEFAULT 0 CHECK(status_sequence >= 0),
+           seen_status_sequence INTEGER NOT NULL DEFAULT 0 CHECK(seen_status_sequence BETWEEN 0 AND status_sequence),
+           last_error_code TEXT,last_error_message TEXT,last_started_at TEXT,last_exited_at TEXT,
+           created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+         );
+         CREATE TABLE terminal_run (
+           id TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL REFERENCES terminal_session(id) ON DELETE CASCADE,
+           ordinal INTEGER NOT NULL CHECK(ordinal > 0),
+           launch_mode TEXT NOT NULL CHECK(launch_mode IN ('fresh','resume')),
+           state TEXT NOT NULL CHECK(state IN ('starting','running','stopping','exited','failed','interrupted')),
+           provider_session_id_at_launch TEXT,exit_code INTEGER,exit_reason TEXT,error_code TEXT,error_message TEXT,
+           started_at TEXT,exited_at TEXT,created_at TEXT NOT NULL,
+           UNIQUE(session_id, ordinal)
+         );
+         CREATE UNIQUE INDEX idx_terminal_one_active_run ON terminal_run(session_id)
+           WHERE state IN ('starting','running','stopping');
+         CREATE INDEX idx_terminal_session_task ON terminal_session(task_id);
+         CREATE INDEX idx_terminal_run_session ON terminal_run(session_id,ordinal);
+         CREATE TABLE terminal_status_receipt (
+           event_id TEXT PRIMARY KEY,
+           session_id TEXT NOT NULL REFERENCES terminal_session(id) ON DELETE CASCADE,
+           run_id TEXT NOT NULL REFERENCES terminal_run(id) ON DELETE CASCADE,
+           status TEXT NOT NULL CHECK(status IN ('unknown','idle','active','blocked','completed')),
+           created_at TEXT NOT NULL
+         );
+         CREATE INDEX idx_terminal_status_receipt_run ON terminal_status_receipt(run_id);",
+    )?;
+    let foreign_key_violations: i64 =
+        transaction.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_violations != 0 {
+        return Err(StoreError::Invalid(
+            "v5 migration failed foreign-key validation".to_owned(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO schema_migration(version,name,checksum,applied_at)
+         VALUES(?1,'terminal sessions',?2,?3)",
+        params![SCHEMA_VERSION, SCHEMA_CHECKSUM, now()],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -4271,23 +3426,6 @@ fn has_application_tables(connection: &Connection) -> rusqlite::Result<bool> {
         [],
         |row| row.get::<_, i64>(0),
     )? != 0)
-}
-
-fn reset_schema(connection: &Connection) -> StoreResult<()> {
-    connection.pragma_update(None, "foreign_keys", "OFF")?;
-    let mut statement = connection.prepare(
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
-    )?;
-    let tables = statement
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
-    drop(statement);
-    for table in tables {
-        let escaped = table.replace('"', "\"\"");
-        connection.execute_batch(&format!("DROP TABLE IF EXISTS \"{escaped}\";"))?;
-    }
-    connection.pragma_update(None, "foreign_keys", "ON")?;
-    Ok(())
 }
 
 fn table_exists(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
@@ -4317,440 +3455,6 @@ fn bump_task_data_revision(transaction: &Transaction<'_>) -> rusqlite::Result<()
     Ok(())
 }
 
-fn next_message_sequence(transaction: &Transaction<'_>, session_id: &str) -> rusqlite::Result<i64> {
-    transaction.query_row(
-        "SELECT coalesce(max(sequence),0)+1 FROM session_message WHERE session_id=?1",
-        [session_id],
-        |row| row.get(0),
-    )
-}
-
-struct NewTimelineItem<'a> {
-    id: String,
-    session_id: &'a str,
-    turn_id: &'a str,
-    turn_ordinal: i64,
-    kind: &'a str,
-    body: &'a str,
-    call_id: Option<&'a str>,
-    tool_name: Option<&'a str>,
-    input_json: Option<&'a str>,
-    output_text: Option<&'a str>,
-    tool_state: Option<&'a str>,
-    is_error: bool,
-    source_event_sequence: Option<i64>,
-    source_block_index: Option<i64>,
-    fidelity: &'a str,
-    metadata_json: Option<&'a str>,
-    timestamp: &'a str,
-}
-
-fn next_timeline_sequence(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-) -> rusqlite::Result<i64> {
-    transaction.query_row(
-        "SELECT coalesce(max(sequence),0)+1 FROM session_timeline_item WHERE session_id=?1",
-        [session_id],
-        |row| row.get(0),
-    )
-}
-
-fn next_timeline_item_ordinal(
-    transaction: &Transaction<'_>,
-    turn_id: &str,
-) -> rusqlite::Result<i64> {
-    transaction.query_row(
-        "SELECT coalesce(max(item_ordinal),-1)+1 FROM session_timeline_item WHERE turn_id=?1",
-        [turn_id],
-        |row| row.get(0),
-    )
-}
-
-fn insert_timeline_item(
-    transaction: &Transaction<'_>,
-    item: NewTimelineItem<'_>,
-) -> StoreResult<()> {
-    let sequence = next_timeline_sequence(transaction, item.session_id)?;
-    let item_ordinal = next_timeline_item_ordinal(transaction, item.turn_id)?;
-    transaction.execute(
-        "INSERT INTO session_timeline_item(
-           id,session_id,turn_id,sequence,turn_ordinal,item_ordinal,kind,body,
-           call_id,tool_name,input_json,output_text,tool_state,is_error,
-           source_event_sequence,source_block_index,fidelity,metadata_json,created_at,updated_at
-         ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?19)",
-        params![
-            item.id,
-            item.session_id,
-            item.turn_id,
-            sequence,
-            item.turn_ordinal,
-            item_ordinal,
-            item.kind,
-            item.body,
-            item.call_id,
-            item.tool_name,
-            item.input_json,
-            item.output_text,
-            item.tool_state,
-            i64::from(item.is_error),
-            item.source_event_sequence,
-            item.source_block_index,
-            item.fidelity,
-            item.metadata_json,
-            item.timestamp,
-        ],
-    )?;
-    Ok(())
-}
-
-fn insert_turn_event(
-    transaction: &Transaction<'_>,
-    turn_id: &str,
-    event_type: &str,
-    payload: &Value,
-    timestamp: &str,
-) -> StoreResult<(i64, bool)> {
-    let encoded = payload.to_string();
-    let truncated = encoded.len() > SESSION_TIMELINE_PAYLOAD_MAX_BYTES;
-    // Never byte-slice JSON: it can split UTF-8 and, even on a boundary, leave
-    // syntactically invalid JSON. Oversized frames retain a small valid audit
-    // envelope; live semantic projections are committed in the same transaction.
-    let stored = if truncated {
-        json!({
-            "_todoagentRaw": {
-                "originalBytes": encoded.len(),
-                "truncated": true
-            }
-        })
-        .to_string()
-    } else {
-        encoded
-    };
-    let sequence: i64 = transaction.query_row(
-        "SELECT coalesce(max(sequence),0)+1 FROM turn_event WHERE turn_id=?1",
-        [turn_id],
-        |row| row.get(0),
-    )?;
-    transaction.execute(
-        "INSERT INTO turn_event(turn_id,sequence,type,payload,created_at) VALUES(?1,?2,?3,?4,?5)",
-        params![turn_id, sequence, event_type, stored, timestamp],
-    )?;
-    Ok((sequence, truncated))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_agent_text_in_transaction(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    turn_id: &str,
-    turn_ordinal: i64,
-    chunk: &str,
-    source_event_sequence: Option<i64>,
-    source_block_index: Option<i64>,
-    timestamp: &str,
-) -> StoreResult<(String, String, bool)> {
-    // Both projections must agree that text is the latest semantic item. A
-    // reasoning item is timeline-only, so consulting session_message alone
-    // would incorrectly merge text across exposed thinking.
-    let existing: Option<(String, String, Option<String>)> = transaction
-        .query_row(
-            "SELECT m.id,m.body,m.payload_json FROM session_message m
-             WHERE m.turn_id=?1 AND m.role='agent' AND m.kind='text'
-               AND m.sequence=(SELECT max(sequence) FROM session_message WHERE session_id=?2)
-               AND EXISTS(
-                 SELECT 1 FROM session_timeline_item t
-                 WHERE t.id='timeline-'||m.id AND t.turn_id=?1 AND t.kind='assistant_text'
-                   AND t.item_ordinal=(SELECT max(item_ordinal) FROM session_timeline_item WHERE turn_id=?1)
-               )",
-            params![turn_id, session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    if let Some((id, existing_body, existing_metadata)) = existing {
-        let previous_original_bytes = existing_metadata
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.get("originalBytes").and_then(Value::as_u64))
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(existing_body.len());
-        let original_bytes = previous_original_bytes.saturating_add(chunk.len());
-        let mut body = bounded_utf8(&existing_body, SESSION_TIMELINE_TEXT_MAX_BYTES);
-        if body.len() < SESSION_TIMELINE_TEXT_MAX_BYTES {
-            body.push_str(&bounded_utf8(
-                chunk,
-                SESSION_TIMELINE_TEXT_MAX_BYTES - body.len(),
-            ));
-        }
-        let metadata = (original_bytes > SESSION_TIMELINE_TEXT_MAX_BYTES)
-            .then(|| json!({"originalBytes":original_bytes,"truncated":true}).to_string());
-        transaction.execute(
-            "UPDATE session_message SET body=?1,payload_json=?2,updated_at=?3 WHERE id=?4",
-            params![body, metadata.as_deref(), timestamp, id],
-        )?;
-        let timeline_id = format!("timeline-{id}");
-        transaction.execute(
-            "UPDATE session_timeline_item
-             SET body=?1,metadata_json=?2,updated_at=?3,
-                 source_event_sequence=coalesce(source_event_sequence,?4),
-                 source_block_index=coalesce(source_block_index,?5)
-             WHERE id=?6 AND kind='assistant_text'",
-            params![
-                body,
-                metadata.as_deref(),
-                timestamp,
-                source_event_sequence,
-                source_block_index,
-                timeline_id
-            ],
-        )?;
-        return Ok((id, timeline_id, true));
-    }
-
-    let id = Uuid::new_v4().to_string();
-    let timeline_id = format!("timeline-{id}");
-    let body = bounded_utf8(chunk, SESSION_TIMELINE_TEXT_MAX_BYTES);
-    let metadata = (chunk.len() > SESSION_TIMELINE_TEXT_MAX_BYTES)
-        .then(|| json!({"originalBytes":chunk.len(),"truncated":true}).to_string());
-    let sequence = next_message_sequence(transaction, session_id)?;
-    transaction.execute(
-        "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at)
-         VALUES(?1,?2,?3,?4,'agent','text',?5,?6,?7,?7)",
-        params![
-            id,
-            session_id,
-            turn_id,
-            sequence,
-            body,
-            metadata.as_deref(),
-            timestamp
-        ],
-    )?;
-    insert_timeline_item(
-        transaction,
-        NewTimelineItem {
-            id: timeline_id.clone(),
-            session_id,
-            turn_id,
-            turn_ordinal,
-            kind: "assistant_text",
-            body: &body,
-            call_id: None,
-            tool_name: None,
-            input_json: None,
-            output_text: None,
-            tool_state: None,
-            is_error: false,
-            source_event_sequence,
-            source_block_index,
-            fidelity: "exact",
-            metadata_json: metadata.as_deref(),
-            timestamp,
-        },
-    )?;
-    transaction.execute(
-        "UPDATE task_session SET last_agent_sequence=?1,updated_at=?2 WHERE id=?3",
-        params![sequence, timestamp, session_id],
-    )?;
-    Ok((id, timeline_id, false))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_reasoning_in_transaction(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    turn_id: &str,
-    turn_ordinal: i64,
-    chunk: &str,
-    source_event_sequence: Option<i64>,
-    source_block_index: Option<i64>,
-    timestamp: &str,
-) -> StoreResult<(String, bool)> {
-    let latest: Option<(String, String, Option<String>)> = transaction
-        .query_row(
-            "SELECT id,body,metadata_json FROM session_timeline_item
-             WHERE turn_id=?1 AND kind='reasoning'
-               AND item_ordinal=(SELECT max(item_ordinal) FROM session_timeline_item WHERE turn_id=?1)",
-            [turn_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .optional()?;
-    if let Some((id, existing_body, existing_metadata)) = latest {
-        let previous_original_bytes = existing_metadata
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.get("originalBytes").and_then(Value::as_u64))
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(existing_body.len());
-        let original_bytes = previous_original_bytes.saturating_add(chunk.len());
-        let mut combined = bounded_utf8(&existing_body, SESSION_TIMELINE_REASONING_MAX_BYTES);
-        if combined.len() < SESSION_TIMELINE_REASONING_MAX_BYTES {
-            let remaining = SESSION_TIMELINE_REASONING_MAX_BYTES - combined.len();
-            combined.push_str(&bounded_utf8(chunk, remaining));
-        }
-        let metadata = (original_bytes > SESSION_TIMELINE_REASONING_MAX_BYTES)
-            .then(|| json!({"originalBytes":original_bytes,"truncated":true}).to_string());
-        transaction.execute(
-            "UPDATE session_timeline_item
-             SET body=?1,metadata_json=?2,updated_at=?3,
-                 source_event_sequence=coalesce(source_event_sequence,?4),
-                 source_block_index=coalesce(source_block_index,?5)
-             WHERE id=?6",
-            params![
-                combined,
-                metadata,
-                timestamp,
-                source_event_sequence,
-                source_block_index,
-                id
-            ],
-        )?;
-        return Ok((id, true));
-    }
-
-    let id = Uuid::new_v4().to_string();
-    let body = bounded_utf8(chunk, SESSION_TIMELINE_REASONING_MAX_BYTES);
-    let metadata = (chunk.len() > SESSION_TIMELINE_REASONING_MAX_BYTES)
-        .then(|| json!({"originalBytes":chunk.len(),"truncated":true}).to_string());
-    insert_timeline_item(
-        transaction,
-        NewTimelineItem {
-            id: id.clone(),
-            session_id,
-            turn_id,
-            turn_ordinal,
-            kind: "reasoning",
-            body: &body,
-            call_id: None,
-            tool_name: None,
-            input_json: None,
-            output_text: None,
-            tool_state: None,
-            is_error: false,
-            source_event_sequence,
-            source_block_index,
-            fidelity: "exact",
-            metadata_json: metadata.as_deref(),
-            timestamp,
-        },
-    )?;
-    Ok((id, false))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_legacy_message_in_transaction(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    turn_id: &str,
-    role: MessageRole,
-    kind: &str,
-    body: &str,
-    payload_json: Option<&str>,
-    source_event_sequence: Option<i64>,
-    source_block_index: Option<i64>,
-    timestamp: &str,
-) -> StoreResult<(String, Option<(String, bool)>)> {
-    let payload = payload_json
-        .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        .unwrap_or(Value::Null);
-    let call_id = payload_string(&payload, "callId").map(str::to_owned);
-    let existing_timeline_id = call_id
-        .as_deref()
-        .map(|call_id| {
-            transaction
-                .query_row(
-                    "SELECT id FROM session_timeline_item WHERE turn_id=?1 AND call_id=?2",
-                    params![turn_id, call_id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-        })
-        .transpose()?
-        .flatten();
-    let sequence = next_message_sequence(transaction, session_id)?;
-    let message_id = Uuid::new_v4().to_string();
-    transaction.execute(
-        "INSERT INTO session_message(id,session_id,turn_id,sequence,role,kind,body,payload_json,created_at,updated_at)
-         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",
-        params![
-            message_id,
-            session_id,
-            turn_id,
-            sequence,
-            role.as_str(),
-            kind,
-            body,
-            payload_json,
-            timestamp
-        ],
-    )?;
-    mirror_legacy_message_to_timeline(
-        transaction,
-        &message_id,
-        session_id,
-        turn_id,
-        role,
-        kind,
-        body,
-        payload_json,
-        timestamp,
-    )?;
-    if role == MessageRole::Agent && kind == "text" {
-        transaction.execute(
-            "UPDATE task_session SET last_agent_sequence=?1,updated_at=?2 WHERE id=?3",
-            params![sequence, timestamp, session_id],
-        )?;
-    }
-    let timeline_id = match (role, kind) {
-        (MessageRole::Tool, "tool_call" | "tool_result") => {
-            if let Some(call_id) = call_id.as_deref() {
-                transaction
-                    .query_row(
-                        "SELECT id FROM session_timeline_item WHERE turn_id=?1 AND call_id=?2",
-                        params![turn_id, call_id],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .optional()?
-            } else if kind == "tool_call" {
-                Some(format!("timeline-tool-{turn_id}-legacy-{message_id}"))
-            } else {
-                Some(format!("timeline-tool-{turn_id}-orphan-{message_id}"))
-            }
-        }
-        (MessageRole::System, "status" | "error") => Some(format!("timeline-{message_id}")),
-        _ => None,
-    };
-    if let Some(timeline_id) = timeline_id.as_deref() {
-        transaction.execute(
-            "UPDATE session_timeline_item
-             SET source_event_sequence=coalesce(source_event_sequence,?1),
-                 source_block_index=coalesce(source_block_index,?2)
-             WHERE id=?3",
-            params![source_event_sequence, source_block_index, timeline_id],
-        )?;
-    }
-    Ok((
-        message_id,
-        timeline_id.map(|timeline_id| (timeline_id, existing_timeline_id.is_some())),
-    ))
-}
-
-fn record_once(values: &mut Vec<String>, value: String) {
-    if !values.iter().any(|existing| existing == &value) {
-        values.push(value);
-    }
-}
-
-fn record_timeline_mutation(values: &mut Vec<(String, bool)>, value: String, is_update: bool) {
-    if !values.iter().any(|(existing, _)| existing == &value) {
-        values.push((value, is_update));
-    }
-}
-
-fn timeline_payload(value: Option<&str>) -> Option<String> {
-    value.map(|value| bounded_utf8(value, SESSION_TIMELINE_PAYLOAD_MAX_BYTES))
-}
-
 fn bounded_utf8(value: &str, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value.to_owned();
@@ -4760,6 +3464,17 @@ fn bounded_utf8(value: &str, max_bytes: usize) -> String {
         end -= 1;
     }
     value[..end].to_owned()
+}
+
+fn merged_metadata_json(existing: Option<&str>, additions: Value) -> String {
+    let mut metadata = existing
+        .and_then(|value| serde_json::from_str::<Value>(value).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    if let Value::Object(additions) = additions {
+        metadata.extend(additions);
+    }
+    Value::Object(metadata).to_string()
 }
 
 fn bounded_assistant_message_body(
@@ -4863,455 +3578,6 @@ fn bounded_tool_request_json(tool_name: &str, request_json: &str) -> String {
         }),
     );
     Value::Object(envelope).to_string()
-}
-
-fn payload_string<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
-    payload
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|v| !v.is_empty())
-}
-
-fn merged_metadata_json(existing: Option<&str>, additions: Value) -> String {
-    let mut metadata = existing
-        .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        .and_then(|value| value.as_object().cloned())
-        .unwrap_or_default();
-    if let Value::Object(additions) = additions {
-        metadata.extend(additions);
-    }
-    Value::Object(metadata).to_string()
-}
-
-fn insert_legacy_agent_text_if_missing(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    turn_id: &str,
-    turn_ordinal: i64,
-    message: &SessionMessage,
-) -> StoreResult<bool> {
-    let timeline_id = format!("timeline-{}", message.id);
-    let exists: bool = transaction.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_timeline_item WHERE id=?1)",
-        [&timeline_id],
-        |row| row.get::<_, i64>(0).map(|value| value != 0),
-    )?;
-    if exists {
-        return Ok(false);
-    }
-    let body = bounded_utf8(&message.body, SESSION_TIMELINE_TEXT_MAX_BYTES);
-    let metadata = if message.body.len() > SESSION_TIMELINE_TEXT_MAX_BYTES {
-        Some(json!({"originalBytes":message.body.len(),"truncated":true}).to_string())
-    } else {
-        message.payload_json.clone()
-    };
-    insert_timeline_item(
-        transaction,
-        NewTimelineItem {
-            id: timeline_id,
-            session_id,
-            turn_id,
-            turn_ordinal,
-            kind: "assistant_text",
-            body: &body,
-            call_id: None,
-            tool_name: None,
-            input_json: None,
-            output_text: None,
-            tool_state: None,
-            is_error: false,
-            source_event_sequence: None,
-            source_block_index: None,
-            fidelity: "legacy",
-            metadata_json: metadata.as_deref(),
-            timestamp: &message.created_at,
-        },
-    )?;
-    Ok(true)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn mirror_legacy_message_to_timeline(
-    transaction: &Transaction<'_>,
-    message_id: &str,
-    session_id: &str,
-    turn_id: &str,
-    role: MessageRole,
-    kind: &str,
-    body: &str,
-    payload_json: Option<&str>,
-    timestamp: &str,
-) -> StoreResult<()> {
-    let turn_ordinal: i64 = transaction.query_row(
-        "SELECT ordinal FROM session_turn WHERE id=?1",
-        [turn_id],
-        |row| row.get(0),
-    )?;
-    let payload = payload_json
-        .and_then(|value| serde_json::from_str::<Value>(value).ok())
-        .unwrap_or(Value::Null);
-    match (role, kind) {
-        (MessageRole::Tool, "tool_call") => {
-            let call_id = payload_string(&payload, "callId")
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("legacy-{message_id}"));
-            let name = payload_string(&payload, "name").unwrap_or(body);
-            let input = payload
-                .get("input")
-                .filter(|value| !value.is_null())
-                .map(Value::to_string);
-            let input_original_bytes = payload
-                .get("inputOriginalBytes")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or_else(|| input.as_ref().map_or(0, String::len));
-            let input_truncated = payload
-                .get("inputTruncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(input_original_bytes > SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
-            let existing_metadata: Option<String> = transaction
-                .query_row(
-                    "SELECT metadata_json FROM session_timeline_item
-                     WHERE turn_id=?1 AND call_id=?2 AND kind='tool'",
-                    params![turn_id, call_id],
-                    |row| row.get(0),
-                )
-                .optional()?
-                .flatten();
-            let metadata = merged_metadata_json(
-                existing_metadata.as_deref(),
-                json!({
-                    "inputOriginalBytes": input_original_bytes,
-                    "inputTruncated": input_truncated,
-                }),
-            );
-            let input = timeline_payload(input.as_deref());
-            let changed = transaction.execute(
-                "UPDATE session_timeline_item
-                 SET tool_name=?1,input_json=?2,metadata_json=?3,updated_at=?4
-                 WHERE turn_id=?5 AND call_id=?6 AND kind='tool'",
-                params![name, input, metadata, timestamp, turn_id, call_id],
-            )?;
-            if changed == 0 {
-                insert_timeline_item(
-                    transaction,
-                    NewTimelineItem {
-                        id: format!("timeline-tool-{turn_id}-{call_id}"),
-                        session_id,
-                        turn_id,
-                        turn_ordinal,
-                        kind: "tool",
-                        body: "",
-                        call_id: Some(&call_id),
-                        tool_name: Some(name),
-                        input_json: input.as_deref(),
-                        output_text: None,
-                        tool_state: Some("running"),
-                        is_error: false,
-                        source_event_sequence: None,
-                        source_block_index: None,
-                        fidelity: if call_id.starts_with("legacy-") {
-                            "partial"
-                        } else {
-                            "exact"
-                        },
-                        metadata_json: Some(&metadata),
-                        timestamp,
-                    },
-                )?;
-            }
-        }
-        (MessageRole::Tool, "tool_result") => {
-            let call_id = payload_string(&payload, "callId").map(str::to_owned);
-            let is_error = payload.get("isError").and_then(Value::as_bool) == Some(true)
-                || payload.get("success").and_then(Value::as_bool) == Some(false)
-                || matches!(
-                    payload.get("status").and_then(Value::as_str),
-                    Some("error" | "failed" | "failure" | "cancelled" | "interrupted")
-                );
-            let output = bounded_utf8(body, SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
-            let output_original_bytes = payload
-                .get("outputOriginalBytes")
-                .and_then(Value::as_u64)
-                .and_then(|value| usize::try_from(value).ok())
-                .unwrap_or(body.len());
-            let output_truncated = payload
-                .get("outputTruncated")
-                .and_then(Value::as_bool)
-                .unwrap_or(output_original_bytes > SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
-            let existing_metadata: Option<String> = call_id
-                .as_deref()
-                .map(|call_id| {
-                    transaction
-                        .query_row(
-                            "SELECT metadata_json FROM session_timeline_item
-                             WHERE turn_id=?1 AND call_id=?2 AND kind='tool'",
-                            params![turn_id, call_id],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                })
-                .transpose()?
-                .flatten()
-                .flatten();
-            let metadata = merged_metadata_json(
-                existing_metadata.as_deref(),
-                json!({
-                    "outputOriginalBytes": output_original_bytes,
-                    "outputTruncated": output_truncated,
-                }),
-            );
-            let changed = if let Some(call_id) = call_id.as_deref() {
-                transaction.execute(
-                    "UPDATE session_timeline_item
-                     SET output_text=?1,tool_state=?2,is_error=?3,updated_at=?4,
-                         metadata_json=?5
-                     WHERE turn_id=?6 AND call_id=?7 AND kind='tool'",
-                    params![
-                        output,
-                        if is_error { "failed" } else { "completed" },
-                        i64::from(is_error),
-                        timestamp,
-                        metadata,
-                        turn_id,
-                        call_id,
-                    ],
-                )?
-            } else {
-                0
-            };
-            if changed == 0 {
-                let synthetic = call_id.unwrap_or_else(|| format!("orphan-{message_id}"));
-                let name = payload_string(&payload, "name").unwrap_or("tool");
-                insert_timeline_item(
-                    transaction,
-                    NewTimelineItem {
-                        id: format!("timeline-tool-{turn_id}-{synthetic}"),
-                        session_id,
-                        turn_id,
-                        turn_ordinal,
-                        kind: "tool",
-                        body: "",
-                        call_id: Some(&synthetic),
-                        tool_name: Some(name),
-                        input_json: None,
-                        output_text: Some(&output),
-                        tool_state: Some(if is_error { "failed" } else { "completed" }),
-                        is_error,
-                        source_event_sequence: None,
-                        source_block_index: None,
-                        fidelity: "partial",
-                        metadata_json: Some(&metadata),
-                        timestamp,
-                    },
-                )?;
-            }
-        }
-        (MessageRole::System, "status" | "error") => {
-            let timeline_id = format!("timeline-{message_id}");
-            let changed = transaction.execute(
-                "UPDATE session_timeline_item
-                 SET kind=?1,body=?2,is_error=?3,metadata_json=?4,updated_at=?5
-                 WHERE id=?6",
-                params![
-                    if kind == "error" { "error" } else { "status" },
-                    body,
-                    i64::from(kind == "error"),
-                    payload_json,
-                    timestamp,
-                    timeline_id,
-                ],
-            )?;
-            if changed == 0 {
-                insert_timeline_item(
-                    transaction,
-                    NewTimelineItem {
-                        id: timeline_id,
-                        session_id,
-                        turn_id,
-                        turn_ordinal,
-                        kind: if kind == "error" { "error" } else { "status" },
-                        body,
-                        call_id: None,
-                        tool_name: None,
-                        input_json: None,
-                        output_text: None,
-                        tool_state: None,
-                        is_error: kind == "error",
-                        source_event_sequence: None,
-                        source_block_index: None,
-                        fidelity: "exact",
-                        metadata_json: payload_json,
-                        timestamp,
-                    },
-                )?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn append_replayed_segment(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    turn_id: &str,
-    turn_ordinal: i64,
-    kind: &str,
-    body: &str,
-    source_event_sequence: i64,
-    source_block_index: i64,
-    timestamp: &str,
-) -> StoreResult<()> {
-    let maximum_bytes = if kind == "reasoning" {
-        SESSION_TIMELINE_REASONING_MAX_BYTES
-    } else {
-        SESSION_TIMELINE_TEXT_MAX_BYTES
-    };
-    let latest: Option<(String, String, String, Option<String>)> = transaction
-        .query_row(
-            "SELECT id,kind,body,metadata_json FROM session_timeline_item WHERE turn_id=?1
-             ORDER BY item_ordinal DESC LIMIT 1",
-            [turn_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    if let Some((id, latest_kind, existing_body, existing_metadata)) = latest
-        && latest_kind == kind
-    {
-        let previous_original_bytes = existing_metadata
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<Value>(value).ok())
-            .and_then(|value| value.get("originalBytes").and_then(Value::as_u64))
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(existing_body.len());
-        let original_bytes = previous_original_bytes.saturating_add(body.len());
-        let mut combined = bounded_utf8(&existing_body, maximum_bytes);
-        if combined.len() < maximum_bytes {
-            combined.push_str(&bounded_utf8(body, maximum_bytes - combined.len()));
-        }
-        let metadata = (original_bytes > maximum_bytes)
-            .then(|| json!({"originalBytes":original_bytes,"truncated":true}).to_string());
-        transaction.execute(
-            "UPDATE session_timeline_item SET body=?1,metadata_json=?2,updated_at=?3 WHERE id=?4",
-            params![combined, metadata, timestamp, id],
-        )?;
-        return Ok(());
-    }
-    let bounded = bounded_utf8(body, maximum_bytes);
-    let metadata = (body.len() > maximum_bytes)
-        .then(|| json!({"originalBytes":body.len(),"truncated":true}).to_string());
-    insert_timeline_item(
-        transaction,
-        NewTimelineItem {
-            id: format!(
-                "timeline-raw-{turn_id}-{source_event_sequence}-{source_block_index}-{kind}"
-            ),
-            session_id,
-            turn_id,
-            turn_ordinal,
-            kind,
-            body: &bounded,
-            call_id: None,
-            tool_name: None,
-            input_json: None,
-            output_text: None,
-            tool_state: None,
-            is_error: false,
-            source_event_sequence: Some(source_event_sequence),
-            source_block_index: Some(source_block_index),
-            fidelity: "exact",
-            metadata_json: metadata.as_deref(),
-            timestamp,
-        },
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn mirror_replayed_provider_event(
-    transaction: &Transaction<'_>,
-    session_id: &str,
-    turn_id: &str,
-    turn_ordinal: i64,
-    event_sequence: i64,
-    block_index: i64,
-    event: ProviderEvent,
-    timestamp: &str,
-) -> StoreResult<()> {
-    match event {
-        ProviderEvent::Text(text) => append_replayed_segment(
-            transaction,
-            session_id,
-            turn_id,
-            turn_ordinal,
-            "assistant_text",
-            &text,
-            event_sequence,
-            block_index,
-            timestamp,
-        ),
-        ProviderEvent::Reasoning(text) => append_replayed_segment(
-            transaction,
-            session_id,
-            turn_id,
-            turn_ordinal,
-            "reasoning",
-            &text,
-            event_sequence,
-            block_index,
-            timestamp,
-        ),
-        ProviderEvent::ToolUse {
-            name,
-            call_id,
-            input,
-        } => {
-            let payload = json!({"name":name,"callId":call_id,"input":input}).to_string();
-            mirror_legacy_message_to_timeline(
-                transaction,
-                &format!("raw-{event_sequence}-{block_index}"),
-                session_id,
-                turn_id,
-                MessageRole::Tool,
-                "tool_call",
-                &name,
-                Some(&payload),
-                timestamp,
-            )
-        }
-        ProviderEvent::ToolResult {
-            name,
-            call_id,
-            output,
-            is_error,
-        } => {
-            let payload = json!({"name":name,"callId":call_id,"isError":is_error}).to_string();
-            mirror_legacy_message_to_timeline(
-                transaction,
-                &format!("raw-{event_sequence}-{block_index}"),
-                session_id,
-                turn_id,
-                MessageRole::Tool,
-                "tool_result",
-                &output,
-                Some(&payload),
-                timestamp,
-            )
-        }
-        ProviderEvent::Status(status) => mirror_legacy_message_to_timeline(
-            transaction,
-            &format!("raw-{event_sequence}-{block_index}"),
-            session_id,
-            turn_id,
-            MessageRole::System,
-            "status",
-            &status,
-            None,
-            timestamp,
-        ),
-        ProviderEvent::SessionId(_) => Ok(()),
-    }
 }
 
 fn project_assistant_timeline(
@@ -6364,12 +4630,14 @@ fn execute_builtin_tool(
                 0
             };
             let runtime_count: i64 = transaction.query_row(
-                "SELECT count(*) FROM task_session WHERE state IN ('queued','running')",
+                "SELECT count(DISTINCT session_id) FROM terminal_run
+                 WHERE state IN ('starting','running','stopping')",
                 [],
                 |row| row.get(0),
             )?;
             let unread_count: i64 = transaction.query_row(
-                "SELECT count(*) FROM task_session WHERE last_agent_sequence > last_read_sequence",
+                "SELECT count(*) FROM terminal_session
+                 WHERE status_sequence > seen_status_sequence",
                 [],
                 |row| row.get(0),
             )?;
@@ -6409,12 +4677,9 @@ fn execute_builtin_tool(
             let (completed, completed_truncated) =
                 tool_task_projections(transaction, TaskStatus::Completed, None, None, 50)?;
             let (runtime_sessions, runtime_truncated) =
-                task_session_summaries(transaction, "state IN ('queued','running')", 20)?;
-            let (unread_sessions, unread_truncated) = task_session_summaries(
-                transaction,
-                "last_agent_sequence > last_read_sequence",
-                20,
-            )?;
+                terminal_session_summaries(transaction, true, false, 20)?;
+            let (unread_sessions, unread_truncated) =
+                terminal_session_summaries(transaction, false, true, 20)?;
             let truncated = open_truncated
                 || completed_truncated
                 || lists_truncated
@@ -6902,18 +5167,26 @@ fn bounded_task_projection(task: &Task) -> (Value, bool) {
     )
 }
 
-fn task_session_summaries(
+fn terminal_session_summaries(
     transaction: &Transaction<'_>,
-    filter: &str,
+    active_only: bool,
+    unread_only: bool,
     limit: i64,
 ) -> rusqlite::Result<(Vec<Value>, bool)> {
-    let mut statement = transaction.prepare(&format!(
-        "SELECT s.id,s.task_id,t.title,s.state,s.last_agent_sequence,s.last_read_sequence
-         FROM task_session s JOIN task t ON t.id=s.task_id WHERE {filter}
-         ORDER BY s.updated_at DESC LIMIT ?1"
-    ))?;
+    let mut statement = transaction.prepare(
+        "SELECT s.id,s.task_id,t.title,
+                coalesce((SELECT r.state FROM terminal_run r
+                          WHERE r.session_id=s.id AND r.state IN ('starting','running','stopping')
+                          ORDER BY r.ordinal DESC LIMIT 1),s.agent_status),
+                s.status_sequence,s.seen_status_sequence,s.agent_status
+         FROM terminal_session s JOIN task t ON t.id=s.task_id
+         WHERE (NOT ?1 OR EXISTS(SELECT 1 FROM terminal_run r
+                                 WHERE r.session_id=s.id AND r.state IN ('starting','running','stopping')))
+           AND (NOT ?2 OR s.status_sequence>s.seen_status_sequence)
+         ORDER BY s.updated_at DESC LIMIT ?3",
+    )?;
     let rows = statement
-        .query_map([limit + 1], |row| {
+        .query_map(params![active_only, unread_only, limit + 1], |row| {
             let title = row.get::<_, String>(2)?;
             let (title, title_truncated) = truncate_utf8(&title, 192);
             Ok(json!({
@@ -6924,6 +5197,7 @@ fn task_session_summaries(
                 "state": row.get::<_, String>(3)?,
                 "lastAgentSequence": row.get::<_, i64>(4)?,
                 "lastReadSequence": row.get::<_, i64>(5)?,
+                "agentStatus": row.get::<_, String>(6)?,
             }))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -7077,11 +5351,26 @@ fn bounded_tool_result_text(tool_name: &str, value: &str) -> String {
         })
 }
 
-fn session_select(suffix: &str) -> String {
+fn terminal_session_select(suffix: &str) -> String {
     format!(
-        "SELECT id,task_id,runtime_kind,working_directory,provider_session_id,provider_engine,state,
-         last_agent_sequence,last_read_sequence,last_error_code,last_error_message,created_at,updated_at
-         FROM task_session {suffix}"
+        "SELECT id,task_id,runtime_kind,working_directory,provider_session_id,
+         provider_binding_state,provider_binding_source,agent_status,status_sequence,
+         seen_status_sequence,last_error_code,last_error_message,last_started_at,last_exited_at,
+         created_at,updated_at,
+         EXISTS(
+           SELECT 1 FROM terminal_run
+           WHERE terminal_run.session_id=terminal_session.id
+             AND terminal_run.state IN ('starting','running','stopping')
+         ) AS has_active_run
+         FROM terminal_session {suffix}"
+    )
+}
+
+fn terminal_run_select(suffix: &str) -> String {
+    format!(
+        "SELECT id,session_id,ordinal,launch_mode,state,provider_session_id_at_launch,
+         exit_code,exit_reason,error_code,error_message,started_at,exited_at,created_at
+         FROM terminal_run {suffix}"
     )
 }
 
@@ -7181,160 +5470,51 @@ fn row_to_runtime(row: &rusqlite::Row<'_>) -> rusqlite::Result<Runtime> {
     })
 }
 
-fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSession> {
+fn row_to_terminal_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalSession> {
     let runtime: String = row.get(2)?;
-    let state: String = row.get(6)?;
-    Ok(TaskSession {
+    let binding: String = row.get(5)?;
+    let status: String = row.get(7)?;
+    Ok(TerminalSession {
         id: row.get(0)?,
         task_id: row.get(1)?,
         runtime_kind: RuntimeKind::parse(&runtime).ok_or(rusqlite::Error::InvalidQuery)?,
         working_directory: row.get(3)?,
         provider_session_id: row.get(4)?,
-        provider_engine: row.get(5)?,
-        state: SessionState::parse(&state).ok_or(rusqlite::Error::InvalidQuery)?,
-        last_agent_sequence: row.get(7)?,
-        last_read_sequence: row.get(8)?,
-        last_error_code: row.get(9)?,
-        last_error_message: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        provider_binding_state: ProviderBindingState::parse(&binding)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        provider_binding_source: row.get(6)?,
+        agent_status: TerminalAgentStatus::parse(&status).ok_or(rusqlite::Error::InvalidQuery)?,
+        has_active_run: row.get(16)?,
+        status_sequence: row.get(8)?,
+        seen_status_sequence: row.get(9)?,
+        last_error_code: row.get(10)?,
+        last_error_message: row.get(11)?,
+        last_started_at: row.get(12)?,
+        last_exited_at: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 
-fn row_to_turn(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTurn> {
-    let status: String = row.get(6)?;
-    Ok(SessionTurn {
+fn row_to_terminal_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<TerminalRun> {
+    let launch_mode: String = row.get(3)?;
+    let state: String = row.get(4)?;
+    Ok(TerminalRun {
         id: row.get(0)?,
         session_id: row.get(1)?,
         ordinal: row.get(2)?,
-        user_message_id: row.get(3)?,
-        provider_session_id_before: row.get(4)?,
-        provider_session_id_after: row.get(5)?,
-        status: TurnStatus::parse(&status).ok_or(rusqlite::Error::InvalidQuery)?,
-        exit_code: row.get(7)?,
-        final_output: row.get(8)?,
-        error_code: row.get(9)?,
-        error_message: row.get(10)?,
-        provider_usage_json: row.get(11)?,
-        started_at: row.get(12)?,
-        ended_at: row.get(13)?,
-        created_at: row.get(14)?,
+        launch_mode: TerminalLaunchMode::parse(&launch_mode)
+            .ok_or(rusqlite::Error::InvalidQuery)?,
+        state: TerminalRunState::parse(&state).ok_or(rusqlite::Error::InvalidQuery)?,
+        provider_session_id_at_launch: row.get(5)?,
+        exit_code: row.get(6)?,
+        exit_reason: row.get(7)?,
+        error_code: row.get(8)?,
+        error_message: row.get(9)?,
+        started_at: row.get(10)?,
+        exited_at: row.get(11)?,
+        created_at: row.get(12)?,
     })
-}
-
-fn row_to_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMessage> {
-    let role: String = row.get(5)?;
-    Ok(SessionMessage {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        turn_id: row.get(2)?,
-        sequence: row.get(3)?,
-        client_message_id: row.get(4)?,
-        role: MessageRole::parse(&role).ok_or(rusqlite::Error::InvalidQuery)?,
-        kind: row.get(6)?,
-        body: row.get(7)?,
-        payload_json: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
-    })
-}
-
-fn timeline_select() -> &'static str {
-    "SELECT id,session_id,turn_id,sequence,turn_ordinal,item_ordinal,kind,body,
-            call_id,tool_name,input_json,output_text,tool_state,is_error,
-            source_event_sequence,source_block_index,fidelity,metadata_json,created_at,updated_at
-     FROM session_timeline_item"
-}
-
-fn session_bundle_for_turn_connection(
-    connection: &Connection,
-    session_id: &str,
-    turn_id: &str,
-    limit: i64,
-) -> StoreResult<SessionBundle> {
-    let session = connection
-        .query_row(&session_select("WHERE id=?1"), [session_id], row_to_session)
-        .optional()?
-        .ok_or(StoreError::NotFound)?;
-    let mut statement = connection.prepare(
-        "SELECT id,session_id,turn_id,sequence,client_message_id,role,kind,body,payload_json,created_at,updated_at
-         FROM session_message WHERE session_id=?1 AND turn_id=?2 ORDER BY sequence LIMIT ?3",
-    )?;
-    let messages = statement
-        .query_map(
-            params![session_id, turn_id, limit.clamp(1, 2000)],
-            row_to_message,
-        )?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(SessionBundle {
-        session,
-        messages,
-        active_turn: None,
-    })
-}
-
-fn timeline_item_connection(
-    connection: &Connection,
-    id: &str,
-) -> StoreResult<Option<SessionTimelineItem>> {
-    Ok(connection
-        .query_row(
-            &format!("{} WHERE id=?1", timeline_select()),
-            [id],
-            row_to_timeline_item,
-        )
-        .optional()?)
-}
-
-fn row_to_timeline_item(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionTimelineItem> {
-    Ok(SessionTimelineItem {
-        id: row.get(0)?,
-        session_id: row.get(1)?,
-        turn_id: row.get(2)?,
-        sequence: row.get(3)?,
-        turn_ordinal: row.get(4)?,
-        item_ordinal: row.get(5)?,
-        kind: row.get(6)?,
-        body: row.get(7)?,
-        call_id: row.get(8)?,
-        tool_name: row.get(9)?,
-        input_json: row.get(10)?,
-        output_text: row.get(11)?,
-        tool_state: row.get(12)?,
-        is_error: row.get::<_, i64>(13)? != 0,
-        source_event_sequence: row.get(14)?,
-        source_block_index: row.get(15)?,
-        fidelity: row.get(16)?,
-        metadata_json: row.get(17)?,
-        created_at: row.get(18)?,
-        updated_at: row.get(19)?,
-    })
-}
-
-/// Steps SQLite lazily and stops before retaining a page whose serialized
-/// timeline items would exceed the IPC budget. The first item is always kept,
-/// even if a future schema introduces a single item larger than the current
-/// budget, so callers can always advance their ordinal cursor.
-fn collect_bounded_timeline_rows(
-    rows: &mut rusqlite::Rows<'_>,
-) -> rusqlite::Result<Vec<SessionTimelineItem>> {
-    let mut items = Vec::new();
-    let mut retained_bytes = 0_usize;
-    while let Some(row) = rows.next()? {
-        let item = row_to_timeline_item(row)?;
-        // SessionTimelineItem only contains JSON-safe scalar/string fields, so
-        // serialization cannot fail under the current model. Treat an
-        // unexpected future serializer error as an over-budget item.
-        let item_bytes = serde_json::to_vec(&item).map_or(usize::MAX, |value| value.len() + 1);
-        if !items.is_empty()
-            && retained_bytes.saturating_add(item_bytes) > SESSION_TIMELINE_PAGE_MAX_BYTES
-        {
-            break;
-        }
-        retained_bytes = retained_bytes.saturating_add(item_bytes);
-        items.push(item);
-    }
-    Ok(items)
 }
 
 fn row_to_assistant_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssistantSession> {
@@ -7774,13 +5954,9 @@ fn task_record_exists(connection: &Connection, id: &str) -> StoreResult<bool> {
 fn ensure_task_session_inactive(connection: &Connection, task_id: &str) -> StoreResult<()> {
     let active = connection.query_row(
         "SELECT EXISTS(
-           SELECT 1 FROM task_session AS session
-           WHERE session.task_id=?1 AND (
-             session.state IN ('queued','running') OR EXISTS(
-               SELECT 1 FROM session_turn AS turn
-               WHERE turn.session_id=session.id AND turn.status IN ('queued','running')
-             )
-           )
+           SELECT 1 FROM terminal_session AS session
+           JOIN terminal_run AS run ON run.session_id=session.id
+           WHERE session.task_id=?1 AND run.state IN ('starting','running','stopping')
          )",
         [task_id],
         |row| row.get::<_, i64>(0),
@@ -7789,6 +5965,29 @@ fn ensure_task_session_inactive(connection: &Connection, task_id: &str) -> Store
         Err(StoreError::Conflict("task_session_active"))
     } else {
         Ok(())
+    }
+}
+
+fn validate_provider_session_id(value: &str) -> StoreResult<()> {
+    let value = value.trim();
+    if value.is_empty() || value.len() > 512 || value.chars().any(char::is_control) {
+        return Err(StoreError::Invalid(
+            "providerSessionId must contain 1 to 512 printable bytes".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_binding_source(value: &str) -> StoreResult<()> {
+    if matches!(
+        value,
+        "preallocated" | "session_start_hook" | "create_chat" | "session_store_scan" | "manual"
+    ) {
+        Ok(())
+    } else {
+        Err(StoreError::Invalid(
+            "unknown provider binding source".to_owned(),
+        ))
     }
 }
 
@@ -7805,7 +6004,7 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use tempfile::tempdir;
 
     fn runtime_record(
@@ -7865,6 +6064,595 @@ mod tests {
         let first = serde_json::from_str::<Value>(&first.result_json).unwrap();
         assert_eq!(first["taskRevision"], first["pagination"]["taskRevision"]);
         first["pagination"]["nextCursor"].clone()
+    }
+
+    #[test]
+    fn terminal_runs_resume_one_provider_and_keep_latest_run_in_bundle() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("终端任务", "", None, None, None).unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Codex, "/tmp")
+            .unwrap();
+        let first_run_id = Uuid::new_v4().to_string();
+        let first = store
+            .prepare_terminal_run(&session.id, &first_run_id)
+            .unwrap();
+        assert_eq!(first.active_run.as_ref().unwrap().ordinal, 1);
+        store
+            .bind_terminal_provider(
+                &session.id,
+                &first_run_id,
+                "provider-session-1",
+                "session_start_hook",
+            )
+            .unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &first_run_id)
+            .unwrap();
+        let exited = store
+            .finish_terminal_run(
+                &session.id,
+                &first_run_id,
+                Some(0),
+                "process_exit",
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(exited.active_run.as_ref().unwrap().id, first_run_id);
+        assert_eq!(
+            exited.active_run.as_ref().unwrap().state,
+            TerminalRunState::Exited
+        );
+
+        let second_run_id = Uuid::new_v4().to_string();
+        let resumed = store
+            .prepare_terminal_run(&session.id, &second_run_id)
+            .unwrap();
+        let run = resumed.active_run.unwrap();
+        assert_eq!(run.ordinal, 2);
+        assert_eq!(run.launch_mode, TerminalLaunchMode::Resume);
+        assert_eq!(
+            run.provider_session_id_at_launch.as_deref(),
+            Some("provider-session-1")
+        );
+    }
+
+    #[test]
+    fn inactive_terminal_session_can_rebind_workspace_without_losing_provider_identity() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Moved workspace", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/old/project")
+            .unwrap();
+        let provider_id = session.provider_session_id.clone();
+        let completed_run_id = Uuid::new_v4().to_string();
+        store
+            .prepare_terminal_run(&session.id, &completed_run_id)
+            .unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &completed_run_id)
+            .unwrap();
+        store
+            .finish_terminal_run(
+                &session.id,
+                &completed_run_id,
+                Some(0),
+                "process_exit",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let rebound = store
+            .rebind_terminal_session_workspace(&session.id, "/replacement/project")
+            .unwrap();
+        assert_eq!(rebound.session.working_directory, "/replacement/project");
+        assert_eq!(rebound.session.runtime_kind, RuntimeKind::Claude);
+        assert_eq!(rebound.session.provider_session_id, provider_id);
+        assert_eq!(
+            rebound.session.provider_binding_source.as_deref(),
+            Some("preallocated")
+        );
+        assert_eq!(
+            rebound.active_run.as_ref().map(|run| run.id.as_str()),
+            Some(completed_run_id.as_str())
+        );
+        assert_eq!(
+            rebound.active_run.as_ref().map(|run| run.state),
+            Some(TerminalRunState::Exited)
+        );
+
+        let revision = store.revision().unwrap();
+        let replay = store
+            .rebind_terminal_session_workspace(&session.id, "/replacement/project")
+            .unwrap();
+        assert_eq!(replay.session.working_directory, "/replacement/project");
+        assert_eq!(store.revision().unwrap(), revision);
+        assert!(matches!(
+            store.rebind_terminal_session_workspace(&session.id, "relative/project"),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn active_terminal_session_rejects_workspace_rebind() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Active workspace", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/old/project")
+            .unwrap();
+        store
+            .prepare_terminal_run(&session.id, &Uuid::new_v4().to_string())
+            .unwrap();
+
+        let result = store.rebind_terminal_session_workspace(&session.id, "/replacement/project");
+        assert!(matches!(
+            result,
+            Err(StoreError::Conflict("terminal_session_active"))
+        ));
+        assert_eq!(
+            store
+                .terminal_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .working_directory,
+            "/old/project"
+        );
+    }
+
+    #[test]
+    fn claude_without_materialized_transcript_reuses_preallocated_id_as_fresh() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Claude terminal", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let provider_id = session.provider_session_id.clone().unwrap();
+        let first_run_id = Uuid::new_v4().to_string();
+        store
+            .prepare_terminal_run(&session.id, &first_run_id)
+            .unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &first_run_id)
+            .unwrap();
+        store
+            .finish_terminal_run(
+                &session.id,
+                &first_run_id,
+                Some(0),
+                "user_ended",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let fresh_retry = store
+            .prepare_terminal_run_with_resume_readiness(
+                &session.id,
+                &Uuid::new_v4().to_string(),
+                false,
+            )
+            .unwrap()
+            .active_run
+            .unwrap();
+        assert_eq!(fresh_retry.ordinal, 2);
+        assert_eq!(fresh_retry.launch_mode, TerminalLaunchMode::Fresh);
+        assert_eq!(
+            fresh_retry.provider_session_id_at_launch.as_deref(),
+            Some(provider_id.as_str())
+        );
+    }
+
+    #[test]
+    fn claude_with_materialized_transcript_resumes_preallocated_id() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Claude resume", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let first_run_id = Uuid::new_v4().to_string();
+        store
+            .prepare_terminal_run(&session.id, &first_run_id)
+            .unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &first_run_id)
+            .unwrap();
+        store
+            .finish_terminal_run(
+                &session.id,
+                &first_run_id,
+                Some(0),
+                "process_exit",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let resumed = store
+            .prepare_terminal_run_with_resume_readiness(
+                &session.id,
+                &Uuid::new_v4().to_string(),
+                true,
+            )
+            .unwrap()
+            .active_run
+            .unwrap();
+        assert_eq!(resumed.launch_mode, TerminalLaunchMode::Resume);
+    }
+
+    #[test]
+    fn kiro_process_lifecycle_projects_active_run_without_status_hooks() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Kiro terminal", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Kiro, "/tmp")
+            .unwrap();
+        assert!(!session.has_active_run);
+        assert_eq!(session.agent_status, TerminalAgentStatus::Unknown);
+
+        let run_id = Uuid::new_v4().to_string();
+        let prepared = store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        assert!(prepared.session.has_active_run);
+        let started = store
+            .mark_terminal_run_started(&session.id, &run_id)
+            .unwrap();
+        assert!(started.session.has_active_run);
+        assert_eq!(started.session.agent_status, TerminalAgentStatus::Unknown);
+        assert!(
+            store
+                .bootstrap()
+                .unwrap()
+                .sessions
+                .iter()
+                .find(|candidate| candidate.id == session.id)
+                .unwrap()
+                .has_active_run
+        );
+
+        let exited = store
+            .finish_terminal_run(&session.id, &run_id, Some(0), "process_exit", None, None)
+            .unwrap();
+        assert!(!exited.session.has_active_run);
+        assert_eq!(exited.session.agent_status, TerminalAgentStatus::Unknown);
+        assert!(
+            !store
+                .terminal_session(&session.id)
+                .unwrap()
+                .unwrap()
+                .has_active_run
+        );
+    }
+
+    #[test]
+    fn terminal_run_lifecycle_retries_are_idempotent_but_conflicts_fail() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("retry", "", None, None, None).unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &run_id)
+            .unwrap();
+        assert_eq!(
+            store
+                .mark_terminal_run_started(&session.id, &run_id)
+                .unwrap()
+                .active_run
+                .unwrap()
+                .state,
+            TerminalRunState::Running
+        );
+        store
+            .mark_terminal_run_stopping(&session.id, &run_id)
+            .unwrap();
+        store
+            .mark_terminal_run_stopping(&session.id, &run_id)
+            .unwrap();
+        store
+            .finish_terminal_run(&session.id, &run_id, Some(0), "process_exit", None, None)
+            .unwrap();
+        store
+            .finish_terminal_run(&session.id, &run_id, Some(0), "process_exit", None, None)
+            .unwrap();
+        assert!(matches!(
+            store.finish_terminal_run(&session.id, &run_id, Some(1), "process_exit", None, None,),
+            Err(StoreError::Conflict("terminal_run_result_conflict"))
+        ));
+        assert!(matches!(
+            store.mark_terminal_run_started(&session.id, &run_id),
+            Err(StoreError::Conflict("terminal_run_result_conflict"))
+        ));
+    }
+
+    #[test]
+    fn stopping_run_can_durably_record_a_runner_that_already_started() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("started during end", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Codex, "/tmp")
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        store
+            .mark_terminal_run_stopping(&session.id, &run_id)
+            .unwrap();
+
+        let started = store
+            .mark_terminal_run_started(&session.id, &run_id)
+            .unwrap();
+        let run = started.active_run.unwrap();
+        assert_eq!(run.state, TerminalRunState::Stopping);
+        assert!(run.started_at.is_some());
+        assert!(started.session.last_started_at.is_some());
+
+        let replay = store
+            .mark_terminal_run_started(&session.id, &run_id)
+            .unwrap();
+        assert_eq!(replay.active_run.unwrap().started_at, run.started_at);
+    }
+
+    #[test]
+    fn unstarted_launch_failure_allows_fresh_retry_but_started_unbound_requires_binding() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Codex retry", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Codex, "/tmp")
+            .unwrap();
+
+        let failed_run_id = Uuid::new_v4().to_string();
+        store
+            .prepare_terminal_run(&session.id, &failed_run_id)
+            .unwrap();
+        store
+            .finish_terminal_run(
+                &session.id,
+                &failed_run_id,
+                None,
+                "launch_failed",
+                Some("surface_failed"),
+                Some("surface never started"),
+            )
+            .unwrap();
+        let retry_id = Uuid::new_v4().to_string();
+        let retry = store.prepare_terminal_run(&session.id, &retry_id).unwrap();
+        assert_eq!(
+            retry.active_run.unwrap().launch_mode,
+            TerminalLaunchMode::Fresh
+        );
+
+        store
+            .mark_terminal_run_started(&session.id, &retry_id)
+            .unwrap();
+        store
+            .finish_terminal_run(&session.id, &retry_id, Some(1), "process_exit", None, None)
+            .unwrap();
+        assert!(matches!(
+            store.prepare_terminal_run(&session.id, &Uuid::new_v4().to_string()),
+            Err(StoreError::Conflict("provider_binding_required"))
+        ));
+    }
+
+    #[test]
+    fn duplicate_terminal_status_event_does_not_increment_attention_twice() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("status", "", None, None, None).unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        let event_id = Uuid::new_v4().to_string();
+        store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &run_id)
+            .unwrap();
+        let first = store
+            .report_terminal_status(
+                &event_id,
+                &session.id,
+                &run_id,
+                TerminalAgentStatus::Blocked,
+            )
+            .unwrap();
+        let replay = store
+            .report_terminal_status(
+                &event_id,
+                &session.id,
+                &run_id,
+                TerminalAgentStatus::Blocked,
+            )
+            .unwrap();
+        assert_eq!(first.session.status_sequence, 1);
+        assert_eq!(replay.session.status_sequence, 1);
+        assert!(matches!(
+            store.report_terminal_status(
+                &event_id,
+                &session.id,
+                &run_id,
+                TerminalAgentStatus::Completed,
+            ),
+            Err(StoreError::Conflict("terminal_status_event_id_reused"))
+        ));
+    }
+
+    #[test]
+    fn manual_provider_binding_is_allowed_only_on_latest_run() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("恢复", "", None, None, None).unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Kiro, "/tmp")
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        store
+            .finish_terminal_run(&session.id, &run_id, Some(0), "process_exit", None, None)
+            .unwrap();
+        let bound = store
+            .bind_terminal_provider(&session.id, &run_id, "kiro-provider", "manual")
+            .unwrap();
+        assert_eq!(
+            bound.session.provider_session_id.as_deref(),
+            Some("kiro-provider")
+        );
+    }
+
+    #[test]
+    fn v4_migration_preserves_product_data_drops_agent_history_and_creates_secure_backup() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("todoagent.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE terminal_status_receipt;
+                     DROP TABLE terminal_run;
+                     DROP TABLE terminal_session;",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migration(version,name,checksum,applied_at)
+                     VALUES(4,'structured sessions','v4-test',?1)",
+                    [now()],
+                )
+                .unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE task_session(id TEXT PRIMARY KEY);
+                     CREATE TABLE session_turn(id TEXT PRIMARY KEY,session_id TEXT REFERENCES task_session(id));
+                     CREATE TABLE session_message(id TEXT PRIMARY KEY,turn_id TEXT REFERENCES session_turn(id));
+                     CREATE TABLE turn_event(id INTEGER PRIMARY KEY,turn_id TEXT REFERENCES session_turn(id));
+                     CREATE TABLE session_timeline_item(id TEXT PRIMARY KEY,turn_id TEXT REFERENCES session_turn(id));
+                     CREATE TABLE session_timeline_projection(turn_id TEXT PRIMARY KEY REFERENCES session_turn(id));
+                     INSERT INTO task_session VALUES('legacy-session');",
+                )
+                .unwrap();
+            let timestamp = now();
+            let task_id = "abcdefab-cdef-4abc-8def-abcdefabc101";
+            connection
+                .execute(
+                    "INSERT INTO task(id,title,note,status,created_at,updated_at)
+                     VALUES(?1,'kept','note','open',?2,?2)",
+                    params![task_id, timestamp],
+                )
+                .unwrap();
+        }
+
+        let migrated = Store::open(&path).unwrap();
+        assert_eq!(migrated.health().unwrap()["schemaVersion"], 5);
+        assert!(
+            migrated
+                .task("abcdefab-cdef-4abc-8def-abcdefabc101")
+                .unwrap()
+                .is_some()
+        );
+        assert!(table_exists(&migrated.connection, "terminal_session").unwrap());
+        assert!(!table_exists(&migrated.connection, "task_session").unwrap());
+        let backups = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".v4-backup-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            backups[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn failed_v4_migration_rolls_back_and_can_be_retried() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("todoagent.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE terminal_status_receipt;
+                     DROP TABLE terminal_run;
+                     DROP TABLE terminal_session;
+                     INSERT INTO schema_migration(version,name,checksum,applied_at)
+                       VALUES(4,'structured sessions','v4-test','now');
+                     CREATE TABLE task_session(id TEXT PRIMARY KEY);
+                     INSERT INTO task_session VALUES('legacy-session');
+                     PRAGMA foreign_keys=OFF;
+                     INSERT INTO task_attachment(
+                       id,task_id,original_name,size_bytes,mime_type,relative_path,created_at
+                     ) VALUES(
+                       'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa','missing-task','x.txt',1,
+                       'text/plain','Attachments/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.txt','now'
+                     );",
+                )
+                .unwrap();
+        }
+
+        assert!(Store::open(&path).is_err());
+        {
+            let connection = Connection::open(&path).unwrap();
+            assert!(table_exists(&connection, "task_session").unwrap());
+            assert!(!table_exists(&connection, "terminal_session").unwrap());
+            assert_eq!(database_schema_version(&connection).unwrap(), Some(4));
+            connection
+                .execute("DELETE FROM task_attachment", [])
+                .unwrap();
+        }
+        assert_eq!(
+            Store::open(&path).unwrap().health().unwrap()["schemaVersion"],
+            5
+        );
+    }
+
+    #[test]
+    fn v5_checksum_mismatch_fails_closed() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("todoagent.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migration(version,name,checksum,applied_at)
+                     VALUES(5,'terminal sessions','wrong','now')",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(matches!(Store::open(&path), Err(StoreError::Invalid(_))));
     }
 
     #[test]
@@ -7976,1366 +6764,6 @@ mod tests {
         assert_eq!(store.revision().unwrap(), initial_revision + 2);
         assert_eq!(store.bootstrap().unwrap().runtimes.len(), 2);
     }
-
-    #[test]
-    fn provider_session_mutations_advance_bootstrap_revision() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store.create_task("Provider", "", None, None, None).unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Codex, "/tmp")
-            .unwrap();
-        let initial_revision = store.revision().unwrap();
-
-        store
-            .set_provider_session(&session.id.to_uppercase(), "provider-1")
-            .unwrap();
-        assert_eq!(store.revision().unwrap(), initial_revision + 1);
-        assert_eq!(
-            store.bootstrap().unwrap().sessions[0]
-                .provider_session_id
-                .as_deref(),
-            Some("provider-1")
-        );
-
-        store
-            .clear_provider_session(&session.id.to_uppercase())
-            .unwrap();
-        assert_eq!(store.revision().unwrap(), initial_revision + 2);
-        assert!(
-            store.bootstrap().unwrap().sessions[0]
-                .provider_session_id
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn create_list_from_task_is_atomic_and_unicode_truncates_to_200_characters() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let old_list = store.create_list("旧清单", "orange", None).unwrap();
-        let title = format!("新清单{}", "界".repeat(250));
-        let task = store
-            .create_task(&title, "", Some(&old_list.id), None, None)
-            .unwrap();
-        let app_revision = store.revision().unwrap();
-        let task_revision: i64 = store
-            .connection
-            .query_row(
-                "SELECT revision FROM task_data_revision WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        let list = store
-            .create_list_from_task(&task.id.to_uppercase())
-            .unwrap();
-
-        assert_eq!(list.name.chars().count(), 200);
-        assert_eq!(list.name, title.chars().take(200).collect::<String>());
-        assert_eq!(list.color, "blue");
-        assert!(list.repository_path.is_none());
-        assert_eq!(
-            store.task(&task.id).unwrap().unwrap().list_id.as_deref(),
-            Some(list.id.as_str())
-        );
-        assert_eq!(store.revision().unwrap(), app_revision + 1);
-        let updated_task_revision: i64 = store
-            .connection
-            .query_row(
-                "SELECT revision FROM task_data_revision WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(updated_task_revision, task_revision + 1);
-        assert!(matches!(
-            store.create_list_from_task(&Uuid::new_v4().to_string()),
-            Err(StoreError::NotFound)
-        ));
-        assert!(matches!(
-            store.create_list_from_task("not-a-uuid"),
-            Err(StoreError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn rename_and_delete_list_preserve_tasks_and_advance_revisions_atomically() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let list = store.create_list("  原清单  ", "blue", None).unwrap();
-        assert_eq!(list.name, "原清单");
-        let task = store
-            .create_task("保留任务", "", Some(&list.id), Some("2026-08-10"), None)
-            .unwrap();
-        let before_rename = store.revision().unwrap();
-
-        let renamed = store
-            .rename_list(&list.id.to_uppercase(), "  新清单  ")
-            .unwrap();
-
-        assert_eq!(renamed.name, "新清单");
-        assert_eq!(store.revision().unwrap(), before_rename + 1);
-        assert_eq!(
-            store.task(&task.id).unwrap().unwrap().list_id.as_deref(),
-            Some(list.id.as_str())
-        );
-
-        let before_delete = store.revision().unwrap();
-        let task_revision: i64 = store
-            .connection
-            .query_row(
-                "SELECT revision FROM task_data_revision WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        store.delete_list(&list.id.to_uppercase()).unwrap();
-
-        let preserved = store.task(&task.id).unwrap().unwrap();
-        assert!(preserved.list_id.is_none());
-        assert_eq!(preserved.execution_date.as_deref(), Some("2026-08-10"));
-        assert_eq!(store.revision().unwrap(), before_delete + 1);
-        let updated_task_revision: i64 = store
-            .connection
-            .query_row(
-                "SELECT revision FROM task_data_revision WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(updated_task_revision, task_revision + 1);
-        assert!(store.bootstrap().unwrap().lists.is_empty());
-        assert!(matches!(
-            store.rename_list(&list.id, "不存在"),
-            Err(StoreError::NotFound)
-        ));
-        assert!(matches!(
-            store.delete_list(&list.id),
-            Err(StoreError::NotFound)
-        ));
-        assert!(matches!(
-            store.rename_list(&Uuid::new_v4().to_string(), "  "),
-            Err(StoreError::Invalid(_))
-        ));
-    }
-
-    #[test]
-    fn delete_task_cascades_owned_records_and_advances_revisions_once() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store.create_task("删除任务", "", None, None, None).unwrap();
-        let attachment_id = Uuid::new_v4().to_string();
-        let attachment = TaskAttachment {
-            id: attachment_id.clone(),
-            task_id: task.id.clone(),
-            original_name: "memo.txt".to_owned(),
-            size_bytes: 4,
-            mime_type: "text/plain".to_owned(),
-            relative_path: format!("Attachments/{attachment_id}.txt"),
-            created_at: now(),
-        };
-        store
-            .add_task_attachments(&task.id, std::slice::from_ref(&attachment))
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Codex, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "删除任务")
-            .unwrap();
-        store
-            .finish_turn(
-                &queued.turn.id,
-                TurnStatus::Completed,
-                Some(0),
-                Some("完成"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        assert_eq!(
-            store.prepare_delete_task(&task.id).unwrap(),
-            vec![attachment]
-        );
-        let app_revision = store.revision().unwrap();
-        let task_revision: i64 = store
-            .connection
-            .query_row(
-                "SELECT revision FROM task_data_revision WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        store.delete_task(&task.id.to_uppercase()).unwrap();
-
-        assert!(store.task(&task.id).unwrap().is_none());
-        assert!(store.bootstrap().unwrap().task_attachments.is_empty());
-        assert!(store.bootstrap().unwrap().sessions.is_empty());
-        for table in ["task_session", "session_turn", "session_message"] {
-            let sql = format!("SELECT count(*) FROM {table}");
-            let count: i64 = store
-                .connection
-                .query_row(&sql, [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(count, 0, "{table} should cascade with its task");
-        }
-        assert_eq!(store.revision().unwrap(), app_revision + 1);
-        let updated_task_revision: i64 = store
-            .connection
-            .query_row(
-                "SELECT revision FROM task_data_revision WHERE singleton=1",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(updated_task_revision, task_revision + 1);
-        assert!(matches!(
-            store.delete_task(&task.id),
-            Err(StoreError::NotFound)
-        ));
-    }
-
-    #[test]
-    fn delete_task_rejects_queued_or_running_session_without_mutation() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store.create_task("运行中", "", None, None, None).unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Codex, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "运行中")
-            .unwrap();
-        let revision = store.revision().unwrap();
-
-        assert!(matches!(
-            store.prepare_delete_task(&task.id),
-            Err(StoreError::Conflict("task_session_active"))
-        ));
-        assert!(matches!(
-            store.delete_task(&task.id),
-            Err(StoreError::Conflict("task_session_active"))
-        ));
-        assert!(store.task(&task.id).unwrap().is_some());
-        assert!(store.session(&queued.session.id).unwrap().is_some());
-        assert_eq!(store.revision().unwrap(), revision);
-    }
-
-    #[test]
-    fn fresh_database_round_trips_session_and_unread() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let list = store
-            .create_list("产品", "blue", Some("/tmp/repo"))
-            .unwrap();
-        let task = store
-            .create_task(
-                "完成原生版",
-                "接通后端",
-                Some(&list.id),
-                None,
-                Some("2026-08-08"),
-            )
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Codex, "/tmp/repo")
-            .unwrap();
-        let queued = store
-            .send_message(
-                &session.id,
-                &Uuid::new_v4().to_string(),
-                "完成原生版\n\n接通后端",
-            )
-            .unwrap();
-        store.mark_turn_running(&queued.turn.id).unwrap();
-        let message = store.append_agent_text(&queued.turn.id, "完成").unwrap();
-        store
-            .finish_turn(
-                &queued.turn.id,
-                TurnStatus::Completed,
-                Some(0),
-                Some("完成"),
-                Some("provider-1"),
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        let bundle = store.session_bundle(&queued.session.id, 0, 100).unwrap();
-        assert_eq!(bundle.messages.len(), 2);
-        assert_eq!(bundle.messages[1], message);
-        assert!(bundle.session.last_agent_sequence > bundle.session.last_read_sequence);
-        let read = store
-            .mark_read(&queued.session.id, message.sequence)
-            .unwrap();
-        assert!(read.last_agent_sequence <= read.last_read_sequence);
-        assert_eq!(store.health().unwrap()["schemaVersion"], 4);
-    }
-
-    #[test]
-    fn reopening_v4_adds_chat_v2_tables_without_rewriting_legacy_rows() {
-        let directory = tempdir().unwrap();
-        let database = directory.path().join("todoagent.sqlite3");
-        let store = Store::open(&database).unwrap();
-        let task = store
-            .create_task("保留旧数据", "原始备注", None, Some("2026-08-11"), None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp/original")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "原始消息")
-            .unwrap();
-        let before: (String, String, String, String, i64) = store
-            .connection
-            .query_row(
-                "SELECT t.title,t.note,s.working_directory,m.body,m.sequence
-                 FROM task t JOIN task_session s ON s.task_id=t.id
-                 JOIN session_message m ON m.session_id=s.id
-                 WHERE t.id=?1 AND m.turn_id=?2",
-                params![task.id, queued.turn.id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-        drop(store);
-
-        let reopened = Store::open(&database).unwrap();
-        let after: (String, String, String, String, i64) = reopened
-            .connection
-            .query_row(
-                "SELECT t.title,t.note,s.working_directory,m.body,m.sequence
-                 FROM task t JOIN task_session s ON s.task_id=t.id
-                 JOIN session_message m ON m.session_id=s.id
-                 WHERE t.id=?1 AND m.turn_id=?2",
-                params![task.id, queued.turn.id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                    ))
-                },
-            )
-            .unwrap();
-        assert_eq!(before, after);
-        assert_eq!(reopened.health().unwrap()["schemaVersion"], 4);
-        assert!(table_exists(&reopened.connection, "session_timeline_item").unwrap());
-        assert!(table_exists(&reopened.connection, "session_timeline_projection").unwrap());
-    }
-
-    #[test]
-    fn chat_v2_keeps_adjacent_text_but_splits_across_tools_and_reasoning() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store.create_task("Chat V2", "", None, None, None).unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "检查项目")
-            .unwrap();
-        store.append_agent_text(&queued.turn.id, "第一段").unwrap();
-        store.append_agent_text(&queued.turn.id, "继续").unwrap();
-        store
-            .append_message(
-                &queued.turn.id,
-                MessageRole::Tool,
-                "tool_call",
-                "Read",
-                Some(r#"{"name":"Read","callId":"call-1","input":{"path":"a"}}"#),
-            )
-            .unwrap();
-        store
-            .append_message(
-                &queued.turn.id,
-                MessageRole::Tool,
-                "tool_result",
-                "contents",
-                Some(r#"{"name":"Read","callId":"call-1","isError":false}"#),
-            )
-            .unwrap();
-        store
-            .append_agent_text(&queued.turn.id, "工具之后")
-            .unwrap();
-        store.append_reasoning(&queued.turn.id, "考虑").unwrap();
-        store.append_reasoning(&queued.turn.id, "更多").unwrap();
-        store
-            .append_agent_text(&queued.turn.id, "思考之后")
-            .unwrap();
-
-        let page = store.session_timeline(&session.id, 0, 100).unwrap();
-        assert_eq!(
-            page.items
-                .iter()
-                .map(|item| item.kind.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "user",
-                "assistant_text",
-                "tool",
-                "assistant_text",
-                "reasoning",
-                "assistant_text"
-            ]
-        );
-        assert_eq!(page.items[1].body, "第一段继续");
-        assert_eq!(page.items[2].tool_state.as_deref(), Some("completed"));
-        assert_eq!(page.items[2].output_text.as_deref(), Some("contents"));
-        assert_eq!(page.items[3].body, "工具之后");
-        assert_eq!(page.items[4].body, "考虑更多");
-        assert_eq!(page.items[5].body, "思考之后");
-        assert_eq!(store.health().unwrap()["schemaVersion"], 4);
-    }
-
-    #[test]
-    fn chat_v2_atomic_frame_preserves_raw_order_and_coalesces_adjacent_parts() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Atomic Chat V2", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        let applied = store
-            .apply_provider_frame(
-                &queued.turn.id,
-                ProviderFrame {
-                    raw_kind: Some("assistant".to_owned()),
-                    raw_payload: Some(json!({"type":"assistant","fixture":true})),
-                    events: vec![
-                        ProviderEvent::Text("前言".to_owned()),
-                        ProviderEvent::Text("继续".to_owned()),
-                        ProviderEvent::Reasoning("检查".to_owned()),
-                        ProviderEvent::Text("结论".to_owned()),
-                        ProviderEvent::ToolUse {
-                            name: "Read".to_owned(),
-                            call_id: "call-atomic".to_owned(),
-                            input: json!({"path":"a"}),
-                        },
-                        ProviderEvent::ToolResult {
-                            name: "Read".to_owned(),
-                            call_id: "call-atomic".to_owned(),
-                            output: "ok".to_owned(),
-                            is_error: false,
-                        },
-                    ],
-                },
-            )
-            .unwrap();
-
-        let raw_count: i64 = store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM turn_event WHERE turn_id=?1",
-                [&queued.turn.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(raw_count, 1);
-        assert_eq!(applied.messages.len(), 4);
-        assert_eq!(applied.timeline.len(), 4);
-        let page = store.session_timeline(&session.id, 0, 100).unwrap();
-        assert_eq!(
-            page.items
-                .iter()
-                .map(|item| item.kind.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "user",
-                "assistant_text",
-                "reasoning",
-                "assistant_text",
-                "tool"
-            ]
-        );
-        assert_eq!(page.items[1].body, "前言继续");
-        assert_eq!(page.items[2].body, "检查");
-        assert_eq!(page.items[3].body, "结论");
-        assert_eq!(page.items[4].tool_state.as_deref(), Some("completed"));
-        assert!(
-            page.items[1..]
-                .iter()
-                .all(|item| item.source_event_sequence == Some(1))
-        );
-        assert_eq!(page.next_cursor.unwrap().turn_ordinal, 1);
-    }
-
-    #[test]
-    fn chat_v2_provider_frame_rolls_back_raw_and_both_projections_together() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Atomic rollback", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        let counts = |table: &str| -> i64 {
-            store
-                .connection
-                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap()
-        };
-        let before = (
-            counts("turn_event"),
-            counts("session_message"),
-            counts("session_timeline_item"),
-        );
-        let result = store.apply_provider_frame(
-            &queued.turn.id,
-            ProviderFrame {
-                raw_kind: Some("assistant".to_owned()),
-                raw_payload: Some(json!({"type":"assistant","fixture":"rollback"})),
-                events: vec![
-                    ProviderEvent::Text("不得提交".to_owned()),
-                    ProviderEvent::ToolUse {
-                        name: "Read".to_owned(),
-                        call_id: String::new(),
-                        input: json!({}),
-                    },
-                ],
-            },
-        );
-        assert!(matches!(result, Err(StoreError::Invalid(_))));
-        assert_eq!(
-            (
-                counts("turn_event"),
-                counts("session_message"),
-                counts("session_timeline_item"),
-            ),
-            before
-        );
-    }
-
-    #[test]
-    fn chat_v2_projection_failure_is_monotonic_across_later_exact_frames() {
-        for (fidelity, error) in [
-            ("failed", "raw frame could not be persisted"),
-            ("partial", "raw frame was truncated"),
-        ] {
-            let directory = tempdir().unwrap();
-            let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-            let task = store
-                .create_task("Projection fidelity", "", None, None, None)
-                .unwrap();
-            let session = store
-                .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-                .unwrap();
-            let queued = store
-                .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-                .unwrap();
-            store
-                .mark_timeline_projection_degraded(&queued.turn.id, fidelity, error)
-                .unwrap();
-            store
-                .apply_provider_frame(
-                    &queued.turn.id,
-                    ProviderFrame {
-                        raw_kind: Some("assistant".to_owned()),
-                        raw_payload: Some(json!({"type":"assistant","text":"later"})),
-                        events: vec![ProviderEvent::Text("后续正常帧".to_owned())],
-                    },
-                )
-                .unwrap();
-
-            let projection: (String, Option<String>) = store
-                .connection
-                .query_row(
-                    "SELECT fidelity,last_error FROM session_timeline_projection WHERE turn_id=?1",
-                    [&queued.turn.id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .unwrap();
-            assert_eq!(projection.0, fidelity);
-            assert_eq!(projection.1.as_deref(), Some(error));
-        }
-    }
-
-    #[test]
-    fn chat_v2_terminal_turn_maps_unfinished_tools_without_false_failures() {
-        for (status, expected_state, expected_error) in [
-            (TurnStatus::Completed, "interrupted", false),
-            (TurnStatus::Cancelled, "interrupted", false),
-            (TurnStatus::Failed, "failed", true),
-        ] {
-            let directory = tempdir().unwrap();
-            let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-            let task = store
-                .create_task("Tool terminal state", "", None, None, None)
-                .unwrap();
-            let session = store
-                .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-                .unwrap();
-            let queued = store
-                .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-                .unwrap();
-            store
-                .apply_provider_frame(
-                    &queued.turn.id,
-                    ProviderFrame {
-                        raw_kind: Some("assistant".to_owned()),
-                        raw_payload: Some(json!({"type":"assistant"})),
-                        events: vec![ProviderEvent::ToolUse {
-                            name: "Read".to_owned(),
-                            call_id: "unfinished".to_owned(),
-                            input: json!({}),
-                        }],
-                    },
-                )
-                .unwrap();
-            let finished = store
-                .finish_turn(&queued.turn.id, status, None, None, None, None, None, None)
-                .unwrap();
-            if status == TurnStatus::Completed {
-                assert!(
-                    finished
-                        .timeline_mutations
-                        .iter()
-                        .all(|item| item.kind == "tool")
-                );
-            } else {
-                let terminal = finished
-                    .timeline_mutations
-                    .iter()
-                    .find(|item| matches!(item.kind.as_str(), "status" | "error"))
-                    .unwrap();
-                assert_eq!(terminal.kind == "error", status == TurnStatus::Failed);
-                assert_eq!(terminal.is_error, status == TurnStatus::Failed);
-            }
-            let tool = store
-                .session_timeline(&session.id, 0, 100)
-                .unwrap()
-                .items
-                .into_iter()
-                .find(|item| item.kind == "tool")
-                .unwrap();
-            assert_eq!(tool.tool_state.as_deref(), Some(expected_state));
-            assert_eq!(tool.is_error, expected_error);
-        }
-    }
-
-    #[test]
-    fn finish_turn_rolls_back_when_terminal_snapshot_read_fails() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Terminal snapshot rollback", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        store
-            .connection
-            .execute_batch(
-                "CREATE TEMP TRIGGER fail_terminal_snapshot
-                 AFTER UPDATE OF status ON session_turn
-                 WHEN NEW.id IS NOT NULL
-                 BEGIN
-                   DELETE FROM task_session WHERE id=NEW.session_id;
-                 END;",
-            )
-            .unwrap();
-
-        let result = store.finish_turn(
-            &queued.turn.id,
-            TurnStatus::Completed,
-            Some(0),
-            Some("不得提交"),
-            None,
-            None,
-            None,
-            None,
-        );
-        assert!(matches!(result, Err(StoreError::NotFound)));
-        assert_eq!(
-            store.turn(&queued.turn.id).unwrap().unwrap().status,
-            TurnStatus::Queued
-        );
-        assert_eq!(
-            store.session(&session.id).unwrap().unwrap().state,
-            SessionState::Queued
-        );
-    }
-
-    #[test]
-    fn chat_v2_truncation_is_utf8_safe_and_tracks_cumulative_original_bytes() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Bounded Chat V2", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        let reasoning = "界".repeat(SESSION_TIMELINE_REASONING_MAX_BYTES / 3 + 11);
-        store.append_reasoning(&queued.turn.id, &reasoning).unwrap();
-        store.append_reasoning(&queued.turn.id, "追加😀").unwrap();
-        let page = store.session_timeline(&session.id, 0, 100).unwrap();
-        let item = page
-            .items
-            .iter()
-            .find(|item| item.kind == "reasoning")
-            .unwrap();
-        assert!(item.body.len() <= SESSION_TIMELINE_REASONING_MAX_BYTES);
-        assert!(item.body.is_char_boundary(item.body.len()));
-        let metadata: Value = serde_json::from_str(item.metadata_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            metadata["originalBytes"].as_u64().unwrap() as usize,
-            reasoning.len() + "追加😀".len()
-        );
-
-        let oversized = json!({
-            "type":"assistant",
-            "text":"😀".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / 4 + 64)
-        });
-        let original_bytes = oversized.to_string().len();
-        store
-            .apply_provider_frame(
-                &queued.turn.id,
-                ProviderFrame {
-                    raw_kind: Some("assistant".to_owned()),
-                    raw_payload: Some(oversized),
-                    events: vec![ProviderEvent::Text("完成".to_owned())],
-                },
-            )
-            .unwrap();
-        let stored_raw: String = store
-            .connection
-            .query_row(
-                "SELECT payload FROM turn_event WHERE turn_id=?1 ORDER BY sequence DESC LIMIT 1",
-                [&queued.turn.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let audit: Value = serde_json::from_str(&stored_raw).unwrap();
-        assert_eq!(
-            audit["_todoagentRaw"]["originalBytes"].as_u64().unwrap() as usize,
-            original_bytes
-        );
-        assert_eq!(audit["_todoagentRaw"]["truncated"], true);
-        store
-            .finish_turn(
-                &queued.turn.id,
-                TurnStatus::Completed,
-                Some(0),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        for _ in 0..2 {
-            let page = store.session_timeline(&session.id, 0, 100).unwrap();
-            assert_eq!(page.fidelity, "partial");
-            assert!(!page.has_more);
-        }
-    }
-
-    #[test]
-    fn chat_v2_bounds_legacy_text_and_tool_payloads_with_merged_metadata() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Bound every projection", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-
-        let first_text = "文".repeat(SESSION_TIMELINE_TEXT_MAX_BYTES / 3 + 8);
-        store
-            .append_agent_text(&queued.turn.id, &first_text)
-            .unwrap();
-        store.append_agent_text(&queued.turn.id, "追加😀").unwrap();
-        let message = store
-            .session_bundle(&session.id, 0, 100)
-            .unwrap()
-            .messages
-            .into_iter()
-            .find(|message| message.role == MessageRole::Agent)
-            .unwrap();
-        assert!(message.body.len() <= SESSION_TIMELINE_TEXT_MAX_BYTES);
-        assert!(message.body.is_char_boundary(message.body.len()));
-        let text_metadata: Value =
-            serde_json::from_str(message.payload_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            text_metadata["originalBytes"].as_u64().unwrap() as usize,
-            first_text.len() + "追加😀".len()
-        );
-
-        let oversized_input = json!({
-            "emoji":"😀".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / 4 + 64)
-        });
-        let input_original_bytes = oversized_input.to_string().len();
-        let oversized_output = "界".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / 3 + 64);
-        let output_original_bytes = oversized_output.len();
-        store
-            .apply_provider_frame(
-                &queued.turn.id,
-                ProviderFrame {
-                    raw_kind: None,
-                    raw_payload: None,
-                    events: vec![
-                        ProviderEvent::ToolUse {
-                            name: "Read".to_owned(),
-                            call_id: "bounded-tool".to_owned(),
-                            input: oversized_input,
-                        },
-                        ProviderEvent::ToolResult {
-                            name: "Read".to_owned(),
-                            call_id: "bounded-tool".to_owned(),
-                            output: oversized_output,
-                            is_error: false,
-                        },
-                    ],
-                },
-            )
-            .unwrap();
-        let page = store.session_timeline(&session.id, 0, 100).unwrap();
-        let tool = page
-            .items
-            .iter()
-            .find(|item| item.call_id.as_deref() == Some("bounded-tool"))
-            .unwrap();
-        assert!(tool.input_json.as_ref().unwrap().len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
-        assert!(tool.output_text.as_ref().unwrap().len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES);
-        let metadata: Value = serde_json::from_str(tool.metadata_json.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            metadata["inputOriginalBytes"].as_u64().unwrap() as usize,
-            input_original_bytes
-        );
-        assert_eq!(
-            metadata["outputOriginalBytes"].as_u64().unwrap() as usize,
-            output_original_bytes
-        );
-        assert_eq!(metadata["inputTruncated"], true);
-        assert_eq!(metadata["outputTruncated"], true);
-
-        let tool_messages = store
-            .session_bundle(&session.id, 0, 100)
-            .unwrap()
-            .messages
-            .into_iter()
-            .filter(|message| message.role == MessageRole::Tool)
-            .collect::<Vec<_>>();
-        assert!(
-            tool_messages
-                .iter()
-                .all(|message| message.body.len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES)
-        );
-        assert!(tool_messages.iter().all(|message| {
-            message
-                .payload_json
-                .as_ref()
-                .is_none_or(|payload| payload.len() <= SESSION_TIMELINE_PAYLOAD_MAX_BYTES)
-        }));
-    }
-
-    #[test]
-    fn chat_v2_pages_stop_at_byte_budget_and_resume_by_ordinal_cursor() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Bounded timeline pages", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        let long_text = "界".repeat(SESSION_TIMELINE_TEXT_MAX_BYTES / "界".len());
-        let long_tool_output = "果".repeat(SESSION_TIMELINE_PAYLOAD_MAX_BYTES / "果".len() + 32);
-        let mut events = Vec::new();
-        for index in 0..10 {
-            events.push(ProviderEvent::Text(long_text.clone()));
-            if index == 4 {
-                events.push(ProviderEvent::ToolUse {
-                    name: "Read".to_owned(),
-                    call_id: "large-page-tool".to_owned(),
-                    input: json!({
-                        "payload":"参".repeat(
-                            SESSION_TIMELINE_PAYLOAD_MAX_BYTES / "参".len() + 32
-                        )
-                    }),
-                });
-                events.push(ProviderEvent::ToolResult {
-                    name: "Read".to_owned(),
-                    call_id: "large-page-tool".to_owned(),
-                    output: long_tool_output.clone(),
-                    is_error: false,
-                });
-            } else {
-                events.push(ProviderEvent::Reasoning(format!("分隔-{index}")));
-            }
-        }
-        store
-            .apply_provider_frame(
-                &queued.turn.id,
-                ProviderFrame {
-                    raw_kind: None,
-                    raw_payload: None,
-                    events,
-                },
-            )
-            .unwrap();
-        store
-            .finish_turn(
-                &queued.turn.id,
-                TurnStatus::Completed,
-                Some(0),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        let expected_count: usize = store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM session_timeline_item WHERE turn_id=?1",
-                [&queued.turn.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-
-        let assert_pages = |turn_only: bool| {
-            let mut cursor = None;
-            let mut seen = HashSet::new();
-            let mut page_count = 0;
-            loop {
-                let page = if turn_only {
-                    store
-                        .session_timeline_turn_page(
-                            &session.id,
-                            &queued.turn.id,
-                            cursor.as_ref(),
-                            500,
-                        )
-                        .unwrap()
-                } else {
-                    store
-                        .session_timeline_page(&session.id, 0, cursor.as_ref(), 2000)
-                        .unwrap()
-                };
-                page_count += 1;
-                assert!(!page.items.is_empty());
-                let retained_bytes = page
-                    .items
-                    .iter()
-                    .map(|item| serde_json::to_vec(item).unwrap().len() + 1)
-                    .sum::<usize>();
-                assert!(retained_bytes <= SESSION_TIMELINE_PAGE_MAX_BYTES || page.items.len() == 1);
-                for item in &page.items {
-                    assert!(
-                        seen.insert(item.id.clone()),
-                        "timeline page duplicated an item"
-                    );
-                }
-                if !page.has_more {
-                    break;
-                }
-                cursor = page.next_cursor;
-                assert!(cursor.is_some());
-                assert!(page_count < 10);
-            }
-            assert!(page_count > 1, "fixture must cross the byte budget");
-            assert_eq!(seen.len(), expected_count);
-        };
-        assert_pages(false);
-        assert_pages(true);
-    }
-
-    #[test]
-    fn chat_v2_unknown_valid_raw_never_erases_unwatermarked_reasoning() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Preserve unknown reasoning", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        store
-            .append_reasoning(&queued.turn.id, "仅存的公开思考")
-            .unwrap();
-        store
-            .append_turn_event(
-                &queued.turn.id,
-                "future_provider_event",
-                &json!({"type":"future_provider_event","payload":{"v":99}}),
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "INSERT INTO session_timeline_projection(
-                   turn_id,parser_version,raw_through_sequence,fidelity,updated_at
-                 ) VALUES(?1,1,0,'exact',?2)",
-                params![queued.turn.id, now()],
-            )
-            .unwrap();
-        store
-            .finish_turn(
-                &queued.turn.id,
-                TurnStatus::Completed,
-                Some(0),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-
-        for _ in 0..2 {
-            let page = store.session_timeline(&session.id, 0, 100).unwrap();
-            assert!(
-                page.items.iter().any(|item| {
-                    item.kind == "reasoning" && item.body == "仅存的公开思考"
-                })
-            );
-            assert_eq!(page.fidelity, "partial");
-            assert!(!page.has_more);
-        }
-        let projection: (i64, String, Option<String>) = store
-            .connection
-            .query_row(
-                "SELECT parser_version,fidelity,last_error
-                 FROM session_timeline_projection WHERE turn_id=?1",
-                [&queued.turn.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(projection.0, SESSION_TIMELINE_PARSER_VERSION);
-        assert_eq!(projection.1, "partial");
-        assert_eq!(projection.2.as_deref(), Some("preserved_unreplayable"));
-    }
-
-    #[test]
-    fn chat_v2_replays_raw_claude_order_and_provider_exposed_thinking() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("恢复 Claude", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        let thinking = "r".repeat(4_952);
-        for payload in [
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"前言"}]}}),
-            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"path":"a"}}]}}),
-            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"ok"}]}}),
-            json!({"type":"assistant","message":{"content":[{"type":"thinking","thinking":thinking}]}}),
-            json!({"type":"assistant","message":{"content":[{"type":"text","text":"结论"}]}}),
-        ] {
-            store
-                .append_turn_event(&queued.turn.id, payload["type"].as_str().unwrap(), &payload)
-                .unwrap();
-        }
-        store
-            .finish_turn(
-                &queued.turn.id,
-                TurnStatus::Completed,
-                Some(0),
-                Some("结论"),
-                None,
-                None,
-                None,
-                None,
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "DELETE FROM session_timeline_item WHERE session_id=?1",
-                [&session.id],
-            )
-            .unwrap();
-
-        let first = store.session_timeline(&session.id, 0, 100).unwrap();
-        let second = store.session_timeline(&session.id, 0, 100).unwrap();
-        assert_eq!(first.items, second.items);
-        assert_eq!(
-            first
-                .items
-                .iter()
-                .map(|item| item.kind.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "user",
-                "assistant_text",
-                "tool",
-                "reasoning",
-                "assistant_text"
-            ]
-        );
-        assert_eq!(first.items[1].body, "前言");
-        assert_eq!(first.items[2].tool_state.as_deref(), Some("completed"));
-        assert_eq!(first.items[3].body.len(), 4_952);
-        assert_eq!(first.items[4].body, "结论");
-        assert_eq!(first.fidelity, "exact");
-    }
-
-    #[test]
-    fn chat_v2_legacy_recovery_is_bounded_and_continues_by_turn_cursor() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Long history", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        for ordinal in 1..=35 {
-            let queued = store
-                .send_message(
-                    &session.id,
-                    &Uuid::new_v4().to_string(),
-                    &format!("问题 {ordinal}"),
-                )
-                .unwrap();
-            store
-                .append_agent_text(&queued.turn.id, &format!("回答 {ordinal}"))
-                .unwrap();
-            store
-                .finish_turn(
-                    &queued.turn.id,
-                    TurnStatus::Completed,
-                    Some(0),
-                    Some(&format!("回答 {ordinal}")),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap();
-        }
-        store
-            .connection
-            .execute(
-                "DELETE FROM session_timeline_item WHERE session_id=?1",
-                [&session.id],
-            )
-            .unwrap();
-        store
-            .connection
-            .execute(
-                "DELETE FROM session_timeline_projection WHERE turn_id IN
-                 (SELECT id FROM session_turn WHERE session_id=?1)",
-                [&session.id],
-            )
-            .unwrap();
-
-        let first = store.session_timeline(&session.id, 0, 1).unwrap();
-        let projected_after_first: i64 = store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM session_timeline_projection projection
-                 JOIN session_turn turn_row ON turn_row.id=projection.turn_id
-                 WHERE turn_row.session_id=?1",
-                [&session.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(projected_after_first, SESSION_TIMELINE_BACKFILL_TURN_BATCH);
-        assert!(first.has_more);
-        assert_eq!(first.fidelity, "partial");
-
-        let cursor = first.next_cursor.unwrap();
-        let second = store
-            .session_timeline_page(&session.id, 0, Some(&cursor), 1)
-            .unwrap();
-        let projected_after_second: i64 = store
-            .connection
-            .query_row(
-                "SELECT count(*) FROM session_timeline_projection projection
-                 JOIN session_turn turn_row ON turn_row.id=projection.turn_id
-                 WHERE turn_row.session_id=?1",
-                [&session.id],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(projected_after_second, 35);
-        assert!(second.next_cursor.unwrap().turn_ordinal >= cursor.turn_ordinal);
-    }
-
-    #[test]
-    fn chat_v2_first_page_uses_turn_cursor_order_even_when_sequences_are_repaired_late() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task("Cursor order", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        for ordinal in 1..=2 {
-            let queued = store
-                .send_message(
-                    &session.id,
-                    &Uuid::new_v4().to_string(),
-                    &format!("问题 {ordinal}"),
-                )
-                .unwrap();
-            store
-                .append_agent_text(&queued.turn.id, &format!("回答 {ordinal}"))
-                .unwrap();
-            store
-                .finish_turn(
-                    &queued.turn.id,
-                    TurnStatus::Completed,
-                    Some(0),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-                .unwrap();
-        }
-        store
-            .connection
-            .execute(
-                "UPDATE session_timeline_item SET sequence=10000
-                 WHERE session_id=?1 AND turn_ordinal=1 AND kind='assistant_text'",
-                [&session.id],
-            )
-            .unwrap();
-
-        let first = store
-            .session_timeline_page(&session.id, 0, None, 2)
-            .unwrap();
-        assert_eq!(
-            first
-                .items
-                .iter()
-                .map(|item| (item.turn_ordinal, item.kind.as_str()))
-                .collect::<Vec<_>>(),
-            [(1, "user"), (1, "assistant_text")]
-        );
-        let second = store
-            .session_timeline_page(&session.id, 0, first.next_cursor.as_ref(), 2)
-            .unwrap();
-        assert_eq!(
-            second
-                .items
-                .iter()
-                .map(|item| (item.turn_ordinal, item.kind.as_str()))
-                .collect::<Vec<_>>(),
-            [(2, "user"), (2, "assistant_text")]
-        );
-    }
-
-    #[test]
-    fn chat_v2_restart_repairs_partial_turn_error_and_running_tool_idempotently() {
-        let directory = tempdir().unwrap();
-        let database = directory.path().join("todoagent.sqlite3");
-        let store = Store::open(&database).unwrap();
-        let task = store
-            .create_task("Crash repair", "", None, None, None)
-            .unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "开始")
-            .unwrap();
-        store.mark_turn_running(&queued.turn.id).unwrap();
-        let raw = json!({
-            "type":"assistant",
-            "message":{"content":[{"type":"text","text":"已开始"}]}
-        });
-        store
-            .append_turn_event(&queued.turn.id, "assistant", &raw)
-            .unwrap();
-        store.append_agent_text(&queued.turn.id, "旧投影").unwrap();
-        store
-            .append_message(
-                &queued.turn.id,
-                MessageRole::Tool,
-                "tool_call",
-                "Read",
-                Some(r#"{"name":"Read","callId":"crash-tool","input":{}}"#),
-            )
-            .unwrap();
-        drop(store);
-
-        let reopened = Store::open(&database).unwrap();
-        let first = reopened.session_timeline(&session.id, 0, 100).unwrap();
-        let second = reopened.session_timeline(&session.id, 0, 100).unwrap();
-        assert_eq!(first.items, second.items);
-        assert_eq!(
-            first
-                .items
-                .iter()
-                .map(|item| item.kind.as_str())
-                .collect::<Vec<_>>(),
-            ["user", "assistant_text", "tool", "error"]
-        );
-        assert_eq!(first.items[1].body, "已开始");
-        let tool = first.items.iter().find(|item| item.kind == "tool").unwrap();
-        assert_eq!(tool.tool_state.as_deref(), Some("interrupted"));
-        assert!(!tool.is_error);
-        assert!(first.items.iter().any(|item| {
-            item.kind == "error" && item.body.contains("上次退出时本轮仍在运行")
-        }));
-        let projection: (i64, i64, String) = reopened
-            .connection
-            .query_row(
-                "SELECT parser_version,raw_through_sequence,fidelity
-                 FROM session_timeline_projection WHERE turn_id=?1",
-                [&queued.turn.id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(projection.0, SESSION_TIMELINE_PARSER_VERSION);
-        assert_eq!(projection.1, 1);
-    }
-
     #[test]
     fn task_dates_are_strict_distinct_and_patch_dates_are_tri_state() {
         let directory = tempdir().unwrap();
@@ -9724,272 +7152,6 @@ mod tests {
     }
 
     #[test]
-    fn prepare_v4_rebuild_removes_only_database_and_managed_attachments() {
-        let directory = tempdir().unwrap();
-        let database = directory.path().join("todoagent.sqlite3");
-        let attachments = directory.path().join("Attachments");
-        fs::create_dir_all(&attachments).unwrap();
-        fs::write(attachments.join("old-copy"), b"old").unwrap();
-        fs::write(directory.path().join("credentials.json"), b"credential").unwrap();
-        fs::write(directory.path().join("settings.json"), b"settings").unwrap();
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
-                 INSERT INTO schema_migration VALUES(3,'old','v3','2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        drop(connection);
-        fs::write(sqlite_sidecar_path(&database, "-wal"), b"wal").unwrap();
-        fs::write(sqlite_sidecar_path(&database, "-shm"), b"shm").unwrap();
-
-        prepare_database_files(&database, &attachments).unwrap();
-
-        assert!(!database.exists());
-        assert!(!sqlite_sidecar_path(&database, "-wal").exists());
-        assert!(!sqlite_sidecar_path(&database, "-shm").exists());
-        assert!(attachments.exists());
-        assert_eq!(fs::read_dir(&attachments).unwrap().count(), 0);
-        assert_eq!(
-            fs::read(directory.path().join("credentials.json")).unwrap(),
-            b"credential"
-        );
-        assert_eq!(
-            fs::read(directory.path().join("settings.json")).unwrap(),
-            b"settings"
-        );
-    }
-
-    #[test]
-    fn prepare_v4_finishes_an_interrupted_reset_when_database_is_already_gone() {
-        let directory = tempdir().unwrap();
-        let database = directory.path().join("todoagent.sqlite3");
-        let attachments = directory.path().join("Attachments");
-        fs::create_dir_all(&attachments).unwrap();
-        fs::write(attachments.join("orphaned-copy"), b"old").unwrap();
-        fs::write(sqlite_sidecar_path(&database, "-wal"), b"stale wal").unwrap();
-        fs::write(sqlite_sidecar_path(&database, "-shm"), b"stale shm").unwrap();
-        fs::write(directory.path().join("credentials.json"), b"credential").unwrap();
-        fs::write(directory.path().join("settings.json"), b"settings").unwrap();
-        fs::create_dir_all(directory.path().join("Logs")).unwrap();
-        fs::write(directory.path().join("Logs/engine.log"), b"log").unwrap();
-
-        prepare_database_files(&database, &attachments).unwrap();
-
-        assert!(!sqlite_sidecar_path(&database, "-wal").exists());
-        assert!(!sqlite_sidecar_path(&database, "-shm").exists());
-        assert_eq!(fs::read_dir(&attachments).unwrap().count(), 0);
-        assert_eq!(
-            fs::read(directory.path().join("credentials.json")).unwrap(),
-            b"credential"
-        );
-        assert_eq!(
-            fs::read(directory.path().join("settings.json")).unwrap(),
-            b"settings"
-        );
-        assert_eq!(
-            fs::read(directory.path().join("Logs/engine.log")).unwrap(),
-            b"log"
-        );
-    }
-
-    #[test]
-    fn attachment_reset_and_reconciliation_reject_symlink_roots() {
-        let directory = tempdir().unwrap();
-        let external = directory.path().join("external");
-        fs::create_dir_all(&external).unwrap();
-        let sentinel = external.join("sentinel.txt");
-        fs::write(&sentinel, b"keep").unwrap();
-        let attachments = directory.path().join("Attachments");
-        symlink(&external, &attachments).unwrap();
-        let database = directory.path().join("todoagent.sqlite3");
-
-        let reset_error = prepare_database_files(&database, &attachments).unwrap_err();
-        assert!(matches!(
-            reset_error,
-            StoreError::Invalid(_) | StoreError::Io(_)
-        ));
-        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
-
-        let store = Store::open(&database).unwrap();
-        let reconcile_error = store
-            .reconcile_task_attachment_files(&attachments)
-            .unwrap_err();
-        assert!(matches!(
-            reconcile_error,
-            StoreError::Invalid(_) | StoreError::Io(_)
-        ));
-        assert_eq!(fs::read(&sentinel).unwrap(), b"keep");
-        assert_eq!(fs::read_dir(&external).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn prepare_v4_rejects_future_database_without_deleting_it() {
-        let directory = tempdir().unwrap();
-        let database = directory.path().join("todoagent.sqlite3");
-        let attachments = directory.path().join("Attachments");
-        fs::create_dir_all(&attachments).unwrap();
-        fs::write(attachments.join("keep"), b"keep").unwrap();
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
-                 INSERT INTO schema_migration VALUES(5,'future','v5','2026-01-01T00:00:00Z');",
-            )
-            .unwrap();
-        drop(connection);
-
-        let error = prepare_database_files(&database, &attachments).unwrap_err();
-
-        assert!(matches!(error, StoreError::Invalid(_)));
-        assert!(database.exists());
-        assert!(attachments.join("keep").exists());
-    }
-
-    #[test]
-    fn session_create_is_empty_and_same_configuration_replays_without_revision_bump() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store
-            .create_task(
-                "任务标题",
-                "任务备注",
-                None,
-                Some("2026-08-10"),
-                Some("2026-08-12"),
-            )
-            .unwrap();
-        let revision_before = store.revision().unwrap();
-
-        let session = store
-            .create_session(&task.id.to_uppercase(), RuntimeKind::Codex, "/tmp")
-            .unwrap();
-        assert_eq!(session.state, SessionState::Idle);
-        assert_eq!(store.revision().unwrap(), revision_before + 1);
-        assert_eq!(store.session_turn_count(&session.id).unwrap(), 0);
-        let bundle = store.session_bundle(&session.id, 0, 100).unwrap();
-        assert!(bundle.messages.is_empty());
-        assert!(bundle.active_turn.is_none());
-
-        let replay_revision = store.revision().unwrap();
-        let replayed = store
-            .create_session(&task.id, RuntimeKind::Codex, "/tmp")
-            .unwrap();
-        assert_eq!(replayed.id, session.id);
-        assert_eq!(store.revision().unwrap(), replay_revision);
-        assert!(matches!(
-            store.create_session(&task.id, RuntimeKind::Claude, "/tmp"),
-            Err(StoreError::Conflict("session_exists"))
-        ));
-        assert!(matches!(
-            store.create_session(&task.id, RuntimeKind::Codex, "/private/tmp"),
-            Err(StoreError::Conflict("session_exists"))
-        ));
-
-        let queued = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "用户实际输入")
-            .unwrap();
-        assert_eq!(queued.prompt, "用户实际输入");
-        let bundle = store.session_bundle(&session.id, 0, 100).unwrap();
-        assert_eq!(bundle.messages.len(), 1);
-        assert_eq!(bundle.messages[0].body, "用户实际输入");
-        assert!(!bundle.messages[0].body.contains("任务标题"));
-        assert!(!bundle.messages[0].body.contains("2026-08-10"));
-        assert!(matches!(
-            store.create_session(&task.id, RuntimeKind::Codex, "/tmp"),
-            Err(StoreError::Conflict("session_exists"))
-        ));
-    }
-
-    #[test]
-    fn client_message_id_is_idempotent() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store.create_task("任务", "", None, None, None).unwrap();
-        let client_id = Uuid::new_v4().to_string();
-        let session = store
-            .create_session(&task.id.to_uppercase(), RuntimeKind::Claude, "/tmp")
-            .unwrap();
-        let first = store
-            .send_message(&session.id, &client_id.to_uppercase(), "任务")
-            .unwrap();
-        let duplicate = store
-            .send_message(
-                &first.session.id.to_uppercase(),
-                &client_id.to_uppercase(),
-                "任务",
-            )
-            .unwrap();
-        assert_eq!(first.turn.id, duplicate.turn.id);
-        assert!(!duplicate.is_new);
-        assert_eq!(first.session.task_id, task.id);
-        assert_eq!(
-            store
-                .session(&first.session.id.to_uppercase())
-                .unwrap()
-                .unwrap()
-                .id,
-            first.session.id
-        );
-    }
-
-    #[test]
-    fn only_one_active_turn_is_allowed_per_session() {
-        let directory = tempdir().unwrap();
-        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
-        let task = store.create_task("任务", "", None, None, None).unwrap();
-        let session = store
-            .create_session(&task.id, RuntimeKind::Cursor, "/tmp")
-            .unwrap();
-        store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "任务")
-            .unwrap();
-        let error = store
-            .send_message(&session.id, &Uuid::new_v4().to_string(), "继续")
-            .unwrap_err();
-        assert!(matches!(error, StoreError::Conflict("session_busy")));
-    }
-
-    #[test]
-    fn older_schema_is_rebuilt_as_empty_v4() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("todoagent.sqlite3");
-        let connection = Connection::open(&path).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE schema_migration(version INTEGER PRIMARY KEY,name TEXT NOT NULL,checksum TEXT NOT NULL,applied_at TEXT NOT NULL);
-                 INSERT INTO schema_migration VALUES(2,'session model','v2','2026-01-01T00:00:00Z');
-                 CREATE TABLE app_revision(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision INTEGER NOT NULL);
-                 INSERT INTO app_revision VALUES(1,0);
-                 CREATE TABLE chat_session(id TEXT PRIMARY KEY,title TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL,archived_at TEXT);
-                 CREATE TABLE chat_message(id TEXT PRIMARY KEY,session_id TEXT NOT NULL,sequence INTEGER NOT NULL,role TEXT NOT NULL,body TEXT NOT NULL,payload_json TEXT,created_at TEXT NOT NULL,UNIQUE(session_id,sequence));",
-            )
-            .unwrap();
-        drop(connection);
-        let store = Store::open(&path).unwrap();
-        assert_eq!(store.health().unwrap()["schemaVersion"], 4);
-        let columns = store
-            .connection
-            .prepare("PRAGMA table_info(chat_message)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(columns.contains(&"turn_id".to_owned()));
-        assert!(columns.contains(&"updated_at".to_owned()));
-        let task_columns = store
-            .connection
-            .prepare("PRAGMA table_info(task)")
-            .unwrap()
-            .query_map([], |row| row.get::<_, String>(1))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(task_columns.contains(&"execution_date".to_owned()));
-    }
-
-    #[test]
     fn assistant_turn_receipt_is_idempotent_and_task_mutation_is_atomic() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
@@ -10152,10 +7314,10 @@ mod tests {
             .create_task("运行中不能删除", "", None, None, None)
             .unwrap();
         let task_session = store
-            .create_session(&active_task.id, RuntimeKind::Codex, "/tmp")
+            .create_terminal_session(&active_task.id, RuntimeKind::Codex, "/tmp")
             .unwrap();
         store
-            .send_message(&task_session.id, &Uuid::new_v4().to_string(), "正在运行")
+            .prepare_terminal_run(&task_session.id, &Uuid::new_v4().to_string())
             .unwrap();
         let queued = running_assistant_turn(&store, "安全删除");
         let active_result = store.execute_assistant_delete_task(
@@ -10514,10 +7676,17 @@ mod tests {
         store
             .connection
             .execute(
-                "INSERT INTO task_session(id,task_id,runtime_kind,working_directory,state,last_agent_sequence,last_read_sequence,created_at,updated_at)
-                 VALUES(?1,?2,'codex','/tmp','running',3,1,?3,?3)",
+                "INSERT INTO terminal_session(id,task_id,runtime_kind,working_directory,agent_status,status_sequence,seen_status_sequence,created_at,updated_at)
+                 VALUES(?1,?2,'codex','/tmp','blocked',3,1,?3,?3)",
                 params![Uuid::new_v4().to_string(), open_tasks[0].id, timestamp],
             )
+            .unwrap();
+        let summary_session = store
+            .terminal_session_for_task(&open_tasks[0].id)
+            .unwrap()
+            .unwrap();
+        store
+            .prepare_terminal_run(&summary_session.id, &Uuid::new_v4().to_string())
             .unwrap();
         let queued = running_assistant_turn(&store, "精确计数");
         let state = store

@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -122,68 +124,26 @@ pub struct Runtime {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum SessionState {
-    Idle,
-    Queued,
-    Running,
-    Failed,
-    Closed,
+pub enum ProviderBindingState {
+    Unbound,
+    Bound,
+    CaptureFailed,
 }
 
-impl SessionState {
+impl ProviderBindingState {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Idle => "idle",
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Failed => "failed",
-            Self::Closed => "closed",
+            Self::Unbound => "unbound",
+            Self::Bound => "bound",
+            Self::CaptureFailed => "capture_failed",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "idle" => Some(Self::Idle),
-            "queued" => Some(Self::Queued),
-            "running" => Some(Self::Running),
-            "failed" => Some(Self::Failed),
-            "closed" => Some(Self::Closed),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnStatus {
-    Queued,
-    Running,
-    Completed,
-    Failed,
-    Cancelled,
-    Interrupted,
-}
-
-impl TurnStatus {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Cancelled => "cancelled",
-            Self::Interrupted => "interrupted",
-        }
-    }
-
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "queued" => Some(Self::Queued),
-            "running" => Some(Self::Running),
-            "completed" => Some(Self::Completed),
-            "failed" => Some(Self::Failed),
-            "cancelled" => Some(Self::Cancelled),
-            "interrupted" => Some(Self::Interrupted),
+            "unbound" => Some(Self::Unbound),
+            "bound" => Some(Self::Bound),
+            "capture_failed" => Some(Self::CaptureFailed),
             _ => None,
         }
     }
@@ -191,29 +151,100 @@ impl TurnStatus {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum MessageRole {
-    User,
-    Agent,
-    System,
-    Tool,
+pub enum TerminalAgentStatus {
+    Unknown,
+    Idle,
+    Active,
+    Blocked,
+    Completed,
 }
 
-impl MessageRole {
+impl TerminalAgentStatus {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::User => "user",
-            Self::Agent => "agent",
-            Self::System => "system",
-            Self::Tool => "tool",
+            Self::Unknown => "unknown",
+            Self::Idle => "idle",
+            Self::Active => "active",
+            Self::Blocked => "blocked",
+            Self::Completed => "completed",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
         match value {
-            "user" => Some(Self::User),
-            "agent" => Some(Self::Agent),
-            "system" => Some(Self::System),
-            "tool" => Some(Self::Tool),
+            "unknown" => Some(Self::Unknown),
+            "idle" => Some(Self::Idle),
+            "active" => Some(Self::Active),
+            "blocked" => Some(Self::Blocked),
+            "completed" => Some(Self::Completed),
+            _ => None,
+        }
+    }
+
+    pub fn creates_attention(self) -> bool {
+        matches!(self, Self::Blocked | Self::Completed)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalRunState {
+    Starting,
+    Running,
+    Stopping,
+    Exited,
+    Failed,
+    Interrupted,
+}
+
+impl TerminalRunState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Stopping => "stopping",
+            Self::Exited => "exited",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "starting" => Some(Self::Starting),
+            "running" => Some(Self::Running),
+            "stopping" => Some(Self::Stopping),
+            "exited" => Some(Self::Exited),
+            "failed" => Some(Self::Failed),
+            "interrupted" => Some(Self::Interrupted),
+            _ => None,
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(self, Self::Starting | Self::Running | Self::Stopping)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalLaunchMode {
+    Fresh,
+    Resume,
+}
+
+impl TerminalLaunchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Resume => "resume",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fresh" => Some(Self::Fresh),
+            "resume" => Some(Self::Resume),
             _ => None,
         }
     }
@@ -221,56 +252,79 @@ impl MessageRole {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct TaskSession {
+pub struct TerminalSession {
     pub id: String,
     pub task_id: String,
     pub runtime_kind: RuntimeKind,
     pub working_directory: String,
     pub provider_session_id: Option<String>,
-    pub provider_engine: Option<String>,
-    pub state: SessionState,
-    pub last_agent_sequence: i64,
-    pub last_read_sequence: i64,
+    pub provider_binding_state: ProviderBindingState,
+    pub provider_binding_source: Option<String>,
+    pub agent_status: TerminalAgentStatus,
+    /// Process lifecycle is intentionally independent from provider hook
+    /// attention. Kiro, and providers whose hooks are disabled, can be
+    /// running while `agent_status` remains `unknown`.
+    pub has_active_run: bool,
+    pub status_sequence: i64,
+    pub seen_status_sequence: i64,
     pub last_error_code: Option<String>,
     pub last_error_message: Option<String>,
+    pub last_started_at: Option<String>,
+    pub last_exited_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionTurn {
+pub struct TerminalResumeCandidate {
+    pub provider_session_id: String,
+    pub source: String,
+    pub created_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalResumeCandidates {
+    pub session: TerminalSession,
+    pub candidates: Vec<TerminalResumeCandidate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalRun {
     pub id: String,
     pub session_id: String,
     pub ordinal: i64,
-    pub user_message_id: String,
-    pub provider_session_id_before: Option<String>,
-    pub provider_session_id_after: Option<String>,
-    pub status: TurnStatus,
+    pub launch_mode: TerminalLaunchMode,
+    pub state: TerminalRunState,
+    pub provider_session_id_at_launch: Option<String>,
     pub exit_code: Option<i32>,
-    pub final_output: Option<String>,
+    pub exit_reason: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
-    pub provider_usage_json: Option<String>,
     pub started_at: Option<String>,
-    pub ended_at: Option<String>,
+    pub exited_at: Option<String>,
     pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct SessionMessage {
-    pub id: String,
-    pub session_id: String,
-    pub turn_id: Option<String>,
-    pub sequence: i64,
-    pub client_message_id: Option<String>,
-    pub role: MessageRole,
-    pub kind: String,
-    pub body: String,
-    pub payload_json: Option<String>,
-    pub created_at: String,
-    pub updated_at: String,
+pub struct TerminalSessionBundle {
+    pub session: TerminalSession,
+    pub active_run: Option<TerminalRun>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TerminalLaunchPlan {
+    pub session: TerminalSession,
+    pub run: TerminalRun,
+    pub executable: String,
+    pub arguments: Vec<String>,
+    pub working_directory: String,
+    pub environment: BTreeMap<String, String>,
+    pub capture_strategy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -281,15 +335,7 @@ pub struct Bootstrap {
     pub tasks: Vec<Task>,
     pub task_attachments: Vec<TaskAttachment>,
     pub runtimes: Vec<Runtime>,
-    pub sessions: Vec<TaskSession>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionBundle {
-    pub session: TaskSession,
-    pub messages: Vec<SessionMessage>,
-    pub active_turn: Option<SessionTurn>,
+    pub sessions: Vec<TerminalSession>,
 }
 
 /// Provider-neutral Chat V2 item. Provider call/result frames are paired into
@@ -318,33 +364,6 @@ pub struct SessionTimelineItem {
     pub metadata_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionTimelineCursor {
-    pub turn_ordinal: i64,
-    pub item_ordinal: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct SessionTimelinePage {
-    pub session: TaskSession,
-    pub items: Vec<SessionTimelineItem>,
-    pub active_turn: Option<SessionTurn>,
-    pub next_sequence: i64,
-    pub next_cursor: Option<SessionTimelineCursor>,
-    pub has_more: bool,
-    pub fidelity: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct QueuedTurn {
-    pub session: TaskSession,
-    pub turn: SessionTurn,
-    pub prompt: String,
-    pub is_new: bool,
 }
 
 /// A persistent conversational session owned by the TodoAgent assistant.

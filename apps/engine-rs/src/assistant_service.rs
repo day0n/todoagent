@@ -1795,7 +1795,7 @@ fn assistant_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "list_state",
-            "读取未完成/已完成任务摘要、运行中的本地 Session 与未读 Agent 消息摘要。按执行日期、状态或清单过滤时使用快照游标分页；pagination.hasMore 为 true 时保持过滤条件不变，并把 nextCursor 原样传入 cursor，直到 hasMore 为 false。若返回 list_state_cursor_stale，丢弃旧页面并从第一页重新查询。",
+            "读取未完成/已完成任务摘要，以及本地 Terminal Run 生命周期与 attention 状态。按执行日期、状态或清单过滤时使用快照游标分页；pagination.hasMore 为 true 时保持过滤条件不变，并把 nextCursor 原样传入 cursor，直到 hasMore 为 false。若返回 list_state_cursor_stale，丢弃旧页面并从第一页重新查询。",
             json!({
                 "type":"object",
                 "properties":{

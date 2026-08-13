@@ -524,8 +524,8 @@ impl StepBuilder {
             }
         }
         if let Some(arguments) = self.arguments_text.take() {
-            let value = serde_json::from_str::<Value>(&arguments)
-                .unwrap_or_else(|_| Value::String(arguments));
+            let value =
+                serde_json::from_str::<Value>(&arguments).unwrap_or(Value::String(arguments));
             self.payload.insert("arguments".to_owned(), value);
         }
         self.stopped = true;
