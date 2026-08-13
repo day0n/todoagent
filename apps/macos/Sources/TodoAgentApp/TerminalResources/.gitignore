@@ -1,0 +1,6 @@
+ghostty/
+terminfo/
+THIRD_PARTY_NOTICES.md
+GPL-3.0.txt
+!ThirdPartyLicenses/
+!ThirdPartyLicenses/**
