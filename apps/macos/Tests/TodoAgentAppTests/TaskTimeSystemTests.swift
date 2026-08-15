@@ -1242,7 +1242,7 @@ struct TaskTimeSystemTests {
         }
     }
 
-    @Test("engine restart ready coalesces recovery and keeps a pending draft on top")
+    @Test("a newer engine ready schedules its own recovery and keeps a pending draft on top")
     func engineReadyRecoversSnapshotAndDraft() async throws {
         let item = task("原始")
         let repository = TaskMutationSpyRepository(
@@ -1268,11 +1268,124 @@ struct TaskTimeSystemTests {
         await repository.releaseSync(1)
         await waitUntil { state.revision == 5 }
 
-        #expect(await repository.syncCallCount() == 1)
+        await repository.waitUntilSyncStarted(2)
+        #expect(await repository.syncCallCount() == 2)
         #expect(state.task(id: item.id)?.title == "重启后权威任务")
         #expect(state.task(id: item.id)?.note == "未落盘草稿")
         #expect(await state.flushTaskEdits(taskID: item.id))
         #expect(await repository.persistedTask(id: item.id)?.note == "未落盘草稿")
+    }
+
+    @Test("a dropped Engine event episode coalesces one authoritative snapshot recovery")
+    func droppedEventRecoversSnapshotOnce() async throws {
+        let item = task("旧标题")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(revision: 11, tasks: [item]),
+            gatedSyncCalls: [1]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        var recovered = item
+        recovered.title = "权威标题"
+        await repository.replaceSnapshot(snapshot(revision: 12, tasks: [recovered]))
+        let dropped = EngineEvent.authoritativeResyncRequired(episode: 7)
+
+        await state.consume(dropped)
+        await repository.waitUntilSyncStarted(1)
+        await state.consume(dropped)
+        await repository.releaseSync(1)
+        await waitUntil { state.revision == 12 }
+
+        #expect(await repository.syncCallCount() == 1)
+        #expect(state.task(id: item.id)?.title == "权威标题")
+    }
+
+    @Test("a newer dropped-event episode waits behind the active recovery")
+    func newerDroppedEventQueuesAnotherSnapshotRecovery() async throws {
+        let item = task("旧标题")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(revision: 20, tasks: [item]),
+            gatedSyncCalls: [1, 2]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        var first = item
+        first.title = "第一次恢复"
+        await repository.replaceSnapshot(snapshot(revision: 21, tasks: [first]))
+        await state.consume(.authoritativeResyncRequired(episode: 10))
+        await repository.waitUntilSyncStarted(1)
+
+        var second = item
+        second.title = "第二次恢复"
+        await repository.replaceSnapshot(snapshot(revision: 22, tasks: [second]))
+        await state.consume(.authoritativeResyncRequired(episode: 11))
+
+        await repository.releaseSync(1)
+        await repository.waitUntilSyncStarted(2)
+        await repository.releaseSync(2)
+        await waitUntil { state.revision == 22 }
+
+        #expect(await repository.syncCallCount() == 2)
+        #expect(state.task(id: item.id)?.title == "第二次恢复")
+    }
+
+    @Test("engine.ready preempts a stalled dropped-event recovery and preserves its episode")
+    func engineReadyPreemptsDroppedEventRecovery() async throws {
+        let item = task("旧标题")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(revision: 25, tasks: [item]),
+            gatedSyncCalls: [1]
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        var recovered = item
+        recovered.title = "新 Engine 权威标题"
+        await repository.replaceSnapshot(snapshot(revision: 26, tasks: [recovered]))
+
+        await state.consume(.authoritativeResyncRequired(episode: 15))
+        await repository.waitUntilSyncStarted(1)
+
+        // The first sync deliberately ignores task cancellation until released.
+        // A ready generation must still start restart reconciliation and its own
+        // sync immediately, rather than waiting behind that stale request.
+        await state.consume(EngineEvent(name: "engine.ready", data: Data("{}".utf8)))
+        await repository.waitUntilSyncStarted(2)
+        await waitUntil { state.revision == 26 }
+
+        // The preempted dropped-event episode remains queued and is repaired
+        // after the higher-priority restart recovery.
+        await repository.waitUntilSyncStarted(3)
+        #expect(await repository.syncCallCount() == 3)
+        #expect(state.task(id: item.id)?.title == "新 Engine 权威标题")
+
+        await repository.releaseSync(1)
+        await Task.yield()
+        #expect(state.revision == 26)
+    }
+
+    @Test("one engine ready retries a failed snapshot recovery without another event")
+    func engineReadyRetriesFailedSnapshotRecovery() async throws {
+        let item = task("旧标题")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(revision: 30, tasks: [item]),
+            syncFailuresRemaining: 1
+        )
+        let state = AppState(repository: repository)
+        await state.load()
+
+        var recovered = item
+        recovered.title = "重试后的权威标题"
+        await repository.replaceSnapshot(snapshot(revision: 31, tasks: [recovered]))
+
+        await state.consume(EngineEvent(name: "engine.ready", data: Data("{}".utf8)))
+        await repository.waitUntilSyncStarted(2)
+        await waitUntil { state.revision == 31 }
+
+        #expect(await repository.syncCallCount() == 2)
+        #expect(state.task(id: item.id)?.title == "重试后的权威标题")
     }
 
     @Test("runtime changed applies only a newer authoritative revision")
@@ -1726,6 +1839,7 @@ private actor TaskMutationSpyRepository: AppRepository {
     private var snapshot: AppSnapshot
     private let staleRuntimeSnapshot: AppSnapshot?
     private var failuresRemaining: Int
+    private var syncFailuresRemaining: Int
     private var attachmentFailuresRemaining: Int
     private var ambiguousAttachmentFailuresRemaining: Int
     private var ambiguousDeleteFailuresRemaining: Int
@@ -1771,6 +1885,7 @@ private actor TaskMutationSpyRepository: AppRepository {
     init(
         snapshot: AppSnapshot,
         failuresRemaining: Int = 0,
+        syncFailuresRemaining: Int = 0,
         attachmentFailuresRemaining: Int = 0,
         ambiguousAttachmentFailuresRemaining: Int = 0,
         ambiguousDeleteFailuresRemaining: Int = 0,
@@ -1789,6 +1904,7 @@ private actor TaskMutationSpyRepository: AppRepository {
     ) {
         self.snapshot = snapshot
         self.failuresRemaining = failuresRemaining
+        self.syncFailuresRemaining = syncFailuresRemaining
         self.attachmentFailuresRemaining = attachmentFailuresRemaining
         self.ambiguousAttachmentFailuresRemaining = ambiguousAttachmentFailuresRemaining
         self.ambiguousDeleteFailuresRemaining = ambiguousDeleteFailuresRemaining
@@ -1817,6 +1933,10 @@ private actor TaskMutationSpyRepository: AppRepository {
             await withCheckedContinuation { continuation in
                 syncReleaseContinuations[call] = continuation
             }
+        }
+        if syncFailuresRemaining > 0 {
+            syncFailuresRemaining -= 1
+            throw AppRepositoryError.runtimeUnavailable
         }
         return snapshot
     }

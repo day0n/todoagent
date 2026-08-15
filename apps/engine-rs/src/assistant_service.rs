@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex as StdMutex, mpsc::SyncSender};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use chrono::Local;
@@ -26,6 +26,7 @@ use crate::models::{
     AssistantToolSummary, AssistantTurn, AssistantTurnStatus, QueuedAssistantTurn,
     SessionTimelineItem,
 };
+use crate::output::OutputWriter;
 use crate::protocol::Event;
 use crate::store::AssistantDeleteTaskOutcome;
 use crate::store::StoreError;
@@ -58,7 +59,7 @@ pub enum AssistantServiceError {
 #[derive(Clone)]
 pub struct AssistantService {
     store: StoreWorker,
-    writer: SyncSender<Value>,
+    writer: OutputWriter,
     gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
     data_directory: Arc<PathBuf>,
     task_file_mutation: Arc<Mutex<()>>,
@@ -223,7 +224,7 @@ fn default_history_limit() -> i64 {
 impl AssistantService {
     pub fn new(
         store: StoreWorker,
-        writer: SyncSender<Value>,
+        writer: OutputWriter,
         gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
         data_directory: Arc<PathBuf>,
         task_file_mutation: Arc<Mutex<()>>,
@@ -283,7 +284,8 @@ impl AssistantService {
             .call(move |store| store.create_assistant_session(&title))
             .await?;
         let session = AssistantSessionView::from_session(session, None);
-        self.emit("assistant.session.changed", json!({"session": session}));
+        self.emit("assistant.session.changed", json!({"session": session}))
+            .await;
         Ok(session)
     }
 
@@ -300,7 +302,8 @@ impl AssistantService {
             .call(move |store| store.rename_assistant_session(&session_id, &title))
             .await?;
         let session = AssistantSessionView::from_session(session, None);
-        self.emit("assistant.session.changed", json!({"session": session}));
+        self.emit("assistant.session.changed", json!({"session": session}))
+            .await;
         Ok(session)
     }
 
@@ -314,7 +317,8 @@ impl AssistantService {
             .call(move |store| store.archive_assistant_session(&persisted_session_id))
             .await?;
         let session = AssistantSessionView::from_session(session, None);
-        self.emit("assistant.session.changed", json!({"session": session}));
+        self.emit("assistant.session.changed", json!({"session": session}))
+            .await;
         Ok(session)
     }
 
@@ -420,7 +424,8 @@ impl AssistantService {
         self.emit(
             "assistant.session.changed",
             json!({"session": bundle.session}),
-        );
+        )
+        .await;
         Ok(bundle)
     }
 
@@ -539,7 +544,8 @@ impl AssistantService {
                 return;
             }
         };
-        self.emit_turn("assistant.turn.started", &running, Some(&queued.message));
+        self.emit_turn("assistant.turn.started", &running, Some(&queued.message))
+            .await;
         let session_id = queued.session.id.clone();
         if let Ok(session) = self
             .store
@@ -550,7 +556,8 @@ impl AssistantService {
             self.emit(
                 "assistant.session.changed",
                 json!({"session": AssistantSessionView::from_session(session, running.model_id.clone())}),
-            );
+            )
+            .await;
         }
 
         let key = self.gemini_key.lock().await.as_ref().cloned();
@@ -657,7 +664,7 @@ impl AssistantService {
             {
                 Ok((message, turn)) => {
                     if let Some(message) = message {
-                        self.emit_message(message);
+                        self.emit_message(message).await;
                     }
                     Some(turn)
                 }
@@ -677,7 +684,7 @@ impl AssistantService {
                     {
                         Ok((message, turn)) => {
                             if let Some(message) = message {
-                                self.emit_message(message);
+                                self.emit_message(message).await;
                             }
                             turn
                         }
@@ -697,7 +704,8 @@ impl AssistantService {
         self.remove_active_if_turn(&queued.session.id, &queued.turn.id)
             .await;
         if let Some(turn) = persisted_turn {
-            self.emit_turn("assistant.turn.finished", &turn, Some(&queued.message));
+            self.emit_turn("assistant.turn.finished", &turn, Some(&queued.message))
+                .await;
             let session_id = queued.session.id.clone();
             match self
                 .store
@@ -708,7 +716,8 @@ impl AssistantService {
                     self.emit(
                         "assistant.session.changed",
                         json!({"session": AssistantSessionView::from_session(session, turn.model_id.clone())}),
-                    );
+                    )
+                    .await;
                 }
                 Ok(None) => {}
                 Err(error) => tracing::error!("failed to reload assistant session: {error}"),
@@ -758,10 +767,11 @@ impl AssistantService {
             .await
         {
             if let Some(message) = turn.0 {
-                self.emit_message(message);
+                self.emit_message(message).await;
             }
             let turn = turn.1;
-            self.emit_turn("assistant.turn.finished", &turn, Some(&queued.message));
+            self.emit_turn("assistant.turn.finished", &turn, Some(&queued.message))
+                .await;
             let session_id = queued.session.id.clone();
             if let Ok(Some(session)) = self
                 .store
@@ -771,12 +781,13 @@ impl AssistantService {
                 self.emit(
                     "assistant.session.changed",
                     json!({"session": AssistantSessionView::from_session(session, turn.model_id.clone())}),
-                );
+                )
+                .await;
             }
         }
     }
 
-    fn emit_turn(
+    async fn emit_turn(
         &self,
         event: &'static str,
         turn: &AssistantTurn,
@@ -788,10 +799,11 @@ impl AssistantService {
                 "sessionId": turn.session_id,
                 "turn": AssistantTurnView::from_turn(turn.clone(), user),
             }),
-        );
+        )
+        .await;
     }
 
-    fn emit_message(&self, message: AssistantMessage) {
+    async fn emit_message(&self, message: AssistantMessage) {
         let session_id = message.session_id.clone();
         self.emit(
             "assistant.message.appended",
@@ -799,21 +811,18 @@ impl AssistantService {
                 "sessionId": session_id,
                 "message": AssistantMessageView::from(message),
             }),
-        );
+        )
+        .await;
     }
 
-    fn emit<T: Serialize>(&self, event: &'static str, data: T) {
-        if let Ok(value) = serde_json::to_value(Event { event, data }) {
-            // Persistent state notifications must not disappear behind a burst
-            // of text deltas. The dedicated stdout thread is the only writer.
-            let _ = self.writer.send(value);
-        }
+    async fn emit<T: Serialize>(&self, event: &'static str, data: T) {
+        // Persistent state notifications must not disappear behind a burst of
+        // text deltas. Waiting for bounded queue capacity yields to the runtime.
+        self.writer.send(&Event { event, data }).await;
     }
 
     fn emit_ephemeral<T: Serialize>(&self, event: &'static str, data: T) {
-        if let Ok(value) = serde_json::to_value(Event { event, data }) {
-            let _ = self.writer.try_send(value);
-        }
+        self.writer.try_send_ephemeral(&Event { event, data });
     }
 }
 
@@ -1286,7 +1295,7 @@ impl AssistantHost for EngineAssistantHost {
         self.remember_tool_references(&request.call_id, references.clone());
         if matches!(request.name.as_str(), "create_tasks" | "update_task") && !result.is_error {
             if let Ok(snapshot) = self.service.store.call(|store| store.bootstrap()).await {
-                self.service.emit("task.changed", snapshot);
+                self.service.emit("task.changed", snapshot).await;
             }
         }
         Ok(ToolReceipt {
@@ -1336,7 +1345,7 @@ impl AssistantHost for EngineAssistantHost {
         if let Ok(mut state) = self.state.lock() {
             state.completed_turn = Some(turn);
         }
-        self.service.emit_message(message);
+        self.service.emit_message(message).await;
         Ok(())
     }
 
@@ -1454,7 +1463,7 @@ impl AssistantHost for EngineAssistantHost {
             AgentEvent::ToolStarted { call_id, name } => {
                 self.flush_draft();
                 self.flush_thought();
-                self.service.emit(
+                self.service.emit_ephemeral(
                     "assistant.tool.started",
                     json!({
                         "sessionId": self.session_id,
@@ -1477,7 +1486,7 @@ impl AssistantHost for EngineAssistantHost {
                     .ok()
                     .and_then(|state| state.tool_references.get(&call_id).cloned())
                     .unwrap_or_default();
-                self.service.emit(
+                self.service.emit_ephemeral(
                     "assistant.tool.finished",
                     json!({
                         "sessionId": self.session_id,
@@ -2127,7 +2136,7 @@ async fn execute_assistant_delete_tool(
 
     if applied {
         match service.store.call(|store| store.bootstrap()).await {
-            Ok(snapshot) => service.emit("task.changed", snapshot),
+            Ok(snapshot) => service.emit("task.changed", snapshot).await,
             Err(error) => {
                 tracing::warn!(
                     task_id,
@@ -2300,6 +2309,19 @@ fn user_facing_assistant_error(error: &AssistantError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_writer(capacity: usize) -> (OutputWriter, std::sync::mpsc::Receiver<Value>) {
+        crate::output::test_channel(capacity)
+    }
+
+    fn recv_event(receiver: &std::sync::mpsc::Receiver<Value>, event_name: &str) -> Value {
+        loop {
+            let value = receiver.recv().unwrap();
+            if value["event"] == event_name {
+                return value;
+            }
+        }
+    }
 
     use crate::models::{AssistantCompaction, AssistantSession, TaskAttachment};
     use crate::store::Store;
@@ -2655,7 +2677,7 @@ mod tests {
     async fn send_rejects_an_empty_message_before_provider_or_storage_work() {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
-        let (writer, _receiver) = std::sync::mpsc::sync_channel(4);
+        let (writer, _receiver) = test_writer(4);
         let service = AssistantService::new(
             worker.clone(),
             writer,
@@ -2721,7 +2743,7 @@ mod tests {
         let quarantine_path = data_directory
             .join("Attachments")
             .join(format!(".removing-{attachment_id}"));
-        let (writer, receiver) = std::sync::mpsc::sync_channel(16);
+        let (writer, receiver) = test_writer(16);
         let service = AssistantService::new(
             worker.clone(),
             writer,
@@ -2863,7 +2885,7 @@ mod tests {
             .join(format!(".removing-{attachment_id}"));
         let task_file_mutation = Arc::new(Mutex::new(()));
         let held_file_lock = task_file_mutation.lock().await;
-        let (writer, receiver) = std::sync::mpsc::sync_channel(16);
+        let (writer, receiver) = test_writer(16);
         let service = AssistantService::new(
             worker.clone(),
             writer,
@@ -2969,7 +2991,7 @@ mod tests {
     async fn short_delta_flushes_after_the_real_time_deadline() {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
-        let (writer, receiver) = std::sync::mpsc::sync_channel(16);
+        let (writer, receiver) = test_writer(16);
         let service = AssistantService::new(
             worker.clone(),
             writer,
@@ -2979,12 +3001,12 @@ mod tests {
         );
         let host = EngineAssistantHost::new(service, "session".to_owned(), "turn".to_owned());
         host.begin_model_interaction();
-        let _ = receiver.try_recv();
+        let _ = recv_event(&receiver, "assistant.message.delta");
 
         host.append_delta(1, "短片段");
         assert!(receiver.try_recv().is_err());
         sleep(DELTA_FLUSH_INTERVAL + Duration::from_millis(30)).await;
-        let event = receiver.try_recv().expect("deadline should flush a delta");
+        let event = recv_event(&receiver, "assistant.message.delta");
         assert_eq!(event["event"], "assistant.message.delta");
         assert_eq!(event["data"]["delta"], "短片段");
 
@@ -2995,7 +3017,11 @@ mod tests {
     async fn fast_megabyte_delta_stream_is_coalesced_into_bounded_event_count() {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
-        let (writer, receiver) = std::sync::mpsc::sync_channel(256);
+        // This test verifies coalescing, not the intentionally lossy
+        // backpressure policy. Size the observation queue for the bounded
+        // worst-case event count so scheduling cannot discard valid deltas.
+        let maximum_delta_events = 1024 * 1024 / DELTA_FLUSH_BYTES + 2;
+        let (writer, receiver) = test_writer(maximum_delta_events);
         let service = AssistantService::new(
             worker.clone(),
             writer,
@@ -3005,7 +3031,7 @@ mod tests {
         );
         let host = EngineAssistantHost::new(service, "session".to_owned(), "turn".to_owned());
         host.begin_model_interaction();
-        let _ = receiver.try_recv();
+        let _ = recv_event(&receiver, "assistant.message.delta");
 
         let chunk = "x".repeat(256);
         for _ in 0..(1024 * 1024 / chunk.len()) {
@@ -3024,7 +3050,7 @@ mod tests {
                 .sum::<usize>(),
             1024 * 1024
         );
-        assert!(deltas.len() <= 1024 * 1024 / DELTA_FLUSH_BYTES + 1);
+        assert!(deltas.len() < maximum_delta_events);
 
         worker.shutdown().await.unwrap();
     }
@@ -3033,7 +3059,7 @@ mod tests {
     async fn thought_summary_events_are_public_bounded_deltas_with_global_parts() {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
-        let (writer, receiver) = std::sync::mpsc::sync_channel(16);
+        let (writer, receiver) = test_writer(16);
         let service = AssistantService::new(
             worker.clone(),
             writer,
@@ -3043,7 +3069,7 @@ mod tests {
         );
         let host = EngineAssistantHost::new(service, "session".to_owned(), "turn".to_owned());
         host.begin_model_interaction();
-        let _ = receiver.try_recv();
+        let _ = recv_event(&receiver, "assistant.message.delta");
 
         AssistantHost::emit(
             &host,
@@ -3055,7 +3081,7 @@ mod tests {
             },
         );
         sleep(DELTA_FLUSH_INTERVAL + Duration::from_millis(20)).await;
-        let first = receiver.recv().unwrap();
+        let first = recv_event(&receiver, "assistant.thought.summary");
         assert_eq!(first["data"]["content"], "先");
         assert_eq!(first["data"]["attempt"], 1);
         assert_eq!(first["data"]["interactionOrdinal"], 1);
@@ -3074,12 +3100,12 @@ mod tests {
             },
         );
         sleep(DELTA_FLUSH_INTERVAL + Duration::from_millis(20)).await;
-        let accumulated = receiver.recv().unwrap();
+        let accumulated = recv_event(&receiver, "assistant.thought.summary");
         assert_eq!(accumulated["data"]["content"], "想");
         assert!(!accumulated.to_string().contains("PRIVATE-SIGNATURE"));
 
         host.begin_model_interaction();
-        let _ = receiver.try_recv();
+        let _ = recv_event(&receiver, "assistant.message.delta");
         AssistantHost::emit(
             &host,
             "session",
@@ -3090,7 +3116,7 @@ mod tests {
             },
         );
         sleep(DELTA_FLUSH_INTERVAL + Duration::from_millis(20)).await;
-        let next = receiver.recv().unwrap();
+        let next = recv_event(&receiver, "assistant.thought.summary");
         assert_eq!(next["data"]["content"], "后");
         assert_eq!(next["data"]["attempt"], 4);
         assert_ne!(first["data"]["partId"], next["data"]["partId"]);
@@ -3121,7 +3147,7 @@ mod tests {
     async fn stale_turn_cleanup_never_removes_the_next_turn_token() {
         let directory = tempfile::tempdir().unwrap();
         let worker = StoreWorker::open(&directory.path().join("active.sqlite3")).unwrap();
-        let (writer, _receiver) = std::sync::mpsc::sync_channel(16);
+        let (writer, _receiver) = test_writer(16);
         let service = AssistantService::new(
             worker.clone(),
             writer,

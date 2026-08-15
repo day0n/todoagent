@@ -107,6 +107,8 @@ CREATE TABLE IF NOT EXISTS terminal_session (
   last_error_message       TEXT,
   last_started_at          TEXT,
   last_exited_at           TEXT,
+  last_exit_reason         TEXT,
+  auto_resume              INTEGER NOT NULL DEFAULT 0 CHECK(auto_resume IN (0,1)),
   created_at               TEXT NOT NULL,
   updated_at               TEXT NOT NULL
 );

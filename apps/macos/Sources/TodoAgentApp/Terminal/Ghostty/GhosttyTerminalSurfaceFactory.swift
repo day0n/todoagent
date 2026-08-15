@@ -17,6 +17,21 @@ final class GhosttyTerminalSurfaceFactory: TerminalSurfaceFactory {
         )
         return try GhosttyTerminalSession(configuration: configuration)
     }
+
+    func makeHostSurface(
+        workingDirectory: String,
+        environment: [String: String]
+    ) throws -> any TerminalSurfaceSession {
+        let home = TerminalHostDefaults.workingDirectory
+        let initialDirectory = TerminalWorkingDirectoryPolicy.isAvailable(home) ? home : workingDirectory
+        try GhosttyLaunchPlanValidator.validateWorkingDirectory(initialDirectory)
+        let configuration = GhosttyTerminalConfiguration(
+            command: try GhosttyCommandBuilder.hostShellCommand(),
+            workingDirectory: initialDirectory,
+            environment: environment
+        )
+        return try GhosttyTerminalSession(configuration: configuration)
+    }
 }
 
 @MainActor
@@ -52,5 +67,10 @@ final class GhosttyTerminalSession: TerminalSurfaceSession {
 
     func performAction(_ action: String) {
         surfaceView.performBinding(action)
+    }
+
+    func sendText(_ text: String) {
+        let payload = text.hasSuffix("\n") ? text : text + "\n"
+        surfaceView.insertPasted(payload)
     }
 }

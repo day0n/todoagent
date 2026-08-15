@@ -131,6 +131,7 @@ pub enum ProviderBindingState {
 }
 
 impl ProviderBindingState {
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unbound => "unbound",
@@ -271,8 +272,40 @@ pub struct TerminalSession {
     pub last_error_message: Option<String>,
     pub last_started_at: Option<String>,
     pub last_exited_at: Option<String>,
+    #[serde(default)]
+    pub last_exit_reason: Option<String>,
+    #[serde(default)]
+    pub auto_resume: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum TerminalLaunchIntent {
+    Auto,
+    Fresh,
+    Resume,
+}
+
+impl TerminalLaunchIntent {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Fresh => "fresh",
+            Self::Resume => "resume",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "auto" => Some(Self::Auto),
+            "fresh" => Some(Self::Fresh),
+            "resume" => Some(Self::Resume),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

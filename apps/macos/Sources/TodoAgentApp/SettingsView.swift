@@ -113,7 +113,7 @@ private struct GeneralSettingsPane: View {
     var body: some View {
         settingsForm {
             Section("工作区") {
-                Text("本地 Agent 会直接在你选择的目录中启动，不检查 Git 状态，也不会自动提交、合并或清理你的改动。")
+                Text("打开任务后是一条本机终端。你可以自己 cd、自己启动 Agent。TodoAgent 不检查 Git 状态，也不会自动提交、合并或清理你的改动。")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

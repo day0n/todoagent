@@ -28,6 +28,11 @@ final class AppState {
     }
 
     private struct ActiveEngineRecovery {
+        enum Kind: Equatable, Sendable {
+            case restart
+            case droppedEvents(episode: UInt64)
+        }
+
         let token: UUID
         let task: Task<Void, Never>
     }
@@ -77,11 +82,18 @@ final class AppState {
     private var activeTaskCommandWaiters: [CheckedContinuation<Void, Never>] = []
     private var failedTaskCommands: [UUID: FailedTaskCommand] = [:]
     private var activeEngineRecovery: ActiveEngineRecovery?
+    private var currentEngineRecoveryKind: ActiveEngineRecovery.Kind?
+    private var pendingEngineRestartRecovery = false
+    private var pendingEngineRestartRecoverySequence: UInt64 = 0
+    private var activeEngineRestartRecoverySequence: UInt64 = 0
+    private var pendingEventDropEpisode: UInt64?
+    private var lastRecoveredEventDropEpisode: UInt64?
     private var localDayRefreshTask: Task<Void, Never>?
     private var calendarObservers: [NSObjectProtocol] = []
     private var workspaceCalendarObserver: NSObjectProtocol?
     @ObservationIgnored weak var taskWorkspacePresenter: (any TaskWorkspacePresenting)?
     @ObservationIgnored var terminalSessions: TerminalSessionRegistry?
+    private var preferredWorkspaces: [UUID: String] = [:]
 
     private(set) var revision: Int64 = 0
     private(set) var lists: [TodoList] = []
@@ -177,8 +189,13 @@ final class AppState {
 
     private func performInitialLoad(generation: UInt64) async {
         do {
-            let snapshot = try await repository.load()
+            var snapshot = try await repository.load()
             guard loadGeneration == generation else { return }
+            await terminalSessions?.replayPendingExitReports()
+            guard loadGeneration == generation else { return }
+            if terminalSessions != nil {
+                snapshot = try await repository.sync()
+            }
             apply(snapshot)
             startEventsIfNeeded()
             scheduleLocalDayRefresh()
@@ -228,6 +245,11 @@ final class AppState {
         timelineRefreshWork.removeAll()
         activeEngineRecovery?.task.cancel()
         activeEngineRecovery = nil
+        currentEngineRecoveryKind = nil
+        pendingEngineRestartRecovery = false
+        pendingEngineRestartRecoverySequence = 0
+        activeEngineRestartRecoverySequence = 0
+        pendingEventDropEpisode = nil
         sessionLoadGeneration &+= 1
         sessionLoadTask?.cancel()
         sessionLoadTask = nil
@@ -734,9 +756,9 @@ final class AppState {
         cancelSessionLoad()
         presentedSheet = .taskSession(task.id)
         // `app.bootstrap` already tells us whether this task owns a Session.
-        // A task without one goes straight to setup; querying `session.get`
+        // The workbench binds a host terminal itself; querying `session.get`
         // here only creates a deferred error that becomes visible after the
-        // modal sheet closes.
+        // window closes.
         guard bundles[task.id] == nil, session(for: task) != nil else { return }
 
         sessionLoadGeneration &+= 1
@@ -1028,6 +1050,54 @@ final class AppState {
         task.listID.flatMap { id in lists.first(where: { $0.id == id })?.repositoryPath } ?? ""
     }
 
+    func workspacePath(for task: TaskItem) -> String {
+        if let live = terminalSessions?.controller(for: task.id)?.session.workingDirectory,
+           !live.isEmpty
+        {
+            return live
+        }
+        if let session = session(for: task), !session.workingDirectory.isEmpty {
+            return session.workingDirectory
+        }
+        if let preferred = preferredWorkspaces[task.id], !preferred.isEmpty {
+            return preferred
+        }
+        return suggestedWorkspace(for: task)
+    }
+
+    func canChangeWorkspace(for task: TaskItem) -> Bool {
+        terminalSessions?.controller(for: task.id)?.isActive != true
+    }
+
+    func applyTaskWorkspace(_ path: String, for task: TaskItem) async -> String? {
+        let directory = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !directory.isEmpty else { return "请选择一个文件夹。" }
+        preferredWorkspaces[task.id] = directory
+        guard let terminalSessions else { return nil }
+        do {
+            if let controller = terminalSessions.controller(for: task.id) {
+                try await terminalSessions.rebindWorkspaceAndResume(
+                    directory,
+                    controller: controller,
+                    taskTitle: task.title
+                )
+                return nil
+            }
+            if let session = session(for: task) {
+                let incoming = try await repository.rebindTerminalWorkspace(
+                    sessionID: session.id,
+                    workspace: directory
+                )
+                mergeTerminal(incoming)
+            }
+            return nil
+        } catch is CancellationError {
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+
     func hasUnreadAgentMessage(for task: TaskItem) -> Bool { session(for: task)?.hasUnread == true }
 
     @discardableResult
@@ -1221,6 +1291,16 @@ final class AppState {
             return
         } else if event.name == "engine.ready" {
             recoverSnapshotAfterEngineReadyIfNeeded()
+        } else if event.name == EngineEvent.authoritativeResyncRequiredName {
+            recoverSnapshotAfterDroppedEventsIfNeeded(event)
+        } else if event.name == "terminal.session.deleted" {
+            if let payload = try? JSONDecoder.engineDecoder.decode(
+                TerminalSessionDeletedEvent.self,
+                from: event.data
+            ) {
+                sessions.removeAll(where: { $0.id == payload.sessionID })
+                terminalSessions?.forget(sessionID: payload.sessionID, taskID: payload.taskID)
+            }
         } else if event.name.hasPrefix("terminal.") {
             if let bundle = try? JSONDecoder.engineDecoder.decode(
                 TerminalSessionBundle.self,
@@ -1304,31 +1384,139 @@ final class AppState {
     /// on this stream represents a restarted sidecar. One coalesced sync repairs
     /// any mutation whose durable response/event was lost with that process.
     private func recoverSnapshotAfterEngineReadyIfNeeded() {
-        guard hasAppliedSnapshot, activeEngineRecovery == nil else { return }
+        guard hasAppliedSnapshot else { return }
+        pendingEngineRestartRecoverySequence &+= 1
+        pendingEngineRestartRecovery = true
+        preemptDroppedEventRecoveryForRestartIfNeeded()
+        startEngineRecoveryWorkerIfNeeded()
+    }
 
+    /// A new ready generation invalidates the process assumptions behind an
+    /// in-flight dropped-event sync. Restart reconciliation must terminate the
+    /// old PTY/process generation immediately instead of waiting behind that
+    /// sync's request timeout or retry backoff. Preserve the interrupted episode
+    /// so the replacement worker repairs it after the restart recovery.
+    private func preemptDroppedEventRecoveryForRestartIfNeeded() {
+        guard case let .droppedEvents(episode)? = currentEngineRecoveryKind,
+              let recovery = activeEngineRecovery
+        else { return }
+
+        pendingEventDropEpisode = max(pendingEventDropEpisode ?? 0, episode)
+        activeEngineRecovery = nil
+        currentEngineRecoveryKind = nil
+        activeEngineRestartRecoverySequence = 0
+        recovery.task.cancel()
+    }
+
+    private func startEngineRecoveryWorkerIfNeeded() {
+        guard hasAppliedSnapshot,
+              activeEngineRecovery == nil,
+              pendingEngineRestartRecovery || pendingEventDropEpisode != nil
+        else { return }
         let token = UUID()
         let recovery = Task { @MainActor [weak self] in
             guard let self else { return }
-            do {
-                // Store startup reconciles active Runs to `interrupted`. Stop
-                // the matching old runner/PTY generation before applying that
-                // snapshot so UI, Engine, and OS processes cannot split-brain.
-                await self.terminalSessions?.reconcileEngineRestart()
-                let snapshot = try await self.repository.sync()
-                self.apply(snapshot)
-            } catch is CancellationError {
-                // App shutdown or a superseding lifecycle ends recovery.
-            } catch {
-                self.errorMessage = error.localizedDescription
-            }
-            self.finishEngineRecovery(token: token)
+            await self.runEngineRecoveryWorker(token: token)
         }
         activeEngineRecovery = ActiveEngineRecovery(token: token, task: recovery)
     }
 
-    private func finishEngineRecovery(token: UUID) {
+    private func runEngineRecoveryWorker(token: UUID) async {
+        while !Task.isCancelled, activeEngineRecovery?.token == token {
+            guard let kind = dequeueEngineRecovery() else { break }
+            currentEngineRecoveryKind = kind
+            if kind == .restart {
+                activeEngineRestartRecoverySequence = pendingEngineRestartRecoverySequence
+            }
+
+            if kind == .restart {
+                // Store startup reconciles active Runs to `interrupted`.
+                // Stop the matching old runner/PTY generation before
+                // applying that snapshot so UI, Engine, and OS processes
+                // cannot split-brain.
+                await terminalSessions?.replayPendingExitReports()
+                await terminalSessions?.reconcileEngineRestart()
+            }
+
+            var failureCount = 0
+            while !Task.isCancelled, activeEngineRecovery?.token == token {
+                do {
+                    let snapshot = try await repository.sync()
+                    guard !Task.isCancelled, activeEngineRecovery?.token == token else { break }
+                    apply(snapshot)
+                    if case let .droppedEvents(episode) = kind {
+                        lastRecoveredEventDropEpisode = max(
+                            lastRecoveredEventDropEpisode ?? 0,
+                            episode
+                        )
+                    }
+                    currentEngineRecoveryKind = nil
+                    if kind == .restart,
+                       pendingEngineRestartRecoverySequence > activeEngineRestartRecoverySequence {
+                        pendingEngineRestartRecovery = true
+                    }
+                    break
+                } catch is CancellationError {
+                    break
+                } catch {
+                    errorMessage = error.localizedDescription
+                    let delay = Self.engineRecoveryRetryDelay(failureCount: failureCount)
+                    failureCount += 1
+                    do {
+                        try await Task.sleep(for: delay)
+                    } catch {
+                        break
+                    }
+                }
+            }
+        }
+
         guard activeEngineRecovery?.token == token else { return }
+        currentEngineRecoveryKind = nil
+        activeEngineRestartRecoverySequence = 0
         activeEngineRecovery = nil
+        // A signal can be enqueued after the loop observes an empty queue but
+        // before this worker clears its token. Recheck once to avoid losing it.
+        startEngineRecoveryWorkerIfNeeded()
+    }
+
+    private func dequeueEngineRecovery() -> ActiveEngineRecovery.Kind? {
+        if pendingEngineRestartRecovery {
+            pendingEngineRestartRecovery = false
+            return .restart
+        }
+        if let episode = pendingEventDropEpisode {
+            pendingEventDropEpisode = nil
+            return .droppedEvents(episode: episode)
+        }
+        return nil
+    }
+
+    private static func engineRecoveryRetryDelay(failureCount: Int) -> Duration {
+        let exponent = min(max(failureCount, 0), 5)
+        return .milliseconds(min(8_000, 250 * (1 << exponent)))
+    }
+
+    /// Bounded AsyncStream buffers intentionally protect memory. If any
+    /// subscriber falls behind, EngineClient broadcasts one episode identifier
+    /// to all projections. Coalescing here repairs task, runtime, and terminal
+    /// state once for the episode while AssistantViewState reloads its own
+    /// authoritative state from the same signal.
+    private func recoverSnapshotAfterDroppedEventsIfNeeded(_ event: EngineEvent) {
+        guard let episode = event.authoritativeResyncEpisode else { return }
+        let activeEpisode: UInt64
+        if case let .droppedEvents(current)? = currentEngineRecoveryKind {
+            activeEpisode = current
+        } else {
+            activeEpisode = 0
+        }
+        guard
+              episode > (lastRecoveredEventDropEpisode ?? 0),
+              episode > activeEpisode,
+              episode > (pendingEventDropEpisode ?? 0)
+        else { return }
+        pendingEventDropEpisode = episode
+        startEngineRecoveryWorkerIfNeeded()
     }
 
     private func merge(_ incoming: SessionBundle, taskID: UUID) {
@@ -1898,6 +2086,7 @@ final class AppState {
         timelineRefreshWork[taskID]?.task.cancel()
         timelineRefreshWork[taskID] = nil
         sessions.removeAll(where: { $0.taskID == taskID })
+        preferredWorkspaces[taskID] = nil
         if presentedSheet == .taskSession(taskID) || loadingSessionTaskID == taskID {
             finishDismissingTaskSession(taskID: taskID)
         }
@@ -2362,6 +2551,16 @@ final class AssistantViewState {
         let attachments: [AssistantTextAttachment]
     }
 
+    private struct ActiveAssistantRecovery {
+        enum Kind: Equatable, Sendable {
+            case engineReady
+            case droppedEvents(episode: UInt64)
+        }
+
+        let token: UUID
+        let task: Task<Void, Never>
+    }
+
     private struct TranscriptProjectionCacheEntry {
         let structureRevision: UInt64
         let stableRevision: UInt64
@@ -2617,6 +2816,11 @@ final class AssistantViewState {
     @ObservationIgnored private let keyLoader: @MainActor @Sendable () throws -> String?
     @ObservationIgnored private var eventTask: Task<Void, Never>?
     @ObservationIgnored private var eventGeneration: UInt64 = 0
+    @ObservationIgnored private var activeAssistantRecovery: ActiveAssistantRecovery?
+    @ObservationIgnored private var currentAssistantRecoveryKind: ActiveAssistantRecovery.Kind?
+    @ObservationIgnored private var pendingEngineReadyRecovery = false
+    @ObservationIgnored private var pendingEventDropEpisode: UInt64?
+    @ObservationIgnored private var lastRecoveredEventDropEpisode: UInt64?
     @ObservationIgnored private var historyLoadGeneration: UInt64 = 0
     @ObservationIgnored private var finishedHistoryWork: [String: FinishedHistoryWork] = [:]
     @ObservationIgnored private var shouldEnsureDefaultSession = false
@@ -3107,7 +3311,7 @@ final class AssistantViewState {
 
     func load() async {
         startEventsIfNeeded()
-        await restoreCredentialAndReload(
+        _ = await restoreCredentialAndReload(
             resetEphemeralState: false,
             showLoadingState: true
         )
@@ -3118,6 +3322,11 @@ final class AssistantViewState {
         historyLoadGeneration &+= 1
         eventTask?.cancel()
         eventTask = nil
+        activeAssistantRecovery?.task.cancel()
+        activeAssistantRecovery = nil
+        currentAssistantRecoveryKind = nil
+        pendingEngineReadyRecovery = false
+        pendingEventDropEpisode = nil
         for work in finishedHistoryWork.values { work.task.cancel() }
         finishedHistoryWork.removeAll()
     }
@@ -3126,7 +3335,7 @@ final class AssistantViewState {
 
     func clearError() { errorMessage = nil }
 
-    func refresh() async { await reloadContent(showLoadingState: false) }
+    func refresh() async { _ = await reloadContent(showLoadingState: false) }
 
     func selectSession(_ sessionID: String) async {
         guard sessions.contains(where: { $0.id == sessionID && !$0.archived }) else { return }
@@ -3314,7 +3523,11 @@ final class AssistantViewState {
     /// the stored event task below, so tests never need timing-based sleeps.
     func consumeAssistantEvent(_ event: EngineEvent) async {
         if event.name == "engine.ready" {
-            await restoreAfterEngineReady()
+            enqueueEngineReadyRecovery()
+            return
+        }
+        if event.name == EngineEvent.authoritativeResyncRequiredName {
+            enqueueDroppedEventRecoveryIfNeeded(event)
             return
         }
         guard event.name.hasPrefix("assistant.") else { return }
@@ -3432,7 +3645,8 @@ final class AssistantViewState {
         )
     }
 
-    private func reloadContent(showLoadingState: Bool) async {
+    @discardableResult
+    private func reloadContent(showLoadingState: Bool) async -> Bool {
         if showLoadingState { loadState = .loading }
         do {
             let nextStatus = try await repository.assistantStatus()
@@ -3451,17 +3665,26 @@ final class AssistantViewState {
             for session in nextSessions { upsertSession(session) }
             if let selectedSessionID {
                 evictDetailedHistory(except: selectedSessionID)
-                await loadHistory(sessionID: selectedSessionID, after: 0, replaceActiveTurn: true)
+                guard await loadHistory(
+                    sessionID: selectedSessionID,
+                    after: 0,
+                    replaceActiveTurn: true
+                ) else {
+                    loadState = .failed(errorMessage ?? "TodoAgent 对话历史恢复失败。")
+                    return false
+                }
             }
             loadState = .loaded
             if shouldEnsureDefaultSession {
                 _ = await provisionDefaultSessionIfPossible()
             }
+            return true
         } catch is CancellationError {
-            return
+            return false
         } catch {
             loadState = .failed(error.localizedDescription)
             errorMessage = nil
+            return false
         }
     }
 
@@ -3483,13 +3706,14 @@ final class AssistantViewState {
         return created
     }
 
+    @discardableResult
     private func loadHistory(
         sessionID: String,
         after sequence: Int64,
         replaceActiveTurn: Bool,
         targetSequence: Int64? = nil,
         reconcilingFinishedTurnID: String? = nil
-    ) async {
+    ) async -> Bool {
         historyLoadGeneration &+= 1
         let generation = historyLoadGeneration
         isLoadingHistory = true
@@ -3518,7 +3742,7 @@ final class AssistantViewState {
                 guard
                     historyLoadGeneration == generation,
                     selectedSessionID == sessionID
-                else { return }
+                else { return false }
                 desiredSequence = max(desiredSequence, response.session.lastSequence)
                 let responseCursor = response.messages.map(\.sequence).max() ?? cursor
                 merge(
@@ -3547,10 +3771,12 @@ final class AssistantViewState {
             if sequence == 0, !hydration.reachedLimit {
                 historyFloorSequences.removeValue(forKey: sessionID)
             }
+            return true
         } catch is CancellationError {
-            return
+            return false
         } catch {
             errorMessage = error.localizedDescription
+            return false
         }
     }
 
@@ -3600,17 +3826,100 @@ final class AssistantViewState {
         }
     }
 
-    private func restoreAfterEngineReady() async {
-        await restoreCredentialAndReload(
-            resetEphemeralState: true,
-            showLoadingState: false
-        )
+    private func enqueueEngineReadyRecovery() {
+        pendingEngineReadyRecovery = true
+        startAssistantRecoveryWorkerIfNeeded()
+    }
+
+    private func enqueueDroppedEventRecoveryIfNeeded(_ event: EngineEvent) {
+        guard let episode = event.authoritativeResyncEpisode else { return }
+        let activeEpisode: UInt64
+        if case let .droppedEvents(current)? = currentAssistantRecoveryKind {
+            activeEpisode = current
+        } else {
+            activeEpisode = 0
+        }
+        guard
+              episode > (lastRecoveredEventDropEpisode ?? 0),
+              episode > activeEpisode,
+              episode > (pendingEventDropEpisode ?? 0)
+        else { return }
+        pendingEventDropEpisode = episode
+        startAssistantRecoveryWorkerIfNeeded()
+    }
+
+    private func startAssistantRecoveryWorkerIfNeeded() {
+        guard activeAssistantRecovery == nil,
+              pendingEngineReadyRecovery || pendingEventDropEpisode != nil
+        else { return }
+        let token = UUID()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.runAssistantRecoveryWorker(token: token)
+        }
+        activeAssistantRecovery = ActiveAssistantRecovery(token: token, task: task)
+    }
+
+    private func runAssistantRecoveryWorker(token: UUID) async {
+        while !Task.isCancelled, activeAssistantRecovery?.token == token {
+            guard let kind = dequeueAssistantRecovery() else { break }
+            currentAssistantRecoveryKind = kind
+            var failureCount = 0
+
+            while !Task.isCancelled, activeAssistantRecovery?.token == token {
+                let didRecover = await restoreCredentialAndReload(
+                    resetEphemeralState: true,
+                    showLoadingState: false
+                )
+                guard !Task.isCancelled, activeAssistantRecovery?.token == token else { break }
+                if didRecover {
+                    if case let .droppedEvents(episode) = kind {
+                        lastRecoveredEventDropEpisode = max(
+                            lastRecoveredEventDropEpisode ?? 0,
+                            episode
+                        )
+                    }
+                    currentAssistantRecoveryKind = nil
+                    break
+                }
+
+                let delay = Self.assistantRecoveryRetryDelay(failureCount: failureCount)
+                failureCount += 1
+                do {
+                    try await Task.sleep(for: delay)
+                } catch {
+                    break
+                }
+            }
+        }
+
+        guard activeAssistantRecovery?.token == token else { return }
+        currentAssistantRecoveryKind = nil
+        activeAssistantRecovery = nil
+        startAssistantRecoveryWorkerIfNeeded()
+    }
+
+    private func dequeueAssistantRecovery() -> ActiveAssistantRecovery.Kind? {
+        if pendingEngineReadyRecovery {
+            pendingEngineReadyRecovery = false
+            return .engineReady
+        }
+        if let episode = pendingEventDropEpisode {
+            pendingEventDropEpisode = nil
+            return .droppedEvents(episode: episode)
+        }
+        return nil
+    }
+
+    private static func assistantRecoveryRetryDelay(failureCount: Int) -> Duration {
+        let exponent = min(max(failureCount, 0), 5)
+        return .milliseconds(min(8_000, 250 * (1 << exponent)))
     }
 
     private func restoreCredentialAndReload(
         resetEphemeralState: Bool,
         showLoadingState: Bool
-    ) async {
+    ) async -> Bool {
         if resetEphemeralState {
             // A restarted sidecar has no in-memory turn state. Drop ephemeral
             // projections before rebuilding them from persisted history.
@@ -3636,13 +3945,13 @@ final class AssistantViewState {
                 try await repository.injectGeminiKey(key)
             }
         } catch is CancellationError {
-            return
+            return false
         } catch {
             credentialError = "TodoAgent 凭据恢复失败：\(error.localizedDescription)"
         }
 
         errorMessage = nil
-        await reloadContent(showLoadingState: showLoadingState)
+        let didReload = await reloadContent(showLoadingState: showLoadingState)
         if let credentialError {
             if let reloadError = errorMessage, reloadError != credentialError {
                 errorMessage = "\(credentialError)\n\(reloadError)"
@@ -3650,6 +3959,7 @@ final class AssistantViewState {
                 errorMessage = credentialError
             }
         }
+        return didReload && credentialError == nil
     }
 
     private func applyTurn(_ turn: AssistantTurn, sessionID: String, finished: Bool) {

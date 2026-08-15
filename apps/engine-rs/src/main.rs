@@ -1,6 +1,8 @@
 mod assistant;
 mod assistant_service;
+mod instance_lock;
 mod models;
+mod output;
 mod protocol;
 mod runtime;
 mod store;
@@ -9,16 +11,18 @@ mod terminal;
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::mpsc::{SyncSender, sync_channel};
 use std::time::Duration;
 
-use models::{RuntimeKind, TaskAttachment, TerminalAgentStatus, UpdateTaskInput};
+use models::{
+    RuntimeKind, TaskAttachment, TerminalAgentStatus, TerminalLaunchIntent, UpdateTaskInput,
+};
+use output::{DrainOutcome, OutputWriter};
 use protocol::{Request, Response};
 use serde::Serialize;
 use serde::{Deserialize, Deserializer};
@@ -33,16 +37,23 @@ use zeroize::Zeroizing;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_TASK_ATTACHMENT_BYTES: u64 = 100 * 1024 * 1024;
 const CURSOR_CREATE_CHAT_TIMEOUT: Duration = Duration::from_secs(15);
+const OUTPUT_QUEUE_CAPACITY: usize = 512;
+const REQUEST_QUEUE_CAPACITY: usize = 64;
+const CONTROL_QUEUE_CAPACITY: usize = 32;
+const REQUEST_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+const ENGINE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct Engine {
     store: StoreWorker,
-    writer: SyncSender<Value>,
+    writer: OutputWriter,
     authorized_directories: Arc<Mutex<HashSet<PathBuf>>>,
     gemini_key: Arc<Mutex<Option<Zeroizing<String>>>>,
     assistant: assistant_service::AssistantService,
     data_directory: Arc<PathBuf>,
     task_file_mutation: Arc<Mutex<()>>,
+    shutdown_requested: tokio_util::sync::CancellationToken,
 }
 
 #[derive(Debug, Error)]
@@ -187,6 +198,10 @@ struct PrepareTerminalLaunchParams {
     hook_token: String,
     host_pid: u32,
     provider_hooks_enabled: bool,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    runtime_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -309,6 +324,10 @@ async fn main() {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let paths = prepare_directories()?;
+    // Acquire ownership before opening SQLite or running any startup recovery.
+    // The binding must stay alive until `run` returns so a second Engine cannot
+    // reconcile live sessions or remove this process's launch descriptors.
+    let _data_directory_lease = instance_lock::DataDirectoryLease::acquire(&paths.data)?;
     init_logging(&paths.logs);
     let database_path = paths.data.join("todoagent.sqlite3");
     let attachments_path = paths.data.join("Attachments");
@@ -321,80 +340,190 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .call(move |store| store.reconcile_task_attachment_files(&recovery_attachments))
         .await?;
     fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600))?;
-    let (writer_tx, writer_rx) = sync_channel::<Value>(512);
-    let writer_thread = std::thread::spawn(move || -> io::Result<()> {
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-        while let Ok(value) = writer_rx.recv() {
-            let mut bytes = match serde_json::to_vec(&value) {
-                Ok(bytes) => bytes,
-                Err(_) => continue,
-            };
-            bytes.push(b'\n');
-            stdout.write_all(&bytes)?;
-            stdout.flush()?;
-        }
-        Ok(())
-    });
+    let (writer, writer_drain) = output::spawn(OUTPUT_QUEUE_CAPACITY, io::stdout());
     let gemini_key = Arc::new(Mutex::new(None));
     let data_directory = Arc::new(paths.data);
     let task_file_mutation = Arc::new(Mutex::new(()));
     let assistant = assistant_service::AssistantService::new(
         store.clone(),
-        writer_tx.clone(),
+        writer.clone(),
         gemini_key.clone(),
         data_directory.clone(),
         task_file_mutation.clone(),
     );
     let engine = Engine {
         store,
-        writer: writer_tx,
+        writer,
         authorized_directories: Arc::new(Mutex::new(HashSet::new())),
         gemini_key,
         assistant,
         data_directory,
         task_file_mutation,
+        shutdown_requested: tokio_util::sync::CancellationToken::new(),
     };
     engine.send(&protocol::handshake()).await;
+    run_request_loop(BufReader::new(tokio::io::stdin()).lines(), engine.clone()).await?;
+    engine.shutdown().await;
+    // Never wait for output queue capacity during process teardown. The writer
+    // gets a bounded opportunity to flush accepted NDJSON; a wedged OS stdout
+    // write is then detached so returning from `main` terminates the process.
+    let _ = engine.writer.try_shutdown();
+    drop(engine);
+    if writer_drain.wait(OUTPUT_DRAIN_TIMEOUT).await? == DrainOutcome::TimedOut {
+        tracing::warn!("stdout writer did not drain before shutdown deadline");
+    }
+    Ok(())
+}
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
+async fn run_request_loop<R>(
+    mut lines: tokio::io::Lines<BufReader<R>>,
+    engine: Engine,
+) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    // The data lane preserves the pre-existing request ordering and every
+    // StoreWorker/file mutation serialization guarantee. Control requests are
+    // handled independently so a slow probe or attachment copy cannot delay
+    // cancellation, health reporting, or shutdown acknowledgement.
+    let (request_tx, mut request_rx) = tokio::sync::mpsc::channel(REQUEST_QUEUE_CAPACITY);
+    let request_engine = engine.clone();
+    let mut request_worker = tokio::spawn(async move {
+        while let Some(request) = request_rx.recv().await {
+            let response = request_engine.handle(request).await;
+            request_engine.send(&response).await;
+        }
+    });
+    // A bounded control lane replaces one spawned task per request. Its
+    // responses use non-waiting output so stdout backpressure cannot retain an
+    // unbounded number of health/cancellation tasks.
+    let (control_tx, mut control_rx) = tokio::sync::mpsc::channel(CONTROL_QUEUE_CAPACITY);
+    let control_engine = engine.clone();
+    let mut control_worker = tokio::spawn(async move {
+        while let Some(request) = control_rx.recv().await {
+            let response = control_engine.handle(request).await;
+            control_engine.send_control(&response);
+        }
+    });
+
+    let mut shutdown_requested = false;
     while let Some(line) = lines.next_line().await? {
         if line.trim().is_empty() {
             continue;
         }
         if line.len() > MAX_REQUEST_BYTES {
-            engine.send(&json!({"id":Value::Null,"error":{"code":"invalid_request","message":"request exceeds 1 MiB"}})).await;
+            engine.send_control(&json!({"id":Value::Null,"error":{"code":"invalid_request","message":"request exceeds 1 MiB"}}));
             continue;
         }
         let request: Request = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                engine.send(&json!({"id":Value::Null,"error":{"code":"invalid_request","message":error.to_string()}})).await;
+                engine.send_control(&json!({"id":Value::Null,"error":{"code":"invalid_request","message":error.to_string()}}));
                 continue;
             }
         };
-        let shutdown = request.method == "engine.shutdown";
-        let response = engine.handle(request).await;
-        engine.send(&response).await;
-        if shutdown {
-            engine.shutdown().await;
-            break;
+        match request.method.as_str() {
+            "engine.shutdown" => {
+                engine.shutdown_requested.cancel();
+                engine.send_control(&Response::ok(request.id, json!({"ok":true})));
+                shutdown_requested = true;
+                break;
+            }
+            "engine.health" | "health" | "assistant.cancel_turn" => {
+                match control_tx.try_send(request) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                        engine.send_control(&Response::err(
+                            request.id,
+                            "engine_busy",
+                            "engine control queue is full; retry later",
+                        ));
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(request)) => {
+                        engine.send_control(&Response::err(
+                            request.id,
+                            "engine_shutting_down",
+                            "engine is shutting down",
+                        ));
+                        break;
+                    }
+                }
+            }
+            _ => {
+                match request_tx.try_send(request) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(request)) => {
+                        // Never wait for data-lane capacity in the parser: the
+                        // next line may be the cancellation, health probe, or
+                        // shutdown request needed to unblock that lane.
+                        engine.send_control(&Response::err(
+                            request.id,
+                            "engine_busy",
+                            "engine request queue is full; retry later",
+                        ));
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
         }
     }
-    // EOF is also a shutdown path. Release every stdout sender (including the
-    // AssistantService clone) before joining the writer thread.
-    engine.shutdown().await;
-    drop(engine);
-    writer_thread
-        .join()
-        .map_err(|_| io::Error::other("stdout writer panicked"))??;
+    drop(request_tx);
+    drop(control_tx);
+    if shutdown_requested {
+        request_worker.abort();
+        control_worker.abort();
+        let _ = request_worker.await;
+        let _ = control_worker.await;
+    } else {
+        // EOF normally drains accepted work. Bound that grace period because a
+        // worker may be suspended in a durable send behind a blocked stdout.
+        let drain_workers = async {
+            let (request_result, control_result) =
+                tokio::join!(&mut request_worker, &mut control_worker);
+            (request_result, control_result)
+        };
+        match tokio::time::timeout(REQUEST_DRAIN_TIMEOUT, drain_workers).await {
+            Ok((request_result, control_result)) => {
+                if let Err(error) = request_result {
+                    tracing::error!("request worker failed: {error}");
+                }
+                if let Err(error) = control_result {
+                    tracing::error!("control worker failed: {error}");
+                }
+            }
+            Err(_) => {
+                engine.shutdown_requested.cancel();
+                request_worker.abort();
+                control_worker.abort();
+                let _ = request_worker.await;
+                let _ = control_worker.await;
+                tracing::warn!("request workers did not drain before shutdown deadline");
+            }
+        }
+    }
     Ok(())
+}
+
+#[cfg(test)]
+async fn run_request_stream<R>(reader: R, engine: Engine) -> io::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    run_request_loop(BufReader::new(reader).lines(), engine).await
 }
 
 impl Engine {
     async fn handle(&self, request: Request) -> Response {
         let id = request.id.clone();
-        let result = self.handle_inner(&request).await;
+        let result = if request.method == "engine.shutdown" {
+            self.handle_inner(&request).await
+        } else {
+            tokio::select! {
+                biased;
+                _ = self.shutdown_requested.cancelled() => Err(EngineError::Runtime("engine_shutting_down")),
+                result = self.handle_inner(&request) => result,
+            }
+        };
         match result {
             Ok(value) => Response::ok(id, value),
             Err(error) => response_for_error(id, error),
@@ -640,11 +769,11 @@ impl Engine {
                 let session = if let Some(session) = replayed {
                     session
                 } else {
-                    let runtime = self.ready_runtime(kind).await?;
-                    let _executable = runtime
-                        .resolved_path
-                        .or(runtime.launch_path)
-                        .ok_or(EngineError::Runtime("runtime_missing"))?;
+                    // A task owns a host shell even when its preferred Agent
+                    // runtime is not installed yet. Runtime verification stays
+                    // at the launch boundary so opening the task can always
+                    // present the retained terminal instead of a setup/error
+                    // replacement view.
                     self.store
                         .call(move |store| {
                             store.create_terminal_session(&task_id, kind, &working_directory)
@@ -683,6 +812,25 @@ impl Engine {
                     })
                     .await?;
                 to_value(bundle)
+            }
+            "terminal.session.delete" => {
+                let params: TerminalSessionIDParams = parse(&request.params)?;
+                let lookup = params.session_id.clone();
+                let session = self
+                    .store
+                    .call(move |store| store.terminal_session(&lookup)?.ok_or(StoreError::NotFound))
+                    .await?;
+                let session_id = session.id.clone();
+                let task_id = session.task_id.clone();
+                self.store
+                    .call(move |store| store.delete_idle_terminal_session(&session_id))
+                    .await?;
+                self.emit(
+                    "terminal.session.deleted",
+                    &json!({"sessionId": session.id, "taskId": task_id}),
+                )
+                .await;
+                to_value(json!({"ok": true}))
             }
             "terminal.session.rebind_workspace" => {
                 let params: RebindTerminalWorkspaceParams = parse(&request.params)?;
@@ -891,6 +1039,18 @@ impl Engine {
                 "terminal status tokens must be distinct".to_owned(),
             ));
         }
+        let intent = match params.intent.as_deref() {
+            None | Some("") => TerminalLaunchIntent::Auto,
+            Some(value) => TerminalLaunchIntent::parse(value)
+                .ok_or_else(|| EngineError::Invalid("invalid terminal launch intent".to_owned()))?,
+        };
+        let requested_kind = match params.runtime_kind.as_deref() {
+            None | Some("") => None,
+            Some(value) => Some(
+                RuntimeKind::parse(value)
+                    .ok_or_else(|| EngineError::Invalid("unknown runtime".to_owned()))?,
+            ),
+        };
         let lookup_id = params.session_id.clone();
         let session = self
             .store
@@ -900,6 +1060,27 @@ impl Engine {
                     .ok_or(StoreError::NotFound)
             })
             .await?;
+        let will_resume = match intent {
+            TerminalLaunchIntent::Resume => session.provider_session_id.is_some(),
+            TerminalLaunchIntent::Auto => {
+                session.auto_resume && session.provider_session_id.is_some()
+            }
+            TerminalLaunchIntent::Fresh => false,
+        };
+        if (will_resume || intent == TerminalLaunchIntent::Resume)
+            && requested_kind.is_some_and(|kind| kind != session.runtime_kind)
+        {
+            return Err(EngineError::Conflict("runtime_change_requires_fresh"));
+        }
+        // Resume is an identity-preserving operation. Keep both the executable
+        // and argument profile on the Session's persisted Runtime even if an
+        // older client also sends a different optional runtimeKind. Changing
+        // Runtime is only valid for a fresh launch.
+        let launch_kind = if will_resume || intent == TerminalLaunchIntent::Resume {
+            session.runtime_kind
+        } else {
+            requested_kind.unwrap_or(session.runtime_kind)
+        };
         // A Session keeps the original canonical cwd permanently, but that
         // directory can be moved or deleted later. Reject it before scanning
         // provider state or durably inserting a `starting` Run; otherwise the
@@ -908,7 +1089,7 @@ impl Engine {
             .map_err(|_| EngineError::Runtime("terminal_working_directory_unavailable"))?;
         let status_socket = PathBuf::from(&params.status_socket);
         validate_status_socket(&status_socket, params.host_pid)?;
-        let provider_session_is_resumable = if session.runtime_kind == RuntimeKind::Claude {
+        let provider_session_is_resumable = if will_resume && launch_kind == RuntimeKind::Claude {
             let provider_session_id = session
                 .provider_session_id
                 .as_deref()
@@ -921,7 +1102,9 @@ impl Engine {
             .await
             .map_err(|_| EngineError::Runtime("claude_session_scan_failed"))?;
             match resume_state {
-                Ok(terminal::ClaudeResumeState::Absent) => false,
+                Ok(terminal::ClaudeResumeState::Absent) => {
+                    return Err(EngineError::Runtime("claude_session_not_found"));
+                }
                 Ok(terminal::ClaudeResumeState::Resumable) => true,
                 Ok(terminal::ClaudeResumeState::Unusable) => {
                     return Err(EngineError::Runtime("claude_session_not_resumable"));
@@ -931,7 +1114,7 @@ impl Engine {
         } else {
             true
         };
-        let runtime = self.ready_runtime_for_launch(session.runtime_kind).await?;
+        let runtime = self.ready_runtime_for_launch(launch_kind).await?;
         let agent_executable = runtime
             .resolved_path
             .or(runtime.launch_path)
@@ -942,11 +1125,56 @@ impl Engine {
         let runner = current_executable.with_file_name(terminal::RUNNER_BINARY_NAME);
         validate_launch_executable(&runner, "terminal runner")?;
 
-        if session.runtime_kind == RuntimeKind::Cursor && session.provider_session_id.is_none() {
+        // Reserve or replay the exact durable Run before any provider-side
+        // effect. The persisted launch mode, rather than mutable Session
+        // `auto_resume`, is authoritative when a lost response is retried.
+        let prepare_session_id = params.session_id.clone();
+        let prepare_run_id = params.run_id.clone();
+        let bundle = self
+            .store
+            .call(move |store| {
+                store.prepare_terminal_run_with_options(
+                    &prepare_session_id,
+                    &prepare_run_id,
+                    intent,
+                    provider_session_is_resumable,
+                    Some(launch_kind),
+                )
+            })
+            .await?;
+        if bundle.session.id != params.session_id || bundle.session.runtime_kind != launch_kind {
+            return Err(EngineError::Conflict("terminal_run_not_prepared"));
+        }
+        let prepared_run = bundle
+            .active_run
+            .as_ref()
+            .filter(|run| {
+                run.id == params.run_id && run.state == models::TerminalRunState::Starting
+            })
+            .ok_or(EngineError::Conflict("terminal_run_not_prepared"))?;
+
+        if launch_kind == RuntimeKind::Cursor
+            && prepared_run.launch_mode == models::TerminalLaunchMode::Fresh
+        {
+            // Cursor allocates its chat identity externally. A competing launch
+            // is rejected by the reservation above; an exact replay with an
+            // already-bound ID skips the external create-chat side effect.
+            if let Some(provider_id) = prepared_run.provider_session_id_at_launch.as_deref() {
+                if bundle.session.provider_session_id.as_deref() != Some(provider_id) {
+                    return Err(EngineError::Conflict("provider_session_conflict"));
+                }
+                return self.build_terminal_plan(
+                    params,
+                    bundle,
+                    runner,
+                    agent_executable,
+                    launch_kind,
+                );
+            }
             let mut command = tokio::process::Command::new(&agent_executable);
             command
                 .arg("create-chat")
-                .current_dir(&session.working_directory)
+                .current_dir(&bundle.session.working_directory)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true);
@@ -989,43 +1217,24 @@ impl Engine {
             }
             let id = parse_single_uuid(&stdout)
                 .ok_or(EngineError::Runtime("cursor_create_chat_invalid"))?;
-            // Cursor obtains its identity before the terminal starts. Persist
-            // the binding and first run in one transaction before exposing the
-            // launch plan.
-            let prepare_session_id = params.session_id.clone();
-            let prepare_run_id = params.run_id.clone();
+            // Cursor obtains its identity before the terminal starts. Bind it
+            // to the already-reserved fresh Run before exposing the plan.
+            let bind_session_id = params.session_id.clone();
+            let bind_run_id = params.run_id.clone();
             let bundle = self
                 .store
                 .call(move |store| {
-                    store.prepare_terminal_run_with_provider(
-                        &prepare_session_id,
-                        &prepare_run_id,
+                    store.bind_prepared_terminal_provider(
+                        &bind_session_id,
+                        &bind_run_id,
                         &id,
                         "create_chat",
                     )
                 })
                 .await?;
-            return self.build_terminal_plan(params, bundle, runner, agent_executable);
+            return self.build_terminal_plan(params, bundle, runner, agent_executable, launch_kind);
         }
-
-        let prepare_session_id = params.session_id.clone();
-        let prepare_run_id = params.run_id.clone();
-        let is_claude = session.runtime_kind == RuntimeKind::Claude;
-        let bundle = self
-            .store
-            .call(move |store| {
-                if is_claude {
-                    store.prepare_terminal_run_with_resume_readiness(
-                        &prepare_session_id,
-                        &prepare_run_id,
-                        provider_session_is_resumable,
-                    )
-                } else {
-                    store.prepare_terminal_run(&prepare_session_id, &prepare_run_id)
-                }
-            })
-            .await?;
-        self.build_terminal_plan(params, bundle, runner, agent_executable)
+        self.build_terminal_plan(params, bundle, runner, agent_executable, launch_kind)
     }
 
     async fn resume_candidates(
@@ -1060,10 +1269,18 @@ impl Engine {
         bundle: models::TerminalSessionBundle,
         runner: PathBuf,
         agent_executable: String,
+        expected_runtime: RuntimeKind,
     ) -> Result<models::TerminalLaunchPlan, EngineError> {
+        if bundle.session.id != params.session_id || bundle.session.runtime_kind != expected_runtime
+        {
+            return Err(EngineError::Conflict("terminal_run_not_prepared"));
+        }
         let run = bundle
             .active_run
             .ok_or(EngineError::Conflict("terminal_run_not_active"))?;
+        if run.id != params.run_id || run.state != models::TerminalRunState::Starting {
+            return Err(EngineError::Conflict("terminal_run_not_prepared"));
+        }
         let descriptor_directory = self.data_directory.join("TerminalRuns");
         terminal::build_launch_plan(
             bundle.session,
@@ -1365,10 +1582,30 @@ impl Engine {
     }
 
     async fn shutdown(&self) {
-        self.assistant.shutdown().await;
-        *self.gemini_key.lock().await = None;
-        if let Err(error) = self.store.shutdown().await {
-            tracing::error!("failed to stop database worker: {error}");
+        let _ = self.shutdown_with_timeout(ENGINE_SHUTDOWN_TIMEOUT).await;
+    }
+
+    /// Gives in-flight assistant work a chance to persist its cancellation before
+    /// closing SQLite, while bounding the whole sequence. If an already-running
+    /// OS-thread job never returns, dropping the timed-out future leaves that
+    /// thread detached so `main` can continue to the independent stdout-drain
+    /// deadline and then exit the process.
+    async fn shutdown_with_timeout(&self, timeout: Duration) -> bool {
+        let shutdown = async {
+            self.assistant.shutdown().await;
+            *self.gemini_key.lock().await = None;
+            self.store.shutdown().await
+        };
+        match tokio::time::timeout(timeout, shutdown).await {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                tracing::error!("failed to stop database worker: {error}");
+                true
+            }
+            Err(_) => {
+                tracing::warn!("Engine resources did not stop before shutdown deadline");
+                false
+            }
         }
     }
 
@@ -1377,9 +1614,11 @@ impl Engine {
     }
 
     async fn send<T: serde::Serialize>(&self, value: &T) {
-        if let Ok(value) = serde_json::to_value(value) {
-            let _ = self.writer.send(value);
-        }
+        self.writer.send(value).await;
+    }
+
+    fn send_control<T: serde::Serialize>(&self, value: &T) {
+        let _ = self.writer.try_send_control(value);
     }
 }
 
@@ -1733,6 +1972,9 @@ fn response_for_error(id: String, error: EngineError) -> Response {
         }
         EngineError::Runtime(code) => {
             let message = match code {
+                "claude_session_not_found" => {
+                    "找不到这个 TodoAgent Session 绑定的 Claude 本地会话记录。为避免打开错误对话，已停止恢复；请确认 Claude 配置目录和原会话文件仍然存在。"
+                }
                 "claude_session_not_resumable" => {
                     "Claude 的会话记录已存在，但还没有可恢复的对话内容。请先在 Claude Code 中处理或移走这条不完整记录，再重试。"
                 }
@@ -1921,6 +2163,7 @@ fn init_logging(logs: &Path) {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    use tokio::io::AsyncWriteExt;
     use uuid::Uuid;
 
     fn test_engine(
@@ -1928,7 +2171,7 @@ mod tests {
         _concurrency: usize,
         data_directory: PathBuf,
     ) -> (Engine, std::sync::mpsc::Receiver<Value>) {
-        let (writer, receiver) = sync_channel(512);
+        let (writer, receiver) = output::test_channel(512);
         let gemini_key = Arc::new(Mutex::new(None));
         let data_directory = Arc::new(data_directory);
         let task_file_mutation = Arc::new(Mutex::new(()));
@@ -1948,6 +2191,7 @@ mod tests {
                 assistant,
                 data_directory,
                 task_file_mutation,
+                shutdown_requested: tokio_util::sync::CancellationToken::new(),
             },
             receiver,
         )
@@ -1956,6 +2200,278 @@ mod tests {
     #[test]
     fn request_size_is_bounded() {
         assert_eq!(MAX_REQUEST_BYTES, 1024 * 1024);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_session_create_keeps_the_host_shell_independent_of_agent_installation() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let workspace = fs::canonicalize(workspace).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| store.create_task("Direct terminal", "", None, None, None))
+            .await
+            .unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        engine
+            .authorized_directories
+            .lock()
+            .await
+            .insert(workspace.clone());
+
+        let response = engine
+            .handle(Request {
+                id: "create-terminal-without-runtime".to_owned(),
+                method: "terminal.session.create".to_owned(),
+                params: json!({
+                    "taskId": task.id,
+                    "runtimeKind": "claude",
+                    "workingDirectory": workspace,
+                }),
+            })
+            .await;
+
+        let bundle = response.result.expect("the host shell should be created");
+        assert_eq!(bundle["session"]["runtimeKind"], "claude");
+        assert_eq!(bundle["session"]["taskId"], task.id);
+        let event = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(event["event"], "terminal.session.created");
+        assert!(matches!(
+            engine.ready_runtime_for_launch(RuntimeKind::Claude).await,
+            Err(EngineError::Runtime("runtime_missing"))
+        ));
+        let session_id = bundle["session"]["id"].as_str().unwrap().to_owned();
+        assert!(
+            worker
+                .call(move |store| store.latest_terminal_run(&session_id))
+                .await
+                .unwrap()
+                .is_none(),
+            "creating the host shell must not prepare or start an Agent Run"
+        );
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_bypasses_a_blocked_data_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let worker = StoreWorker::open(&directory.path().join("shutdown-lane.sqlite3")).unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        let held_file_mutation = engine.task_file_mutation.lock().await;
+        let source = directory.path().join("source.txt");
+        fs::write(&source, b"pending").unwrap();
+        let list = worker
+            .call(|store| store.create_list("work", "blue", None))
+            .await
+            .unwrap();
+        let task = worker
+            .call(move |store| store.create_task("blocked", "", Some(&list.id), None, None))
+            .await
+            .unwrap();
+        let input = format!(
+            "{{\"id\":\"slow\",\"method\":\"task.attachment.add\",\"params\":{{\"taskId\":\"{}\",\"sourcePaths\":[{}],\"clientMutationId\":\"{}\"}}}}\n{{\"id\":\"stop\",\"method\":\"engine.shutdown\"}}\n",
+            task.id,
+            serde_json::to_string(source.to_str().unwrap()).unwrap(),
+            Uuid::new_v4()
+        );
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            run_request_stream(std::io::Cursor::new(input.into_bytes()), engine.clone()),
+        )
+        .await
+        .expect("shutdown must not wait for a blocked data request")
+        .unwrap();
+
+        let response = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(response["id"], "stop");
+        assert_eq!(response["result"]["ok"], true);
+        drop(held_file_mutation);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_bypasses_a_saturated_data_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let worker = StoreWorker::open(&directory.path().join("saturated-lane.sqlite3")).unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        let held_file_mutation = engine.task_file_mutation.lock().await;
+        let source = directory.path().join("source.txt");
+        fs::write(&source, b"pending").unwrap();
+        let list = worker
+            .call(|store| store.create_list("work", "blue", None))
+            .await
+            .unwrap();
+        let task = worker
+            .call(move |store| store.create_task("blocked", "", Some(&list.id), None, None))
+            .await
+            .unwrap();
+        let mut input = format!(
+            "{{\"id\":\"slow\",\"method\":\"task.attachment.add\",\"params\":{{\"taskId\":\"{}\",\"sourcePaths\":[{}],\"clientMutationId\":\"{}\"}}}}\n",
+            task.id,
+            serde_json::to_string(source.to_str().unwrap()).unwrap(),
+            Uuid::new_v4()
+        );
+        // One request may already be running while the parser fills the bounded
+        // queue, so submit capacity + 1 followers to guarantee one overflow in
+        // either scheduling order.
+        for index in 0..=REQUEST_QUEUE_CAPACITY {
+            input.push_str(&format!(
+                "{{\"id\":\"queued-{index}\",\"method\":\"unknown.data.request\"}}\n"
+            ));
+        }
+        input.push_str("{\"id\":\"stop\",\"method\":\"engine.shutdown\"}\n");
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            run_request_stream(std::io::Cursor::new(input.into_bytes()), engine.clone()),
+        )
+        .await
+        .expect("shutdown must remain readable after the data queue is full")
+        .unwrap();
+
+        let mut saw_busy = false;
+        let mut saw_shutdown = false;
+        for _ in 0..3 {
+            let response = receiver.recv_timeout(Duration::from_secs(1)).unwrap();
+            saw_busy |= response["error"]["code"] == "engine_busy";
+            saw_shutdown |= response["id"] == "stop" && response["result"]["ok"] == true;
+            if saw_busy && saw_shutdown {
+                break;
+            }
+        }
+        assert!(
+            saw_busy,
+            "the overflow request must receive a retryable error"
+        );
+        assert!(saw_shutdown, "shutdown must bypass the saturated data lane");
+
+        drop(held_file_mutation);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn shutdown_does_not_wait_for_full_output_or_spawn_per_control_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let worker = StoreWorker::open(&directory.path().join("full-output.sqlite3")).unwrap();
+        let (mut engine, _unused_receiver) = test_engine(worker, 0, data);
+        let (blocked_writer, _blocked_receiver) = OutputWriter::channel(1);
+        assert!(blocked_writer.try_send_control(&json!({"fills": "queue"})));
+        engine.writer = blocked_writer;
+
+        // More than the bounded control capacity proves that excess requests
+        // are rejected inline rather than retained as one task per request.
+        let mut input = String::new();
+        for index in 0..(CONTROL_QUEUE_CAPACITY * 4) {
+            input.push_str(&format!(
+                "{{\"id\":\"health-{index}\",\"method\":\"engine.health\"}}\n"
+            ));
+        }
+        input.push_str("{\"id\":\"stop\",\"method\":\"engine.shutdown\"}\n");
+
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            run_request_stream(std::io::Cursor::new(input.into_bytes()), engine.clone()),
+        )
+        .await
+        .expect("shutdown parsing must not wait for stdout capacity")
+        .unwrap();
+
+        assert!(engine.shutdown_requested.is_cancelled());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn engine_shutdown_has_a_deadline_when_the_database_worker_never_returns() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let worker = StoreWorker::open(&directory.path().join("blocked-shutdown.sqlite3")).unwrap();
+        let (engine, _receiver) = test_engine(worker.clone(), 0, data);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let (_release_tx, release_rx) = std::sync::mpsc::sync_channel::<()>(0);
+        let blocked = tokio::spawn(async move {
+            worker
+                .call(move |_store| {
+                    let _ = started_tx.send(());
+                    // The sender deliberately remains alive for the duration of
+                    // this test, modelling an OS/SQLite call that does not yield.
+                    let _ = release_rx.recv();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || {
+            started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("database worker must enter the simulated blocking call");
+        })
+        .await
+        .unwrap();
+
+        let started_at = tokio::time::Instant::now();
+        assert!(
+            !engine
+                .shutdown_with_timeout(Duration::from_millis(25))
+                .await
+        );
+        assert!(started_at.elapsed() < Duration::from_millis(250));
+        blocked.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn health_bypasses_a_blocked_data_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        let worker = StoreWorker::open(&directory.path().join("health-lane.sqlite3")).unwrap();
+        let (engine, receiver) = test_engine(worker.clone(), 0, data);
+        let held_file_mutation = engine.task_file_mutation.lock().await;
+        let source = directory.path().join("source.txt");
+        fs::write(&source, b"pending").unwrap();
+        let list = worker
+            .call(|store| store.create_list("work", "blue", None))
+            .await
+            .unwrap();
+        let task = worker
+            .call(move |store| store.create_task("blocked", "", Some(&list.id), None, None))
+            .await
+            .unwrap();
+        let input = format!(
+            "{{\"id\":\"slow\",\"method\":\"task.attachment.add\",\"params\":{{\"taskId\":\"{}\",\"sourcePaths\":[{}],\"clientMutationId\":\"{}\"}}}}\n{{\"id\":\"health\",\"method\":\"engine.health\"}}\n",
+            task.id,
+            serde_json::to_string(source.to_str().unwrap()).unwrap(),
+            Uuid::new_v4()
+        );
+        let (mut reader, mut writer) = tokio::io::duplex(input.len() + 1);
+        writer.write_all(input.as_bytes()).await.unwrap();
+
+        let loop_engine = engine.clone();
+        let request_loop =
+            tokio::spawn(async move { run_request_stream(&mut reader, loop_engine).await });
+        let response = tokio::task::spawn_blocking(move || {
+            receiver.recv_timeout(Duration::from_millis(250)).unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(response["id"], "health");
+        assert_eq!(response["result"]["ok"], true);
+
+        request_loop.abort();
+        drop(writer);
+        drop(held_file_mutation);
+        engine.shutdown().await;
     }
 
     fn write_fake_claude(path: &Path, version: &str) {
@@ -2086,6 +2602,8 @@ mod tests {
                 hook_token: "hook-token".to_owned(),
                 host_pid: std::process::id(),
                 provider_hooks_enabled: false,
+                intent: None,
+                runtime_kind: None,
             })
             .await;
         assert!(matches!(
@@ -2101,6 +2619,97 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a stale working directory must not create a durable starting Run"
+        );
+
+        engine.assistant.shutdown().await;
+        worker.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn resume_rejects_a_different_requested_runtime_before_launch_side_effects() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        let workspace = directory.path().join("workspace");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir(&workspace).unwrap();
+        let worker = StoreWorker::open(&data.join("todoagent.sqlite3")).unwrap();
+        let task = worker
+            .call(|store| store.create_task("Resume runtime", "", None, None, None))
+            .await
+            .unwrap();
+        let task_id = task.id;
+        let workspace = workspace.to_string_lossy().into_owned();
+        let session = worker
+            .call(move |store| {
+                store.create_terminal_session(&task_id, RuntimeKind::Claude, &workspace)
+            })
+            .await
+            .unwrap();
+        let first_run_id = Uuid::new_v4().to_string();
+        let prepare_session_id = session.id.clone();
+        let prepare_run_id = first_run_id.clone();
+        worker
+            .call(move |store| store.prepare_terminal_run(&prepare_session_id, &prepare_run_id))
+            .await
+            .unwrap();
+        let start_session_id = session.id.clone();
+        let start_run_id = first_run_id.clone();
+        worker
+            .call(move |store| store.mark_terminal_run_started(&start_session_id, &start_run_id))
+            .await
+            .unwrap();
+        let finish_session_id = session.id.clone();
+        let finish_run_id = first_run_id.clone();
+        worker
+            .call(move |store| {
+                store.finish_terminal_run(
+                    &finish_session_id,
+                    &finish_run_id,
+                    Some(143),
+                    "app_shutdown",
+                    None,
+                    None,
+                )
+            })
+            .await
+            .unwrap();
+
+        let (engine, _receiver) = test_engine(worker.clone(), 0, data);
+        let rejected_run_id = Uuid::new_v4().to_string();
+        let result = engine
+            .prepare_terminal_launch(PrepareTerminalLaunchParams {
+                session_id: session.id.clone(),
+                run_id: rejected_run_id.clone(),
+                task_title: None,
+                // Runtime mismatch must fail before socket/runtime validation.
+                status_socket: "/not/a/status.sock".to_owned(),
+                lifecycle_token: "lifecycle-token".to_owned(),
+                hook_token: "hook-token".to_owned(),
+                host_pid: std::process::id(),
+                provider_hooks_enabled: true,
+                intent: Some("resume".to_owned()),
+                runtime_kind: Some("cursor".to_owned()),
+            })
+            .await;
+        assert!(matches!(
+            result,
+            Err(EngineError::Conflict("runtime_change_requires_fresh"))
+        ));
+        let persisted_session_id = session.id.clone();
+        let persisted = worker
+            .call(move |store| store.terminal_session_bundle(&persisted_session_id))
+            .await
+            .unwrap();
+        assert_eq!(persisted.session.runtime_kind, RuntimeKind::Claude);
+        assert!(persisted.session.auto_resume);
+        assert_eq!(persisted.active_run.unwrap().id, first_run_id);
+        let missing_run_id = rejected_run_id.clone();
+        assert!(
+            worker
+                .call(move |store| store.terminal_run(&missing_run_id))
+                .await
+                .unwrap()
+                .is_none()
         );
 
         engine.assistant.shutdown().await;
@@ -2127,7 +2736,28 @@ mod tests {
             })
             .await
             .unwrap();
-        let provider_id = session.provider_session_id.clone();
+        let session_id = session.id.clone();
+        let run_id = uuid::Uuid::new_v4().to_string();
+        let prepared = worker
+            .call(move |store| store.prepare_terminal_run(&session_id, &run_id))
+            .await
+            .unwrap();
+        let provider_id = prepared.session.provider_session_id.clone();
+        let finish_session = prepared.session.id.clone();
+        let finish_run = prepared.active_run.unwrap().id.clone();
+        worker
+            .call(move |store| {
+                store.finish_terminal_run(
+                    &finish_session,
+                    &finish_run,
+                    Some(0),
+                    "process_exit",
+                    None,
+                    None,
+                )
+            })
+            .await
+            .unwrap();
         let (engine, receiver) = test_engine(worker.clone(), 0, data);
         let request = || Request {
             id: "rebind".to_owned(),

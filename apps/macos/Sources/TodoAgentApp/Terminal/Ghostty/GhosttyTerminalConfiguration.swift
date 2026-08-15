@@ -70,6 +70,53 @@ enum GhosttyCommandBuilder {
         return ([executable] + arguments).map(shellQuote).joined(separator: " ")
     }
 
+    static func changeDirectoryCommand(workingDirectory: String) throws -> String {
+        try requireAbsolutePath(workingDirectory)
+        return "cd -- \(shellQuote(workingDirectory))"
+    }
+
+    static func officialLaunchCommand(
+        executable: String,
+        arguments: [String],
+        workingDirectory: String
+    ) throws -> String {
+        let changeDirectory = try changeDirectoryCommand(workingDirectory: workingDirectory)
+        let runner = try command(executable: executable, arguments: arguments)
+        return "\(changeDirectory) && \(runner)"
+    }
+
+    static func hostShellCommand(
+        workingDirectory: String? = nil,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) throws -> String {
+        let shell: String
+        if let path = environment["SHELL"] {
+            guard path.hasPrefix("/") else {
+                throw GhosttyTerminalError.invalidLaunchPlan
+            }
+            shell = path
+        } else {
+            shell = "/bin/zsh"
+        }
+        let name = URL(fileURLWithPath: shell).lastPathComponent
+        let allowed: Set<String> = ["zsh", "bash", "sh", "fish", "dash", "ksh"]
+        guard allowed.contains(name), !shell.contains("\0") else {
+            throw GhosttyTerminalError.invalidLaunchPlan
+        }
+        guard let workingDirectory else {
+            return [shell, "-l"].map(shellQuote).joined(separator: " ")
+        }
+        try requireAbsolutePath(workingDirectory)
+        let script = "cd -- \(shellQuote(workingDirectory)) && exec \(shellQuote(shell))"
+        return [shell, "-l", "-c", script].map(shellQuote).joined(separator: " ")
+    }
+
+    private static func requireAbsolutePath(_ path: String) throws {
+        guard path.hasPrefix("/"), !path.contains("\0") else {
+            throw GhosttyTerminalError.invalidLaunchPlan
+        }
+    }
+
     static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }

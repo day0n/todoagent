@@ -11,7 +11,7 @@ Engine 只通过 stdin/stdout 上的版本化 NDJSON 通信，不监听 TCP 端�
 ## 模块
 
 - `main.rs` / `protocol.rs`：IPC v4 握手、请求分发、事件输出和 Engine 生命周期。
-- `store.rs` / `store_worker.rs` / `schema.sql`：SQLite v5 schema、事务和串行
+- `store.rs` / `store_worker.rs` / `schema.sql`：SQLite v6 schema、事务和串行
   数据访问。
 - `runtime.rs` / `terminal.rs`：Codex、Claude Code、Cursor Agent、Kiro CLI 的
   检测、验证、fresh/resume launch plan、Provider ID 候选扫描和安全 descriptor。
@@ -25,9 +25,10 @@ Swift 和 Rust 共用的 NDJSON 契约 fixture 位于仓库根目录
 
 ## 数据模型与并发
 
-SQLite 是 Session 元数据的唯一事实来源，schema version 为 5。Engine 保存任务、
-清单、任务附件、`terminal_session`、每次 App 内启动对应的 `terminal_run`，以及助手
-Session、Turn、模型步骤、工具执行和上下文摘要。终端 PTY 字节和滚屏不写入 SQLite。
+SQLite 是 Session 元数据的唯一事实来源，schema version 为 6。Engine 保存任务、
+清单、任务附件、`terminal_session`（含 `last_exit_reason` / `auto_resume`）、每次
+官方 Agent 启动对应的 `terminal_run`，以及助手 Session、Turn、模型步骤、工具执行
+和上下文摘要。终端 PTY 字节和滚屏不写入 SQLite。
 
 - 每个 Terminal Session 同时只允许一个活动 Run；不同任务的 Run 不设 Engine
   semaphore 上限，App 在启动第 4 个活跃终端前提示资源消耗。
@@ -36,17 +37,18 @@ Session、Turn、模型步骤、工具执行和上下文摘要。终端 PTY 字�
 - `clientMessageId` 和持久化工具 receipt 用于防止超时重试产生重复消息或重复任务。
 - `task.attachment.add/remove` 要求稳定的 `clientMutationId`；SQLite receipt 使响应丢失
   后的同参数重放直接成功且不会重复复制或删除，复用同一 UUID 发送不同参数会返回冲突。
-- `terminal.session.create` 将任务永久绑定到 Runtime 和规范化工作目录；
-  原目录移动后可通过 `terminal.session.rebind_workspace` 显式重新授权和绑定，
-  保留原 Runtime、Provider Session ID 和 Run 历史；
-  `terminal.session.prepare_launch` 以 Swift 生成的 `runId` 幂等创建 fresh/resume Run。
-- Provider Session ID 只能从空值绑定一次；Codex/Kiro 找不到唯一候选时必须由用户选择。
-- Engine 重启时，遗留的活动 Terminal Run 会标记为 `interrupted`；App 同时终止旧 PTY
-  与进程组，用户随后显式恢复 Provider 对话。
+- `terminal.session.create` 只建终端行，不再预绑 Claude Provider ID。同一任务已有
+  终端则复用；Runtime 和对话可在后续 fresh 启动时更换。
+- `terminal.session.prepare_launch` 接受 `intent=fresh|resume|auto`。自动 resume
+  仅当 `auto_resume=1`（上次以 `app_shutdown` / `engine_interrupted` 结束且仍有
+  Provider ID）。Claude 每次 fresh 使用新 UUID。
+- 无活动 Run 时允许替换 Provider Session ID；`auto_resume=1` 或正在 Resume 的
+  Run 遇到不同 ID 仍返回 `provider_session_conflict`。
+- Engine 重启时，遗留的活动 Terminal Run 会标记为 `interrupted` 并置 `auto_resume`；
+  App 终止旧 host/Agent，再打开任务时自动续上那段对话。
 
-从 v4 打开时会先建立权限为 `0600` 的数据库备份，再保留任务、附件、Runtime、设置
-和 Gemini 助手数据迁移到 v5；上一代结构化 CLI 历史不迁移。更旧、未知或未来 schema
-会原样保留并拒绝打开。
+从 v4 打开时会先建立权限为 `0600` 的数据库备份，再迁移到 v5，然后备份 v5 并迁到
+v6。更旧、未知或高于 v6 的 schema 会原样保留并拒绝打开。
 
 ## Gemini 助手边界
 

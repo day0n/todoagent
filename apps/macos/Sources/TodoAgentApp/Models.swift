@@ -881,6 +881,12 @@ enum TerminalRunLaunchMode: String, Codable, Sendable {
     case resume
 }
 
+enum TerminalLaunchIntent: String, Codable, Sendable {
+    case auto
+    case fresh
+    case resume
+}
+
 enum TerminalRunState: String, Codable, Sendable {
     case starting
     case running
@@ -931,11 +937,14 @@ struct TerminalSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
     let lastErrorMessage: String?
     let lastStartedAt: String?
     let lastExitedAt: String?
+    let lastExitReason: String?
+    let autoResume: Bool
     let createdAt: String
     let updatedAt: String
 
     var hasUnread: Bool { statusSequence > seenStatusSequence }
     var state: SessionState { hasActiveRun ? .running : .idle }
+    var hasOfficialAgentRun: Bool { hasActiveRun || lastStartedAt != nil }
     var lastAgentSequence: Int64 { statusSequence }
     var lastReadSequence: Int64 { seenStatusSequence }
     var providerEngine: String? { nil }
@@ -956,6 +965,8 @@ struct TerminalSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
         lastErrorMessage: String? = nil,
         lastStartedAt: String? = nil,
         lastExitedAt: String? = nil,
+        lastExitReason: String? = nil,
+        autoResume: Bool = false,
         createdAt: String = "",
         updatedAt: String = ""
     ) {
@@ -974,6 +985,8 @@ struct TerminalSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
         self.lastErrorMessage = lastErrorMessage
         self.lastStartedAt = lastStartedAt
         self.lastExitedAt = lastExitedAt
+        self.lastExitReason = lastExitReason
+        self.autoResume = autoResume
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -1020,6 +1033,7 @@ struct TerminalSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
         case providerBindingState, providerBindingSource, agentStatus, hasActiveRun
         case statusSequence, seenStatusSequence
         case lastErrorCode, lastErrorMessage, lastStartedAt, lastExitedAt
+        case lastExitReason, autoResume
         case createdAt, updatedAt
         case providerEngine, state, lastAgentSequence, lastReadSequence
     }
@@ -1052,6 +1066,8 @@ struct TerminalSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
         lastErrorMessage = try values.decodeIfPresent(String.self, forKey: .lastErrorMessage)
         lastStartedAt = try values.decodeIfPresent(String.self, forKey: .lastStartedAt)
         lastExitedAt = try values.decodeIfPresent(String.self, forKey: .lastExitedAt)
+        lastExitReason = try values.decodeIfPresent(String.self, forKey: .lastExitReason)
+        autoResume = try values.decodeIfPresent(Bool.self, forKey: .autoResume) ?? false
         createdAt = try values.decodeIfPresent(String.self, forKey: .createdAt) ?? ""
         updatedAt = try values.decodeIfPresent(String.self, forKey: .updatedAt) ?? ""
     }
@@ -1073,6 +1089,8 @@ struct TerminalSessionDescriptor: Identifiable, Codable, Equatable, Sendable {
         try values.encodeIfPresent(lastErrorMessage, forKey: .lastErrorMessage)
         try values.encodeIfPresent(lastStartedAt, forKey: .lastStartedAt)
         try values.encodeIfPresent(lastExitedAt, forKey: .lastExitedAt)
+        try values.encodeIfPresent(lastExitReason, forKey: .lastExitReason)
+        try values.encode(autoResume, forKey: .autoResume)
         try values.encode(createdAt, forKey: .createdAt)
         try values.encode(updatedAt, forKey: .updatedAt)
     }
@@ -1107,6 +1125,16 @@ struct TerminalRun: Identifiable, Codable, Equatable, Sendable {
 struct TerminalSessionBundle: Codable, Equatable, Sendable {
     let session: TerminalSessionDescriptor
     let activeRun: TerminalRun?
+}
+
+struct TerminalSessionDeletedEvent: Codable, Equatable, Sendable {
+    let sessionID: String
+    let taskID: UUID
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
+        case taskID = "taskId"
+    }
 }
 
 struct TerminalResumeCandidate: Identifiable, Codable, Equatable, Sendable {

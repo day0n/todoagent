@@ -156,12 +156,23 @@ struct PrepareTerminalLaunchRequest: Encodable, Sendable {
     let hookToken: String
     let providerHooksEnabled: Bool
     let hostPID: Int32
+    let intent: TerminalLaunchIntent
+    let runtimeKind: RuntimeKind?
 
     private enum CodingKeys: String, CodingKey {
         case sessionID = "sessionId"
         case runID = "runId"
         case taskTitle, statusSocket, lifecycleToken, hookToken, providerHooksEnabled
         case hostPID = "hostPid"
+        case intent, runtimeKind
+    }
+}
+
+struct DeleteTerminalSessionRequest: Encodable, Sendable {
+    let sessionID: String
+
+    private enum CodingKeys: String, CodingKey {
+        case sessionID = "sessionId"
     }
 }
 struct TerminalRunIdentityRequest: Encodable, Sendable {
@@ -492,7 +503,9 @@ actor EngineRepository: AppRepository {
         lifecycleToken: String,
         hookToken: String,
         providerHooksEnabled: Bool,
-        hostPID: Int32
+        hostPID: Int32,
+        intent: TerminalLaunchIntent,
+        runtimeKind: RuntimeKind?
     ) async throws -> TerminalLaunchPlan {
         try await client.request(
             method: "terminal.session.prepare_launch",
@@ -504,10 +517,21 @@ actor EngineRepository: AppRepository {
                 lifecycleToken: lifecycleToken,
                 hookToken: hookToken,
                 providerHooksEnabled: providerHooksEnabled,
-                hostPID: hostPID
+                hostPID: hostPID,
+                intent: intent,
+                runtimeKind: runtimeKind
             ),
             as: TerminalLaunchPlan.self,
             timeout: Self.terminalLaunchPreparationTimeout
+        )
+    }
+
+    func deleteTerminalSession(sessionID: String) async throws {
+        struct Ok: Decodable { let ok: Bool }
+        _ = try await client.request(
+            method: "terminal.session.delete",
+            params: DeleteTerminalSessionRequest(sessionID: sessionID),
+            as: Ok.self
         )
     }
 

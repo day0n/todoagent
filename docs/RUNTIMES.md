@@ -1,17 +1,18 @@
 # Local Runtime Integrations
 
 TodoAgent 支持用户已经安装并登录的 Codex、Claude Code、Cursor Agent 和 Kiro CLI。
-四者都运行自己的原生 TUI；TodoAgent 管理工作目录、启动参数、Provider Session ID、
-进程生命周期和可用状态，不将终端输出转换成统一聊天协议。
+四者都运行自己的原生 TUI。每个任务固定对应一个本机终端；已登记的受管 Run 仍通过
+Terminal Runner 持久化 Runtime、工作目录和 Provider Session ID。TodoAgent 不将终端
+输出转换成统一聊天协议。
 
 ## 集成矩阵
 
 | Runtime | Fresh launch | Resume | Provider ID | 状态来源 |
 |---|---|---|---|---|
-| Codex | `codex -C <workspace>` | `codex resume -C <workspace> <id>` | 完成后精确扫描候选并绑定 | 可选用户级 Hook + 进程状态 |
-| Claude Code | 预分配 `--session-id`，可附加 `--name` | `--resume <id>` | 首次启动前生成并绑定 | run-scoped `--settings` Hook + 进程状态 |
+| Codex | `codex -C <workspace>` | `codex resume -C <workspace> <id>` | Hook/运行期唯一捕获；否则退出后确认候选 | 可选用户级 Hook + 进程状态 |
+| Claude Code | 每次 fresh 生成新 UUID，走 `--session-id`，可附加 `--name` | `--resume <id>` | 该次 fresh 启动时绑定 | run-scoped `--settings` Hook + 进程状态 |
 | Cursor Agent | 先创建 chat，再以 `--workspace ... --resume <id>` 启动 | 相同 resume 入口 | 创建 chat 时绑定 | 可选用户级 Hook + 进程状态 |
-| Kiro CLI | `chat --tui` | `chat --tui --resume-id <id>` | 完成后精确扫描候选并绑定 | 当前仅进程状态 |
+| Kiro CLI | `chat --tui` | `chat --tui --resume-id <id>` | 运行期唯一元数据捕获；否则退出后确认候选 | 当前仅进程状态 |
 
 表中命令用于解释集成语义，并不是建议用户手工复制的稳定公共 API。TodoAgent 启动前
 会探测当前 CLI 的实际 `--help` grammar；上游 CLI 的参数和存储格式可能变化。
@@ -26,18 +27,32 @@ TodoAgent 支持用户已经安装并登录的 Codex、Claude Code、Cursor Agen
 4. 进行不修改用户项目的登录/可用性检查；
 5. 返回 `ready`、`missing`、`auth_required` 或明确错误。
 
-单个 Runtime 不可用不会阻止任务管理、Gemini 助手、其他 Runtime 或 App 构建。
+单个 Runtime 不可用不会阻止任务管理、该任务的普通终端、Gemini 助手、其他 Runtime
+或 App 构建。只有真正启动对应 Agent 时才要求 Runtime 已安装并通过验证。
 CLI 被升级、替换或移动后必须重新验证，TodoAgent 不会静默执行一个已变化的 binary。
 
 ## Session 规则
 
-- 创建 Session 时由用户选择 Runtime 和工作目录。
-- 工作目录必须是绝对路径，并由用户通过系统界面授权；它不要求是 Git 仓库，也不因
-  dirty worktree 阻止启动。
-- 一个任务永久绑定一个 Runtime；当前不能在同一任务中切换 Agent。
-- TodoAgent 不自动发送任务标题、备注和附件。终端打开后，由用户在 TUI 内决定输入。
-- 关闭工作台窗口不终止 Agent；显式结束 Session、删除任务或退出 App 才停止它。
-- App 重启后使用已绑定的 Provider Session ID 恢复对话语义，但不恢复旧 scrollback。
+- 首次点击任务会自动创建它唯一的 `TerminalSession` 和普通 shell；同一任务只会有
+  一个终端和最多一个活动受管 Run。
+- Fresh Run 在启动 CLI 前持久化 Run identity 与 launch mode。Claude 会预分配 UUID
+  并使用 `--session-id <id>`；恢复严格使用 `--resume <同一 id>`。Codex/Kiro 的
+  Provider ID 只能在运行中验证捕获或退出后由用户确认候选。
+- 收起终端或切换任务只会 detach surface，PTY 和 Agent 继续运行。Cmd+Q 会结束进程组，
+  并把正在运行、有稳定 Provider ID 的活动受管 Run 标为 `app_shutdown` /
+  `auto_resume=1`。
+- 新 App 进程再次打开同一任务时会自动恢复 `auto_resume` Session。普通 process exit
+  或用户显式结束不会自动启动；界面直接保留普通 shell，不显示恢复或新建 Provider
+  Session 页面。
+- TodoAgent 恢复的是 Provider 对话语义，不保存旧 PTY、scrollback 或正在运行的进程。
+  Claude transcript 缺失或不可恢复时不会降级成 fresh 对话；可用的 shell 仍会显示。
+- 直接在普通 shell 中手打 CLI 不会经过 Runner，也就没有可跨 App 重启恢复的
+  Run/Provider 绑定；但在 App 仍运行时，收起和任务切换会保留原 PTY 状态。
+- TodoAgent 不把任务标题、备注和附件作为 Prompt。Claude fresh Run 会把任务标题作为
+  `--name` Session 名称传给 Claude CLI；备注与附件不会自动发送。
+
+为精确绑定和恢复，Engine 会有界读取 Provider 本地会话元数据，以及 Claude transcript
+的记录类型；只判断 ID、工作目录、时间和是否存在可恢复对话，不提取、保存或发送正文。
 
 ## 状态 Hook
 
@@ -58,7 +73,9 @@ Hook 配置仍需要用户结合所装版本确认信任边界；可随时从设
 ### Claude Code
 
 TodoAgent 不修改 Claude 的全局用户设置。每次 Run 生成临时、权限受控的 settings
-文件，并通过 `--settings` 仅注入当前 Session 所需的 Hook。
+文件，并通过 `--settings` 仅注入当前 Session 所需的 Hook。受管 Run 会固定使用
+Engine 启动时继承的 `CLAUDE_CONFIG_DIR`；未设置时使用 `~/.claude`。因此只在交互式
+shell 配置中临时改写该变量不会让 fresh 与下一次恢复扫描落到两个不同目录。
 
 ### Kiro CLI
 
@@ -70,7 +87,8 @@ TodoAgent 不修改 Claude 的全局用户设置。每次 Run 生成临时、权
 - CLI 使用用户自己已经登录的身份和权限；TodoAgent 不分发、复制或接管它们的凭据。
 - Agent 可以在用户授权的工作目录中按自身能力读取、修改文件和运行命令。请先检查
   该目录及各 CLI 自己的 approval/sandbox 设置。
-- TodoAgent 不通过 shell 插值拼接启动参数；Terminal Runner 直接执行已验证 binary。
+- App 只向 login shell 注入严格引用的 Runner 与 descriptor 路径；Agent executable 和
+  参数不进入 shell，由 Terminal Runner 从验证后的 descriptor 直接执行。
 - Provider Session ID 候选必须与工作目录和运行时间窗口匹配；歧义时要求人工选择。
 - Hook 配置写入使用所有者、文件类型、符号链接、硬链接、权限和大小检查，并在变更前
   创建备份。

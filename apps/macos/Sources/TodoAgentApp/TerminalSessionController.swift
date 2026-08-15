@@ -19,6 +19,7 @@ protocol TerminalSurfaceSession: AnyObject {
     func focus()
     func commitComposition()
     func performAction(_ action: String)
+    func sendText(_ text: String)
     func terminate()
     func close()
 }
@@ -26,6 +27,7 @@ protocol TerminalSurfaceSession: AnyObject {
 @MainActor
 protocol TerminalSurfaceFactory: AnyObject {
     func makeSurface(configuration: TerminalLaunchPlan) throws -> any TerminalSurfaceSession
+    func makeHostSurface(workingDirectory: String, environment: [String: String]) throws -> any TerminalSurfaceSession
 }
 
 @MainActor
@@ -37,6 +39,13 @@ final class UnavailableTerminalSurfaceFactory: TerminalSurfaceFactory {
     }
 
     func makeSurface(configuration _: TerminalLaunchPlan) throws -> any TerminalSurfaceSession {
+        throw UnavailableError()
+    }
+
+    func makeHostSurface(
+        workingDirectory _: String,
+        environment _: [String: String]
+    ) throws -> any TerminalSurfaceSession {
         throw UnavailableError()
     }
 }
@@ -52,6 +61,8 @@ enum TerminalSessionPresentationPhase: Equatable, Sendable {
     case preparing
     case launching
     case agentRunning
+    case shellIdle
+    case hostExited
     case ended(exitCode: Int32?)
     case stopping
     case failed(String)
@@ -61,6 +72,8 @@ enum TerminalSessionPresentationPhase: Equatable, Sendable {
         case .preparing: "正在准备"
         case .launching: "正在启动"
         case .agentRunning: "运行中"
+        case .shellIdle: "终端就绪"
+        case .hostExited: "终端已退出"
         case .ended: "已结束"
         case .stopping: "正在结束"
         case .failed: "启动失败"
@@ -70,7 +83,7 @@ enum TerminalSessionPresentationPhase: Equatable, Sendable {
     var isActive: Bool {
         switch self {
         case .preparing, .launching, .agentRunning, .stopping: true
-        case .ended, .failed: false
+        case .shellIdle, .hostExited, .ended, .failed: false
         }
     }
 }
@@ -109,6 +122,7 @@ final class TerminalSessionController {
 
     @ObservationIgnored private let repository: any AppRepository
     @ObservationIgnored private let surfaceFactory: any TerminalSurfaceFactory
+    @ObservationIgnored private let exitJournal: TerminalExitJournalCoordinator
     @ObservationIgnored private var surfaceSession: (any TerminalSurfaceSession)?
     @ObservationIgnored private var hostView: TerminalSurfaceHostView?
     @ObservationIgnored private var launchTask: Task<Void, Never>?
@@ -126,30 +140,45 @@ final class TerminalSessionController {
     @ObservationIgnored private var startedReportWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored private var didReportExit = false
     @ObservationIgnored private var isReportingExit = false
-    @ObservationIgnored private var pendingExitReport: PendingExitReport?
+    @ObservationIgnored private var pendingExitReport: TerminalExitRecord?
     @ObservationIgnored private var exitReportRetryTask: Task<Void, Never>?
     @ObservationIgnored private var exitReportFailureCount = 0
+    @ObservationIgnored private var endOperationTask: Task<Void, Never>?
+    @ObservationIgnored private var endOperationReason: TerminalRunExitReason?
+    @ObservationIgnored private var endCallWaiters: [CheckedContinuation<Void, Never>] = []
+    @ObservationIgnored private var shutdownExitDeadlineTask: Task<Void, Never>?
+    @ObservationIgnored private var shutdownExitDeadline: ContinuousClock.Instant?
+    @ObservationIgnored private var isShutdownExitDeferred = false
     @ObservationIgnored private var isHandlingEngineRestart = false
     @ObservationIgnored private var kiroMetadataWatcher: KiroMetadataWatcher?
     @ObservationIgnored private var exitWaiters: [CheckedContinuation<Void, Never>] = []
+    @ObservationIgnored var onHostAbandoned: (@MainActor () -> Void)?
 
-    private struct PendingExitReport: Equatable {
-        let runID: String
-        let exitCode: Int32?
-        let reason: TerminalRunExitReason
-        let errorCode: String?
-        let errorMessage: String?
-    }
-
-    init(
+    convenience init(
         bundle: TerminalSessionBundle,
         repository: any AppRepository,
-        surfaceFactory: any TerminalSurfaceFactory
+        surfaceFactory: any TerminalSurfaceFactory,
+        exitJournal: any TerminalExitJournaling = NoopTerminalExitJournal()
+    ) {
+        self.init(
+            bundle: bundle,
+            repository: repository,
+            surfaceFactory: surfaceFactory,
+            exitJournalCoordinator: TerminalExitJournalCoordinator(journal: exitJournal)
+        )
+    }
+
+    fileprivate init(
+        bundle: TerminalSessionBundle,
+        repository: any AppRepository,
+        surfaceFactory: any TerminalSurfaceFactory,
+        exitJournalCoordinator: TerminalExitJournalCoordinator
     ) {
         taskID = bundle.session.taskID
         self.bundle = bundle
         self.repository = repository
         self.surfaceFactory = surfaceFactory
+        exitJournal = exitJournalCoordinator
         workingDirectory = bundle.session.workingDirectory
         needsAttention = bundle.session.hasUnread || bundle.session.agentStatus.needsAttention
         phase = Self.phase(for: bundle)
@@ -157,6 +186,7 @@ final class TerminalSessionController {
 
     var session: TerminalSessionDescriptor { bundle.session }
     var activeRun: TerminalRun? { bundle.activeRun }
+    var isActive: Bool { phase.isActive }
     var view: NSView? { surfaceSession?.view }
     var workingDirectoryIsAvailable: Bool {
         TerminalWorkingDirectoryPolicy.isAvailable(session.workingDirectory)
@@ -168,9 +198,14 @@ final class TerminalSessionController {
             && (session.runtimeKind == .codex || session.runtimeKind == .kiro)
     }
 
-    func launch(taskTitle: String?) {
-        guard surfaceSession == nil,
-              launchTask == nil,
+    func launch(
+        taskTitle: String?,
+        intent: TerminalLaunchIntent = .auto,
+        runtimeKind: RuntimeKind? = nil
+    ) {
+        guard launchTask == nil,
+              !isShutdownExitDeferred,
+              endOperationTask == nil,
               activeRun?.state.isActive != true,
               pendingExitReport == nil
         else { return }
@@ -204,6 +239,7 @@ final class TerminalSessionController {
             guard let self else { return }
             defer { self.launchTask = nil }
             do {
+                try self.ensureHostSurface()
                 let server = try TerminalStatusServer(sessionID: sessionID, runID: runID)
                 self.statusServer = server
                 self.consumeStatusEvents(from: server, runID: runID)
@@ -215,20 +251,21 @@ final class TerminalSessionController {
                     lifecycleToken: server.credentials.lifecycleToken,
                     hookToken: server.credentials.hookToken,
                     providerHooksEnabled: TerminalStatusAuthorization.state(
-                        for: self.session.runtimeKind
+                        for: runtimeKind ?? self.session.runtimeKind
                     ) == .enabled,
-                    hostPID: ProcessInfo.processInfo.processIdentifier
+                    hostPID: ProcessInfo.processInfo.processIdentifier,
+                    intent: intent,
+                    runtimeKind: runtimeKind
                 )
                 guard !Task.isCancelled, self.session.id == plan.session.id else { return }
                 self.bundle = TerminalSessionBundle(session: plan.session, activeRun: plan.run)
                 self.phase = .launching
-                let surface = try self.surfaceFactory.makeSurface(configuration: plan)
-                surface.onEvent = { [weak self] event in
-                    self?.handleSurfaceEvent(event)
-                }
-                self.surfaceSession = surface
-                self.hasLiveSurface = true
-                self.hostView?.attach(surface.view)
+                let command = try GhosttyCommandBuilder.officialLaunchCommand(
+                    executable: plan.executable,
+                    arguments: plan.arguments,
+                    workingDirectory: plan.workingDirectory
+                )
+                self.surfaceSession?.sendText(command)
                 self.focusIfAppropriate()
             } catch is CancellationError {
                 self.finishStatusServer()
@@ -240,13 +277,36 @@ final class TerminalSessionController {
                     error: error
                 )
                 if !hasDurableRun {
-                    self.destroySurfaceAndServer()
+                    self.finishStatusServer()
                 }
             }
         }
     }
 
+    func ensureHostSurface() throws {
+        if surfaceSession != nil { return }
+        let surface = try surfaceFactory.makeHostSurface(
+            workingDirectory: TerminalHostDefaults.workingDirectory,
+            environment: [:]
+        )
+        surface.onEvent = { [weak self] event in
+            self?.handleSurfaceEvent(event)
+        }
+        surfaceSession = surface
+        hasLiveSurface = true
+        workingDirectory = TerminalHostDefaults.workingDirectory
+        hostView?.attach(surface.view)
+        if !phase.isActive {
+            phase = .shellIdle
+        }
+    }
+
+    func reportHostFailure(_ message: String) {
+        phase = .failed(message)
+    }
+
     func attach(to host: TerminalSurfaceHostView) {
+        let hostChanged = hostView !== host
         if let previous = hostView, previous !== host {
             previous.detach()
         }
@@ -255,7 +315,12 @@ final class TerminalSessionController {
         if let view = surfaceSession?.view {
             host.attach(view)
         }
-        focusIfAppropriate()
+        // SwiftUI may call updateNSView for unrelated observed state changes.
+        // Only a real reparent should request focus; repeated updates must not
+        // steal keyboard navigation from toolbar buttons or other controls.
+        if hostChanged {
+            focusIfAppropriate()
+        }
     }
 
     func detach(from host: TerminalSurfaceHostView) {
@@ -304,7 +369,76 @@ final class TerminalSessionController {
         surfaceSession?.commitComposition()
     }
 
-    func end(reason: TerminalRunExitReason = .userEnded) async {
+    func end(
+        reason: TerminalRunExitReason = .userEnded,
+        persistenceDeadline: Duration? = nil
+    ) async {
+        guard !isShutdownExitDeferred else { return }
+        let authoritativeReason: TerminalRunExitReason
+        if let endOperationReason {
+            authoritativeReason = endOperationReason
+        } else {
+            endOperationReason = reason
+            exitReasonOverride = reason
+            authoritativeReason = reason
+        }
+        if endOperationTask == nil {
+            let operation = Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.performEnd(reason: authoritativeReason)
+                self.finishEndOperation()
+            }
+            endOperationTask = operation
+        }
+        if let persistenceDeadline {
+            scheduleShutdownExitDeadline(after: persistenceDeadline, reason: authoritativeReason)
+        }
+
+        await withCheckedContinuation { continuation in
+            if endOperationTask == nil || isShutdownExitDeferred {
+                continuation.resume()
+            } else {
+                endCallWaiters.append(continuation)
+            }
+        }
+    }
+
+    private func finishEndOperation() {
+        shutdownExitDeadlineTask?.cancel()
+        shutdownExitDeadlineTask = nil
+        shutdownExitDeadline = nil
+        endOperationTask = nil
+        endOperationReason = nil
+        resumeEndCallWaiters()
+    }
+
+    private func resumeEndCallWaiters() {
+        let waiters = endCallWaiters
+        endCallWaiters.removeAll()
+        for waiter in waiters { waiter.resume() }
+    }
+
+    private func scheduleShutdownExitDeadline(
+        after duration: Duration,
+        reason: TerminalRunExitReason
+    ) {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: duration)
+        if let shutdownExitDeadline, shutdownExitDeadline <= deadline { return }
+        shutdownExitDeadlineTask?.cancel()
+        shutdownExitDeadline = deadline
+        shutdownExitDeadlineTask = Task { @MainActor [weak self] in
+            do {
+                try await clock.sleep(until: deadline)
+            } catch {
+                return
+            }
+            guard let self else { return }
+            await self.deferExitAtShutdownDeadline(reason: reason)
+        }
+    }
+
+    private func performEnd(reason: TerminalRunExitReason) async {
         // `prepareTerminalLaunch` durably creates a `starting` Run before the
         // Ghostty surface exists. Never cancel that request halfway through:
         // wait for its bounded result, then transition the resulting Run out of
@@ -312,21 +446,25 @@ final class TerminalSessionController {
         if let pendingLaunch = launchTask {
             phase = .stopping
             await pendingLaunch.value
+            guard !isShutdownExitDeferred else { return }
         }
         if pendingExitReport != nil, !didReportExit {
             await persistPendingExitReportIfNeeded()
+            guard !isShutdownExitDeferred else { return }
         }
-        if activeRun == nil {
-            destroySurfaceAndServer()
-            phase = .ended(exitCode: nil)
+        if activeRun == nil || activeRun?.state.isActive != true {
+            if reason == .appShutdown {
+                destroySurfaceAndServer()
+                phase = .ended(exitCode: nil)
+            }
             activeRunID = nil
             resumeExitWaiters()
             return
         }
-        guard let runID = activeRun?.id ?? activeRunID,
-              activeRun?.state.isActive == true || surfaceSession != nil
-        else {
-            destroySurfaceAndServer()
+        guard let runID = activeRun?.id ?? activeRunID else {
+            if reason == .appShutdown {
+                destroySurfaceAndServer()
+            }
             return
         }
         phase = .stopping
@@ -335,17 +473,22 @@ final class TerminalSessionController {
         // process group before any bounded Engine reconciliation so an Engine
         // outage can never leave the Agent running while End/Quit waits.
         surfaceSession?.commitComposition()
-        surfaceSession?.terminate()
+        if reason == .appShutdown {
+            surfaceSession?.terminate()
+        }
         if let processGroupID { Darwin.kill(-processGroupID, SIGTERM) }
         scheduleTerminationEscalation(runID: runID, reason: reason)
         if runnerDidStart, !didReportStarted { await reportStartedIfNeeded(runID: runID) }
-        if activeRun?.state.isActive == true,
-           let incoming = try? await repository.markTerminalRunStopping(
+        guard !isShutdownExitDeferred else { return }
+        if activeRun?.state.isActive == true {
+            let incoming = try? await repository.markTerminalRunStopping(
                sessionID: session.id,
                runID: runID
-        ) {
-            merge(incoming)
+            )
+            guard !isShutdownExitDeferred else { return }
+            if let incoming { merge(incoming) }
         }
+        guard !isShutdownExitDeferred else { return }
         await withCheckedContinuation { continuation in
             if didReportExit, !isReportingExit {
                 continuation.resume()
@@ -370,12 +513,14 @@ final class TerminalSessionController {
     }
 
     func rebindWorkspace(_ workspace: String) async throws {
-        guard !hasLiveSurface,
-              activeRun?.state.isActive != true,
+        guard activeRun?.state.isActive != true,
               launchTask == nil,
               pendingExitReport == nil
         else {
             throw TerminalWorkspaceRebindError.sessionIsActive
+        }
+        if hasLiveSurface {
+            destroySurfaceAndServer()
         }
         let incoming = try await repository.rebindTerminalWorkspace(
             sessionID: session.id,
@@ -479,10 +624,16 @@ final class TerminalSessionController {
         case .attentionRequested:
             needsAttention = true
         case let .processExited(exitCode, reason):
-            scheduleSurfaceExitFallback(
-                exitCode: exitCode,
-                reason: exitReasonOverride ?? reason
-            )
+            if exitReasonOverride == .appShutdown || isShutdownExitDeferred {
+                scheduleSurfaceExitFallback(
+                    exitCode: exitCode,
+                    reason: exitReasonOverride ?? reason
+                )
+                return
+            }
+            Task { @MainActor [weak self] in
+                await self?.abandonHost(exitCode: exitCode, reason: reason)
+            }
         }
     }
 
@@ -595,7 +746,9 @@ final class TerminalSessionController {
         errorMessage: String? = nil
     ) async {
         guard let runID = activeRun?.id ?? activeRunID else { return }
-        let report = PendingExitReport(
+        let report = TerminalExitRecord(
+            taskID: taskID,
+            sessionID: session.id,
             runID: runID,
             exitCode: exitCode,
             reason: reason,
@@ -608,6 +761,16 @@ final class TerminalSessionController {
             return
         }
         pendingExitReport = report
+        do {
+            try await exitJournal.store(report)
+        } catch {
+            // The Engine request may still succeed. If both stores are
+            // unavailable, surface the durability problem without changing the
+            // first authoritative payload.
+            phase = .failed(error.localizedDescription)
+            needsAttention = true
+        }
+        guard !isShutdownExitDeferred else { return }
         await persistPendingExitReportIfNeeded()
     }
 
@@ -630,8 +793,16 @@ final class TerminalSessionController {
                 errorCode: report.errorCode,
                 errorMessage: report.errorMessage
             )
+            guard !isShutdownExitDeferred else {
+                isReportingExit = false
+                return
+            }
             completeDurableExit(incoming, report: report)
         } catch {
+            if isShutdownExitDeferred {
+                isReportingExit = false
+                return
+            }
             if isHandlingEngineRestart {
                 isReportingExit = false
                 return
@@ -651,8 +822,12 @@ final class TerminalSessionController {
 
     private func completeDurableExit(
         _ incoming: TerminalSessionBundle,
-        report: PendingExitReport
+        report: TerminalExitRecord
     ) {
+        guard !isShutdownExitDeferred else {
+            isReportingExit = false
+            return
+        }
         merge(incoming)
         didReportExit = true
         isReportingExit = false
@@ -660,10 +835,24 @@ final class TerminalSessionController {
         exitReportFailureCount = 0
         exitReportRetryTask?.cancel()
         exitReportRetryTask = nil
-        phase = report.reason == .launchFailed
-            ? .failed(report.errorMessage ?? "终端启动失败。")
-            : .ended(exitCode: report.exitCode)
-        destroySurfaceAndServer()
+        // Engine acknowledgement makes the journal entry redundant. Cleanup is
+        // ordered behind its store but never gates terminal teardown; retaining
+        // it after an I/O failure is safe because exact replay is idempotent.
+        exitJournal.enqueueRemove(runID: report.runID)
+        finishStatusServer()
+        activeRunID = nil
+        processGroupID = nil
+        kiroMetadataWatcher?.stop()
+        kiroMetadataWatcher = nil
+        switch report.reason {
+        case .appShutdown:
+            destroySurfaceAndServer()
+            phase = .ended(exitCode: report.exitCode)
+        case .launchFailed:
+            phase = .failed(report.errorMessage ?? "终端启动失败。")
+        case .processExit, .userEnded:
+            phase = .shellIdle
+        }
         resumeExitWaiters()
     }
 
@@ -680,6 +869,44 @@ final class TerminalSessionController {
             self.exitReportRetryTask = nil
             await self.persistPendingExitReportIfNeeded()
         }
+    }
+
+    private func deferExitAtShutdownDeadline(reason: TerminalRunExitReason) async {
+        guard !didReportExit, !isShutdownExitDeferred else { return }
+        isShutdownExitDeferred = true
+        shutdownExitDeadlineTask = nil
+        shutdownExitDeadline = nil
+        endOperationTask?.cancel()
+        launchTask?.cancel()
+        if !didReportExit,
+           pendingExitReport == nil,
+           let runID = activeRun?.id ?? activeRunID {
+            let report = TerminalExitRecord(
+                taskID: taskID,
+                sessionID: session.id,
+                runID: runID,
+                exitCode: nil,
+                reason: reason,
+                errorCode: nil,
+                errorMessage: nil
+            )
+            pendingExitReport = report
+            // This is intentionally non-waiting. The persistence deadline must
+            // release AppKit even if fsync never returns, while the dedicated
+            // serial queue retains and eventually performs this exact write.
+            exitJournal.enqueueStore(report)
+        }
+
+        // Terminate the local process tree before releasing AppKit's
+        // terminateLater gate. The journal is replayed by the next healthy
+        // Engine generation, so the IPC retry can no longer keep Quit stuck.
+        if let processGroupID { Darwin.kill(-processGroupID, SIGKILL) }
+        isReportingExit = false
+        destroySurfaceAndServer()
+        phase = .ended(exitCode: pendingExitReport?.exitCode)
+        activeRunID = nil
+        resumeExitWaiters()
+        resumeEndCallWaiters()
     }
 
     private func scheduleSurfaceExitFallback(exitCode: Int32?, reason: TerminalRunExitReason) {
@@ -708,7 +935,9 @@ final class TerminalSessionController {
             }
             guard let self, !self.didReportExit, self.activeRunID == runID else { return }
             if let processGroupID = self.processGroupID { Darwin.kill(-processGroupID, SIGKILL) }
-            self.surfaceSession?.close()
+            if self.exitReasonOverride == .appShutdown {
+                self.surfaceSession?.close()
+            }
             do {
                 try await Task.sleep(for: .milliseconds(500))
             } catch {
@@ -738,6 +967,18 @@ final class TerminalSessionController {
         isAttached = false
         processGroupID = nil
         finishStatusServer()
+    }
+
+    private func abandonHost(exitCode: Int32?, reason: TerminalRunExitReason) async {
+        if activeRun?.state.isActive == true || activeRunID != nil {
+            await reportExitIfNeeded(exitCode: exitCode, reason: reason)
+        }
+        let sessionID = session.id
+        try? await repository.deleteTerminalSession(sessionID: sessionID)
+        destroySurfaceAndServer()
+        phase = .hostExited
+        onHostAbandoned?()
+        resumeExitWaiters()
     }
 
     private func finishStatusServer() {
@@ -827,7 +1068,7 @@ final class TerminalSessionController {
         }
     }
 
-    private func exitReport(_ report: PendingExitReport, matches run: TerminalRun?) -> Bool {
+    private func exitReport(_ report: TerminalExitRecord, matches run: TerminalRun?) -> Bool {
         guard let run,
               run.id == report.runID,
               !run.state.isActive,
@@ -844,7 +1085,9 @@ final class TerminalSessionController {
     private func merge(_ incoming: TerminalSessionBundle) {
         guard incoming.session.id == session.id else { return }
         bundle = incoming
-        workingDirectory = incoming.session.workingDirectory
+        if !hasLiveSurface {
+            workingDirectory = incoming.session.workingDirectory
+        }
         if incoming.activeRun?.state.isActive != true {
             isHandlingEngineRestart = false
         }
@@ -875,18 +1118,25 @@ final class TerminalSessionController {
     }
 
     private static func phase(for bundle: TerminalSessionBundle) -> TerminalSessionPresentationPhase {
-        guard let run = bundle.activeRun else {
-            if let message = bundle.session.lastErrorMessage, !message.isEmpty { return .failed(message) }
-            return .ended(exitCode: nil)
-        }
+        guard let run = bundle.activeRun else { return .shellIdle }
         switch run.state {
         case .starting: return .launching
         case .running: return .agentRunning
         case .stopping: return .stopping
-        case .exited, .interrupted: return .ended(exitCode: run.exitCode)
+        case .exited, .interrupted: return .shellIdle
         case .failed: return .failed(run.errorMessage ?? "终端启动失败。")
         }
     }
+}
+
+enum TerminalHostDefaults {
+    static var workingDirectory: String {
+        FileManager.default.homeDirectoryForCurrentUser
+            .resolvingSymlinksInPath()
+            .path
+    }
+
+    static let storedRuntime = RuntimeKind.claude
 }
 
 @MainActor
@@ -894,16 +1144,22 @@ final class TerminalSessionController {
 final class TerminalSessionRegistry {
     @ObservationIgnored private let repository: any AppRepository
     @ObservationIgnored private let surfaceFactory: any TerminalSurfaceFactory
+    @ObservationIgnored private let exitJournal: TerminalExitJournalCoordinator
+    @ObservationIgnored private let shutdownExitPersistenceDeadline: Duration
     @ObservationIgnored private var controllers: [UUID: TerminalSessionController] = [:]
     private(set) var isShuttingDown = false
     private(set) var isRecoveringEngine = false
 
     init(
         repository: any AppRepository,
-        surfaceFactory: any TerminalSurfaceFactory = UnavailableTerminalSurfaceFactory()
+        surfaceFactory: any TerminalSurfaceFactory = UnavailableTerminalSurfaceFactory(),
+        exitJournal: any TerminalExitJournaling = TerminalExitJournalStore(),
+        shutdownExitPersistenceDeadline: Duration = .seconds(4)
     ) {
         self.repository = repository
         self.surfaceFactory = surfaceFactory
+        self.exitJournal = TerminalExitJournalCoordinator(journal: exitJournal)
+        self.shutdownExitPersistenceDeadline = shutdownExitPersistenceDeadline
     }
 
     func controller(for taskID: UUID) -> TerminalSessionController? {
@@ -928,18 +1184,92 @@ final class TerminalSessionRegistry {
         let controller = TerminalSessionController(
             bundle: bundle,
             repository: repository,
-            surfaceFactory: surfaceFactory
+            surfaceFactory: surfaceFactory,
+            exitJournalCoordinator: exitJournal
         )
         controllers[bundle.session.taskID] = controller
+        controller.onHostAbandoned = { [weak self, weak controller, taskID = bundle.session.taskID] in
+            guard let self, let controller, self.controllers[taskID] === controller else { return }
+            self.controllers[taskID] = nil
+        }
         return controller
     }
 
+    func forget(taskID: UUID) {
+        controllers[taskID] = nil
+    }
+
+    /// Drops the in-memory controller only when it is still the deleted session.
+    /// A late `terminal.session.deleted` for an exited host must not evict the
+    /// replacement created by `ensureHost`.
+    func forget(sessionID: String, taskID: UUID) {
+        guard controllers[taskID]?.session.id == sessionID else { return }
+        controllers[taskID] = nil
+    }
+
     func load(taskID: UUID) async throws -> TerminalSessionController? {
+        try Task.checkCancellation()
         guard !isShuttingDown, !isRecoveringEngine else { return nil }
         if let existing = controllers[taskID] { return existing }
-        guard let bundle = try await repository.terminalSession(taskID: taskID) else { return nil }
+        let bundle = try await repository.terminalSession(taskID: taskID)
+        try Task.checkCancellation()
         guard !isShuttingDown, !isRecoveringEngine else { return nil }
+        // Another open may have installed or launched the Controller while this
+        // repository lookup was suspended. Never apply the older snapshot to
+        // that newer in-memory state.
+        if let existing = controllers[taskID] { return existing }
+        guard let bundle else { return nil }
         return restore(bundle)
+    }
+
+    /// Opens or creates the task's host shell. Does not launch an Agent.
+    func ensureHost(task: TaskItem) async throws -> TerminalSessionController {
+        try Task.checkCancellation()
+        guard !isShuttingDown, !isRecoveringEngine else { throw CancellationError() }
+        if let existing = controllers[task.id] {
+            if existing.phase != .hostExited {
+                try Task.checkCancellation()
+                restoreHostIfNeeded(existing)
+                existing.focusIfAppropriate()
+                return existing
+            }
+            forget(taskID: task.id)
+        }
+        if let loaded = try await load(taskID: task.id), loaded.phase != .hostExited {
+            try Task.checkCancellation()
+            restoreHostIfNeeded(loaded)
+            loaded.focusIfAppropriate()
+            return loaded
+        }
+        let workspace = TerminalHostDefaults.workingDirectory
+        try? WorkspaceAuthorizationStore.save(
+            URL(fileURLWithPath: workspace, isDirectory: true)
+        )
+        let bundle = try await repository.createTerminalSession(
+            taskID: task.id,
+            runtime: TerminalHostDefaults.storedRuntime,
+            workspace: workspace
+        )
+        try Task.checkCancellation()
+        guard !isShuttingDown, !isRecoveringEngine, let controller = restore(bundle) else {
+            throw CancellationError()
+        }
+        restoreHostIfNeeded(controller)
+        return controller
+    }
+
+    /// Product entry point for a task's terminal. Every task opens directly to
+    /// a retained host shell. Only a durable app-shutdown marker is allowed to
+    /// auto-resume the exact provider conversation; ordinary exits stay idle.
+    func openTask(_ task: TaskItem) async throws -> TerminalSessionController {
+        guard !isShuttingDown, !isRecoveringEngine else { throw CancellationError() }
+        let controller = try await ensureHost(task: task)
+        try Task.checkCancellation()
+        guard controllers[task.id] === controller else { throw CancellationError() }
+        await resumeIfNeeded(taskID: task.id, taskTitle: task.title)
+        try Task.checkCancellation()
+        guard controllers[task.id] === controller else { throw CancellationError() }
+        return controller
     }
 
     func create(
@@ -949,8 +1279,11 @@ final class TerminalSessionRegistry {
     ) async throws -> TerminalSessionController {
         guard !isShuttingDown, !isRecoveringEngine else { throw CancellationError() }
         if let existing = controllers[task.id] {
-            if !existing.hasLiveSurface, existing.activeRun?.state.isActive != true {
-                await resumeOrLaunch(existing, taskTitle: task.title)
+            if existing.activeRun?.state.isActive != true {
+                if existing.session.workingDirectory != workspace {
+                    try await existing.rebindWorkspace(workspace)
+                }
+                await launchAgent(existing, taskTitle: task.title, intent: .fresh, runtimeKind: runtime)
             }
             return existing
         }
@@ -962,30 +1295,62 @@ final class TerminalSessionRegistry {
         guard !isShuttingDown, !isRecoveringEngine, let controller = restore(bundle) else {
             throw CancellationError()
         }
-        await resumeOrLaunch(controller, taskTitle: task.title)
+        await launchAgent(controller, taskTitle: task.title, intent: .fresh, runtimeKind: runtime)
         return controller
     }
 
     func resumeOrLaunch(_ controller: TerminalSessionController, taskTitle: String?) async {
         guard !isShuttingDown, !isRecoveringEngine else { return }
-        guard !controller.hasLiveSurface, !controller.phase.isActive else {
+        let intent: TerminalLaunchIntent = if controller.session.hasOfficialAgentRun {
+            .resume
+        } else {
+            .fresh
+        }
+        await launchAgent(controller, taskTitle: taskTitle, intent: intent)
+    }
+
+    func launchAgent(
+        _ controller: TerminalSessionController,
+        taskTitle: String?,
+        intent: TerminalLaunchIntent,
+        runtimeKind: RuntimeKind? = nil
+    ) async {
+        guard !Task.isCancelled, !isShuttingDown, !isRecoveringEngine else { return }
+        if controller.requiresProviderSelection, intent != .fresh {
+            await controller.loadResumeCandidates()
+            guard !Task.isCancelled,
+                  !isShuttingDown,
+                  !isRecoveringEngine,
+                  !controller.requiresProviderSelection
+            else { return }
+        }
+        guard confirmResourceUseIfNeeded() else { return }
+        guard !Task.isCancelled, !isShuttingDown, !isRecoveringEngine else { return }
+        restoreHostIfNeeded(controller)
+        guard !Task.isCancelled else { return }
+        controller.launch(taskTitle: taskTitle, intent: intent, runtimeKind: runtimeKind)
+    }
+
+    func restoreHostIfNeeded(_ controller: TerminalSessionController) {
+        guard !controller.hasLiveSurface, !controller.phase.isActive else { return }
+        do {
+            try controller.ensureHostSurface()
+        } catch {
+            controller.reportHostFailure(error.localizedDescription)
+        }
+    }
+
+    /// Reopen entry point used by retained and newly reconstructed task
+    /// windows. Only a durable app-shutdown marker is allowed to auto-launch.
+    func resumeIfNeeded(taskID: UUID, taskTitle: String? = nil) async {
+        guard !Task.isCancelled, let controller = controllers[taskID] else { return }
+        guard controller.session.autoResume,
+              controller.session.providerSessionID != nil
+        else {
             controller.focusIfAppropriate()
             return
         }
-        if controller.requiresProviderSelection {
-            await controller.loadResumeCandidates()
-            guard !isShuttingDown, !isRecoveringEngine, !controller.requiresProviderSelection else { return }
-        }
-        guard confirmResourceUseIfNeeded() else { return }
-        guard !isShuttingDown, !isRecoveringEngine else { return }
-        controller.launch(taskTitle: taskTitle)
-    }
-
-    /// Reopen entry point used by retained task windows. Active terminals are
-    /// only focused; ended terminals start exactly one fresh/resume launch.
-    func resumeIfNeeded(taskID: UUID, taskTitle: String?) async {
-        guard let controller = controllers[taskID] else { return }
-        await resumeOrLaunch(controller, taskTitle: taskTitle)
+        await launchAgent(controller, taskTitle: taskTitle, intent: .resume)
     }
 
     func bindAndResume(
@@ -999,7 +1364,7 @@ final class TerminalSessionRegistry {
             guard !isShuttingDown, !isRecoveringEngine else { return }
             guard confirmResourceUseIfNeeded() else { return }
             guard !isShuttingDown, !isRecoveringEngine else { return }
-            controller.launch(taskTitle: taskTitle)
+            controller.launch(taskTitle: taskTitle, intent: .resume)
         } catch {
             guard !isShuttingDown, !isRecoveringEngine else { return }
             // Keep the candidate list visible; the workbench renders this error.
@@ -1034,13 +1399,44 @@ final class TerminalSessionRegistry {
         let active = controllers
         let endings = active.values.map { controller in
             return Task { @MainActor in
-                await controller.end(reason: reason)
+                await controller.end(
+                    reason: reason,
+                    persistenceDeadline: shutdownExitPersistenceDeadline
+                )
             }
         }
         for ending in endings {
             await ending.value
         }
         controllers.removeAll()
+    }
+
+    /// Replays write-ahead exit facts after a healthy Engine generation is
+    /// available. Records are removed only after the Engine confirms the exact
+    /// payload; a partial replay is retried on the next ready event.
+    func replayPendingExitReports() async {
+        let records: [TerminalExitRecord]
+        do {
+            records = try await exitJournal.records()
+        } catch {
+            return
+        }
+        for record in records {
+            do {
+                _ = try await repository.reportTerminalRunExited(
+                    sessionID: record.sessionID,
+                    runID: record.runID,
+                    exitCode: record.exitCode,
+                    reason: record.reason,
+                    errorCode: record.errorCode,
+                    errorMessage: record.errorMessage
+                )
+                try await exitJournal.remove(runID: record.runID)
+            } catch {
+                // The supervisor calls this again for every healthy Engine
+                // generation. Never delete an unacknowledged exit fact.
+            }
+        }
     }
 
     func reconcileEngineRestart() async {
@@ -1064,18 +1460,33 @@ final class TerminalSessionRegistry {
     }
 
     var activeCount: Int {
-        controllers.values.count(where: { $0.hasLiveSurface || $0.phase.isActive })
+        controllers.values.count(where: \.isActive)
     }
 
     private func confirmResourceUseIfNeeded() -> Bool {
         guard activeCount >= 3 else { return true }
+        if isRunningUnitTests {
+            return true
+        }
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "启动第 4 个活跃终端？"
-        alert.informativeText = "每个 Agent 都会保留独立的 PTY、渲染 Surface 和子进程，继续启动会增加内存与 CPU 消耗。"
+        alert.messageText = "启动第 4 个活跃 Agent？"
+        alert.informativeText = "每个 Agent 都会保留独立的 runner 子进程，继续启动会增加内存与 CPU 消耗。空闲的 host shell 不计入这个上限。"
         alert.addButton(withTitle: "继续启动")
         alert.addButton(withTitle: "取消")
         return alert.runModal() == .alertFirstButtonReturn
+    }
+
+    private var isRunningUnitTests: Bool {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["XCTestConfigurationFilePath"] != nil
+            || environment["XCTestBundlePath"] != nil
+        {
+            return true
+        }
+        return CommandLine.arguments.contains { argument in
+            argument.contains("xctest") || argument.contains("PackageTests")
+        }
     }
 }
 

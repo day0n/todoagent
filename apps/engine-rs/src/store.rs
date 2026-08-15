@@ -19,12 +19,14 @@ use crate::models::{
     AssistantSession, AssistantStep, AssistantToolExecution, AssistantToolResult,
     AssistantToolSummary, AssistantTurn, AssistantTurnStatus, Bootstrap, CreateTaskInput, List,
     ProviderBindingState, QueuedAssistantTurn, Runtime, RuntimeKind, SessionTimelineItem, Task,
-    TaskAttachment, TaskState, TaskStatus, TerminalAgentStatus, TerminalLaunchMode, TerminalRun,
-    TerminalRunState, TerminalSession, TerminalSessionBundle, UpdateTaskInput,
+    TaskAttachment, TaskState, TaskStatus, TerminalAgentStatus, TerminalLaunchIntent,
+    TerminalLaunchMode, TerminalRun, TerminalRunState, TerminalSession, TerminalSessionBundle,
+    UpdateTaskInput,
 };
 
-pub const SCHEMA_VERSION: i64 = 5;
-const SCHEMA_CHECKSUM: &str = "todoagent-native-v5-terminal-sessions-receipts";
+pub const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_CHECKSUM_V5: &str = "todoagent-native-v5-terminal-sessions-receipts";
+const SCHEMA_CHECKSUM: &str = "todoagent-native-v6-terminal-host";
 const ASSISTANT_TOOL_RESULT_MAX_BYTES: usize = 8 * 1024;
 const ASSISTANT_FILTERED_TASK_PAGE_SIZE: usize = 50;
 const SESSION_TIMELINE_PAYLOAD_MAX_BYTES: usize = 256 * 1024;
@@ -2325,24 +2327,19 @@ impl Store {
     }
 
     /// Returns an already-created session for an exact replay, rejects a
-    /// conflicting configuration for the task, or returns `None` when a new
-    /// session may be created. Engine performs this read before runtime
-    /// validation so a lost successful response remains replayable even if the
-    /// runtime later becomes unavailable.
+    /// Returns the existing terminal for the task, or `None` when a new
+    /// session may be created. A task still owns at most one terminal; Runtime
+    /// and working directory are current/last Agent state and can change on a
+    /// later fresh launch.
     pub fn prepare_terminal_session_create(
         &self,
         task_id: &str,
-        runtime_kind: RuntimeKind,
-        working_directory: &str,
+        _runtime_kind: RuntimeKind,
+        _working_directory: &str,
     ) -> StoreResult<Option<TerminalSession>> {
         let task_id = canonical_uuid(task_id, "taskId")?;
         if let Some(existing) = self.terminal_session_for_task(&task_id)? {
-            if existing.runtime_kind == runtime_kind
-                && existing.working_directory == working_directory
-            {
-                return Ok(Some(existing));
-            }
-            return Err(StoreError::Conflict("terminal_session_exists"));
+            return Ok(Some(existing));
         }
         if self.task(&task_id)?.is_none() {
             return Err(StoreError::NotFound);
@@ -2364,35 +2361,42 @@ impl Store {
         let task_id = canonical_uuid(task_id, "taskId")?;
         let id = Uuid::new_v4().to_string();
         let timestamp = now();
-        let (provider_id, binding_state, binding_source) = if runtime_kind == RuntimeKind::Claude {
-            (
-                Some(id.as_str()),
-                ProviderBindingState::Bound.as_str(),
-                Some("preallocated"),
-            )
-        } else {
-            (None, ProviderBindingState::Unbound.as_str(), None)
-        };
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             "INSERT INTO terminal_session(
                id,task_id,runtime_kind,working_directory,provider_session_id,
                provider_binding_state,provider_binding_source,created_at,updated_at
-             ) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+             ) VALUES(?1,?2,?3,?4,NULL,'unbound',NULL,?5,?5)",
             params![
                 id,
                 task_id,
                 runtime_kind.as_str(),
                 working_directory,
-                provider_id,
-                binding_state,
-                binding_source,
                 timestamp
             ],
         )?;
         bump_revision(&transaction)?;
         transaction.commit()?;
         self.terminal_session(&id)?.ok_or(StoreError::NotFound)
+    }
+
+    pub fn delete_idle_terminal_session(&self, session_id: &str) -> StoreResult<()> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        if self.terminal_session(&session_id)?.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        if self.active_terminal_run(&session_id)?.is_some() {
+            return Err(StoreError::Conflict("terminal_session_active"));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed =
+            transaction.execute("DELETE FROM terminal_session WHERE id=?1", [&session_id])?;
+        if changed == 0 {
+            return Err(StoreError::NotFound);
+        }
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Permanently rebinds an inactive Session to a replacement workspace.
@@ -2433,63 +2437,151 @@ impl Store {
         self.terminal_session_bundle(&session_id)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn prepare_terminal_run(
         &self,
         session_id: &str,
         run_id: &str,
     ) -> StoreResult<TerminalSessionBundle> {
-        self.prepare_terminal_run_with_resume_readiness(session_id, run_id, true)
+        self.prepare_terminal_run_with_options(
+            session_id,
+            run_id,
+            TerminalLaunchIntent::Auto,
+            true,
+            None,
+        )
     }
 
+    #[allow(dead_code)]
     pub fn prepare_terminal_run_with_resume_readiness(
         &self,
         session_id: &str,
         run_id: &str,
         provider_session_is_resumable: bool,
     ) -> StoreResult<TerminalSessionBundle> {
+        self.prepare_terminal_run_with_options(
+            session_id,
+            run_id,
+            TerminalLaunchIntent::Auto,
+            provider_session_is_resumable,
+            None,
+        )
+    }
+
+    pub fn prepare_terminal_run_with_options(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        intent: TerminalLaunchIntent,
+        provider_session_is_resumable: bool,
+        runtime_kind: Option<RuntimeKind>,
+    ) -> StoreResult<TerminalSessionBundle> {
         let session_id = canonical_uuid(session_id, "sessionId")?;
         let run_id = canonical_uuid(run_id, "runId")?;
+        let session = self
+            .terminal_session(&session_id)?
+            .ok_or(StoreError::NotFound)?;
         if let Some(existing) = self.terminal_run(&run_id)? {
             if existing.session_id != session_id {
                 return Err(StoreError::Conflict("terminal_run_id_reused"));
             }
-            return self.terminal_session_bundle(&session_id);
+            let active = self.active_terminal_run(&session_id)?;
+            if existing.state != TerminalRunState::Starting
+                || active.as_ref().map(|run| run.id.as_str()) != Some(run_id.as_str())
+            {
+                return Err(StoreError::Conflict("terminal_run_not_prepared"));
+            }
+            if runtime_kind.unwrap_or(session.runtime_kind) != session.runtime_kind {
+                return Err(StoreError::Conflict("runtime_change_requires_fresh"));
+            }
+            let intent_matches = match intent {
+                TerminalLaunchIntent::Auto => true,
+                TerminalLaunchIntent::Fresh => existing.launch_mode == TerminalLaunchMode::Fresh,
+                TerminalLaunchIntent::Resume => existing.launch_mode == TerminalLaunchMode::Resume,
+            };
+            if !intent_matches {
+                return Err(StoreError::Conflict("terminal_launch_intent_conflict"));
+            }
+            if existing.launch_mode == TerminalLaunchMode::Resume
+                && (existing.provider_session_id_at_launch.is_none()
+                    || existing.provider_session_id_at_launch != session.provider_session_id)
+            {
+                return Err(StoreError::Conflict("provider_session_conflict"));
+            }
+            return Ok(TerminalSessionBundle {
+                session,
+                active_run: Some(existing),
+            });
         }
-        let session = self
-            .terminal_session(&session_id)?
-            .ok_or(StoreError::NotFound)?;
         if self.active_terminal_run(&session_id)?.is_some() {
             return Err(StoreError::Conflict("terminal_session_active"));
+        }
+        let launch_kind = runtime_kind.unwrap_or(session.runtime_kind);
+        let launch_mode = match intent {
+            TerminalLaunchIntent::Resume => {
+                if session.provider_session_id.is_none() {
+                    return Err(StoreError::Conflict("provider_binding_required"));
+                }
+                if !provider_session_is_resumable {
+                    return Err(StoreError::Conflict("provider_session_not_resumable"));
+                }
+                TerminalLaunchMode::Resume
+            }
+            TerminalLaunchIntent::Auto
+                if session.auto_resume && session.provider_session_id.is_some() =>
+            {
+                if !provider_session_is_resumable {
+                    return Err(StoreError::Conflict("provider_session_not_resumable"));
+                }
+                TerminalLaunchMode::Resume
+            }
+            TerminalLaunchIntent::Auto | TerminalLaunchIntent::Fresh => TerminalLaunchMode::Fresh,
+        };
+        if launch_mode == TerminalLaunchMode::Resume && launch_kind != session.runtime_kind {
+            return Err(StoreError::Conflict("runtime_change_requires_fresh"));
+        }
+        if launch_kind == RuntimeKind::Cursor
+            && session.provider_session_id.is_none()
+            && launch_mode == TerminalLaunchMode::Resume
+        {
+            return Err(StoreError::Conflict("provider_session_unbound"));
         }
         let ordinal: i64 = self.connection.query_row(
             "SELECT coalesce(max(ordinal),0)+1 FROM terminal_run WHERE session_id=?1",
             [&session_id],
             |row| row.get(0),
         )?;
-        let prior_started: bool = self.connection.query_row(
-            "SELECT EXISTS(
-               SELECT 1 FROM terminal_run
-               WHERE session_id=?1 AND started_at IS NOT NULL
-             )",
-            [&session_id],
-            |row| row.get::<_, i64>(0),
-        )? != 0;
-        if prior_started && session.provider_session_id.is_none() {
-            return Err(StoreError::Conflict("provider_binding_required"));
-        }
-        if session.runtime_kind == RuntimeKind::Cursor && session.provider_session_id.is_none() {
-            return Err(StoreError::Conflict("provider_session_unbound"));
-        }
         let timestamp = now();
-        let launch_mode = if session.provider_session_id.is_some()
-            && prior_started
-            && provider_session_is_resumable
-        {
-            TerminalLaunchMode::Resume
-        } else {
-            TerminalLaunchMode::Fresh
-        };
         let transaction = self.connection.unchecked_transaction()?;
+        let provider_id_at_launch = if launch_mode == TerminalLaunchMode::Fresh {
+            if launch_kind == RuntimeKind::Claude {
+                let fresh_id = Uuid::new_v4().to_string();
+                transaction.execute(
+                    "UPDATE terminal_session SET runtime_kind=?1,provider_session_id=?2,
+                     provider_binding_state='bound',provider_binding_source='preallocated',
+                     agent_status='unknown',last_error_code=NULL,last_error_message=NULL,
+                     auto_resume=0,updated_at=?3 WHERE id=?4",
+                    params![launch_kind.as_str(), fresh_id, timestamp, session_id],
+                )?;
+                Some(fresh_id)
+            } else {
+                transaction.execute(
+                    "UPDATE terminal_session SET runtime_kind=?1,provider_session_id=NULL,
+                     provider_binding_state='unbound',provider_binding_source=NULL,
+                     agent_status='unknown',last_error_code=NULL,last_error_message=NULL,
+                     auto_resume=0,updated_at=?2 WHERE id=?3",
+                    params![launch_kind.as_str(), timestamp, session_id],
+                )?;
+                None
+            }
+        } else {
+            transaction.execute(
+                "UPDATE terminal_session SET agent_status='unknown',last_error_code=NULL,
+                 last_error_message=NULL,auto_resume=0,updated_at=?1 WHERE id=?2",
+                params![timestamp, session_id],
+            )?;
+            session.provider_session_id.clone()
+        };
         transaction.execute(
             "INSERT INTO terminal_run(id,session_id,ordinal,launch_mode,state,provider_session_id_at_launch,created_at)
              VALUES(?1,?2,?3,?4,'starting',?5,?6)",
@@ -2498,67 +2590,7 @@ impl Store {
                 session_id,
                 ordinal,
                 launch_mode.as_str(),
-                session.provider_session_id,
-                timestamp
-            ],
-        )?;
-        transaction.execute(
-            "UPDATE terminal_session SET agent_status='unknown',last_error_code=NULL,
-             last_error_message=NULL,updated_at=?1 WHERE id=?2",
-            params![timestamp, session_id],
-        )?;
-        bump_revision(&transaction)?;
-        transaction.commit()?;
-        self.terminal_session_bundle(&session_id)
-    }
-
-    pub fn prepare_terminal_run_with_provider(
-        &self,
-        session_id: &str,
-        run_id: &str,
-        provider_session_id: &str,
-        source: &str,
-    ) -> StoreResult<TerminalSessionBundle> {
-        let session_id = canonical_uuid(session_id, "sessionId")?;
-        let run_id = canonical_uuid(run_id, "runId")?;
-        validate_provider_session_id(provider_session_id)?;
-        validate_binding_source(source)?;
-        if self.terminal_run(&run_id)?.is_some() {
-            return Err(StoreError::Conflict("terminal_run_id_reused"));
-        }
-        let session = self
-            .terminal_session(&session_id)?
-            .ok_or(StoreError::NotFound)?;
-        if self.active_terminal_run(&session_id)?.is_some() {
-            return Err(StoreError::Conflict("terminal_session_active"));
-        }
-        if let Some(existing) = session.provider_session_id.as_deref()
-            && existing != provider_session_id
-        {
-            return Err(StoreError::Conflict("provider_session_conflict"));
-        }
-        let ordinal: i64 = self.connection.query_row(
-            "SELECT coalesce(max(ordinal),0)+1 FROM terminal_run WHERE session_id=?1",
-            [&session_id],
-            |row| row.get(0),
-        )?;
-        let timestamp = now();
-        let transaction = self.connection.unchecked_transaction()?;
-        transaction.execute(
-            "UPDATE terminal_session SET provider_session_id=?1,provider_binding_state='bound',
-             provider_binding_source=?2,agent_status='unknown',last_error_code=NULL,
-             last_error_message=NULL,updated_at=?3 WHERE id=?4",
-            params![provider_session_id, source, timestamp, session_id],
-        )?;
-        transaction.execute(
-            "INSERT INTO terminal_run(id,session_id,ordinal,launch_mode,state,provider_session_id_at_launch,created_at)
-             VALUES(?1,?2,?3,?4,'starting',?5,?6)",
-            params![
-                run_id,
-                session_id,
-                ordinal,
-                if ordinal == 1 { "fresh" } else { "resume" },
-                provider_session_id,
+                provider_id_at_launch,
                 timestamp
             ],
         )?;
@@ -2577,6 +2609,58 @@ impl Store {
                 row_to_terminal_run,
             )
             .optional()?)
+    }
+
+    /// Bind a provider identity that an external Runtime allocates after a
+    /// fresh Run has been reserved but before its runner is exposed. Unlike a
+    /// hook-time bind, the identity is also part of the Run's launch record.
+    pub fn bind_prepared_terminal_provider(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        provider_session_id: &str,
+        source: &str,
+    ) -> StoreResult<TerminalSessionBundle> {
+        let session_id = canonical_uuid(session_id, "sessionId")?;
+        let run_id = canonical_uuid(run_id, "runId")?;
+        validate_provider_session_id(provider_session_id)?;
+        validate_binding_source(source)?;
+        let run = self.terminal_run(&run_id)?.ok_or(StoreError::NotFound)?;
+        if run.session_id != session_id
+            || run.state != TerminalRunState::Starting
+            || run.launch_mode != TerminalLaunchMode::Fresh
+        {
+            return Err(StoreError::Conflict("terminal_run_not_prepared"));
+        }
+        let session = self
+            .terminal_session(&session_id)?
+            .ok_or(StoreError::NotFound)?;
+        if run.provider_session_id_at_launch.as_deref() == Some(provider_session_id)
+            && session.provider_session_id.as_deref() == Some(provider_session_id)
+        {
+            return self.terminal_session_bundle(&session_id);
+        }
+        if run.provider_session_id_at_launch.is_some() || session.provider_session_id.is_some() {
+            return Err(StoreError::Conflict("provider_session_conflict"));
+        }
+        let transaction = self.connection.unchecked_transaction()?;
+        let changed = transaction.execute(
+            "UPDATE terminal_run SET provider_session_id_at_launch=?1
+             WHERE id=?2 AND session_id=?3 AND state='starting' AND launch_mode='fresh'
+               AND provider_session_id_at_launch IS NULL",
+            params![provider_session_id, run_id, session_id],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::Conflict("terminal_run_not_prepared"));
+        }
+        transaction.execute(
+            "UPDATE terminal_session SET provider_session_id=?1,provider_binding_state='bound',
+             provider_binding_source=?2,updated_at=?3 WHERE id=?4",
+            params![provider_session_id, source, now(), session_id],
+        )?;
+        bump_revision(&transaction)?;
+        transaction.commit()?;
+        self.terminal_session_bundle(&session_id)
     }
 
     pub fn mark_terminal_run_started(
@@ -2705,11 +2789,31 @@ impl Store {
                 && run.exit_reason.as_deref() == Some(reason)
                 && run.error_code.as_deref() == error_code
                 && run.error_message.as_deref() == error_message;
-            return if exact_replay {
-                self.terminal_session_bundle(&session_id)
-            } else {
-                Err(StoreError::Conflict("terminal_run_result_conflict"))
-            };
+            if exact_replay {
+                return self.terminal_session_bundle(&session_id);
+            }
+            // The macOS client write-ahead logs an authenticated runner exit
+            // before sending it. If the Engine dies first, startup necessarily
+            // marks the still-active row as `engine_interrupted` before the
+            // client can replay that fact. Allow exactly that synthetic crash
+            // marker to be replaced once; no other terminal result is mutable.
+            let may_replace_startup_interruption = run.state == TerminalRunState::Interrupted
+                && run.error_code.as_deref() == Some("engine_interrupted")
+                && run.exit_reason.is_none()
+                && run.exit_code.is_none();
+            if !may_replace_startup_interruption {
+                return Err(StoreError::Conflict("terminal_run_result_conflict"));
+            }
+            return self.transition_terminal_run(
+                &session_id,
+                &run_id,
+                "engine_interrupted",
+                state.as_str(),
+                exit_code,
+                Some(reason),
+                error_code,
+                error_message,
+            );
         }
         self.transition_terminal_run(
             &session_id,
@@ -2738,10 +2842,12 @@ impl Store {
         let session_id = canonical_uuid(session_id, "sessionId")?;
         let run_id = canonical_uuid(run_id, "runId")?;
         let timestamp = now();
-        let predicate = if from == "active" {
-            "state IN ('starting','running','stopping')"
-        } else {
-            "state='starting'"
+        let predicate = match from {
+            "active" => "state IN ('starting','running','stopping')",
+            "engine_interrupted" => {
+                "state='interrupted' AND error_code='engine_interrupted' AND exit_reason IS NULL AND exit_code IS NULL"
+            }
+            _ => "state='starting'",
         };
         let transaction = self.connection.unchecked_transaction()?;
         let changed = transaction.execute(
@@ -2765,12 +2871,36 @@ impl Store {
         if changed == 0 {
             return Err(StoreError::Conflict("terminal_run_not_active"));
         }
+        let auto_resume = if matches!(to, "exited" | "failed" | "interrupted") {
+            auto_resume_flag(exit_reason, error_code)
+        } else {
+            0
+        };
         transaction.execute(
             "UPDATE terminal_session SET
                last_started_at=CASE WHEN ?1='running' THEN ?2 ELSE last_started_at END,
                last_exited_at=CASE WHEN ?1 IN ('exited','failed','interrupted') THEN ?2 ELSE last_exited_at END,
-               last_error_code=?3,last_error_message=?4,updated_at=?2 WHERE id=?5",
-            params![to, timestamp, error_code, error_message, session_id],
+               last_exit_reason=CASE WHEN ?1 IN ('exited','failed','interrupted') THEN ?3 ELSE last_exit_reason END,
+               auto_resume=CASE
+                 WHEN ?1 IN ('exited','failed','interrupted') AND provider_session_id IS NOT NULL THEN ?4
+                 WHEN ?1 IN ('exited','failed','interrupted') THEN 0
+                 ELSE auto_resume
+               END,
+               last_error_code=?5,last_error_message=?6,updated_at=?2
+             WHERE id=?7 AND ?8=(
+               SELECT id FROM terminal_run
+               WHERE session_id=?7 ORDER BY ordinal DESC LIMIT 1
+             )",
+            params![
+                to,
+                timestamp,
+                exit_reason,
+                auto_resume,
+                error_code,
+                error_message,
+                session_id,
+                run_id
+            ],
         )?;
         bump_revision(&transaction)?;
         transaction.commit()?;
@@ -2805,16 +2935,22 @@ impl Store {
         let session = self
             .terminal_session(&session_id)?
             .ok_or(StoreError::NotFound)?;
-        if let Some(existing) = session.provider_session_id {
-            if existing != provider_session_id {
-                return Err(StoreError::Conflict("provider_session_conflict"));
-            }
+        if let Some(existing) = session.provider_session_id.as_deref()
+            && existing == provider_session_id
+        {
             return self.terminal_session_bundle(&session_id);
+        }
+        let replacing = session.provider_session_id.is_some();
+        if replacing
+            && (session.auto_resume
+                || (run.state.is_active() && run.launch_mode == TerminalLaunchMode::Resume))
+        {
+            return Err(StoreError::Conflict("provider_session_conflict"));
         }
         let transaction = self.connection.unchecked_transaction()?;
         transaction.execute(
             "UPDATE terminal_session SET provider_session_id=?1,provider_binding_state='bound',
-             provider_binding_source=?2,updated_at=?3 WHERE id=?4 AND provider_session_id IS NULL",
+             provider_binding_source=?2,updated_at=?3 WHERE id=?4",
             params![provider_session_id, source, now(), session_id],
         )?;
         bump_revision(&transaction)?;
@@ -3025,6 +3161,8 @@ impl Store {
             transaction.execute(
                 "UPDATE terminal_session SET agent_status='unknown',last_error_code='engine_interrupted',
                  last_error_message='TodoAgent exited while this terminal was active',last_exited_at=?1,
+                 last_exit_reason=NULL,
+                 auto_resume=CASE WHEN provider_session_id IS NOT NULL THEN 1 ELSE 0 END,
                  updated_at=?1 WHERE id=?2",
                 params![timestamp, session_id],
             )?;
@@ -3162,7 +3300,7 @@ pub fn prepare_database_files(database: &Path, attachments: &Path) -> StoreResul
             version.unwrap_or_default()
         )));
     }
-    if matches!(version, Some(4 | SCHEMA_VERSION)) {
+    if matches!(version, Some(4 | 5 | SCHEMA_VERSION)) {
         return Ok(());
     }
     Err(StoreError::Invalid(format!(
@@ -3264,8 +3402,18 @@ fn migrate(connection: &Connection) -> StoreResult<()> {
         )));
     }
     if version == Some(4) {
-        create_v4_backup(connection)?;
+        create_schema_backup(connection, 4)?;
         migrate_v4_to_v5(connection)?;
+        migrate_v5_to_v6(connection)?;
+    } else if version == Some(5) {
+        let checksum = schema_checksum(connection, 5)?.unwrap_or_default();
+        if checksum != SCHEMA_CHECKSUM_V5 {
+            return Err(StoreError::Invalid(
+                "database schema v5 checksum does not match this Engine".to_owned(),
+            ));
+        }
+        create_schema_backup(connection, 5)?;
+        migrate_v5_to_v6(connection)?;
     } else if version.is_some_and(|version| version < 4)
         || (version.is_none() && has_application_tables(connection)?)
     {
@@ -3277,7 +3425,7 @@ fn migrate(connection: &Connection) -> StoreResult<()> {
     connection.execute_batch(include_str!("schema.sql"))?;
     connection.execute(
         "INSERT OR IGNORE INTO schema_migration(version,name,checksum,applied_at)
-         VALUES(?1,'terminal sessions',?2,?3)",
+         VALUES(?1,'terminal host sessions',?2,?3)",
         params![SCHEMA_VERSION, SCHEMA_CHECKSUM, now()],
     )?;
     let checksum: String = connection.query_row(
@@ -3287,13 +3435,23 @@ fn migrate(connection: &Connection) -> StoreResult<()> {
     )?;
     if checksum != SCHEMA_CHECKSUM {
         return Err(StoreError::Invalid(
-            "database schema v5 checksum does not match this Engine".to_owned(),
+            "database schema v6 checksum does not match this Engine".to_owned(),
         ));
     }
     Ok(())
 }
 
-fn create_v4_backup(connection: &Connection) -> StoreResult<PathBuf> {
+fn schema_checksum(connection: &Connection, version: i64) -> StoreResult<Option<String>> {
+    Ok(connection
+        .query_row(
+            "SELECT checksum FROM schema_migration WHERE version=?1",
+            [version],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn create_schema_backup(connection: &Connection, from_version: i64) -> StoreResult<PathBuf> {
     use rusqlite::backup::Backup;
 
     connection.execute_batch("PRAGMA wal_checkpoint(FULL);")?;
@@ -3309,7 +3467,7 @@ fn create_v4_backup(connection: &Connection) -> StoreResult<PathBuf> {
         .and_then(|value| value.to_str())
         .ok_or_else(|| StoreError::Invalid("database file name is invalid".to_owned()))?;
     let stamp = Utc::now().format("%Y%m%dT%H%M%S%.fZ");
-    let backup_path = parent.join(format!("{file_name}.v4-backup-{stamp}"));
+    let backup_path = parent.join(format!("{file_name}.v{from_version}-backup-{stamp}"));
     let backup_file = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -3325,9 +3483,9 @@ fn create_v4_backup(connection: &Connection) -> StoreResult<PathBuf> {
     {
         drop(backup_file);
         let _ = fs::remove_file(&backup_path);
-        return Err(StoreError::Invalid(
-            "v4 backup must be a current-user unlinked mode 0600 file".to_owned(),
-        ));
+        return Err(StoreError::Invalid(format!(
+            "v{from_version} backup must be a current-user unlinked mode 0600 file"
+        )));
     }
     drop(backup_file);
     let mut destination = Connection::open(&backup_path)?;
@@ -3403,6 +3561,57 @@ fn migrate_v4_to_v5(connection: &Connection) -> StoreResult<()> {
     transaction.execute(
         "INSERT INTO schema_migration(version,name,checksum,applied_at)
          VALUES(?1,'terminal sessions',?2,?3)",
+        params![5, SCHEMA_CHECKSUM_V5, now()],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v5_to_v6(connection: &Connection) -> StoreResult<()> {
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE terminal_session ADD COLUMN last_exit_reason TEXT;
+         ALTER TABLE terminal_session ADD COLUMN auto_resume INTEGER NOT NULL DEFAULT 0
+           CHECK(auto_resume IN (0,1));",
+    )?;
+    transaction.execute_batch(
+        "UPDATE terminal_session
+         SET last_exit_reason = (
+               SELECT exit_reason FROM terminal_run
+               WHERE terminal_run.session_id = terminal_session.id
+               ORDER BY ordinal DESC LIMIT 1
+             ),
+             auto_resume = CASE
+               WHEN provider_session_id IS NOT NULL
+                AND EXISTS (
+                  SELECT 1 FROM terminal_run
+                  WHERE terminal_run.session_id = terminal_session.id
+                    AND terminal_run.id = (
+                      SELECT id FROM terminal_run
+                      WHERE session_id = terminal_session.id
+                      ORDER BY ordinal DESC LIMIT 1
+                    )
+                    AND (
+                      terminal_run.exit_reason = 'app_shutdown'
+                      OR terminal_run.error_code = 'engine_interrupted'
+                    )
+                )
+               THEN 1
+               ELSE 0
+             END;",
+    )?;
+    let foreign_key_violations: i64 =
+        transaction.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_violations != 0 {
+        return Err(StoreError::Invalid(
+            "v6 migration failed foreign-key validation".to_owned(),
+        ));
+    }
+    transaction.execute(
+        "INSERT INTO schema_migration(version,name,checksum,applied_at)
+         VALUES(?1,'terminal host sessions',?2,?3)",
         params![SCHEMA_VERSION, SCHEMA_CHECKSUM, now()],
     )?;
     transaction.commit()?;
@@ -5356,7 +5565,7 @@ fn terminal_session_select(suffix: &str) -> String {
         "SELECT id,task_id,runtime_kind,working_directory,provider_session_id,
          provider_binding_state,provider_binding_source,agent_status,status_sequence,
          seen_status_sequence,last_error_code,last_error_message,last_started_at,last_exited_at,
-         created_at,updated_at,
+         last_exit_reason,auto_resume,created_at,updated_at,
          EXISTS(
            SELECT 1 FROM terminal_run
            WHERE terminal_run.session_id=terminal_session.id
@@ -5364,6 +5573,14 @@ fn terminal_session_select(suffix: &str) -> String {
          ) AS has_active_run
          FROM terminal_session {suffix}"
     )
+}
+
+fn auto_resume_flag(exit_reason: Option<&str>, error_code: Option<&str>) -> i64 {
+    if exit_reason == Some("app_shutdown") || error_code == Some("engine_interrupted") {
+        1
+    } else {
+        0
+    }
 }
 
 fn terminal_run_select(suffix: &str) -> String {
@@ -5484,15 +5701,17 @@ fn row_to_terminal_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Terminal
             .ok_or(rusqlite::Error::InvalidQuery)?,
         provider_binding_source: row.get(6)?,
         agent_status: TerminalAgentStatus::parse(&status).ok_or(rusqlite::Error::InvalidQuery)?,
-        has_active_run: row.get(16)?,
         status_sequence: row.get(8)?,
         seen_status_sequence: row.get(9)?,
         last_error_code: row.get(10)?,
         last_error_message: row.get(11)?,
         last_started_at: row.get(12)?,
         last_exited_at: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
+        last_exit_reason: row.get(14)?,
+        auto_resume: row.get::<_, i64>(15)? != 0,
+        created_at: row.get(16)?,
+        updated_at: row.get(17)?,
+        has_active_run: row.get(18)?,
     })
 }
 
@@ -6108,7 +6327,13 @@ mod tests {
 
         let second_run_id = Uuid::new_v4().to_string();
         let resumed = store
-            .prepare_terminal_run(&session.id, &second_run_id)
+            .prepare_terminal_run_with_options(
+                &session.id,
+                &second_run_id,
+                TerminalLaunchIntent::Resume,
+                true,
+                None,
+            )
             .unwrap();
         let run = resumed.active_run.unwrap();
         assert_eq!(run.ordinal, 2);
@@ -6129,11 +6354,13 @@ mod tests {
         let session = store
             .create_terminal_session(&task.id, RuntimeKind::Claude, "/old/project")
             .unwrap();
-        let provider_id = session.provider_session_id.clone();
+        assert!(session.provider_session_id.is_none());
         let completed_run_id = Uuid::new_v4().to_string();
-        store
+        let prepared = store
             .prepare_terminal_run(&session.id, &completed_run_id)
             .unwrap();
+        let provider_id = prepared.session.provider_session_id.clone();
+        assert!(provider_id.is_some());
         store
             .mark_terminal_run_started(&session.id, &completed_run_id)
             .unwrap();
@@ -6209,7 +6436,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_without_materialized_transcript_reuses_preallocated_id_as_fresh() {
+    fn claude_fresh_after_user_exit_allocates_a_new_provider_id() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
         let task = store
@@ -6218,15 +6445,19 @@ mod tests {
         let session = store
             .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
             .unwrap();
-        let provider_id = session.provider_session_id.clone().unwrap();
         let first_run_id = Uuid::new_v4().to_string();
-        store
+        let first = store
             .prepare_terminal_run(&session.id, &first_run_id)
             .unwrap();
+        let first_provider = first
+            .session
+            .provider_session_id
+            .clone()
+            .expect("claude fresh allocates a provider id");
         store
             .mark_terminal_run_started(&session.id, &first_run_id)
             .unwrap();
-        store
+        let exited = store
             .finish_terminal_run(
                 &session.id,
                 &first_run_id,
@@ -6236,26 +6467,32 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(!exited.session.auto_resume);
 
         let fresh_retry = store
-            .prepare_terminal_run_with_resume_readiness(
+            .prepare_terminal_run_with_options(
                 &session.id,
                 &Uuid::new_v4().to_string(),
+                TerminalLaunchIntent::Fresh,
                 false,
+                None,
             )
-            .unwrap()
-            .active_run
             .unwrap();
-        assert_eq!(fresh_retry.ordinal, 2);
-        assert_eq!(fresh_retry.launch_mode, TerminalLaunchMode::Fresh);
+        let run = fresh_retry.active_run.unwrap();
+        assert_eq!(run.ordinal, 2);
+        assert_eq!(run.launch_mode, TerminalLaunchMode::Fresh);
+        assert_ne!(
+            run.provider_session_id_at_launch.as_deref(),
+            Some(first_provider.as_str())
+        );
         assert_eq!(
-            fresh_retry.provider_session_id_at_launch.as_deref(),
-            Some(provider_id.as_str())
+            fresh_retry.session.provider_session_id,
+            run.provider_session_id_at_launch
         );
     }
 
     #[test]
-    fn claude_with_materialized_transcript_resumes_preallocated_id() {
+    fn claude_auto_resume_only_after_app_shutdown() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
         let task = store
@@ -6265,9 +6502,291 @@ mod tests {
             .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
             .unwrap();
         let first_run_id = Uuid::new_v4().to_string();
-        store
+        let first = store
             .prepare_terminal_run(&session.id, &first_run_id)
             .unwrap();
+        let provider_id = first.session.provider_session_id.clone();
+        store
+            .mark_terminal_run_started(&session.id, &first_run_id)
+            .unwrap();
+        let interrupted = store
+            .finish_terminal_run(
+                &session.id,
+                &first_run_id,
+                Some(143),
+                "app_shutdown",
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(interrupted.session.auto_resume);
+        assert_eq!(interrupted.session.provider_session_id, provider_id);
+
+        let missing_transcript_run_id = Uuid::new_v4().to_string();
+        assert!(matches!(
+            store.prepare_terminal_run_with_options(
+                &session.id,
+                &missing_transcript_run_id,
+                TerminalLaunchIntent::Auto,
+                false,
+                None,
+            ),
+            Err(StoreError::Conflict("provider_session_not_resumable"))
+        ));
+        let unchanged = store.terminal_session(&session.id).unwrap().unwrap();
+        assert!(unchanged.auto_resume);
+        assert_eq!(unchanged.provider_session_id, provider_id);
+        assert!(
+            store
+                .terminal_run(&missing_transcript_run_id)
+                .unwrap()
+                .is_none()
+        );
+
+        let resume_run_id = Uuid::new_v4().to_string();
+        let resumed = store
+            .prepare_terminal_run_with_options(
+                &session.id,
+                &resume_run_id,
+                TerminalLaunchIntent::Auto,
+                true,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            resumed.active_run.as_ref().unwrap().launch_mode,
+            TerminalLaunchMode::Resume
+        );
+        assert!(!resumed.session.auto_resume);
+        assert_eq!(resumed.session.provider_session_id, provider_id);
+        assert_eq!(
+            store
+                .prepare_terminal_run_with_options(
+                    &session.id,
+                    &resume_run_id,
+                    TerminalLaunchIntent::Auto,
+                    true,
+                    None,
+                )
+                .unwrap(),
+            resumed
+        );
+    }
+
+    #[test]
+    fn claude_auto_resume_identity_survives_closing_and_reopening_sqlite() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("todoagent.sqlite3");
+        let (session_id, provider_id) = {
+            let store = Store::open(&database).unwrap();
+            let task = store
+                .create_task("Persistent Claude resume", "", None, None, None)
+                .unwrap();
+            let session = store
+                .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+                .unwrap();
+            let run_id = Uuid::new_v4().to_string();
+            let prepared = store.prepare_terminal_run(&session.id, &run_id).unwrap();
+            let provider_id = prepared
+                .session
+                .provider_session_id
+                .clone()
+                .expect("fresh Claude launch preallocates a provider id");
+            store
+                .mark_terminal_run_started(&session.id, &run_id)
+                .unwrap();
+            store
+                .finish_terminal_run(&session.id, &run_id, Some(143), "app_shutdown", None, None)
+                .unwrap();
+            (session.id, provider_id)
+        };
+
+        let reopened = Store::open(&database).unwrap();
+        let persisted = reopened
+            .terminal_session_bundle(&session_id)
+            .expect("reopened database retains the terminal session");
+        assert!(persisted.session.auto_resume);
+        assert_eq!(
+            persisted.session.provider_session_id.as_deref(),
+            Some(provider_id.as_str())
+        );
+
+        let resumed = reopened
+            .prepare_terminal_run_with_options(
+                &session_id,
+                &Uuid::new_v4().to_string(),
+                TerminalLaunchIntent::Auto,
+                true,
+                None,
+            )
+            .unwrap();
+        let run = resumed.active_run.unwrap();
+        assert_eq!(run.launch_mode, TerminalLaunchMode::Resume);
+        assert_eq!(
+            run.provider_session_id_at_launch.as_deref(),
+            Some(provider_id.as_str())
+        );
+    }
+
+    #[test]
+    fn fresh_cursor_switch_replaces_auto_resume_identity_before_binding_new_chat() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Switch to Cursor", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let claude_run_id = Uuid::new_v4().to_string();
+        let claude = store
+            .prepare_terminal_run(&session.id, &claude_run_id)
+            .unwrap();
+        let old_provider = claude.session.provider_session_id.clone().unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &claude_run_id)
+            .unwrap();
+        let interrupted = store
+            .finish_terminal_run(
+                &session.id,
+                &claude_run_id,
+                Some(143),
+                "app_shutdown",
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(interrupted.session.auto_resume);
+
+        let cursor_run_id = Uuid::new_v4().to_string();
+        let reserved = store
+            .prepare_terminal_run_with_options(
+                &session.id,
+                &cursor_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Cursor),
+            )
+            .unwrap();
+        assert_eq!(reserved.session.runtime_kind, RuntimeKind::Cursor);
+        assert!(!reserved.session.auto_resume);
+        assert!(reserved.session.provider_session_id.is_none());
+        let reserved_run = reserved.active_run.unwrap();
+        assert_eq!(reserved_run.launch_mode, TerminalLaunchMode::Fresh);
+        assert!(reserved_run.provider_session_id_at_launch.is_none());
+
+        let cursor_provider = Uuid::new_v4().to_string();
+        let bound = store
+            .bind_prepared_terminal_provider(
+                &session.id,
+                &cursor_run_id,
+                &cursor_provider,
+                "create_chat",
+            )
+            .unwrap();
+        assert_eq!(bound.session.runtime_kind, RuntimeKind::Cursor);
+        assert_eq!(
+            bound.session.provider_session_id.as_deref(),
+            Some(cursor_provider.as_str())
+        );
+        assert_ne!(
+            bound.session.provider_session_id.as_deref(),
+            Some(old_provider.as_str())
+        );
+        assert_eq!(
+            bound
+                .active_run
+                .as_ref()
+                .unwrap()
+                .provider_session_id_at_launch
+                .as_deref(),
+            Some(cursor_provider.as_str())
+        );
+
+        let replay = store
+            .prepare_terminal_run_with_options(
+                &session.id,
+                &cursor_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Cursor),
+            )
+            .unwrap();
+        assert_eq!(replay, bound);
+        assert_eq!(
+            store
+                .bind_prepared_terminal_provider(
+                    &session.id,
+                    &cursor_run_id,
+                    &cursor_provider,
+                    "create_chat",
+                )
+                .unwrap(),
+            bound
+        );
+        assert!(matches!(
+            store.bind_prepared_terminal_provider(
+                &session.id,
+                &cursor_run_id,
+                &Uuid::new_v4().to_string(),
+                "create_chat",
+            ),
+            Err(StoreError::Conflict("provider_session_conflict"))
+        ));
+    }
+
+    #[test]
+    fn terminal_prepare_replay_requires_the_exact_starting_run_profile() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Prepare replay", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let first_run_id = Uuid::new_v4().to_string();
+        let first = store
+            .prepare_terminal_run_with_options(
+                &session.id,
+                &first_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Claude),
+            )
+            .unwrap();
+
+        let exact = store
+            .prepare_terminal_run_with_options(
+                &session.id,
+                &first_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Claude),
+            )
+            .unwrap();
+        assert_eq!(exact, first);
+        assert!(matches!(
+            store.prepare_terminal_run_with_options(
+                &session.id,
+                &first_run_id,
+                TerminalLaunchIntent::Resume,
+                true,
+                Some(RuntimeKind::Claude),
+            ),
+            Err(StoreError::Conflict("terminal_launch_intent_conflict"))
+        ));
+        assert!(matches!(
+            store.prepare_terminal_run_with_options(
+                &session.id,
+                &first_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Cursor),
+            ),
+            Err(StoreError::Conflict("runtime_change_requires_fresh"))
+        ));
+
         store
             .mark_terminal_run_started(&session.id, &first_run_id)
             .unwrap();
@@ -6281,17 +6800,84 @@ mod tests {
                 None,
             )
             .unwrap();
+        assert!(matches!(
+            store.prepare_terminal_run_with_options(
+                &session.id,
+                &first_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Claude),
+            ),
+            Err(StoreError::Conflict("terminal_run_not_prepared"))
+        ));
 
-        let resumed = store
-            .prepare_terminal_run_with_resume_readiness(
+        let second_run_id = Uuid::new_v4().to_string();
+        store
+            .prepare_terminal_run_with_options(
+                &session.id,
+                &second_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Claude),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.prepare_terminal_run_with_options(
+                &session.id,
+                &first_run_id,
+                TerminalLaunchIntent::Fresh,
+                true,
+                Some(RuntimeKind::Claude),
+            ),
+            Err(StoreError::Conflict("terminal_run_not_prepared"))
+        ));
+        assert_eq!(
+            store.active_terminal_run(&session.id).unwrap().unwrap().id,
+            second_run_id
+        );
+    }
+
+    #[test]
+    fn auto_resume_rejects_a_different_runtime_profile() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("Keep resume runtime", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let first_run_id = Uuid::new_v4().to_string();
+        store
+            .prepare_terminal_run(&session.id, &first_run_id)
+            .unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &first_run_id)
+            .unwrap();
+        store
+            .finish_terminal_run(
+                &session.id,
+                &first_run_id,
+                Some(143),
+                "app_shutdown",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.prepare_terminal_run_with_options(
                 &session.id,
                 &Uuid::new_v4().to_string(),
+                TerminalLaunchIntent::Auto,
                 true,
-            )
-            .unwrap()
-            .active_run
-            .unwrap();
-        assert_eq!(resumed.launch_mode, TerminalLaunchMode::Resume);
+                Some(RuntimeKind::Cursor),
+            ),
+            Err(StoreError::Conflict("runtime_change_requires_fresh"))
+        ));
+        let unchanged = store.terminal_session(&session.id).unwrap().unwrap();
+        assert_eq!(unchanged.runtime_kind, RuntimeKind::Claude);
+        assert!(unchanged.auto_resume);
     }
 
     #[test]
@@ -6385,6 +6971,123 @@ mod tests {
     }
 
     #[test]
+    fn deferred_exit_replaces_only_the_synthetic_startup_interruption() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("todoagent.sqlite3");
+        let (session_id, run_id) = {
+            let store = Store::open(&database).unwrap();
+            let task = store
+                .create_task("deferred exit", "", None, None, None)
+                .unwrap();
+            let session = store
+                .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+                .unwrap();
+            let run_id = Uuid::new_v4().to_string();
+            store.prepare_terminal_run(&session.id, &run_id).unwrap();
+            store
+                .mark_terminal_run_started(&session.id, &run_id)
+                .unwrap();
+            (session.id, run_id)
+        };
+
+        let store = Store::open(&database).unwrap();
+        let interrupted = store.terminal_run(&run_id).unwrap().unwrap();
+        assert_eq!(interrupted.state, TerminalRunState::Interrupted);
+        assert_eq!(
+            interrupted.error_code.as_deref(),
+            Some("engine_interrupted")
+        );
+        assert!(interrupted.exit_reason.is_none());
+
+        let replayed = store
+            .finish_terminal_run(&session_id, &run_id, Some(143), "app_shutdown", None, None)
+            .unwrap();
+        let run = replayed.active_run.unwrap();
+        assert_eq!(run.state, TerminalRunState::Exited);
+        assert_eq!(run.exit_code, Some(143));
+        assert_eq!(run.exit_reason.as_deref(), Some("app_shutdown"));
+        assert_eq!(run.error_code, None);
+
+        store
+            .finish_terminal_run(&session_id, &run_id, Some(143), "app_shutdown", None, None)
+            .unwrap();
+        assert!(matches!(
+            store.finish_terminal_run(&session_id, &run_id, Some(0), "process_exit", None, None,),
+            Err(StoreError::Conflict("terminal_run_result_conflict"))
+        ));
+    }
+
+    #[test]
+    fn deferred_exit_for_an_old_run_does_not_regress_the_latest_session_summary() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("todoagent.sqlite3");
+        let (session_id, old_run_id) = {
+            let store = Store::open(&database).unwrap();
+            let task = store
+                .create_task("old deferred exit", "", None, None, None)
+                .unwrap();
+            let session = store
+                .create_terminal_session(&task.id, RuntimeKind::Codex, "/tmp")
+                .unwrap();
+            let run_id = Uuid::new_v4().to_string();
+            store.prepare_terminal_run(&session.id, &run_id).unwrap();
+            store
+                .bind_terminal_provider(
+                    &session.id,
+                    &run_id,
+                    "provider-session-1",
+                    "session_start_hook",
+                )
+                .unwrap();
+            store
+                .mark_terminal_run_started(&session.id, &run_id)
+                .unwrap();
+            (session.id, run_id)
+        };
+
+        let store = Store::open(&database).unwrap();
+        assert_eq!(
+            store.terminal_run(&old_run_id).unwrap().unwrap().state,
+            TerminalRunState::Interrupted
+        );
+
+        let latest_run_id = Uuid::new_v4().to_string();
+        store
+            .prepare_terminal_run(&session_id, &latest_run_id)
+            .unwrap();
+        store
+            .mark_terminal_run_started(&session_id, &latest_run_id)
+            .unwrap();
+        let latest = store
+            .finish_terminal_run(
+                &session_id,
+                &latest_run_id,
+                Some(1),
+                "process_exit",
+                Some("newer_failure"),
+                Some("the newer run failed"),
+            )
+            .unwrap();
+
+        let replayed = store
+            .finish_terminal_run(
+                &session_id,
+                &old_run_id,
+                Some(143),
+                "app_shutdown",
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(replayed.session, latest.session);
+        assert_eq!(replayed.active_run.unwrap().id, latest_run_id);
+        let old_run = store.terminal_run(&old_run_id).unwrap().unwrap();
+        assert_eq!(old_run.state, TerminalRunState::Exited);
+        assert_eq!(old_run.exit_reason.as_deref(), Some("app_shutdown"));
+    }
+
+    #[test]
     fn stopping_run_can_durably_record_a_runner_that_already_started() {
         let directory = tempdir().unwrap();
         let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
@@ -6453,9 +7156,22 @@ mod tests {
             .finish_terminal_run(&session.id, &retry_id, Some(1), "process_exit", None, None)
             .unwrap();
         assert!(matches!(
-            store.prepare_terminal_run(&session.id, &Uuid::new_v4().to_string()),
+            store.prepare_terminal_run_with_options(
+                &session.id,
+                &Uuid::new_v4().to_string(),
+                TerminalLaunchIntent::Resume,
+                true,
+                None,
+            ),
             Err(StoreError::Conflict("provider_binding_required"))
         ));
+        let next = store
+            .prepare_terminal_run(&session.id, &Uuid::new_v4().to_string())
+            .unwrap();
+        assert_eq!(
+            next.active_run.unwrap().launch_mode,
+            TerminalLaunchMode::Fresh
+        );
     }
 
     #[test]
@@ -6569,7 +7285,7 @@ mod tests {
         }
 
         let migrated = Store::open(&path).unwrap();
-        assert_eq!(migrated.health().unwrap()["schemaVersion"], 5);
+        assert_eq!(migrated.health().unwrap()["schemaVersion"], 6);
         assert!(
             migrated
                 .task("abcdefab-cdef-4abc-8def-abcdefabc101")
@@ -6631,7 +7347,7 @@ mod tests {
         }
         assert_eq!(
             Store::open(&path).unwrap().health().unwrap()["schemaVersion"],
-            5
+            6
         );
     }
 
@@ -6653,6 +7369,261 @@ mod tests {
                 .unwrap();
         }
         assert!(matches!(Store::open(&path), Err(StoreError::Invalid(_))));
+    }
+
+    #[test]
+    fn v5_to_v6_backfills_auto_resume_and_keeps_a_secure_backup() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("todoagent.sqlite3");
+        let task_id = "abcdefab-cdef-4abc-8def-abcdefabc101";
+        let session_id = "abcdefab-cdef-4abc-8def-abcdefabc201";
+        let shutdown_run = "abcdefab-cdef-4abc-8def-abcdefabc301";
+        let idle_session = "abcdefab-cdef-4abc-8def-abcdefabc202";
+        let idle_run = "abcdefab-cdef-4abc-8def-abcdefabc302";
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .unwrap();
+            connection
+                .execute_batch(
+                    "DROP TABLE terminal_status_receipt;
+                     DROP TABLE terminal_run;
+                     DROP TABLE terminal_session;",
+                )
+                .unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE terminal_session (
+                       id TEXT PRIMARY KEY,
+                       task_id TEXT NOT NULL UNIQUE REFERENCES task(id) ON DELETE CASCADE,
+                       runtime_kind TEXT NOT NULL CHECK(runtime_kind IN ('codex','claude','cursor','kiro')),
+                       working_directory TEXT NOT NULL,
+                       provider_session_id TEXT,
+                       provider_binding_state TEXT NOT NULL DEFAULT 'unbound',
+                       provider_binding_source TEXT,
+                       agent_status TEXT NOT NULL DEFAULT 'unknown',
+                       status_sequence INTEGER NOT NULL DEFAULT 0,
+                       seen_status_sequence INTEGER NOT NULL DEFAULT 0,
+                       last_error_code TEXT,last_error_message TEXT,last_started_at TEXT,last_exited_at TEXT,
+                       created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                     );
+                     CREATE TABLE terminal_run (
+                       id TEXT PRIMARY KEY,
+                       session_id TEXT NOT NULL REFERENCES terminal_session(id) ON DELETE CASCADE,
+                       ordinal INTEGER NOT NULL,
+                       launch_mode TEXT NOT NULL,
+                       state TEXT NOT NULL,
+                       provider_session_id_at_launch TEXT,exit_code INTEGER,exit_reason TEXT,
+                       error_code TEXT,error_message TEXT,started_at TEXT,exited_at TEXT,created_at TEXT NOT NULL
+                     );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migration(version,name,checksum,applied_at)
+                     VALUES(5,'terminal sessions',?1,'now')",
+                    [SCHEMA_CHECKSUM_V5],
+                )
+                .unwrap();
+            let timestamp = now();
+            connection
+                .execute(
+                    "INSERT INTO task(id,title,note,status,created_at,updated_at)
+                     VALUES(?1,'kept','note','open',?2,?2)",
+                    params![task_id, timestamp],
+                )
+                .unwrap();
+            let other_task = "abcdefab-cdef-4abc-8def-abcdefabc102";
+            connection
+                .execute(
+                    "INSERT INTO task(id,title,note,status,created_at,updated_at)
+                     VALUES(?1,'idle','note','open',?2,?2)",
+                    params![other_task, timestamp],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO terminal_session(
+                       id,task_id,runtime_kind,working_directory,provider_session_id,
+                       provider_binding_state,provider_binding_source,created_at,updated_at
+                     ) VALUES(?1,?2,'claude','/tmp','provider-a','bound','preallocated',?3,?3)",
+                    params![session_id, task_id, timestamp],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO terminal_run(id,session_id,ordinal,launch_mode,state,provider_session_id_at_launch,exit_reason,created_at)
+                     VALUES(?1,?2,1,'fresh','exited','provider-a','app_shutdown',?3)",
+                    params![shutdown_run, session_id, timestamp],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO terminal_session(
+                       id,task_id,runtime_kind,working_directory,provider_session_id,
+                       provider_binding_state,provider_binding_source,created_at,updated_at
+                     ) VALUES(?1,?2,'codex','/tmp','provider-b','bound','session_start_hook',?3,?3)",
+                    params![idle_session, other_task, timestamp],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO terminal_run(id,session_id,ordinal,launch_mode,state,provider_session_id_at_launch,exit_reason,created_at)
+                     VALUES(?1,?2,1,'fresh','exited','provider-b','process_exit',?3)",
+                    params![idle_run, idle_session, timestamp],
+                )
+                .unwrap();
+        }
+
+        let migrated = Store::open(&path).unwrap();
+        assert_eq!(migrated.health().unwrap()["schemaVersion"], 6);
+        let shutdown = migrated.terminal_session(session_id).unwrap().unwrap();
+        assert_eq!(shutdown.last_exit_reason.as_deref(), Some("app_shutdown"));
+        assert!(shutdown.auto_resume);
+        let idle = migrated.terminal_session(idle_session).unwrap().unwrap();
+        assert_eq!(idle.last_exit_reason.as_deref(), Some("process_exit"));
+        assert!(!idle.auto_resume);
+        let backups = fs::read_dir(directory.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".v5-backup-"))
+            .collect::<Vec<_>>();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            backups[0].metadata().unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn v6_checksum_mismatch_fails_closed() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("todoagent.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migration(version,name,checksum,applied_at)
+                     VALUES(6,'terminal host sessions','wrong','now')",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(matches!(Store::open(&path), Err(StoreError::Invalid(_))));
+    }
+
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("todoagent.sqlite3");
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute_batch(include_str!("schema.sql"))
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO schema_migration(version,name,checksum,applied_at)
+                     VALUES(7,'future','x','now')",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(matches!(Store::open(&path), Err(StoreError::Invalid(_))));
+        assert!(matches!(
+            prepare_database_files(&path, &directory.path().join("attachments")),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn existing_terminal_is_reused_when_runtime_or_directory_differ() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("reuse", "", None, None, None).unwrap();
+        let first = store
+            .create_terminal_session(&task.id, RuntimeKind::Codex, "/tmp/a")
+            .unwrap();
+        let second = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp/b")
+            .unwrap();
+        assert_eq!(first.id, second.id);
+        assert_eq!(second.runtime_kind, RuntimeKind::Codex);
+        assert_eq!(second.working_directory, "/tmp/a");
+    }
+
+    #[test]
+    fn idle_bind_can_replace_provider_identity() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("replace", "", None, None, None).unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Kiro, "/tmp")
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        store
+            .finish_terminal_run(&session.id, &run_id, Some(0), "process_exit", None, None)
+            .unwrap();
+        store
+            .bind_terminal_provider(&session.id, &run_id, "first-id", "manual")
+            .unwrap();
+        let replaced = store
+            .bind_terminal_provider(&session.id, &run_id, "second-id", "manual")
+            .unwrap();
+        assert_eq!(
+            replaced.session.provider_session_id.as_deref(),
+            Some("second-id")
+        );
+    }
+
+    #[test]
+    fn auto_resume_binding_rejects_a_different_provider_id() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store
+            .create_task("protected", "", None, None, None)
+            .unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Claude, "/tmp")
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        store
+            .mark_terminal_run_started(&session.id, &run_id)
+            .unwrap();
+        store
+            .finish_terminal_run(&session.id, &run_id, Some(143), "app_shutdown", None, None)
+            .unwrap();
+        assert!(matches!(
+            store.bind_terminal_provider(&session.id, &run_id, "other-id", "manual"),
+            Err(StoreError::Conflict("provider_session_conflict"))
+        ));
+    }
+
+    #[test]
+    fn idle_terminal_can_be_deleted_and_active_terminal_cannot() {
+        let directory = tempdir().unwrap();
+        let store = Store::open(&directory.path().join("todoagent.sqlite3")).unwrap();
+        let task = store.create_task("abandon", "", None, None, None).unwrap();
+        let session = store
+            .create_terminal_session(&task.id, RuntimeKind::Codex, "/tmp")
+            .unwrap();
+        let run_id = Uuid::new_v4().to_string();
+        store.prepare_terminal_run(&session.id, &run_id).unwrap();
+        assert!(matches!(
+            store.delete_idle_terminal_session(&session.id),
+            Err(StoreError::Conflict("terminal_session_active"))
+        ));
+        store
+            .finish_terminal_run(&session.id, &run_id, Some(0), "process_exit", None, None)
+            .unwrap();
+        store.delete_idle_terminal_session(&session.id).unwrap();
+        assert!(store.terminal_session(&session.id).unwrap().is_none());
     }
 
     #[test]

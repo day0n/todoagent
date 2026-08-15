@@ -6,44 +6,6 @@ import Testing
 @Suite("Task conversation presentation")
 @MainActor
 struct TaskConversationViewTests {
-    @Test("runtime picker names the Agent without pinning its detected version")
-    func runtimePickerUsesCurrentInstallation() {
-        let readyClaude = RuntimeInfo(
-            kind: .claude,
-            launchPath: "/Users/test/.local/bin/claude",
-            resolvedPath: "/Users/test/.local/share/claude/versions/2.1.228",
-            version: "2.1.228 (Claude Code)",
-            status: .ready,
-            authStatus: "authenticated",
-            capabilities: [:],
-            providerEngine: nil,
-            detectedAt: nil,
-            verifiedAt: "2026-08-13T00:00:00Z",
-            verifyError: nil
-        )
-        let cursorNeedsLogin = RuntimeInfo(
-            kind: .cursor,
-            launchPath: "/usr/local/bin/cursor-agent",
-            resolvedPath: "/usr/local/bin/cursor-agent",
-            version: "2026.07.23",
-            status: .authRequired,
-            authStatus: "unauthenticated",
-            capabilities: [:],
-            providerEngine: nil,
-            detectedAt: nil,
-            verifiedAt: nil,
-            verifyError: nil
-        )
-
-        let claudeTitle = RuntimePickerPresentation.title(.claude, info: readyClaude)
-        #expect(claudeTitle == "Claude Code")
-        #expect(claudeTitle.contains("2.1.228") == false)
-        #expect(
-            RuntimePickerPresentation.title(.cursor, info: cursorNeedsLogin)
-                == "Cursor Agent（需要登录）"
-        )
-    }
-
     @Test("assistant tools use friendly actions and collapse into one turn summary")
     func assistantToolStepPresentation() {
         let completed = assistantTool(name: "create_tasks", state: .completed, callID: "create")
@@ -252,12 +214,6 @@ struct TaskConversationViewTests {
         #expect(hostedToolbarHeight(isSwitcherPresented: true) == TodoAgentToolbar.height)
     }
 
-    @Test("task workbench uses the terminal-first window dimensions")
-    func taskWorkbenchWindowDimensions() {
-        #expect(TaskWorkbenchWindowController.defaultContentSize == CGSize(width: 1_180, height: 760))
-        #expect(TaskWorkbenchWindowController.minimumContentSize == CGSize(width: 900, height: 600))
-    }
-
     @Test("task workbench details start collapsed with the ideal reveal width")
     func taskWorkbenchDetailsDefaultLayout() {
         let layout = TaskWorkbenchLayoutState()
@@ -300,18 +256,102 @@ struct TaskConversationViewTests {
         #expect(layout.detailsWidth == customWidth)
     }
 
-    @Test("task workbench detail disclosure is isolated per window")
-    func taskWorkbenchDetailsAreWindowLocal() {
-        let firstWindow = TaskWorkbenchLayoutState()
-        let secondWindow = TaskWorkbenchLayoutState()
+    @Test("task workbench detail disclosure state is isolated per task")
+    func taskWorkbenchDetailsAreTaskLocal() {
+        let firstTask = TaskWorkbenchLayoutState()
+        let secondTask = TaskWorkbenchLayoutState()
 
-        firstWindow.recordDetailsWidth(TaskWorkbenchLayoutState.maximumDetailsWidth)
-        firstWindow.toggleDetails()
+        firstTask.recordDetailsWidth(TaskWorkbenchLayoutState.maximumDetailsWidth)
+        firstTask.toggleDetails()
 
-        #expect(firstWindow.detailsPresented)
-        #expect(firstWindow.detailsWidth == TaskWorkbenchLayoutState.maximumDetailsWidth)
-        #expect(secondWindow.detailsPresented == false)
-        #expect(secondWindow.detailsWidth == TaskWorkbenchLayoutState.idealDetailsWidth)
+        #expect(firstTask.detailsPresented)
+        #expect(firstTask.detailsWidth == TaskWorkbenchLayoutState.maximumDetailsWidth)
+        #expect(secondTask.detailsPresented == false)
+        #expect(secondTask.detailsWidth == TaskWorkbenchLayoutState.idealDetailsWidth)
+    }
+
+    @Test("embedded task rail uses hysteresis around the default window width")
+    func embeddedTaskRailLayoutPolicy() {
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 829,
+                previous: nil
+            ) == .compact
+        )
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 830,
+                previous: nil
+            ) == .split
+        )
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 820,
+                previous: .split
+            ) == .compact
+        )
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 821,
+                previous: .split
+            ) == .split
+        )
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 839,
+                previous: .compact
+            ) == .compact
+        )
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 840,
+                previous: .compact
+            ) == .split
+        )
+        #expect(TaskWorkspaceLayoutPolicy.railWidth == 320)
+        #expect(TaskWorkspaceLayoutPolicy.terminalMinimumWidth == 500)
+        #expect(TaskWorkbenchPresentation.embedded(compact: true).allowsTaskDetails == false)
+        #expect(TaskWorkbenchPresentation.embedded(compact: false).allowsTaskDetails == false)
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 846,
+                previous: nil
+            ) == .split
+        )
+        #expect(
+            TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: 550,
+                previous: nil
+            ) == .compact
+        )
+    }
+
+    @Test("a live terminal stays visible except while an automatic command is preparing")
+    func terminalPaneIsSurfaceFirst() {
+        #expect(TaskTerminalPaneMode.resolve(
+            hasLiveSurface: true,
+            phase: .shellIdle
+        ) == .terminal)
+        #expect(TaskTerminalPaneMode.resolve(
+            hasLiveSurface: true,
+            phase: .failed("resume failed")
+        ) == .terminal)
+        #expect(TaskTerminalPaneMode.resolve(
+            hasLiveSurface: true,
+            phase: .preparing
+        ) == .launching)
+        #expect(TaskTerminalPaneMode.resolve(
+            hasLiveSurface: false,
+            phase: .preparing
+        ) == .launching)
+        #expect(TaskTerminalPaneMode.resolve(
+            hasLiveSurface: false,
+            phase: .hostExited
+        ) == .rebuilding)
+        #expect(TaskTerminalPaneMode.resolve(
+            hasLiveSurface: false,
+            phase: .failed("host failed")
+        ) == .unavailable("host failed"))
     }
 
     private func assistantTool(

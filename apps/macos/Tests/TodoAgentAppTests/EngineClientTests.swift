@@ -58,7 +58,7 @@ struct EngineClientTests {
             try EngineWireMessage.decode(Data($0.utf8))
         }
 
-        try #require(messages.count == 26)
+        try #require(messages.count == 29)
 
         guard case let .event(ready) = messages[0] else {
             Issue.record("The first contract line must be engine.ready.")
@@ -480,7 +480,7 @@ struct EngineClientTests {
         case .failedHandshakeCanRetry:
             try await failedHandshakeCanRetry()
         case .automaticRestartHandshakes:
-            try await automaticRestartHandshakes()
+            try await repeatedAutomaticRestartHandshakes()
         }
     }
 
@@ -600,7 +600,7 @@ struct EngineClientTests {
         }
     }
 
-    private func automaticRestartHandshakes() async throws {
+    private func repeatedAutomaticRestartHandshakes() async throws {
         let fake = try makeFakeEngine()
         defer { try? FileManager.default.removeItem(at: fake.directory) }
 
@@ -608,14 +608,24 @@ struct EngineClientTests {
             executableURL: URL(fileURLWithPath: "/bin/zsh"),
             executableArguments: [fake.executable.path],
             requestTimeout: .seconds(8),
-            handshakeTimeout: .seconds(8)
+            handshakeTimeout: .seconds(8),
+            automaticRestartDelays: [.zero]
         )
-        let events = await client.events()
+        let secondReadyEvents = await client.events()
+        let thirdReadyEvents = await client.events()
         let secondReady = Task {
             var readyCount = 0
-            for await event in events where event.name == "engine.ready" {
+            for await event in secondReadyEvents where event.name == "engine.ready" {
                 readyCount += 1
                 if readyCount == 2 { return true }
+            }
+            return false
+        }
+        let thirdReady = Task {
+            var readyCount = 0
+            for await event in thirdReadyEvents where event.name == "engine.ready" {
+                readyCount += 1
+                if readyCount == 3 { return true }
             }
             return false
         }
@@ -634,13 +644,182 @@ struct EngineClientTests {
             }
 
             #expect(await secondReady.value)
+            do {
+                let _: EmptyTestResult = try await client.request(
+                    method: "test.exit",
+                    params: EmptyTestParams()
+                )
+                Issue.record("test.exit must end the second fake engine process.")
+            } catch let error as EngineClientError {
+                #expect(error == .processExited(17))
+            }
+
+            #expect(await thirdReady.value)
             #expect(await client.engineVersion == "fake-1.0.0")
             #expect(await client.capabilities == ["engine.shutdown"])
+            #expect(await client.lifecycle == .ready)
             await client.stop()
         } catch {
             await client.stop()
             throw error
         }
+    }
+
+    @Test(
+        "Backpressured Engine stdin cannot block request timeout or stop",
+        .timeLimit(.minutes(1))
+    )
+    func backpressuredInputRemainsBounded() async throws {
+        let fake = try makeNonReadingFakeEngine()
+        defer { try? FileManager.default.removeItem(at: fake.directory) }
+
+        let client = try EngineClient(
+            executableURL: URL(fileURLWithPath: "/bin/zsh"),
+            executableArguments: [fake.executable.path],
+            requestTimeout: .milliseconds(150),
+            handshakeTimeout: .seconds(2),
+            automaticRestartDelays: [.seconds(10)]
+        )
+        try await start(client, stage: "non-reading Engine start")
+
+        let clock = ContinuousClock()
+        let cancelledRequest = Task {
+            let result: EmptyTestResult = try await client.request(
+                method: "test.cancelled-large",
+                params: LargeInputParams(payload: String(repeating: "c", count: 4 * 1_024 * 1_024)),
+                timeout: .seconds(5)
+            )
+            return result
+        }
+        try await Task.sleep(for: .milliseconds(100))
+        let cancellationStartedAt = clock.now
+        cancelledRequest.cancel()
+        do {
+            _ = try await cancelledRequest.value
+            Issue.record("Cancelling a backpressured request must throw.")
+        } catch is CancellationError {
+            // Expected: cancellation is independent of the writer queue.
+        }
+        #expect(clock.now - cancellationStartedAt < .seconds(1))
+
+        let requestStartedAt = clock.now
+        do {
+            let _: EmptyTestResult = try await client.request(
+                method: "test.large",
+                params: LargeInputParams(payload: String(repeating: "x", count: 4 * 1_024 * 1_024))
+            )
+            Issue.record("A non-reading Engine must not complete the large request.")
+        } catch let error as EngineClientError {
+            #expect(error == .timedOut("test.large"))
+        }
+        #expect(clock.now - requestStartedAt < .seconds(2))
+
+        let stopStartedAt = clock.now
+        await client.stop()
+        #expect(clock.now - stopStartedAt < .seconds(5))
+        #expect(await client.lifecycle == .stopped)
+    }
+
+    @Test("Engine stdin writer has a bounded FIFO queue")
+    func inputWriterQueueIsBoundedAndCloseWakesIt() async throws {
+        let pipe = Pipe()
+        let writer = try EngineInputWriter(
+            input: pipe.fileHandleForWriting,
+            generation: UUID(),
+            maximumPendingWrites: 2
+        )
+        let payload = Data(repeating: 0x78, count: 4 * 1_024 * 1_024)
+
+        let first = AsyncStream.makeStream(of: EngineInputWriteResult.self)
+        let second = AsyncStream.makeStream(of: EngineInputWriteResult.self)
+        let rejected = AsyncStream.makeStream(of: EngineInputWriteResult.self)
+        writer.enqueue(id: "first", payload: payload) {
+            first.continuation.yield($0)
+            first.continuation.finish()
+        }
+        writer.enqueue(id: "second", payload: payload) {
+            second.continuation.yield($0)
+            second.continuation.finish()
+        }
+        writer.enqueue(id: "third", payload: payload) {
+            rejected.continuation.yield($0)
+            rejected.continuation.finish()
+        }
+
+        var rejectedIterator = rejected.stream.makeAsyncIterator()
+        #expect(await rejectedIterator.next() == .failed("Engine stdin write queue is full."))
+
+        writer.close()
+        var firstIterator = first.stream.makeAsyncIterator()
+        var secondIterator = second.stream.makeAsyncIterator()
+        #expect(await firstIterator.next() == .discarded)
+        #expect(await secondIterator.next() == .discarded)
+        try? pipe.fileHandleForReading.close()
+    }
+
+    @Test("Engine stdin writer contains a closed reader failure")
+    func inputWriterContainsBrokenPipe() async throws {
+        let pipe = Pipe()
+        let writer = try EngineInputWriter(
+            input: pipe.fileHandleForWriting,
+            generation: UUID()
+        )
+        try pipe.fileHandleForReading.close()
+
+        let result = AsyncStream.makeStream(of: EngineInputWriteResult.self)
+        writer.enqueue(id: "closed-reader", payload: Data("{}\n".utf8)) {
+            result.continuation.yield($0)
+            result.continuation.finish()
+        }
+
+        var iterator = result.stream.makeAsyncIterator()
+        guard case let .failed(message) = await iterator.next() else {
+            Issue.record("Writing to a closed Engine stdin must report a transport failure.")
+            writer.close()
+            return
+        }
+        #expect(message.isEmpty == false)
+        writer.close()
+    }
+
+    @Test("A dropped subscriber event broadcasts one authoritative resync episode")
+    func droppedEventBroadcastsResyncToAllSubscribers() async throws {
+        let client = try EngineClient(
+            executableURL: URL(fileURLWithPath: "/usr/bin/true"),
+            eventBufferSize: 2
+        )
+        let slowEvents = await client.events()
+        let observingEvents = await client.events(bufferingNewest: 32)
+
+        for index in 0..<4 {
+            await client.yieldEventForTesting(
+                EngineEvent(name: "test.changed", data: Data("{\"index\":\(index)}".utf8))
+            )
+        }
+
+        var observingIterator = observingEvents.makeAsyncIterator()
+        var observedRecoveryEvent: EngineEvent?
+        for _ in 0..<16 {
+            guard let event = await observingIterator.next() else { break }
+            if event.name == EngineEvent.authoritativeResyncRequiredName {
+                observedRecoveryEvent = event
+                break
+            }
+        }
+        let recoveryEvent = try #require(observedRecoveryEvent)
+        let episode = try #require(recoveryEvent.authoritativeResyncEpisode)
+        #expect(episode >= 1)
+
+        var slowIterator = slowEvents.makeAsyncIterator()
+        var slowSubscriberSawResync = false
+        for _ in 0..<2 {
+            guard let event = await slowIterator.next() else { break }
+            if event.name == EngineEvent.authoritativeResyncRequiredName {
+                slowSubscriberSawResync = true
+                break
+            }
+        }
+        #expect(slowSubscriberSawResync)
     }
 
     private var repositoryRoot: URL {
@@ -763,6 +942,25 @@ struct EngineClientTests {
             requestLog: requestLog
         )
     }
+
+    private func makeNonReadingFakeEngine() throws -> TemporaryFakeEngine {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "todoagent-nonreading-test-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let executable = directory.appending(path: "fake-nonreading-engine")
+        let script = #"""
+        #!/bin/zsh
+        printf '{"event":"engine.ready","data":{"protocolVersion":4,"engineVersion":"fake-nonreading-1.0.0","capabilities":["engine.shutdown"]}}\n'
+        exec /bin/sleep 30
+        """#
+        try script.write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: executable.path
+        )
+        return TemporaryFakeEngine(directory: directory, executable: executable)
+    }
 }
 
 private struct TemporaryFakeEngine: Sendable {
@@ -784,3 +982,6 @@ private enum EngineLifecycleScenario: CaseIterable, Sendable {
 
 private struct EmptyTestParams: Encodable, Sendable {}
 private struct EmptyTestResult: Decodable, Sendable {}
+private struct LargeInputParams: Encodable, Sendable {
+    let payload: String
+}

@@ -7,8 +7,8 @@
 ![Rust](https://img.shields.io/badge/Rust-1.88.0-000000?logo=rust&logoColor=white)
 
 TodoAgent 是一款本地优先的原生 macOS 待办与 Agent 工作台。它把任务、工作目录和
-你已经安装的 Coding Agent CLI 放在同一个桌面界面中：每个任务都有独立工作台，
-左侧管理任务，右侧直接操作 Agent 自己的真实终端界面。
+你已经安装的 Coding Agent CLI 放在同一个桌面界面中：每个任务固定对应一个终端，
+左侧任务栏和右侧真实终端在主窗口内直接切换。
 
 > **项目状态：开发预览。** 当前只支持 macOS 26+ 与 Apple Silicon arm64；本地
 > DMG 使用 ad-hoc 签名，尚未经过 Developer ID 签名和 Apple 公证，不是面向公众的
@@ -28,11 +28,11 @@ Coding Agent 已经能在终端里工作，但任务管理、工作目录、会�
 
 - 管理任务、清单、执行日期、截止日期、状态和本地附件；支持四日时间线、逾期提示、
   菜单栏今日任务和原生右键操作。
-- 为每个任务打开独立工作台窗口，在嵌入式 Ghostty PTY 中直接运行 Coding Agent
-  自己的 TUI。
+- 在主窗口内为每个任务保留独立的 Ghostty PTY；收起或切换任务只重新挂载界面，
+  不会结束仍在运行的终端。
 - 检测并验证 Codex、Claude Code、Cursor Agent、Kiro CLI；单个 Runtime 未安装或
   未登录时不会阻塞其他功能。
-- 将一个任务绑定到一个 Runtime 和一个工作目录，管理 Agent 的启动、精确恢复、
+- 为每个任务持久化终端元数据；对已经登记且仍在运行的受管 Agent，管理精确恢复、
   Provider Session ID、状态和进程组生命周期。
 - 使用 Gemini 任务助手创建、查找、更新和删除 TodoAgent 中的任务；支持多会话、
   流式回复、取消、崩溃恢复和会话内上下文压缩。
@@ -49,10 +49,12 @@ Coding Agent 已经能在终端里工作，但任务管理、工作目录、会�
 | 不同 Agent 之间接力或协作 | 计划中 |
 | 跨任务、跨会话的长期语义记忆 | 调研中 |
 
-当前的“直接操作 CLI”指用户在内嵌终端中操作原生 TUI。TodoAgent 不解析四家 CLI 的
-对话输出，不会自动发送任务标题、备注或附件，也不保存旧终端滚屏。Gemini 任务助手
-没有 shell、任意文件读写或 CLI 派发权限。自动派发、结果回收和跨 Agent 编排是独立的
-[后续路线](TODO.md)，不能与现有终端能力混为一谈。
+当前的“直接操作 CLI”指用户在内嵌终端中操作原生 TUI。TodoAgent 不提取或保存四家
+CLI 的对话正文，也不保存旧终端滚屏；为精确绑定与恢复，会有界读取 Provider 本地会话
+的 ID、工作目录、时间和记录类型。任务备注和附件不会自动发送给 Coding Agent，任务
+标题也不会作为 Prompt；Claude fresh Run 会把标题作为 `--name` Session 名称交给
+Claude CLI 处理。Gemini 任务助手没有 shell、任意文件读写或 CLI 派发权限。自动派发、
+结果回收和跨 Agent 编排是独立的[后续路线](TODO.md)，不能与现有终端能力混为一谈。
 
 ## 支持的本地 Runtime
 
@@ -100,8 +102,8 @@ Swift App、Rust Engine 与 Terminal Runner，并生成：
 - `dist/TodoAgent.app`：指向临时目录内日常预览 App 的便捷链接；
 - `dist/TodoAgent-0.1.0-arm64.dmg`：仅用于本地测试的 ad-hoc 签名 DMG。
 
-首次打开后，在“设置 → 本机 CLI”中检测并验证已安装的 Runtime；创建任务工作台时，
-再由用户明确选择并授权工作目录。
+创建任务后点击任务即可直接打开它的终端；“设置 → 本机 CLI”用于检测和验证已安装的
+Runtime。普通 shell 中手动启动的 CLI 不会自动登记成可跨 App 重启恢复的 Provider Run。
 
 完整依赖、开发流程和验证命令见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。目前没有可供
 普通用户直接下载的已签名、公证版本。
@@ -111,14 +113,14 @@ Swift App、Rust Engine 与 Terminal Runner，并生成：
 ```text
 SwiftUI / AppKit
   ├─ 任务、清单、时间线与菜单栏
-  ├─ 每任务独立工作台
-  │    └─ Ghostty PTY ── Codex / Claude Code / Cursor Agent / Kiro CLI
+  ├─ 主窗口任务栏 + 每任务唯一终端
+  │    └─ retained Ghostty PTY ── Codex / Claude Code / Cursor Agent / Kiro CLI
   └─ Gemini 任务助手
           │
           │ NDJSON · stdin/stdout · IPC v4
           ▼
 Rust Engine
-  ├─ SQLite schema v5
+  ├─ SQLite schema v6
   ├─ Runtime 探测、launch plan 与 Terminal Session 元数据
   └─ Gemini Interactions API（store=false）
 ```

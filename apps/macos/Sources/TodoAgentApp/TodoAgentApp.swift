@@ -31,7 +31,10 @@ struct TodoAgentApp: App {
 
     var body: some Scene {
         Window("TodoAgent", id: TodoAgentMainWindow.sceneID) {
-            ContentView(state: AppContainer.shared.state)
+            ContentView(
+                state: AppContainer.shared.state,
+                taskWorkspace: AppContainer.shared.taskWorkspace
+            )
                 .frame(
                     minWidth: TodoAgentMainWindowPlacement.minimumContentSize.width,
                     minHeight: TodoAgentMainWindowPlacement.minimumContentSize.height
@@ -69,16 +72,16 @@ struct TodoAgentApp: App {
                 }
                 .keyboardShortcut("i", modifiers: [.command, .option])
 
-                Button("显示或隐藏任务详情") {
-                    AppContainer.shared.taskWorkbenches.toggleActiveTaskDetails()
+                Button("收起任务工作区") {
+                    AppContainer.shared.taskWorkspace.collapseActiveWorkspace()
                 }
-                .keyboardShortcut("s", modifiers: [.command, .control])
+                .keyboardShortcut("[", modifiers: .command)
 
             }
 
             CommandMenu("终端") {
                 Button("聚焦终端") {
-                    AppContainer.shared.taskWorkbenches.focusActiveTerminal()
+                    AppContainer.shared.taskWorkspace.focusActiveTerminal()
                 }
                 .keyboardShortcut("t", modifiers: [.command, .shift])
 
@@ -93,11 +96,11 @@ struct TodoAgentApp: App {
 
                 Divider()
 
-                Button("放大字体") { AppContainer.shared.taskWorkbenches.performTerminalAction("increase_font_size:1") }
+                Button("放大字体") { AppContainer.shared.taskWorkspace.performTerminalAction("increase_font_size:1") }
                     .keyboardShortcut("+", modifiers: .command)
-                Button("缩小字体") { AppContainer.shared.taskWorkbenches.performTerminalAction("decrease_font_size:1") }
+                Button("缩小字体") { AppContainer.shared.taskWorkspace.performTerminalAction("decrease_font_size:1") }
                     .keyboardShortcut("-", modifiers: .command)
-                Button("还原字体大小") { AppContainer.shared.taskWorkbenches.performTerminalAction("reset_font_size") }
+                Button("还原字体大小") { AppContainer.shared.taskWorkspace.performTerminalAction("reset_font_size") }
                     .keyboardShortcut("0", modifiers: .command)
             }
         }

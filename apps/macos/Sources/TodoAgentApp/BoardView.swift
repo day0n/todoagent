@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import SwiftUI
 
 extension Notification.Name {
@@ -9,13 +10,21 @@ extension Notification.Name {
 
 struct BoardView: View {
     let state: AppState
+    let taskWorkspace: TaskWorkspaceCoordinator
+    @State private var focusesComposerWhenWorkspaceCloses = false
 
     var body: some View {
         Group {
-            if isTimeline {
-                TimelineColumns(state: state)
+            if let taskID = taskWorkspace.presentedTaskID {
+                TaskSplitWorkspace(
+                    taskID: taskID,
+                    state: state,
+                    taskWorkspace: taskWorkspace
+                )
+            } else if isTimeline {
+                TimelineColumns(state: state, taskWorkspace: taskWorkspace)
             } else {
-                TaskListView(state: state)
+                TaskListView(state: state, taskWorkspace: taskWorkspace)
             }
         }
         .navigationTitle(state.titleForSelection())
@@ -24,9 +33,26 @@ struct BoardView: View {
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewTask)) { _ in
             focusComposerForCurrentContext()
         }
+        .onChange(of: taskWorkspace.presentedTaskID) { previousTaskID, taskID in
+            guard previousTaskID != nil,
+                  taskID == nil,
+                  focusesComposerWhenWorkspaceCloses
+            else { return }
+            focusesComposerWhenWorkspaceCloses = false
+            postComposerFocus()
+        }
+        .onChange(of: taskWorkspace.closingTaskID) { previousTaskID, taskID in
+            guard previousTaskID != nil,
+                  taskID == nil,
+                  taskWorkspace.presentedTaskID != nil
+            else { return }
+            focusesComposerWhenWorkspaceCloses = false
+        }
     }
 
-    private var isTimeline: Bool { state.selection == .smart(.timeline) }
+    private var isTimeline: Bool {
+        taskWorkspace.presentedTaskID == nil && state.selection == .smart(.timeline)
+    }
 
     @ToolbarContentBuilder
     private var timelineToolbar: some ToolbarContent {
@@ -77,6 +103,17 @@ struct BoardView: View {
     }
 
     private func focusComposerForCurrentContext() {
+        if let taskID = taskWorkspace.presentedTaskID {
+            if taskWorkspace.activeWorkspaceShowsTaskRail {
+                postComposerFocus()
+            } else {
+                state.selection = .smart(.tasks)
+                focusesComposerWhenWorkspaceCloses = true
+                taskWorkspace.closeTaskWorkspace(taskID: taskID)
+            }
+            return
+        }
+
         switch state.selection {
         case .smart(.running), .smart(.done), nil:
             state.selection = .smart(.tasks)
@@ -84,6 +121,10 @@ struct BoardView: View {
             break
         }
 
+        postComposerFocus()
+    }
+
+    private func postComposerFocus() {
         // Navigation may replace the board subtree. Deliver focus on the next
         // main-run-loop turn so the destination composer has mounted.
         DispatchQueue.main.async {
@@ -92,8 +133,161 @@ struct BoardView: View {
     }
 }
 
+enum TaskWorkspaceRailVisibility: Equatable, Sendable {
+    case split
+    case compact
+}
+
+enum TaskWorkspaceLayoutPolicy {
+    static let railWidth: CGFloat = 320
+    static let dividerWidth: CGFloat = 1
+    static let terminalMinimumWidth: CGFloat = 500
+    static let initialSplitWidth: CGFloat = 830
+    static let collapseSplitBelow = railWidth + dividerWidth + terminalMinimumWidth
+    static let restoreSplitAt: CGFloat = 840
+
+    static func railVisibility(
+        availableWidth: CGFloat,
+        previous: TaskWorkspaceRailVisibility?
+    ) -> TaskWorkspaceRailVisibility {
+        switch previous {
+        case .split:
+            availableWidth < collapseSplitBelow ? .compact : .split
+        case .compact:
+            availableWidth >= restoreSplitAt ? .split : .compact
+        case nil:
+            availableWidth >= initialSplitWidth ? .split : .compact
+        }
+    }
+}
+
+private struct TaskSplitWorkspace: View {
+    let taskID: UUID
+    let state: AppState
+    let taskWorkspace: TaskWorkspaceCoordinator
+
+    @State private var railVisibility: TaskWorkspaceRailVisibility?
+    @State private var chromePresented = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { proxy in
+            let resolvedVisibility = TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: proxy.size.width,
+                previous: railVisibility
+            )
+            let layoutState = taskWorkspace.layoutState(for: taskID)
+            let showsRail = resolvedVisibility == .split
+            let isClosing = taskWorkspace.closingTaskID == taskID
+
+            HStack(spacing: 0) {
+                if showsRail {
+                    taskRail
+                        .frame(width: TaskWorkspaceLayoutPolicy.railWidth)
+                        .opacity(chromePresented && !isClosing ? 1 : 0)
+                        .offset(x: chromePresented && !isClosing ? 0 : -10)
+                        .animation(
+                            reduceMotion ? nil : .easeInOut(duration: 0.18),
+                            value: chromePresented && !isClosing
+                        )
+
+                    Rectangle()
+                        .fill(TodoAgentUI.hairline)
+                        .frame(width: TaskWorkspaceLayoutPolicy.dividerWidth)
+                        .accessibilityHidden(true)
+                }
+
+                TaskWorkbenchView(
+                    taskID: taskID,
+                    state: state,
+                    terminalSessions: taskWorkspace.terminalSessions,
+                    layoutState: layoutState,
+                    toggleTaskDetails: {},
+                    requestClose: {
+                        taskWorkspace.closeTaskWorkspace(taskID: taskID)
+                    },
+                    presentation: .embedded(compact: resolvedVisibility == .compact),
+                    isClosing: isClosing
+                )
+                .id(taskID)
+                // Ghostty must jump directly to its final AppKit frame. A
+                // per-frame width animation sends a resize on every frame and
+                // makes terminal input visibly stutter.
+                .transaction { transaction in
+                    transaction.animation = nil
+                }
+            }
+            .onAppear {
+                railVisibility = resolvedVisibility
+                taskWorkspace.updateActiveWorkspaceCompactState(
+                    taskID: taskID,
+                    isCompact: resolvedVisibility == .compact
+                )
+                presentChrome()
+            }
+            .onChange(of: proxy.size.width) { _, width in
+                let next = TaskWorkspaceLayoutPolicy.railVisibility(
+                    availableWidth: width,
+                    previous: railVisibility
+                )
+                guard next != railVisibility else { return }
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    railVisibility = next
+                }
+                taskWorkspace.updateActiveWorkspaceCompactState(
+                    taskID: taskID,
+                    isCompact: next == .compact
+                )
+            }
+        }
+        .background(TodoAgentUI.canvasBackground)
+        .accessibilityIdentifier("task.workspace.split")
+    }
+
+    private var taskRail: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                Text("任务")
+                    .font(.title3.weight(.semibold))
+                Spacer(minLength: 8)
+            }
+            .padding(.horizontal, 14)
+            .frame(height: 50)
+
+            Rectangle()
+                .fill(TodoAgentUI.hairline)
+                .frame(height: 1)
+
+            TaskListView(
+                state: state,
+                taskWorkspace: taskWorkspace,
+                selectedWorkspaceTaskID: taskID,
+                pendingWorkspaceTaskID: taskWorkspace.pendingTaskID,
+                usesWorkspaceRailLayout: true
+            )
+        }
+        .background(TodoAgentUI.sidebarBackground)
+    }
+
+    private func presentChrome() {
+        guard !reduceMotion else {
+            chromePresented = true
+            return
+        }
+        Task { @MainActor in
+            await Task.yield()
+            withAnimation(.easeInOut(duration: 0.22)) {
+                chromePresented = true
+            }
+        }
+    }
+}
+
 private struct TimelineColumns: View {
     let state: AppState
+    let taskWorkspace: TaskWorkspaceCoordinator
 
     @State private var pointerNearScrollIndicator = false
 
@@ -108,7 +302,8 @@ private struct TimelineColumns: View {
                             offset: offset,
                             timelineDay: timelineDay,
                             selectedDateIsToday: state.selectedDay == state.currentDay,
-                            state: state
+                            state: state,
+                            taskWorkspace: taskWorkspace
                         )
                         .frame(width: columnWidth(for: proxy.size.width))
                     }
@@ -214,6 +409,7 @@ private struct TimelineColumn: View {
     let timelineDay: TimelineDay
     let selectedDateIsToday: Bool
     let state: AppState
+    let taskWorkspace: TaskWorkspaceCoordinator
 
     var body: some View {
         let sections = TaskStatusSections(tasks: timelineDay.tasks)
@@ -281,7 +477,8 @@ private struct TimelineColumn: View {
             TimelineInlineTaskComposer(
                 state: state,
                 executionDay: timelineDay.day,
-                focusesForNewTaskCommand: offset == 0
+                focusesForNewTaskCommand: offset == 0,
+                composerState: taskWorkspace.timelineComposerState(for: timelineDay.day)
             )
         }
         .padding(TodoAgentUI.sectionSpacing)
@@ -338,9 +535,8 @@ private struct TimelineInlineTaskComposer: View {
     let state: AppState
     let executionDay: LocalDay
     let focusesForNewTaskCommand: Bool
+    @Bindable var composerState: InlineAddTaskComposerState
 
-    @State private var draft = ""
-    @State private var isSubmitting = false
     @FocusState private var isFocused: Bool
 
     var body: some View {
@@ -349,7 +545,7 @@ private struct TimelineInlineTaskComposer: View {
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
 
-            TextField("添加任务", text: $draft)
+            TextField("添加任务", text: $composerState.draft)
                 .textFieldStyle(.plain)
                 .focused($isFocused)
                 .onSubmit(submit)
@@ -358,7 +554,7 @@ private struct TimelineInlineTaskComposer: View {
                 .accessibilityHint("输入标题并按回车创建，按 Escape 清空")
                 .accessibilityIdentifier("timeline.\(executionDay.description).add-task")
 
-            if isSubmitting {
+            if composerState.isSubmitting {
                 ProgressView()
                     .controlSize(.small)
                     .accessibilityLabel("正在添加任务")
@@ -382,11 +578,11 @@ private struct TimelineInlineTaskComposer: View {
     }
 
     private func submit() {
-        let submittedDraft = draft
+        let submittedDraft = composerState.draft
         let title = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, !isSubmitting else { return }
+        guard !title.isEmpty, !composerState.isSubmitting else { return }
 
-        isSubmitting = true
+        composerState.isSubmitting = true
         Task { @MainActor in
             let succeeded = await state.createTask(
                 title: title,
@@ -394,60 +590,101 @@ private struct TimelineInlineTaskComposer: View {
                 executionDate: executionDay,
                 dueDate: nil
             )
-            isSubmitting = false
-            if succeeded, draft == submittedDraft {
-                draft = ""
+            composerState.isSubmitting = false
+            if succeeded, composerState.draft == submittedDraft {
+                composerState.draft = ""
             }
             isFocused = true
         }
     }
 
     private func cancelEditing() {
-        draft = ""
+        composerState.draft = ""
         isFocused = false
     }
 }
 
 private struct TaskListView: View {
     let state: AppState
+    let taskWorkspace: TaskWorkspaceCoordinator
+    var selectedWorkspaceTaskID: UUID?
+    var pendingWorkspaceTaskID: UUID?
+    var usesWorkspaceRailLayout: Bool
+
+    init(
+        state: AppState,
+        taskWorkspace: TaskWorkspaceCoordinator,
+        selectedWorkspaceTaskID: UUID? = nil,
+        pendingWorkspaceTaskID: UUID? = nil,
+        usesWorkspaceRailLayout: Bool = false
+    ) {
+        self.state = state
+        self.taskWorkspace = taskWorkspace
+        self.selectedWorkspaceTaskID = selectedWorkspaceTaskID
+        self.pendingWorkspaceTaskID = pendingWorkspaceTaskID
+        self.usesWorkspaceRailLayout = usesWorkspaceRailLayout
+    }
 
     var body: some View {
         let tasks = state.visibleTasks()
         let sections = TaskStatusSections(tasks: tasks)
 
         VStack(spacing: 0) {
-            ScrollView {
-                LazyVStack(spacing: TodoAgentUI.standardSpacing) {
-                    if tasks.isEmpty {
-                        ContentUnavailableView(
-                            "没有任务",
-                            systemImage: "checklist",
-                            description: Text(emptyDescription)
-                        )
-                        .frame(maxWidth: .infinity, minHeight: 240)
-                    } else {
-                        ForEach(sections.openTasks) { task in
-                            TaskCard(task: task, state: state)
-                        }
-
-                        if sections.hasCompletedSection {
-                            CompletedTasksSectionHeader(
-                                hasOpenTasks: sections.openTasks.isEmpty == false,
-                                accessibilityIdentifier: completedSectionIdentifier
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    LazyVStack(spacing: TodoAgentUI.standardSpacing) {
+                        if tasks.isEmpty {
+                            ContentUnavailableView(
+                                "没有任务",
+                                systemImage: "checklist",
+                                description: Text(emptyDescription)
                             )
+                            .frame(maxWidth: .infinity, minHeight: 240)
+                        } else {
+                            ForEach(sections.openTasks) { task in
+                                TaskCard(
+                                    task: task,
+                                    state: state,
+                                    isWorkspaceSelected: task.id == selectedWorkspaceTaskID,
+                                    isWorkspacePending: task.id == pendingWorkspaceTaskID
+                                )
+                                .id(task.id)
+                            }
 
-                            ForEach(sections.completedTasks) { task in
-                                TaskCard(task: task, state: state)
+                            if sections.hasCompletedSection {
+                                CompletedTasksSectionHeader(
+                                    hasOpenTasks: sections.openTasks.isEmpty == false,
+                                    accessibilityIdentifier: completedSectionIdentifier
+                                )
+
+                                ForEach(sections.completedTasks) { task in
+                                    TaskCard(
+                                        task: task,
+                                        state: state,
+                                        isWorkspaceSelected: task.id == selectedWorkspaceTaskID,
+                                        isWorkspacePending: task.id == pendingWorkspaceTaskID
+                                    )
+                                    .id(task.id)
+                                }
                             }
                         }
                     }
+                    .frame(maxWidth: usesWorkspaceRailLayout ? .infinity : 780)
+                    .padding(usesWorkspaceRailLayout ? 14 : 20)
                 }
-                .frame(maxWidth: 780)
-                .padding(20)
+                .onAppear { scrollSelectedTaskToVisible(using: scrollProxy) }
+                .onChange(of: selectedWorkspaceTaskID) { _, _ in
+                    scrollSelectedTaskToVisible(using: scrollProxy)
+                }
             }
 
             if let addTaskDestination {
-                InlineAddTaskComposer(state: state, destination: addTaskDestination)
+                InlineAddTaskComposer(
+                    state: state,
+                    destination: addTaskDestination,
+                    composerState: taskWorkspace.composerState(for: addTaskDestination),
+                    horizontalPadding: usesWorkspaceRailLayout ? 14 : 20
+                )
                     .id(addTaskDestination)
             }
         }
@@ -457,12 +694,22 @@ private struct TaskListView: View {
 
     private var addTaskDestination: InlineAddTaskDestination? {
         switch state.selection {
+        case .smart where usesWorkspaceRailLayout:
+            .allTasks
         case .smart(.tasks):
             .allTasks
         case let .list(id):
             .list(id)
         default:
             nil
+        }
+    }
+
+    private func scrollSelectedTaskToVisible(using proxy: ScrollViewProxy) {
+        guard usesWorkspaceRailLayout, let selectedWorkspaceTaskID else { return }
+        Task { @MainActor in
+            await Task.yield()
+            proxy.scrollTo(selectedWorkspaceTaskID, anchor: .center)
         }
     }
 
@@ -517,7 +764,7 @@ private struct CompletedTasksSectionHeader: View {
     }
 }
 
-private enum InlineAddTaskDestination: Hashable {
+enum InlineAddTaskDestination: Hashable {
     case allTasks
     case list(UUID)
 
@@ -538,12 +785,19 @@ private enum InlineAddTaskDestination: Hashable {
     }
 }
 
+@MainActor
+@Observable
+final class InlineAddTaskComposerState {
+    var draft = ""
+    var isSubmitting = false
+}
+
 private struct InlineAddTaskComposer: View {
     let state: AppState
     let destination: InlineAddTaskDestination
+    @Bindable var composerState: InlineAddTaskComposerState
+    let horizontalPadding: CGFloat
 
-    @State private var draft = ""
-    @State private var isSubmitting = false
     @FocusState private var isFocused: Bool
 
     var body: some View {
@@ -558,7 +812,7 @@ private struct InlineAddTaskComposer: View {
                     .foregroundStyle(TodoAgentUI.secondaryText)
                     .accessibilityHidden(true)
 
-                TextField("添加任务", text: $draft)
+                TextField("添加任务", text: $composerState.draft)
                     .textFieldStyle(.plain)
                     .focused($isFocused)
                     .onSubmit(submit)
@@ -567,7 +821,7 @@ private struct InlineAddTaskComposer: View {
                     .accessibilityHint("输入任务标题并按回车创建，按 Escape 清空")
                     .accessibilityIdentifier(destination.accessibilityIdentifier)
 
-                if isSubmitting {
+                if composerState.isSubmitting {
                     ProgressView()
                         .controlSize(.small)
                         .accessibilityLabel("正在添加任务")
@@ -582,7 +836,7 @@ private struct InlineAddTaskComposer: View {
                 RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
                     .stroke(TodoAgentUI.hairline, lineWidth: 1)
             }
-            .padding(.horizontal, 20)
+            .padding(.horizontal, horizontalPadding)
             .padding(.vertical, 10)
         }
         .frame(maxWidth: .infinity)
@@ -593,11 +847,11 @@ private struct InlineAddTaskComposer: View {
     }
 
     private func submit() {
-        let submittedDraft = draft
-        let title = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, !isSubmitting else { return }
+        let submittedDraft = composerState.draft
+        let title = composerState.draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty, !composerState.isSubmitting else { return }
 
-        isSubmitting = true
+        composerState.isSubmitting = true
         Task { @MainActor in
             let succeeded = await state.createTask(
                 title: title,
@@ -605,15 +859,15 @@ private struct InlineAddTaskComposer: View {
                 executionDate: nil,
                 dueDate: nil
             )
-            isSubmitting = false
-            if succeeded, draft == submittedDraft {
-                draft = ""
+            composerState.isSubmitting = false
+            if succeeded, composerState.draft == submittedDraft {
+                composerState.draft = ""
             }
         }
     }
 
     private func cancelEditing() {
-        draft = ""
+        composerState.draft = ""
         isFocused = false
     }
 }
@@ -621,10 +875,25 @@ private struct InlineAddTaskComposer: View {
 struct TaskCard: View {
     let task: TaskItem
     let state: AppState
+    let isWorkspaceSelected: Bool
+    let isWorkspacePending: Bool
+
+    init(
+        task: TaskItem,
+        state: AppState,
+        isWorkspaceSelected: Bool = false,
+        isWorkspacePending: Bool = false
+    ) {
+        self.task = task
+        self.state = state
+        self.isWorkspaceSelected = isWorkspaceSelected
+        self.isWorkspacePending = isWorkspacePending
+    }
 
     @State private var datePickerRequest: TaskDatePickerRequest?
     @State private var isConfirmingDelete = false
     @State private var contextHighlight = TaskContextHighlightState()
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var agentStatus: TaskCardAgentStatus {
         TaskCardAgentStatus(session: state.session(for: task))
@@ -648,7 +917,10 @@ struct TaskCard: View {
         .background(taskCardBackground, in: .rect(cornerRadius: TodoAgentUI.cardRadius))
         .overlay {
             RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
-                .stroke(borderColor, lineWidth: agentStatus.isRunning ? 1.5 : 1)
+                .stroke(
+                    borderColor,
+                    lineWidth: agentStatus.isRunning || isWorkspaceSelected ? 1.5 : 1
+                )
         }
         .shadow(
             color: cardShadowColor,
@@ -656,6 +928,11 @@ struct TaskCard: View {
             y: agentStatus.isRunning ? 0 : (contextHighlight.isHighlighted ? 4 : 2)
         )
         .accessibilityIdentifier("task.\(task.id.uuidString).card")
+        .accessibilityAddTraits(isWorkspaceSelected ? .isSelected : [])
+        .animation(
+            reduceMotion ? nil : .easeInOut(duration: 0.12),
+            value: isWorkspaceSelected
+        )
         .contextMenu {
             taskContextMenu
         }
@@ -916,6 +1193,12 @@ struct TaskCard: View {
 
     private var agentIndicators: some View {
         HStack(spacing: 7) {
+            if isWorkspacePending {
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityLabel("正在切换到此任务")
+            }
+
             if agentStatus.isRunning {
                 ZStack {
                     Circle()
@@ -956,6 +1239,7 @@ struct TaskCard: View {
 
     private var borderColor: Color {
         if case .failed = state.taskSaveState(taskID: task.id) { return .red.opacity(0.58) }
+        if isWorkspaceSelected { return TodoAgentUI.primaryText.opacity(0.55) }
         if agentStatus.isRunning { return .green.opacity(0.72) }
         return contextHighlight.isHighlighted ? TodoAgentUI.primaryText.opacity(0.2) : TodoAgentUI.hairline
     }
@@ -967,13 +1251,16 @@ struct TaskCard: View {
 
     private var cardAccessibilityLabel: String {
         var parts = [task.title]
+        if isWorkspaceSelected { parts.append("已在工作区打开") }
+        if isWorkspacePending { parts.append("正在切换") }
         if agentStatus.isRunning { parts.append("Agent 正在运行") }
         if agentStatus.hasUnread { parts.append("Agent 有新回复") }
         return parts.joined(separator: "，")
     }
 
     private var taskCardBackground: Color {
-        contextHighlight.isHighlighted ? TodoAgentUI.selectionBackground : TodoAgentUI.surfaceBackground
+        if isWorkspaceSelected { return TodoAgentUI.selectionBackground }
+        return contextHighlight.isHighlighted ? TodoAgentUI.selectionBackground : TodoAgentUI.surfaceBackground
     }
 }
 

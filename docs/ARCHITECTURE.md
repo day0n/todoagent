@@ -17,7 +17,7 @@ TodoAgent macOS App
            │ stdin/stdout NDJSON · IPC v4
            ▼
 Rust Engine sidecar
-  ├─ SQLite schema v5 / serialized Store worker
+  ├─ SQLite schema v6 / serialized Store worker
   ├─ Runtime discovery, verification and launch plans
   ├─ Terminal Session, Run and status receipts
   └─ Gemini assistant kernel
@@ -47,43 +47,53 @@ Swift 与 Rust 共用的契约 fixture 位于
 ### Terminal Runner 与 PTY
 
 每个任务工作台都可以拥有一个独立 Ghostty PTY surface。Engine 生成经过验证的
-launch descriptor；App 使用随包 `todoagent-terminal-runner` 启动实际 CLI。Runner
-不经过 shell 拼接命令，负责：
+launch descriptor；App 把只包含随包 Runner 与 descriptor 路径的严格引用命令注入
+保留的 login shell。Agent executable 与参数不进入 shell，由
+`todoagent-terminal-runner` 从 descriptor 验证后直接执行。Runner 负责：
 
 - 独立进程组和退出清理；
 - Host 存活监控；
 - 经过 token 验证的 started/status/exited 事件；
 - 将终端字节留在 PTY，而不是写入 Engine stdout。
 
-TodoAgent 不解析或持久化 CLI 的终端内容。关闭任务工作台窗口只隐藏 surface，不结束
-Agent；显式结束 Session、删除任务或退出 App 才会停止对应进程组。
+TodoAgent 不解析或持久化 CLI 的终端内容。收起终端或切换任务只 detach surface，不结束
+Agent；删除任务或退出 App 会停止对应进程组。退出 App 时，正在
+运行且已有稳定 Provider Session ID 的受管 Run 会先持久化 `app_shutdown` /
+`auto_resume=1`；下次打开同一任务后重建 PTY，并恢复同一个 Provider Session。
 
 ## 任务工作台模型
 
 ```text
-Task 1 ── TerminalSession 1 ── TerminalRun 1..n
+Task 1 ── TerminalSession 0..1（task_id UNIQUE）
+         └─ TerminalRun 0..n（fresh / resume）
 ```
 
-- 一个任务最多绑定一个 `TerminalSession`。
-- Session 固定绑定一个 Runtime 和一个规范化工作目录。
-- 工作目录移动后，用户可以显式重新授权并 rebind；Runtime 和 Provider Session ID
-  不变。
-- 每个 Session 同时只允许一个活动 Run；Run 分为 `fresh` 或 `resume`。
-- Provider Session ID 只能从未绑定状态绑定一次；无法唯一判断 Codex/Kiro 候选时，
-  必须由用户选择，TodoAgent 不猜“最近会话”。
+- 首次点击任务会直接创建该任务唯一的 TerminalSession 和普通 shell；收起或切换任务
+  继续复用同一个 Controller、surface 和 PTY。
+- Agent 必须通过工作台的受管入口启动。Engine 在开始前持久化 Run identity 与 launch
+  mode；Claude 预分配、Cursor 预创建得到的 Provider ID 同步保存，Codex/Kiro 的 ID
+  则在运行期经 Hook/元数据验证，或退出后由用户确认精确候选后绑定。
+- Cmd+Q 会结束本地进程组；只有已有稳定 Provider ID 的活动受管 Run 才保留
+  `auto_resume=1`。新 App 进程打开任务时只对这个持久标记自动 launch，并使用同一个
+  Provider Session ID。
+- 普通进程退出或用户显式结束不会自动重启；终端回到 shell，不显示恢复或新建
+  Provider Session 页面。如果 Provider transcript 缺失，自动恢复不会静默创建另一段
+  对话，可用 shell 仍保持可见。
+- PTY scrollback 与任意手打 shell 进程不属于跨 App 重启的恢复状态。普通 shell 中手打
+  的 `claude` 不会被误认为已登记的可恢复 Run；同一 App 进程内收起和切换仍保留 PTY。
 - 多个任务可以并行运行独立终端；启动第 4 个活跃终端前 App 会提示资源开销，Engine
   当前不设置跨任务的硬并发上限。
 
-一个任务不能切换 Runtime，也没有跨 Agent 接力或 Session 分支树。这些是
+不做多 Agent 并排、Session 树或跨 Runtime 接力。这些是
 [`../TODO.md`](../TODO.md) 中的未来能力。
 
-## SQLite v5
+## SQLite v6
 
 SQLite 是任务和持久元数据的事实来源。主要数据包括：
 
 - 任务、清单、执行日期、截止日期和任务附件；
 - Runtime 检测与验证状态；
-- `terminal_session`、`terminal_run` 和去重的状态 receipt；
+- `terminal_session`（含 `last_exit_reason` / `auto_resume`）、`terminal_run` 和去重的状态 receipt；
 - Gemini 助手 Session、Message、Turn、Step、Tool execution 和 Compaction；
 - 设置、schema migration 与单调 revision。
 
@@ -97,6 +107,13 @@ PTY 字节和旧终端滚屏不写入 SQLite。
 - 删除上一代结构化 CLI 的 `task_session`、Turn、Message 和 Event 表；
 - 创建 `terminal_session`、`terminal_run` 和 terminal status receipt；
 - 验证 foreign keys 和 schema checksum 后提交。
+
+### v5 → v6 迁移
+
+Engine 会先为 v5 数据库创建另一份 `0600` 备份，再在事务中为
+`terminal_session` 增加 `last_exit_reason` 与 `auto_resume`。迁移只会把最新 Run
+确认为 `app_shutdown` 或 `engine_interrupted` 且已有 Provider ID 的 Session 标记为
+可自动恢复；普通退出保持停止状态。
 
 低于 v4、无法识别或高于当前版本的数据库会被原样保留并拒绝打开，不会静默删除。
 原生 App 也不会读取或导入旧 Web 数据。

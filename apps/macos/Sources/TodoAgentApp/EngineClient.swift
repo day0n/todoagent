@@ -1,5 +1,6 @@
 import Darwin
 import CFNetwork
+import Dispatch
 import Foundation
 
 enum EngineClientError: LocalizedError, Equatable {
@@ -32,6 +33,37 @@ enum EngineClientError: LocalizedError, Equatable {
 struct EngineEvent: Sendable, Equatable {
     let name: String
     let data: Data
+
+    /// Synthetic client-side event emitted when any bounded subscriber buffer
+    /// drops a wire event. It is broadcast to every subscriber so independent
+    /// projections (the task UI and Assistant UI) resync from one consistent
+    /// point instead of silently diverging.
+    static let authoritativeResyncRequiredName = "engine.events.dropped"
+
+    static func authoritativeResyncRequired(episode: UInt64) -> EngineEvent {
+        EngineEvent(
+            name: authoritativeResyncRequiredName,
+            data: Data(
+                #"{"reason":"subscriber_buffer_overflow","episode":\#(episode)}"#.utf8
+            )
+        )
+    }
+
+    var authoritativeResyncEpisode: UInt64? {
+        guard name == Self.authoritativeResyncRequiredName,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let number = object["episode"] as? NSNumber
+        else { return nil }
+        return number.uint64Value
+    }
+}
+
+enum EngineClientLifecycle: Sendable, Equatable {
+    case stopped
+    case starting
+    case ready
+    case recovering(attempt: Int)
+    case stopping
 }
 
 /// A decoded line from the versioned NDJSON wire protocol.
@@ -101,10 +133,177 @@ private struct PendingHandshake {
     let timeout: Task<Void, Never>
 }
 
+enum EngineInputWriteResult: Sendable, Equatable {
+    case written
+    case discarded
+    case failed(String)
+}
+
+/// Owns one Engine generation's stdin descriptor.
+///
+/// A successful handshake does not guarantee that the child will keep reading
+/// stdin. Writes therefore run on this serial queue, never on EngineClient's
+/// actor. The descriptor is nonblocking so closing a generation can wake a
+/// backpressured writer without waiting for the child process.
+final class EngineInputWriter: @unchecked Sendable {
+    private static let writablePollMilliseconds: Int32 = 50
+
+    private let input: FileHandle
+    private let descriptor: Int32
+    private let queue: DispatchQueue
+    private let maximumPendingWrites: Int
+    private let lock = NSLock()
+    private var isClosed = false
+    private var pendingWriteIDs: Set<String> = []
+    private var cancelledWriteIDs: Set<String> = []
+
+    init(input: FileHandle, generation: UUID, maximumPendingWrites: Int = 64) throws {
+        self.input = input
+        descriptor = input.fileDescriptor
+        self.maximumPendingWrites = max(1, maximumPendingWrites)
+        queue = DispatchQueue(
+            label: "com.todoagent.engine-input.\(generation.uuidString)",
+            qos: .userInitiated
+        )
+
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        guard flags >= 0,
+              Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0,
+              Darwin.fcntl(descriptor, F_SETNOSIGPIPE, 1) >= 0 else {
+            let errorCode = errno
+            try? input.close()
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errorCode))
+        }
+    }
+
+    func enqueue(
+        id: String,
+        payload: Data,
+        completion: @escaping @Sendable (EngineInputWriteResult) -> Void
+    ) {
+        lock.lock()
+        let closed = isClosed
+        let isFull = pendingWriteIDs.count >= maximumPendingWrites
+        if closed == false, isFull == false {
+            pendingWriteIDs.insert(id)
+        }
+        lock.unlock()
+
+        guard closed == false else {
+            completion(.discarded)
+            return
+        }
+        guard isFull == false else {
+            completion(.failed("Engine stdin write queue is full."))
+            return
+        }
+
+        queue.async { [self] in
+            completion(write(payload, id: id))
+        }
+    }
+
+    /// A frame can be discarded before its first byte is written. A partially
+    /// written NDJSON frame must instead be finished or the generation closed,
+    /// otherwise the next request would corrupt the protocol stream.
+    func cancel(id: String) {
+        lock.lock()
+        if isClosed == false, pendingWriteIDs.contains(id) {
+            cancelledWriteIDs.insert(id)
+        }
+        lock.unlock()
+    }
+
+    func close() {
+        lock.lock()
+        guard isClosed == false else {
+            lock.unlock()
+            return
+        }
+        isClosed = true
+        try? input.close()
+        lock.unlock()
+    }
+
+    private func write(_ payload: Data, id: String) -> EngineInputWriteResult {
+        var offset = 0
+
+        while offset < payload.count {
+            lock.lock()
+            if isClosed {
+                finishWriteLocked(id: id)
+                lock.unlock()
+                return .discarded
+            }
+            if offset == 0, cancelledWriteIDs.contains(id) {
+                finishWriteLocked(id: id)
+                lock.unlock()
+                return .discarded
+            }
+
+            errno = 0
+            let written = payload.withUnsafeBytes { rawBuffer -> Int in
+                guard let baseAddress = rawBuffer.baseAddress else { return 0 }
+                return Darwin.write(
+                    descriptor,
+                    baseAddress.advanced(by: offset),
+                    rawBuffer.count - offset
+                )
+            }
+            let errorCode = errno
+            lock.unlock()
+
+            if written > 0 {
+                offset += written
+                continue
+            }
+            if written == 0 {
+                finishWrite(id: id)
+                return .failed("Engine stdin closed during a write.")
+            }
+            if errorCode == EINTR {
+                continue
+            }
+            if errorCode == EAGAIN || errorCode == EWOULDBLOCK {
+                waitUntilWritableOrClosed()
+                continue
+            }
+
+            finishWrite(id: id)
+            return .failed(String(cString: Darwin.strerror(errorCode)))
+        }
+
+        finishWrite(id: id)
+        return .written
+    }
+
+    private func waitUntilWritableOrClosed() {
+        lock.lock()
+        let closed = isClosed
+        lock.unlock()
+        guard closed == false else { return }
+
+        var descriptorState = pollfd(fd: descriptor, events: Int16(POLLOUT), revents: 0)
+        while Darwin.poll(&descriptorState, 1, Self.writablePollMilliseconds) < 0,
+              errno == EINTR {}
+    }
+
+    private func finishWrite(id: String) {
+        lock.lock()
+        finishWriteLocked(id: id)
+        lock.unlock()
+    }
+
+    private func finishWriteLocked(id: String) {
+        pendingWriteIDs.remove(id)
+        cancelledWriteIDs.remove(id)
+    }
+}
+
 private struct EngineSession {
     let generation: UUID
     let process: Process
-    let input: FileHandle
+    let inputWriter: EngineInputWriter
     let output: FileHandle
     let errorOutput: FileHandle
     var outputBuffer = Data()
@@ -120,16 +319,32 @@ actor EngineClient {
     private static let eventBufferSize = 512
     private static let gracefulStopDuration: Duration = .seconds(1)
     private static let totalStopDuration: Duration = .seconds(3)
+    private static let defaultAutomaticRestartDelays: [Duration] = [
+        .milliseconds(250),
+        .milliseconds(500),
+        .seconds(1),
+        .seconds(2),
+        .seconds(4),
+        .seconds(8),
+        .seconds(10),
+    ]
 
     private let executableURL: URL
     private let executableArguments: [String]
     private let requestTimeout: Duration
     private let handshakeTimeout: Duration
+    private let automaticRestartDelays: [Duration]
+    private let eventBufferSize: Int
     private var session: EngineSession?
     private var pending: [String: PendingRequest] = [:]
     private var pendingHandshake: PendingHandshake?
     private var eventContinuations: [UUID: AsyncStream<EngineEvent>.Continuation] = [:]
-    private var automaticRestartCount = 0
+    private var automaticRestartAttempt = 0
+    private var automaticRestartToken: UUID?
+    private var automaticRestartTask: Task<Void, Never>?
+    private var eventDropEpisode: UInt64?
+    private var nextEventDropEpisode: UInt64 = 1
+    private(set) var lifecycle: EngineClientLifecycle = .stopped
     private(set) var engineVersion: String?
     private(set) var capabilities: Set<String> = []
 
@@ -137,29 +352,60 @@ actor EngineClient {
         executableURL: URL? = Bundle.main.url(forResource: "todoagent-engine", withExtension: nil),
         executableArguments: [String] = [],
         requestTimeout: Duration = .seconds(15),
-        handshakeTimeout: Duration = .seconds(5)
+        handshakeTimeout: Duration = .seconds(5),
+        automaticRestartDelays: [Duration]? = nil,
+        eventBufferSize: Int = 512
     ) throws {
         guard let executableURL else { throw EngineClientError.executableMissing }
         self.executableURL = executableURL
         self.executableArguments = executableArguments
         self.requestTimeout = requestTimeout
         self.handshakeTimeout = handshakeTimeout
+        if let automaticRestartDelays, !automaticRestartDelays.isEmpty {
+            self.automaticRestartDelays = automaticRestartDelays
+        } else {
+            self.automaticRestartDelays = Self.defaultAutomaticRestartDelays
+        }
+        self.eventBufferSize = max(1, eventBufferSize)
     }
 
     func start() async throws {
-        guard session == nil, pendingHandshake == nil else {
+        guard lifecycle == .stopped, session == nil, pendingHandshake == nil else {
             throw EngineClientError.alreadyStarted
         }
-        automaticRestartCount = 0
-        try await establishSession()
+        automaticRestartTask?.cancel()
+        automaticRestartTask = nil
+        automaticRestartToken = nil
+        automaticRestartAttempt = 0
+        lifecycle = .starting
+        do {
+            try await establishSession()
+            guard lifecycle == .starting else {
+                throw EngineClientError.notRunning
+            }
+            lifecycle = .ready
+        } catch {
+            if lifecycle == .starting {
+                lifecycle = .stopped
+            }
+            throw error
+        }
     }
 
     func stop() async {
+        lifecycle = .stopping
+        let recoveryTask = automaticRestartTask
+        automaticRestartToken = nil
+        automaticRestartTask = nil
+        recoveryTask?.cancel()
+
         guard let active = session else {
             failPending(with: EngineClientError.notRunning)
             failHandshake(with: EngineClientError.notRunning)
+            await recoveryTask?.value
             finishEventStreams()
             clearEngineMetadata()
+            lifecycle = .stopped
             return
         }
 
@@ -184,6 +430,9 @@ actor EngineClient {
         }
 
         if active.process.isRunning {
+            // Closing stdin also wakes a backpressured writer before we wait
+            // for the process termination deadline.
+            active.inputWriter.close()
             active.process.terminate()
             _ = await waitForExit(active.process, until: stopDeadline)
         }
@@ -193,8 +442,10 @@ actor EngineClient {
         }
 
         tearDownSession(generation: generation, error: EngineClientError.notRunning)
+        await recoveryTask?.value
         finishEventStreams()
         clearEngineMetadata()
+        lifecycle = .stopped
     }
 
     func request<Params: Encodable & Sendable, Result: Decodable & Sendable>(
@@ -212,11 +463,11 @@ actor EngineClient {
         )
     }
 
-    func events() -> AsyncStream<EngineEvent> {
+    func events(bufferingNewest: Int? = nil) -> AsyncStream<EngineEvent> {
         let token = UUID()
         let (stream, continuation) = AsyncStream.makeStream(
             of: EngineEvent.self,
-            bufferingPolicy: .bufferingNewest(Self.eventBufferSize)
+            bufferingPolicy: .bufferingNewest(max(1, bufferingNewest ?? eventBufferSize))
         )
         continuation.onTermination = { [weak self] _ in
             guard let self else { return }
@@ -225,6 +476,12 @@ actor EngineClient {
         eventContinuations[token] = continuation
         return stream
     }
+
+    #if DEBUG
+    func yieldEventForTesting(_ event: EngineEvent) {
+        yield(event)
+    }
+    #endif
 
     private func establishSession() async throws {
         let generation = UUID()
@@ -326,10 +583,15 @@ actor EngineClient {
                     timeout: timeout
                 )
 
-                do {
-                    try active.input.write(contentsOf: payload)
-                } catch {
-                    completeRequest(id: id, generation: generation, result: .failure(error))
+                active.inputWriter.enqueue(id: id, payload: payload) { [weak self] result in
+                    guard case let .failed(message) = result else { return }
+                    Task {
+                        await self?.inputWriteFailed(
+                            id: id,
+                            generation: generation,
+                            message: message
+                        )
+                    }
                 }
             }
         } onCancel: {
@@ -350,6 +612,10 @@ actor EngineClient {
         let stderrPipe = Pipe()
         let output = stdoutPipe.fileHandleForReading
         let errorOutput = stderrPipe.fileHandleForReading
+        let inputWriter = try EngineInputWriter(
+            input: stdinPipe.fileHandleForWriting,
+            generation: generation
+        )
 
         process.executableURL = executableURL
         process.arguments = executableArguments
@@ -367,13 +633,14 @@ actor EngineClient {
         do {
             try process.run()
         } catch {
+            inputWriter.close()
             throw EngineClientError.launchFailed(error.localizedDescription)
         }
 
         session = EngineSession(
             generation: generation,
             process: process,
-            input: stdinPipe.fileHandleForWriting,
+            inputWriter: inputWriter,
             output: output,
             errorOutput: errorOutput
         )
@@ -495,12 +762,53 @@ actor EngineClient {
 
     private func yield(_ event: EngineEvent) {
         var terminatedTokens: [UUID] = []
+        var droppedForAnySubscriber = false
         for (token, continuation) in eventContinuations {
-            if case .terminated = continuation.yield(event) {
+            switch continuation.yield(event) {
+            case .dropped:
+                droppedForAnySubscriber = true
+            case .terminated:
                 terminatedTokens.append(token)
+            case .enqueued:
+                break
+            @unknown default:
+                droppedForAnySubscriber = true
             }
         }
         for token in terminatedTokens {
+            eventContinuations.removeValue(forKey: token)
+        }
+
+        guard event.name != EngineEvent.authoritativeResyncRequiredName else { return }
+        guard droppedForAnySubscriber else {
+            eventDropEpisode = nil
+            return
+        }
+
+        // Keep broadcasting the same episode while at least one subscriber is
+        // still behind. Once a normal event enqueues for every subscriber, the
+        // episode closes and a later overflow receives a new identifier.
+        let episode: UInt64
+        if let eventDropEpisode {
+            episode = eventDropEpisode
+        } else {
+            episode = nextEventDropEpisode
+            nextEventDropEpisode &+= 1
+            eventDropEpisode = episode
+        }
+
+        // A gap in one subscriber is a gap in the product's combined view of
+        // state. Broadcast the signal to all remaining subscribers. Repeating
+        // it while a producer burst continues keeps a newest-buffered signal
+        // available even if an earlier copy is itself displaced.
+        let recoveryEvent = EngineEvent.authoritativeResyncRequired(episode: episode)
+        var recoveryTerminatedTokens: [UUID] = []
+        for (token, continuation) in eventContinuations {
+            if case .terminated = continuation.yield(recoveryEvent) {
+                recoveryTerminatedTokens.append(token)
+            }
+        }
+        for token in recoveryTerminatedTokens {
             eventContinuations.removeValue(forKey: token)
         }
     }
@@ -519,14 +827,33 @@ actor EngineClient {
     private func timeoutRequest(id: String, generation: UUID) {
         guard let request = pending[id], request.generation == generation else { return }
         pending.removeValue(forKey: id)
+        if session?.generation == generation {
+            session?.inputWriter.cancel(id: id)
+        }
         request.continuation.resume(throwing: EngineClientError.timedOut(request.method))
     }
 
     private func cancelRequest(id: String, generation: UUID) {
+        if session?.generation == generation {
+            session?.inputWriter.cancel(id: id)
+        }
         completeRequest(
             id: id,
             generation: generation,
             result: .failure(CancellationError())
+        )
+    }
+
+    private func inputWriteFailed(id: String, generation: UUID, message: String) {
+        completeRequest(
+            id: id,
+            generation: generation,
+            result: .failure(
+                EngineClientError.requestFailed(
+                    code: "engine_transport_error",
+                    message: "无法写入 TodoAgent Engine：\(message)"
+                )
+            )
         )
     }
 
@@ -564,20 +891,73 @@ actor EngineClient {
         )
         clearEngineMetadata()
 
-        guard wasStopping == false, wasReady else { return }
-        guard automaticRestartCount == 0 else {
-            finishEventStreams()
-            return
-        }
+        guard wasStopping == false,
+              wasReady,
+              lifecycle != .stopping,
+              lifecycle != .stopped
+        else { return }
 
-        automaticRestartCount += 1
-        do {
-            try await establishSession()
-        } catch is CancellationError {
-            finishEventStreams()
-        } catch {
-            Self.logEngineError("automatic restart failed: \(error.localizedDescription)")
-            finishEventStreams()
+        scheduleAutomaticRecovery()
+    }
+
+    private func scheduleAutomaticRecovery() {
+        automaticRestartTask?.cancel()
+        automaticRestartAttempt += 1
+        let attempt = automaticRestartAttempt
+        let token = UUID()
+        automaticRestartToken = token
+        lifecycle = .recovering(attempt: attempt)
+        automaticRestartTask = Task { [weak self] in
+            await self?.runAutomaticRecovery(token: token, startingAt: attempt)
+        }
+    }
+
+    private func runAutomaticRecovery(token: UUID, startingAt firstAttempt: Int) async {
+        var attempt = firstAttempt
+
+        while automaticRestartToken == token,
+              case .recovering = lifecycle {
+            let delay = automaticRestartDelays[
+                min(max(attempt - 1, 0), automaticRestartDelays.count - 1)
+            ]
+            do {
+                try await Task.sleep(for: delay)
+                try Task.checkCancellation()
+            } catch {
+                return
+            }
+
+            guard automaticRestartToken == token,
+                  case .recovering = lifecycle
+            else { return }
+
+            do {
+                try await establishSession()
+                guard automaticRestartToken == token,
+                      case .recovering = lifecycle,
+                      session?.isReady == true
+                else { return }
+                lifecycle = .ready
+                // Backoff applies only to consecutive failed recovery attempts.
+                // A healthy generation starts the next independent crash at
+                // the shortest delay instead of inheriting historical crashes.
+                automaticRestartAttempt = 0
+                automaticRestartToken = nil
+                automaticRestartTask = nil
+                return
+            } catch is CancellationError {
+                return
+            } catch {
+                guard automaticRestartToken == token,
+                      case .recovering = lifecycle
+                else { return }
+                Self.logEngineError(
+                    "automatic restart attempt \(attempt) failed: \(error.localizedDescription)"
+                )
+                attempt += 1
+                automaticRestartAttempt = attempt
+                lifecycle = .recovering(attempt: attempt)
+            }
         }
     }
 
@@ -632,7 +1012,7 @@ actor EngineClient {
 
         active.output.readabilityHandler = nil
         active.errorOutput.readabilityHandler = nil
-        try? active.input.close()
+        active.inputWriter.close()
         try? active.output.close()
         try? active.errorOutput.close()
 

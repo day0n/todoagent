@@ -21,6 +21,7 @@ const CANDIDATE_SCAN_BUDGET: Duration = Duration::from_secs(2);
 const MAX_CLAUDE_PROJECT_DIRECTORIES: usize = 10_000;
 const MAX_CLAUDE_TRANSCRIPT_BYTES: u64 = 2 * 1024 * 1024;
 const CLAUDE_TRANSCRIPT_SCAN_BUDGET: Duration = Duration::from_secs(2);
+const MAX_PRIVATE_LAUNCH_ARTIFACT_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ClaudeResumeState {
@@ -122,23 +123,24 @@ pub fn claude_resume_state(
     provider_session_id: &str,
     working_directory: &Path,
 ) -> std::io::Result<ClaudeResumeState> {
-    let config_directory = match std::env::var_os("CLAUDE_CONFIG_DIR") {
+    let Some(config_directory) = claude_config_directory(working_directory) else {
+        return Ok(ClaudeResumeState::Absent);
+    };
+    claude_resume_state_in(&config_directory, provider_session_id)
+}
+
+fn claude_config_directory(working_directory: &Path) -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(value) if !value.is_empty() => {
             let value = PathBuf::from(value);
             if value.is_absolute() {
-                value
+                Some(value)
             } else {
-                working_directory.join(value)
+                Some(working_directory.join(value))
             }
         }
-        _ => {
-            let Some(home) = dirs::home_dir() else {
-                return Ok(ClaudeResumeState::Absent);
-            };
-            home.join(".claude")
-        }
-    };
-    claude_resume_state_in(&config_directory, provider_session_id)
+        _ => dirs::home_dir().map(|home| home.join(".claude")),
+    }
 }
 
 fn claude_resume_state_in(
@@ -579,6 +581,144 @@ struct RunnerDescriptor<'a> {
     cleanup_paths: &'a [String],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PrivateFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+impl PrivateFileIdentity {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        }
+    }
+
+    fn matches(self, metadata: &fs::Metadata) -> bool {
+        metadata.dev() == self.device && metadata.ino() == self.inode
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivateFileWrite {
+    Created(PrivateFileIdentity),
+    Reused,
+}
+
+fn validate_exact_private_file_metadata(
+    metadata: &fs::Metadata,
+    expected_len: usize,
+) -> std::io::Result<()> {
+    let uid = unsafe { nix::libc::geteuid() };
+    if !metadata.file_type().is_file()
+        || metadata.uid() != uid
+        || metadata.permissions().mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+        || metadata.len() != expected_len as u64
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "launch artifact must be a current-user mode 0600 single-link regular file of the expected size",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_private_file_path(
+    path: &Path,
+    opened: &fs::Metadata,
+    expected_len: usize,
+) -> std::io::Result<()> {
+    let current = fs::symlink_metadata(path)?;
+    validate_exact_private_file_metadata(&current, expected_len)?;
+    if !PrivateFileIdentity::from_metadata(opened).matches(&current) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "launch artifact path changed during validation",
+        ));
+    }
+    Ok(())
+}
+
+fn remove_created_file_if_same(path: &Path, created: PrivateFileIdentity) {
+    let Ok(current) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if created.matches(&current) {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Creates an Engine-to-runner artifact once, or validates an exact replay
+/// without rewriting the original bytes. This keeps a lost IPC response
+/// retryable while refusing to reuse a path for changed launch credentials or
+/// parameters.
+fn write_or_validate_exact_private_file(
+    path: &Path,
+    expected: &[u8],
+) -> std::io::Result<PrivateFileWrite> {
+    if expected.len() > MAX_PRIVATE_LAUNCH_ARTIFACT_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "launch artifact exceeds the size limit",
+        ));
+    }
+
+    match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(mut file) => {
+            let created = PrivateFileIdentity::from_metadata(&file.metadata()?);
+            let result = (|| -> std::io::Result<()> {
+                // `mode` is filtered by the process umask. Set the final mode
+                // explicitly so the runner always sees the promised 0600.
+                file.set_permissions(fs::Permissions::from_mode(0o600))?;
+                file.write_all(expected)?;
+                file.sync_all()?;
+                let final_metadata = file.metadata()?;
+                validate_exact_private_file_metadata(&final_metadata, expected.len())?;
+                validate_private_file_path(path, &final_metadata, expected.len())
+            })();
+            if let Err(error) = result {
+                drop(file);
+                remove_created_file_if_same(path, created);
+                return Err(error);
+            }
+            Ok(PrivateFileWrite::Created(created))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // O_NONBLOCK prevents a hostile pre-existing FIFO from blocking
+            // before its metadata can be rejected.
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC | nix::libc::O_NONBLOCK)
+                .open(path)?;
+            validate_exact_private_file_metadata(&file.metadata()?, expected.len())?;
+            let mut actual = Vec::with_capacity(expected.len());
+            {
+                let mut bounded = (&mut file).take(expected.len() as u64 + 1);
+                bounded.read_to_end(&mut actual)?;
+            }
+            let final_metadata = file.metadata()?;
+            validate_exact_private_file_metadata(&final_metadata, expected.len())?;
+            if actual != expected {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "existing launch artifact does not match this request",
+                ));
+            }
+            validate_private_file_path(path, &final_metadata, expected.len())?;
+            Ok(PrivateFileWrite::Reused)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_launch_plan(
     session: TerminalSession,
@@ -597,6 +737,7 @@ pub fn build_launch_plan(
     // runner repeats this check at consumption time to close the TOCTOU gap.
     let working_directory_identity = launch_working_directory_identity(&session.working_directory)?;
     let mut cleanup_paths = Vec::new();
+    let mut created_cleanup_paths = Vec::new();
     let claude_settings = if session.runtime_kind == RuntimeKind::Claude && provider_hooks_enabled {
         let socket_parent = Path::new(status_socket).parent().ok_or_else(|| {
             std::io::Error::new(
@@ -606,93 +747,101 @@ pub fn build_launch_plan(
         })?;
         let path = socket_parent.join(format!("claude-hooks-{}.json", run.id));
         cleanup_old_claude_hook_settings(socket_parent);
-        write_claude_hook_settings(&path, &runner_executable)?;
+        if let PrivateFileWrite::Created(identity) =
+            write_claude_hook_settings(&path, &runner_executable)?
+        {
+            created_cleanup_paths.push((path.clone(), identity));
+        }
         cleanup_paths.push(path.display().to_string());
         Some(path)
     } else {
         None
     };
-    let (agent_arguments, capture_strategy) =
-        provider_arguments(&session, &run, task_title, claude_settings.as_deref());
-    let mut environment = BTreeMap::new();
-    environment.insert("TODOAGENT_SESSION_ID".to_owned(), session.id.clone());
-    environment.insert("TODOAGENT_RUN_ID".to_owned(), run.id.clone());
-    environment.insert(
-        "TODOAGENT_RUNTIME".to_owned(),
-        session.runtime_kind.as_str().to_owned(),
-    );
-    environment.insert(
-        "TODOAGENT_STATUS_SOCKET".to_owned(),
-        status_socket.to_owned(),
-    );
-    environment.insert("TODOAGENT_HOOK_TOKEN".to_owned(), hook_token.to_owned());
-
-    secure_descriptor_directory(descriptor_directory, true)?;
-    for entry in fs::read_dir(descriptor_directory)? {
-        let entry = entry?;
-        let metadata = match fs::symlink_metadata(entry.path()) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if owned_uuid_json(&entry.path(), &metadata)
-            && metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.elapsed().ok())
-                .is_some_and(|age| age.as_secs() > 24 * 60 * 60)
+    let result = (|| -> std::io::Result<TerminalLaunchPlan> {
+        let (agent_arguments, capture_strategy) =
+            provider_arguments(&session, &run, task_title, claude_settings.as_deref());
+        let mut environment = BTreeMap::new();
+        environment.insert("TODOAGENT_SESSION_ID".to_owned(), session.id.clone());
+        environment.insert("TODOAGENT_RUN_ID".to_owned(), run.id.clone());
+        environment.insert(
+            "TODOAGENT_RUNTIME".to_owned(),
+            session.runtime_kind.as_str().to_owned(),
+        );
+        environment.insert(
+            "TODOAGENT_STATUS_SOCKET".to_owned(),
+            status_socket.to_owned(),
+        );
+        environment.insert("TODOAGENT_HOOK_TOKEN".to_owned(), hook_token.to_owned());
+        if session.runtime_kind == RuntimeKind::Claude
+            && let Some(config_directory) =
+                claude_config_directory(Path::new(&session.working_directory))
         {
-            let _ = fs::remove_file(entry.path());
+            // The managed Runner may itself be launched from a login shell. Pin
+            // Claude to the same configuration root the Engine scans so shell-only
+            // CLAUDE_CONFIG_DIR changes cannot create a transcript that the next
+            // app process looks for somewhere else.
+            environment.insert(
+                "CLAUDE_CONFIG_DIR".to_owned(),
+                config_directory.display().to_string(),
+            );
         }
-    }
-    let descriptor_path = descriptor_directory.join(format!("{}.json", run.id));
-    let descriptor_result = (|| -> std::io::Result<()> {
-        let mut descriptor = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-            .open(&descriptor_path)?;
-        serde_json::to_writer(
-            &mut descriptor,
-            &RunnerDescriptor {
-                version: 3,
-                session_id: &session.id,
-                run_id: &run.id,
-                executable: &agent_executable,
-                arguments: &agent_arguments,
-                working_directory: &session.working_directory,
-                working_directory_device: working_directory_identity.device,
-                working_directory_inode: working_directory_identity.inode,
-                environment: &environment,
-                status_socket,
-                lifecycle_token,
-                hook_token,
-                host_pid,
-                cleanup_paths: &cleanup_paths,
-            },
-        )?;
-        descriptor.write_all(b"\n")?;
-        descriptor.sync_all()
-    })();
-    if let Err(error) = descriptor_result {
-        for path in &cleanup_paths {
-            let _ = fs::remove_file(path);
-        }
-        return Err(error);
-    }
 
-    Ok(TerminalLaunchPlan {
-        working_directory: session.working_directory.clone(),
-        executable: runner_executable,
-        arguments: vec![
-            "--descriptor".to_owned(),
-            descriptor_path.display().to_string(),
-        ],
-        environment: BTreeMap::new(),
-        capture_strategy: capture_strategy.to_owned(),
-        session,
-        run,
-    })
+        secure_descriptor_directory(descriptor_directory, true)?;
+        for entry in fs::read_dir(descriptor_directory)? {
+            let entry = entry?;
+            let metadata = match fs::symlink_metadata(entry.path()) {
+                Ok(metadata) => metadata,
+                Err(_) => continue,
+            };
+            if owned_uuid_json(&entry.path(), &metadata)
+                && metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() > 24 * 60 * 60)
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let descriptor_path = descriptor_directory.join(format!("{}.json", run.id));
+        let mut descriptor_bytes = serde_json::to_vec(&RunnerDescriptor {
+            version: 3,
+            session_id: &session.id,
+            run_id: &run.id,
+            executable: &agent_executable,
+            arguments: &agent_arguments,
+            working_directory: &session.working_directory,
+            working_directory_device: working_directory_identity.device,
+            working_directory_inode: working_directory_identity.inode,
+            environment: &environment,
+            status_socket,
+            lifecycle_token,
+            hook_token,
+            host_pid,
+            cleanup_paths: &cleanup_paths,
+        })?;
+        descriptor_bytes.push(b'\n');
+        write_or_validate_exact_private_file(&descriptor_path, &descriptor_bytes)?;
+
+        Ok(TerminalLaunchPlan {
+            working_directory: session.working_directory.clone(),
+            executable: runner_executable,
+            arguments: vec![
+                "--descriptor".to_owned(),
+                descriptor_path.display().to_string(),
+            ],
+            environment: BTreeMap::new(),
+            capture_strategy: capture_strategy.to_owned(),
+            session,
+            run,
+        })
+    })();
+    if result.is_err() {
+        for (path, identity) in created_cleanup_paths {
+            remove_created_file_if_same(&path, identity);
+        }
+    }
+    result
 }
 
 fn cleanup_old_claude_hook_settings(directory: &Path) {
@@ -725,7 +874,10 @@ fn provider_arguments(
     task_title: Option<&str>,
     claude_settings: Option<&Path>,
 ) -> (Vec<String>, &'static str) {
-    let provider_id = session.provider_session_id.as_deref();
+    let provider_id = run
+        .provider_session_id_at_launch
+        .as_deref()
+        .or(session.provider_session_id.as_deref());
     let first_launch = run.launch_mode == crate::models::TerminalLaunchMode::Fresh;
     match session.runtime_kind {
         RuntimeKind::Codex if first_launch => (
@@ -795,7 +947,10 @@ fn append_claude_settings(arguments: &mut Vec<String>, settings: Option<&Path>) 
     }
 }
 
-fn write_claude_hook_settings(path: &Path, runner_executable: &str) -> std::io::Result<()> {
+fn write_claude_hook_settings(
+    path: &Path,
+    runner_executable: &str,
+) -> std::io::Result<PrivateFileWrite> {
     let mut hooks = serde_json::Map::new();
     for event in [
         "SessionStart",
@@ -816,15 +971,9 @@ fn write_claude_hook_settings(path: &Path, runner_executable: &str) -> std::io::
         });
         hooks.insert(event.to_owned(), serde_json::json!([{"hooks": [handler]}]));
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_CLOEXEC)
-        .open(path)?;
-    serde_json::to_writer(&mut file, &serde_json::json!({"hooks": hooks}))?;
-    file.write_all(b"\n")?;
-    file.sync_all()
+    let mut bytes = serde_json::to_vec(&serde_json::json!({"hooks": hooks}))?;
+    bytes.push(b'\n');
+    write_or_validate_exact_private_file(path, &bytes)
 }
 
 fn required_provider_id(value: Option<&str>) -> &str {
@@ -863,6 +1012,8 @@ mod tests {
             last_error_message: None,
             last_started_at: None,
             last_exited_at: None,
+            last_exit_reason: None,
+            auto_resume: false,
             created_at: "now".to_owned(),
             updated_at: "now".to_owned(),
         }
@@ -888,6 +1039,25 @@ mod tests {
             exited_at: None,
             created_at: "now".to_owned(),
         }
+    }
+
+    #[test]
+    fn claude_fresh_and_resume_use_the_same_explicit_provider_identity() {
+        let provider_id = "7b9a3276-dfcd-46e3-94e3-92d43f9ebad4";
+        let session = session(RuntimeKind::Claude, Some(provider_id));
+        let (fresh_arguments, fresh_source) = provider_arguments(&session, &run(1), None, None);
+        let (resume_arguments, resume_source) = provider_arguments(&session, &run(2), None, None);
+
+        assert_eq!(
+            fresh_arguments,
+            vec!["--session-id".to_owned(), provider_id.to_owned()]
+        );
+        assert_eq!(fresh_source, "preallocated");
+        assert_eq!(
+            resume_arguments,
+            vec!["--resume".to_owned(), provider_id.to_owned()]
+        );
+        assert_eq!(resume_source, "already_bound");
     }
 
     #[test]
@@ -949,6 +1119,122 @@ mod tests {
     }
 
     #[test]
+    fn launch_plan_exact_replay_reuses_descriptor_and_hook_settings() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let descriptor_directory = directory.path().join("TerminalRuns");
+        let status_socket = directory.path().join("status.sock");
+        let provider_session = session(RuntimeKind::Claude, Some("claude-id"));
+        let terminal_run = run(1);
+        let build = |hook_token: &str| {
+            build_launch_plan(
+                provider_session.clone(),
+                terminal_run.clone(),
+                "/app/todoagent-terminal-runner".to_owned(),
+                "/usr/local/bin/claude".to_owned(),
+                Some("task"),
+                status_socket.to_str().unwrap(),
+                "lifecycle-token",
+                hook_token,
+                42,
+                true,
+                &descriptor_directory,
+            )
+        };
+
+        let first = build("hook-token").unwrap();
+        let descriptor_path = PathBuf::from(&first.arguments[1]);
+        let descriptor_before = fs::read(&descriptor_path).unwrap();
+        let descriptor: serde_json::Value = serde_json::from_slice(&descriptor_before).unwrap();
+        let settings_path = PathBuf::from(descriptor["cleanupPaths"][0].as_str().unwrap());
+        let settings_before = fs::read(&settings_path).unwrap();
+
+        let replay = build("hook-token").unwrap();
+        assert_eq!(replay.arguments, first.arguments);
+        assert_eq!(fs::read(&descriptor_path).unwrap(), descriptor_before);
+        assert_eq!(fs::read(&settings_path).unwrap(), settings_before);
+
+        let changed = build("hook-tokem").unwrap_err();
+        assert_eq!(changed.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&descriptor_path).unwrap(), descriptor_before);
+        assert_eq!(
+            fs::read(&settings_path).unwrap(),
+            settings_before,
+            "a conflicting replay must not delete settings created by the original request"
+        );
+    }
+
+    #[test]
+    fn private_launch_artifact_replay_rejects_unsafe_existing_paths() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("artifact.json");
+        let expected = b"{\"version\":3}\n";
+        assert!(matches!(
+            write_or_validate_exact_private_file(&path, expected).unwrap(),
+            PrivateFileWrite::Created(_)
+        ));
+        let metadata_before = fs::metadata(&path).unwrap();
+        assert_eq!(
+            write_or_validate_exact_private_file(&path, expected).unwrap(),
+            PrivateFileWrite::Reused
+        );
+        let metadata_after = fs::metadata(&path).unwrap();
+        assert_eq!(metadata_after.ino(), metadata_before.ino());
+        assert_eq!(
+            metadata_after.modified().unwrap(),
+            metadata_before.modified().unwrap(),
+            "an exact replay must not rewrite the artifact"
+        );
+        let mismatch =
+            write_or_validate_exact_private_file(&path, b"{\"version\":4}\n").unwrap_err();
+        assert_eq!(mismatch.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&path).unwrap(), expected);
+
+        let hardlink = directory.path().join("artifact-hardlink.json");
+        fs::hard_link(&path, &hardlink).unwrap();
+        let hardlink_error = write_or_validate_exact_private_file(&path, expected).unwrap_err();
+        assert_eq!(hardlink_error.kind(), std::io::ErrorKind::PermissionDenied);
+
+        let symlink_path = directory.path().join("artifact-symlink.json");
+        symlink(&path, &symlink_path).unwrap();
+        assert!(write_or_validate_exact_private_file(&symlink_path, expected).is_err());
+    }
+
+    #[test]
+    fn launch_plan_failure_only_cleans_hook_settings_created_by_this_attempt() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let descriptor_directory = directory.path().join("TerminalRuns");
+        fs::create_dir(&descriptor_directory).unwrap();
+        fs::set_permissions(&descriptor_directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let conflicting_descriptor = descriptor_directory.join("run-id.json");
+        fs::write(&conflicting_descriptor, b"{}\n").unwrap();
+        fs::set_permissions(&conflicting_descriptor, fs::Permissions::from_mode(0o600)).unwrap();
+        let status_socket = directory.path().join("status.sock");
+        let hook_settings = directory.path().join("claude-hooks-run-id.json");
+
+        let result = build_launch_plan(
+            session(RuntimeKind::Claude, Some("claude-id")),
+            run(1),
+            "/app/todoagent-terminal-runner".to_owned(),
+            "/usr/local/bin/claude".to_owned(),
+            None,
+            status_socket.to_str().unwrap(),
+            "lifecycle-token",
+            "hook-token",
+            42,
+            true,
+            &descriptor_directory,
+        );
+
+        assert!(result.is_err());
+        assert!(!hook_settings.exists());
+        assert_eq!(fs::read(&conflicting_descriptor).unwrap(), b"{}\n");
+    }
+
+    #[test]
     fn provider_profiles_never_use_ambiguous_last_or_continue_flags() {
         let cases = [
             (RuntimeKind::Codex, Some("codex-id")),
@@ -960,8 +1246,11 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let status_socket = directory.path().join("status.sock");
+            let provider_session = session(kind, provider_id);
+            let expected_claude_config =
+                claude_config_directory(Path::new(&provider_session.working_directory));
             let plan = build_launch_plan(
-                session(kind, provider_id),
+                provider_session,
                 run(2),
                 "/app/runner".to_owned(),
                 "/usr/local/bin/agent".to_owned(),
@@ -982,6 +1271,16 @@ mod tests {
             );
             let descriptor = fs::read_to_string(&plan.arguments[1]).unwrap();
             assert!(descriptor.contains(provider_id.unwrap()));
+            if kind == RuntimeKind::Claude {
+                let descriptor: serde_json::Value = serde_json::from_str(&descriptor).unwrap();
+                assert_eq!(
+                    descriptor["environment"]["CLAUDE_CONFIG_DIR"].as_str(),
+                    expected_claude_config
+                        .as_ref()
+                        .map(|path| path.to_string_lossy())
+                        .as_deref()
+                );
+            }
         }
     }
 

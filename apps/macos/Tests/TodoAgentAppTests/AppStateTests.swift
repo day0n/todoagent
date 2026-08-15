@@ -41,6 +41,22 @@ struct AppStateTests {
         #expect(state.inspectorPresented == false)
     }
 
+    @Test("TodoAgent docks on the task page and overlays a task terminal")
+    func assistantPlacementFollowsWorkspaceMode() {
+        #expect(AssistantPanePlacementPolicy.resolve(
+            inspectorPresented: false,
+            taskWorkspacePresented: false
+        ) == .hidden)
+        #expect(AssistantPanePlacementPolicy.resolve(
+            inspectorPresented: true,
+            taskWorkspacePresented: false
+        ) == .sideBySide)
+        #expect(AssistantPanePlacementPolicy.resolve(
+            inspectorPresented: true,
+            taskWorkspacePresented: true
+        ) == .taskOverlay)
+    }
+
     @Test("TodoAgent defaults to the boundary after two timeline days")
     func assistantWorkspaceAdaptsWithoutOverlayingSidebar() {
         #expect(MainWorkspaceLayoutPolicy.resolve(
@@ -1195,6 +1211,109 @@ struct AppStateTests {
         #expect(projection.count(for: .running, sessions: [session]) == 1)
         #expect(projection.count(for: .done, sessions: [session]) == 0)
         #expect(session.hasUnread)
+    }
+
+    @Test("embedded workspace switches tasks and collapse keeps the last selection")
+    func embeddedWorkspaceSelectionAndCollapse() async {
+        let first = taskFixture()
+        let second = TaskItem(
+            id: UUID(uuidString: "00000000-0000-4000-8000-000000000402")!,
+            listID: nil,
+            title: "继续本地 Agent",
+            note: "",
+            status: .open,
+            dueDate: nil,
+            completedAt: nil,
+            createdAt: .distantPast,
+            updatedAt: "2026-08-09T00:00:00Z"
+        )
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [first, second],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        state.taskWorkspacePresenter = workspace
+        state.terminalSessions = sessions
+        await state.load()
+
+        state.inspectorPresented = true
+        workspace.showTaskWorkspace(taskID: first.id)
+        #expect(workspace.presentedTaskID == first.id)
+        #expect(state.inspectorPresented == false)
+
+        state.inspectorPresented = true
+        workspace.showTaskWorkspace(taskID: second.id)
+        await drainMainActorTasks()
+        #expect(workspace.presentedTaskID == second.id)
+        #expect(state.inspectorPresented)
+
+        let composerDraft = workspace.composerState(for: .allTasks)
+        composerDraft.draft = "切换后仍保留的任务草稿"
+        let timelineComposerDraft = workspace.timelineComposerState(for: state.selectedDay)
+        timelineComposerDraft.draft = "时间线里尚未提交的任务草稿"
+
+        workspace.closeTaskWorkspace(taskID: second.id)
+        await drainMainActorTasks()
+        #expect(workspace.presentedTaskID == nil)
+        #expect(workspace.selectedTaskID == second.id)
+        #expect(workspace.contains(taskID: second.id))
+        #expect(workspace.composerState(for: .allTasks) === composerDraft)
+        #expect(workspace.composerState(for: .allTasks).draft == "切换后仍保留的任务草稿")
+        #expect(workspace.timelineComposerState(for: state.selectedDay) === timelineComposerDraft)
+        #expect(
+            workspace.timelineComposerState(for: state.selectedDay).draft
+                == "时间线里尚未提交的任务草稿"
+        )
+        #expect(workspace.closingTaskID == nil)
+    }
+
+    @Test("a rapid request back to the mounted task cancels the pending switch")
+    func embeddedWorkspaceRapidSwitchBack() async {
+        let first = taskFixture()
+        let second = TaskItem(
+            id: UUID(uuidString: "00000000-0000-4000-8000-000000000403")!,
+            listID: nil,
+            title: "第二个 Agent",
+            note: "",
+            status: .open,
+            dueDate: nil,
+            completedAt: nil,
+            createdAt: .distantPast,
+            updatedAt: "2026-08-09T00:00:00Z"
+        )
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [first, second],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        state.taskWorkspacePresenter = workspace
+        state.terminalSessions = sessions
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: first.id)
+        workspace.showTaskWorkspace(taskID: second.id)
+        #expect(workspace.pendingTaskID == second.id)
+        workspace.showTaskWorkspace(taskID: first.id)
+        await drainMainActorTasks()
+
+        #expect(workspace.presentedTaskID == first.id)
+        #expect(workspace.pendingTaskID == nil)
     }
 
     private func taskFixture() -> TaskItem {

@@ -3,17 +3,28 @@ import SwiftUI
 
 struct ContentView: View {
     @State private var state: AppState
+    @State private var taskWorkspace: TaskWorkspaceCoordinator
     @State private var assistantResizeStartWidth: CGFloat?
     @State private var assistantLiveWidth: CGFloat?
     @AppStorage(AssistantPanePreferences.widthKey) private var storedAssistantWidth = 0.0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    init(state: AppState) {
+    init(state: AppState, taskWorkspace: TaskWorkspaceCoordinator) {
         _state = State(initialValue: state)
+        _taskWorkspace = State(initialValue: taskWorkspace)
     }
 
     init(repository: any AppRepository) {
-        _state = State(initialValue: AppState(repository: repository))
+        let state = AppState(repository: repository)
+        let terminalSessions = TerminalSessionRegistry(repository: repository)
+        let taskWorkspace = TaskWorkspaceCoordinator(
+            state: state,
+            terminalSessions: terminalSessions
+        )
+        state.taskWorkspacePresenter = taskWorkspace
+        state.terminalSessions = terminalSessions
+        _state = State(initialValue: state)
+        _taskWorkspace = State(initialValue: taskWorkspace)
     }
 
     var body: some View {
@@ -30,58 +41,85 @@ struct ContentView: View {
                     availableWidth: proxy.size.width,
                     preferredWidth: assistantLiveWidth ?? persistedAssistantWidth
                 )
-                let assistantContainerWidth = state.inspectorPresented
-                    ? assistantWidth + MainWorkspaceLayoutPolicy.dividerWidth
+                let taskWorkspacePresented = taskWorkspace.presentedTaskID != nil
+                let assistantPlacement = AssistantPanePlacementPolicy.resolve(
+                    inspectorPresented: state.inspectorPresented,
+                    taskWorkspacePresented: taskWorkspacePresented
+                )
+                let assistantIsVisible = assistantPlacement != .hidden
+                let assistantDrawerWidth = assistantWidth + MainWorkspaceLayoutPolicy.dividerWidth
+                let assistantReservedWidth = assistantPlacement == .sideBySide
+                    ? assistantDrawerWidth
                     : 0
 
-                HStack(spacing: 0) {
-                    boardWorkspace
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                ZStack(alignment: .trailing) {
+                    HStack(spacing: 0) {
+                        boardWorkspace
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-                    ZStack(alignment: .trailing) {
-                        if state.inspectorPresented {
-                            HStack(spacing: 0) {
-                                AssistantResizeDivider(
-                                    assistantWidth: assistantWidth,
-                                    onDragChanged: { translation in
-                                        resizeAssistantPane(
-                                            translation: translation,
-                                            currentWidth: assistantWidth,
-                                            availableWidth: proxy.size.width
-                                        )
-                                    },
-                                    onDragEnded: finishResizingAssistantPane,
-                                    onNudge: { delta in
-                                        nudgeAssistantPane(
-                                            by: delta,
-                                            currentWidth: assistantWidth,
-                                            availableWidth: proxy.size.width
-                                        )
-                                    }
-                                )
-
-                                TodoAgentInspector(state: state)
-                                    .frame(width: assistantWidth)
-                            }
-                            .frame(width: assistantWidth + MainWorkspaceLayoutPolicy.dividerWidth)
-                            .transition(
-                                .move(edge: .trailing)
-                                    .combined(with: .opacity)
-                            )
-                        }
+                        Color.clear
+                            .frame(width: assistantReservedWidth)
+                            .accessibilityHidden(true)
                     }
-                    .frame(width: assistantContainerWidth, alignment: .trailing)
-                    .clipped()
+                    .animation(
+                        AssistantWorkspaceMotion.animation(
+                            reduceMotion: reduceMotion || taskWorkspacePresented
+                        ),
+                        value: assistantReservedWidth
+                    )
+
+                    HStack(spacing: 0) {
+                        AssistantResizeDivider(
+                            assistantWidth: assistantWidth,
+                            onDragChanged: { translation in
+                                resizeAssistantPane(
+                                    translation: translation,
+                                    currentWidth: assistantWidth,
+                                    availableWidth: proxy.size.width
+                                )
+                            },
+                            onDragEnded: finishResizingAssistantPane,
+                            onNudge: { delta in
+                                nudgeAssistantPane(
+                                    by: delta,
+                                    currentWidth: assistantWidth,
+                                    availableWidth: proxy.size.width
+                                )
+                            }
+                        )
+
+                        TodoAgentInspector(state: state)
+                            .frame(width: assistantWidth)
+                    }
+                    .frame(width: assistantDrawerWidth)
+                    .background(TodoAgentUI.canvasBackground)
+                    .shadow(
+                        color: assistantPlacement == .taskOverlay && assistantIsVisible
+                            ? TodoAgentUI.shadowColor
+                            : .clear,
+                        radius: 18,
+                        x: -5
+                    )
+                    .offset(x: assistantIsVisible ? 0 : assistantDrawerWidth)
+                    .opacity(assistantIsVisible ? 1 : 0)
+                    .allowsHitTesting(assistantIsVisible)
+                    .accessibilityHidden(!assistantIsVisible)
+                    .accessibilityIdentifier(
+                        assistantPlacement == .taskOverlay
+                            ? "assistant.task-overlay"
+                            : "assistant.side-pane"
+                    )
+                    .animation(
+                        AssistantWorkspaceMotion.animation(reduceMotion: reduceMotion),
+                        value: assistantIsVisible
+                    )
+                    .zIndex(2)
                 }
                 // The divider itself moves while it is being dragged. Keep
                 // the gesture in this fixed workspace coordinate space so
                 // its translation does not feed back into the next event.
                 .coordinateSpace(name: AssistantWorkspaceCoordinateSpace.name)
                 .clipped()
-                .animation(
-                    AssistantWorkspaceMotion.animation(reduceMotion: reduceMotion),
-                    value: state.inspectorPresented
-                )
             }
         }
         .navigationSplitViewStyle(.balanced)
@@ -93,6 +131,28 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewAssistantConversation)) { _ in
             Task { await state.openNewAssistantConversation() }
+        }
+        .onChange(of: state.inspectorPresented) { wasPresented, isPresented in
+            guard wasPresented,
+                  !isPresented,
+                  taskWorkspace.presentedTaskID != nil
+            else { return }
+            Task { @MainActor in
+                await Task.yield()
+                taskWorkspace.focusActiveTerminal()
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
+            guard let window = note.object as? NSWindow,
+                  window.identifier?.rawValue == TodoAgentMainWindow.identifier
+            else { return }
+            taskWorkspace.mainWindowDidBecomeKey()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.willCloseNotification)) { note in
+            guard let window = note.object as? NSWindow,
+                  window.identifier?.rawValue == TodoAgentMainWindow.identifier
+            else { return }
+            taskWorkspace.mainWindowWillClose()
         }
         .overlay {
             if state.isPreparingToTerminate {
@@ -130,26 +190,27 @@ struct ContentView: View {
     }
 
     private var boardWorkspace: some View {
-        ZStack(alignment: .bottomTrailing) {
-            BoardView(state: state)
+        let floatingButtonIsVisible = !state.inspectorPresented
+        let taskWorkspacePresented = taskWorkspace.presentedTaskID != nil
 
-            if !state.inspectorPresented {
-                AssistantFloatingButton {
-                    Task { await state.openAssistant() }
-                }
-                .padding(.trailing, 22)
-                .padding(.bottom, 24)
-                .transition(
-                    .scale(scale: 0.88, anchor: .bottomTrailing)
-                        .combined(with: .opacity)
-                )
+        return ZStack(alignment: .bottomTrailing) {
+            BoardView(state: state, taskWorkspace: taskWorkspace)
+
+            AssistantFloatingButton(isOverTaskTerminal: taskWorkspacePresented) {
+                Task { await state.openAssistant() }
             }
+            .padding(.trailing, 22)
+            .padding(.bottom, taskWorkspacePresented ? 48 : 24)
+            .scaleEffect(floatingButtonIsVisible ? 1 : 0.88, anchor: .bottomTrailing)
+            .opacity(floatingButtonIsVisible ? 1 : 0)
+            .allowsHitTesting(floatingButtonIsVisible)
+            .accessibilityHidden(!floatingButtonIsVisible)
+            .animation(
+                reduceMotion ? nil : .easeInOut(duration: 0.22),
+                value: floatingButtonIsVisible
+            )
         }
         .background(TodoAgentUI.canvasBackground)
-        .animation(
-            AssistantWorkspaceMotion.animation(reduceMotion: reduceMotion),
-            value: state.inspectorPresented
-        )
     }
 
     private var persistedAssistantWidth: CGFloat? {
@@ -203,6 +264,22 @@ struct ContentView: View {
 enum MainWorkspaceLayout: Equatable, Sendable {
     case boardOnly
     case sideBySide(assistantWidth: CGFloat)
+}
+
+enum AssistantPanePlacement: Equatable, Sendable {
+    case hidden
+    case sideBySide
+    case taskOverlay
+}
+
+enum AssistantPanePlacementPolicy {
+    static func resolve(
+        inspectorPresented: Bool,
+        taskWorkspacePresented: Bool
+    ) -> AssistantPanePlacement {
+        guard inspectorPresented else { return .hidden }
+        return taskWorkspacePresented ? .taskOverlay : .sideBySide
+    }
 }
 
 enum MainWorkspaceLayoutPolicy {
@@ -339,6 +416,7 @@ private struct AssistantResizeDivider: View {
 }
 
 private struct AssistantFloatingButton: View {
+    let isOverTaskTerminal: Bool
     let action: () -> Void
 
     var body: some View {
@@ -359,7 +437,11 @@ private struct AssistantFloatingButton: View {
         .contentShape(.circle)
         .help("打开 TodoAgent")
         .accessibilityLabel("打开 TodoAgent")
-        .accessibilityHint("打开 TodoAgent 对话面板")
+        .accessibilityHint(
+            isOverTaskTerminal
+                ? "在当前任务终端上方打开 TodoAgent"
+                : "打开 TodoAgent 对话面板"
+        )
         .accessibilityIdentifier("assistant.floating-button")
     }
 }

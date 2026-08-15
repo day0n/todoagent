@@ -106,6 +106,7 @@ pub fn handshake() -> Event<Handshake> {
                 "terminal.session.rebind_workspace",
                 "terminal.session.resume_candidates",
                 "terminal.session.prepare_launch",
+                "terminal.session.delete",
                 "terminal.run.started",
                 "terminal.run.stopping",
                 "terminal.run.bind_provider",
@@ -146,6 +147,7 @@ mod tests {
         assert!(
             capabilities.contains(&Value::String("terminal.session.prepare_launch".to_owned()))
         );
+        assert!(capabilities.contains(&Value::String("terminal.session.delete".to_owned())));
         assert!(capabilities.contains(&Value::String(
             "terminal.session.rebind_workspace".to_owned()
         )));
@@ -160,7 +162,7 @@ mod tests {
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
             .collect::<Vec<_>>();
 
-        assert_eq!(values.len(), 26);
+        assert_eq!(values.len(), 29);
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("assistant.send")
         }));
@@ -182,6 +184,17 @@ mod tests {
             value.get("method").and_then(Value::as_str) == Some("terminal.session.rebind_workspace")
                 && value["params"]["sessionId"] == "00000000-0000-4000-8000-000000000301"
                 && value["params"]["workingDirectory"] == "/tmp/rebound-project"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("terminal.session.prepare_launch")
+                && value["params"]["intent"] == "fresh"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("terminal.run.bind_provider")
+                && value["params"]["providerSessionId"] == "00000000-0000-4000-8000-000000000304"
+        }));
+        assert!(values.iter().any(|value| {
+            value.get("method").and_then(Value::as_str) == Some("terminal.session.delete")
         }));
         assert!(values.iter().any(|value| {
             value.get("method").and_then(Value::as_str) == Some("task.delete")

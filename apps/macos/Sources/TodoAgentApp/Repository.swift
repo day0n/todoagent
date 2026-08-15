@@ -49,8 +49,11 @@ protocol AppRepository: Sendable {
         lifecycleToken: String,
         hookToken: String,
         providerHooksEnabled: Bool,
-        hostPID: Int32
+        hostPID: Int32,
+        intent: TerminalLaunchIntent,
+        runtimeKind: RuntimeKind?
     ) async throws -> TerminalLaunchPlan
+    func deleteTerminalSession(sessionID: String) async throws
     func markTerminalRunStarted(sessionID: String, runID: String) async throws -> TerminalSessionBundle
     func markTerminalRunStopping(sessionID: String, runID: String) async throws -> TerminalSessionBundle
     func terminalResumeCandidates(sessionID: String) async throws -> TerminalResumeCandidates
@@ -154,10 +157,13 @@ extension AppRepository {
         lifecycleToken _: String,
         hookToken _: String,
         providerHooksEnabled _: Bool,
-        hostPID _: Int32
+        hostPID _: Int32,
+        intent _: TerminalLaunchIntent,
+        runtimeKind _: RuntimeKind?
     ) async throws -> TerminalLaunchPlan {
         throw AppRepositoryError.sessionNotFound
     }
+    func deleteTerminalSession(sessionID _: String) async throws {}
     func markTerminalRunStarted(sessionID _: String, runID _: String) async throws -> TerminalSessionBundle {
         throw AppRepositoryError.sessionNotFound
     }
@@ -225,7 +231,7 @@ actor DemoRepository: AppRepository {
         snapshot = AppSnapshot(
             revision: 1,
             lists: [TodoList(id: listID, name: "TodoAgent", colorName: "blue", repositoryPath: "~/Desktop/todoagent")],
-            tasks: [TaskItem(id: taskID, listID: listID, title: "接通真实本地 Agent", note: "选择 Runtime 与目录后进入完整 Session", status: .open, executionDate: LocalDay(now), dueDate: nil, completedAt: nil, createdAt: now, updatedAt: ISO8601DateFormatter().string(from: now))],
+            tasks: [TaskItem(id: taskID, listID: listID, title: "接通真实本地 Agent", note: "打开任务即可进入本机终端", status: .open, executionDate: LocalDay(now), dueDate: nil, completedAt: nil, createdAt: now, updatedAt: ISO8601DateFormatter().string(from: now))],
             runtimes: RuntimeKind.allCases.map { RuntimeInfo(kind: $0, launchPath: nil, resolvedPath: nil, version: "preview", status: .ready, authStatus: "ready", capabilities: [:], providerEngine: $0 == .kiro ? "v2" : nil, detectedAt: nil, verifiedAt: nil, verifyError: nil) },
             sessions: [],
             messages: []

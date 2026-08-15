@@ -19,9 +19,14 @@ final class TaskWorkbenchLayoutState {
 
     private(set) var detailsPresented = false
     private(set) var detailsWidth = idealDetailsWidth
+    private(set) var hostRefreshToken = 0
 
     func toggleDetails() {
         detailsPresented.toggle()
+    }
+
+    func requestHostRefresh() {
+        hostRefreshToken += 1
     }
 
     func recordDetailsWidth(_ proposedWidth: CGFloat) {
@@ -33,10 +38,26 @@ final class TaskWorkbenchLayoutState {
 }
 
 @MainActor
-final class TaskWorkbenchWindowRegistry: TaskWorkspacePresenting {
+@Observable
+final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
     private let state: AppState
-    private let terminalSessions: TerminalSessionRegistry
-    private var controllers: [UUID: TaskWorkbenchWindowController] = [:]
+    let terminalSessions: TerminalSessionRegistry
+    @ObservationIgnored private var layoutStates: [UUID: TaskWorkbenchLayoutState] = [:]
+    @ObservationIgnored private var composerStates: [InlineAddTaskDestination: InlineAddTaskComposerState] = [:]
+    @ObservationIgnored private var timelineComposerStates: [LocalDay: InlineAddTaskComposerState] = [:]
+    @ObservationIgnored private var transitionTask: Task<Void, Never>?
+    @ObservationIgnored private var transitionGeneration: UInt64 = 0
+    @ObservationIgnored private var detailsTransitionInFlight = false
+
+    private(set) var selectedTaskID: UUID?
+    private(set) var isPresented = false
+    private(set) var pendingTaskID: UUID?
+    private(set) var closingTaskID: UUID?
+    private(set) var activeWorkspaceIsCompact = false
+
+    var presentedTaskID: UUID? {
+        isPresented ? selectedTaskID : nil
+    }
 
     init(state: AppState, terminalSessions: TerminalSessionRegistry) {
         self.state = state
@@ -44,69 +65,260 @@ final class TaskWorkbenchWindowRegistry: TaskWorkspacePresenting {
     }
 
     func showTaskWorkspace(taskID: UUID) {
-        guard let task = state.task(id: taskID) else { return }
-        if let existing = controllers[taskID] {
-            existing.showWindow(nil)
-            NSApp.activate(ignoringOtherApps: true)
-            Task { @MainActor [weak self] in
-                await self?.terminalSessions.resumeIfNeeded(
-                    taskID: taskID,
-                    taskTitle: task.title
-                )
+        guard state.task(id: taskID) != nil else { return }
+
+        if !isPresented, state.inspectorPresented {
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                state.inspectorPresented = false
             }
+        }
+
+        transitionGeneration &+= 1
+        let generation = transitionGeneration
+        transitionTask?.cancel()
+        transitionTask = nil
+        closingTaskID = nil
+
+        if selectedTaskID == taskID {
+            pendingTaskID = nil
+            isPresented = true
+            layoutState(for: taskID).requestHostRefresh()
+            focusTerminalAfterMount(taskID: taskID, generation: generation)
             return
         }
 
-        let controller = TaskWorkbenchWindowController(
-            taskID: taskID,
-            state: state,
-            terminalSessions: terminalSessions
-        )
-        controllers[taskID] = controller
-        controller.showWindow(nil)
-        NSApp.activate(ignoringOtherApps: true)
-    }
+        guard isPresented, let previousTaskID = selectedTaskID else {
+            selectedTaskID = taskID
+            pendingTaskID = nil
+            isPresented = true
+            layoutState(for: taskID).requestHostRefresh()
+            focusTerminalAfterMount(taskID: taskID, generation: generation)
+            return
+        }
 
-    func closeTaskWorkspace(taskID: UUID) {
-        controllers[taskID]?.requestClose()
-    }
-
-    func destroyTaskWorkspace(taskID: UUID) {
-        closeImmediately(taskID: taskID)
-    }
-
-    func commitTaskWorkspaceInput() {
-        for controller in controllers.values {
-            controller.commitInput()
+        pendingTaskID = taskID
+        commitInput(taskID: previousTaskID)
+        transitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await Task.yield()
+            let saved = await self.state.flushTaskEdits(taskID: previousTaskID)
+            guard !Task.isCancelled,
+                  self.transitionGeneration == generation,
+                  self.pendingTaskID == taskID
+            else { return }
+            self.transitionTask = nil
+            self.pendingTaskID = nil
+            guard saved, self.state.task(id: taskID) != nil else { return }
+            self.selectedTaskID = taskID
+            self.isPresented = true
+            self.layoutState(for: taskID).requestHostRefresh()
+            self.focusTerminalAfterMount(taskID: taskID, generation: generation)
         }
     }
 
-    func closeImmediately(taskID: UUID) {
-        controllers[taskID]?.closeImmediately()
-        controllers[taskID] = nil
+    func closeTaskWorkspace(taskID: UUID) {
+        guard isPresented, selectedTaskID == taskID else { return }
+        guard closingTaskID == nil else { return }
+        transitionGeneration &+= 1
+        let generation = transitionGeneration
+        transitionTask?.cancel()
+        pendingTaskID = nil
+        closingTaskID = taskID
+        commitInput(taskID: taskID)
+        transitionTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await Task.yield()
+            let saved = await self.state.flushTaskEdits(taskID: taskID)
+            guard !Task.isCancelled,
+                  self.transitionGeneration == generation,
+                  self.selectedTaskID == taskID
+            else {
+                if self.closingTaskID == taskID { self.closingTaskID = nil }
+                return
+            }
+            self.transitionTask = nil
+            guard saved else {
+                self.closingTaskID = nil
+                return
+            }
+            guard !Task.isCancelled,
+                  self.transitionGeneration == generation,
+                  self.selectedTaskID == taskID,
+                  self.closingTaskID == taskID
+            else { return }
+            // Keep the selection and TerminalSessionController so reopening
+            // attaches the exact same Ghostty surface and scrollback.
+            self.isPresented = false
+            self.closingTaskID = nil
+        }
     }
 
-    func contains(taskID: UUID) -> Bool { controllers[taskID] != nil }
+    func destroyTaskWorkspace(taskID: UUID) {
+        if pendingTaskID == taskID {
+            transitionGeneration &+= 1
+            transitionTask?.cancel()
+            transitionTask = nil
+            pendingTaskID = nil
+        }
+        layoutStates[taskID] = nil
+        guard selectedTaskID == taskID else { return }
+        transitionGeneration &+= 1
+        transitionTask?.cancel()
+        transitionTask = nil
+        selectedTaskID = nil
+        isPresented = false
+        closingTaskID = nil
+        activeWorkspaceIsCompact = false
+    }
+
+    func commitTaskWorkspaceInput() {
+        guard let selectedTaskID else { return }
+        commitInput(taskID: selectedTaskID)
+    }
+
+    func layoutState(for taskID: UUID) -> TaskWorkbenchLayoutState {
+        if let existing = layoutStates[taskID] { return existing }
+        let created = TaskWorkbenchLayoutState()
+        layoutStates[taskID] = created
+        return created
+    }
+
+    func composerState(for destination: InlineAddTaskDestination) -> InlineAddTaskComposerState {
+        if let existing = composerStates[destination] { return existing }
+        let created = InlineAddTaskComposerState()
+        composerStates[destination] = created
+        return created
+    }
+
+    func timelineComposerState(for day: LocalDay) -> InlineAddTaskComposerState {
+        if let existing = timelineComposerStates[day] { return existing }
+        let created = InlineAddTaskComposerState()
+        timelineComposerStates[day] = created
+        return created
+    }
+
+    var activeWorkspaceShowsTaskRail: Bool {
+        presentedTaskID != nil && !activeWorkspaceIsCompact
+    }
+
+    func updateActiveWorkspaceCompactState(taskID: UUID, isCompact: Bool) {
+        guard presentedTaskID == taskID else { return }
+        activeWorkspaceIsCompact = isCompact
+        guard isCompact, layoutState(for: taskID).detailsPresented else { return }
+        closeTaskDetails(taskID: taskID)
+    }
+
+    func contains(taskID: UUID) -> Bool {
+        selectedTaskID == taskID
+    }
 
     func focusActiveTerminal() {
-        let activeTaskID = controllers.first(where: { $0.value.window?.isKeyWindow == true })?.key
-        guard let activeTaskID else { return }
-        terminalSessions.controller(for: activeTaskID)?.focusIfAppropriate()
+        guard isMainWindowCommandTarget, let taskID = presentedTaskID else { return }
+        terminalSessions.controller(for: taskID)?.focusIfAppropriate()
+    }
+
+    @discardableResult
+    func collapseActiveWorkspace() -> Bool {
+        guard isMainWindowCommandTarget, let taskID = presentedTaskID else { return false }
+        closeTaskWorkspace(taskID: taskID)
+        return true
     }
 
     func performTerminalAction(_ action: String) {
-        let activeTaskID = controllers.first(where: { $0.value.window?.isKeyWindow == true })?.key
-        guard let activeTaskID else { return }
-        terminalSessions.controller(for: activeTaskID)?.performAction(action)
+        guard isMainWindowCommandTarget, let taskID = presentedTaskID else { return }
+        terminalSessions.controller(for: taskID)?.performAction(action)
     }
 
     @discardableResult
     func toggleActiveTaskDetails() -> Bool {
-        guard let controller = controllers.values.first(where: { $0.window?.isKeyWindow == true }) else {
-            return false
+        guard isMainWindowCommandTarget,
+              !activeWorkspaceIsCompact,
+              let taskID = presentedTaskID,
+              !detailsTransitionInFlight
+        else { return false }
+        let layoutState = layoutState(for: taskID)
+        guard layoutState.detailsPresented else {
+            layoutState.toggleDetails()
+            return true
         }
-        controller.requestTaskDetailsToggle()
+
+        detailsTransitionInFlight = true
+        commitInput(taskID: taskID)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await Task.yield()
+            let saved = await self.state.flushTaskEdits(taskID: taskID)
+            self.detailsTransitionInFlight = false
+            guard saved, self.presentedTaskID == taskID else { return }
+            self.layoutState(for: taskID).toggleDetails()
+            self.terminalSessions.controller(for: taskID)?.focusIfAppropriate()
+        }
         return true
+    }
+
+    func mainWindowDidBecomeKey() {
+        guard let taskID = presentedTaskID else { return }
+        terminalSessions.controller(for: taskID)?.focusIfAppropriate()
+    }
+
+    func mainWindowWillClose() {
+        guard let taskID = presentedTaskID else { return }
+        commitInput(taskID: taskID)
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            _ = await self?.state.flushTaskEdits(taskID: taskID)
+        }
+    }
+
+    private func commitInput(taskID: UUID) {
+        terminalSessions.controller(for: taskID)?.surfaceCommitComposition()
+        guard let application = NSApp,
+              let window = application.windows.first(where: {
+            $0.identifier?.rawValue == TodoAgentMainWindow.identifier
+        }) else { return }
+        window.endEditing(for: nil)
+        window.makeFirstResponder(nil)
+    }
+
+    private var isMainWindowCommandTarget: Bool {
+        guard presentedTaskID != nil,
+              let application = NSApp,
+              application.keyWindow?.identifier?.rawValue == TodoAgentMainWindow.identifier
+        else { return false }
+        return true
+    }
+
+    private func closeTaskDetails(taskID: UUID) {
+        guard !detailsTransitionInFlight else { return }
+        let layoutState = layoutState(for: taskID)
+        guard layoutState.detailsPresented else { return }
+        detailsTransitionInFlight = true
+        commitInput(taskID: taskID)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await Task.yield()
+            let saved = await self.state.flushTaskEdits(taskID: taskID)
+            self.detailsTransitionInFlight = false
+            guard saved,
+                  self.presentedTaskID == taskID,
+                  self.activeWorkspaceIsCompact,
+                  self.layoutState(for: taskID).detailsPresented
+            else { return }
+            self.layoutState(for: taskID).toggleDetails()
+        }
+    }
+
+    private func focusTerminalAfterMount(taskID: UUID, generation: UInt64) {
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self,
+                  self.transitionGeneration == generation,
+                  self.presentedTaskID == taskID
+            else { return }
+            self.terminalSessions.controller(for: taskID)?.focusIfAppropriate()
+        }
     }
 }
 
@@ -168,6 +380,10 @@ final class TaskWorkbenchWindowController: NSWindowController, NSWindowDelegate 
     override func showWindow(_ sender: Any?) {
         super.showWindow(sender)
         window?.makeKeyAndOrderFront(nil)
+    }
+
+    func requestHostRefresh() {
+        layoutState.requestHostRefresh()
     }
 
     func requestClose() {
@@ -233,6 +449,69 @@ final class TaskWorkbenchWindowController: NSWindowController, NSWindowDelegate 
 
 }
 
+@MainActor
+enum TaskWorkbenchPresentation: Equatable, Sendable {
+    case window
+    case embedded(compact: Bool)
+
+    var minimumContentSize: CGSize? {
+        switch self {
+        case .window: TaskWorkbenchWindowController.minimumContentSize
+        case .embedded: nil
+        }
+    }
+
+    var terminalMinimumWidth: CGFloat {
+        switch self {
+        case .window: 560
+        case .embedded: 320
+        }
+    }
+
+    var minimumDetailsWidth: CGFloat {
+        switch self {
+        case .window: TaskWorkbenchLayoutState.minimumDetailsWidth
+        case .embedded: 220
+        }
+    }
+
+    var isEmbedded: Bool {
+        if case .embedded = self { return true }
+        return false
+    }
+
+    var isCompactEmbedded: Bool {
+        if case let .embedded(compact) = self { return compact }
+        return false
+    }
+
+    var allowsTaskDetails: Bool {
+        self == .window
+    }
+}
+
+enum TaskTerminalPaneMode: Equatable, Sendable {
+    case terminal
+    case launching
+    case rebuilding
+    case unavailable(String)
+
+    static func resolve(
+        hasLiveSurface: Bool,
+        phase: TerminalSessionPresentationPhase
+    ) -> TaskTerminalPaneMode {
+        // `launch()` prepares an exact resume command asynchronously. Keep the
+        // host surface detached until that command has been enqueued so user
+        // keystrokes cannot be concatenated with a delayed automatic resume.
+        if case .preparing = phase { return .launching }
+        if hasLiveSurface { return .terminal }
+        if phase.isActive { return .launching }
+        if case .hostExited = phase { return .rebuilding }
+        if case let .failed(message) = phase { return .unavailable(message) }
+        return .unavailable("终端暂时不可用，请重试。")
+    }
+}
+
 struct TaskWorkbenchView: View {
     let taskID: UUID
     let state: AppState
@@ -240,12 +519,14 @@ struct TaskWorkbenchView: View {
     let layoutState: TaskWorkbenchLayoutState
     let toggleTaskDetails: () -> Void
     let requestClose: () -> Void
+    var presentation: TaskWorkbenchPresentation = .window
+    var isClosing = false
 
-    @State private var isStarting = false
     @State private var terminalController: TerminalSessionController?
-    @State private var isLoadingSession = false
-    @State private var isRebindingWorkspace = false
-    @State private var workspaceRebindError: String?
+    @State private var isLoadingSession = true
+    @State private var terminalLoadGeneration = 0
+    @State private var terminalReloadToken = 0
+    @State private var hostBindError: String?
 
     var body: some View {
         Group {
@@ -254,163 +535,276 @@ struct TaskWorkbenchView: View {
                     task: task,
                     state: state,
                     layoutState: layoutState,
+                    terminalMinimumWidth: presentation.terminalMinimumWidth,
+                    minimumDetailsWidth: presentation.minimumDetailsWidth,
+                    allowsTaskDetails: presentation.allowsTaskDetails,
                     terminalPane: { terminalPane($0) }
                 )
             } else {
-                ContentUnavailableView(
-                    "任务已不存在",
-                    systemImage: "questionmark.folder",
-                    description: Text("这个任务已被删除。")
-                )
+                TaskEmbeddedStateContainer(
+                    title: "任务已不存在",
+                    subtitle: "这个任务已被删除",
+                    presentation: presentation,
+                    isClosing: isClosing,
+                    close: requestClose
+                ) {
+                    ContentUnavailableView(
+                        "任务已不存在",
+                        systemImage: "questionmark.folder",
+                        description: Text("这个任务已被删除。")
+                    )
+                }
             }
         }
-        .frame(minWidth: 900, minHeight: 600)
+        .frame(
+            minWidth: presentation.minimumContentSize?.width,
+            minHeight: presentation.minimumContentSize?.height
+        )
         .disabled(state.isPreparingToTerminate)
         .accessibilityIdentifier("task.workbench.\(taskID.uuidString)")
-        .task(id: taskID) { await loadTerminalController() }
-        .alert(
-            "无法重新定位工作目录",
-            isPresented: Binding(
-                get: { workspaceRebindError != nil },
-                set: { if !$0 { workspaceRebindError = nil } }
-            )
-        ) {
-            Button("好", role: .cancel) { workspaceRebindError = nil }
-        } message: {
-            Text(workspaceRebindError ?? "")
+        .task(id: "\(taskID.uuidString)-\(layoutState.hostRefreshToken)-\(terminalReloadToken)") {
+            await loadTerminalController()
+        }
+        .onChange(of: terminalController?.phase) { _, phase in
+            if case .hostExited = phase,
+               hostBindError == nil,
+               !terminalSessions.isShuttingDown,
+               !terminalSessions.isRecoveringEngine
+            {
+                requestTerminalReload()
+            }
+        }
+        .onChange(of: terminalSessions.isShuttingDown) { wasShuttingDown, isShuttingDown in
+            if wasShuttingDown, !isShuttingDown {
+                requestTerminalReload()
+            }
+        }
+        .onChange(of: terminalSessions.isRecoveringEngine) { wasRecovering, isRecovering in
+            if wasRecovering, !isRecovering {
+                requestTerminalReload()
+            }
         }
     }
 
     @ViewBuilder
     private func terminalPane(_ task: TaskItem) -> some View {
-        if let terminalController {
+        if let hostBindError {
+            TaskEmbeddedStateContainer(
+                title: task.title,
+                subtitle: "终端暂时不可用",
+                presentation: presentation,
+                isClosing: isClosing,
+                close: requestClose
+            ) {
+                TaskTerminalBindFailedPane(
+                    message: hostBindError,
+                    retry: {
+                        requestTerminalReload()
+                    }
+                )
+            }
+        } else if let terminalController {
             VStack(spacing: 0) {
                 TaskTerminalToolbar(
                     task: task,
                     controller: terminalController,
                     detailsPresented: layoutState.detailsPresented,
+                    presentation: presentation,
+                    isClosing: isClosing,
                     toggleTaskDetails: toggleTaskDetails,
-                    close: requestClose,
-                    resumeSession: {
-                        resume(terminalController, task: task)
-                    },
-                    endSession: {
-                        Task {
-                            await terminalSessions.endRetaining(taskID: taskID, reason: .userEnded)
-                        }
-                    }
+                    close: requestClose
                 )
                 Divider()
-                if terminalController.hasLiveSurface {
+                switch TaskTerminalPaneMode.resolve(
+                    hasLiveSurface: terminalController.hasLiveSurface,
+                    phase: terminalController.phase
+                ) {
+                case .terminal:
                     TerminalSurfaceContainer(controller: terminalController)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if terminalController.phase.isActive {
+                        .accessibilityIdentifier("task.terminal.surface")
+                case .launching:
                     TaskTerminalLaunchingPane(controller: terminalController)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else {
-                    TaskTerminalEndedPane(
-                        task: task,
-                        controller: terminalController,
-                        resume: {
-                            resume(terminalController, task: task)
-                        },
-                        relocateWorkspace: {
-                            relocateWorkspace(terminalController, task: task)
-                        },
-                        isRebindingWorkspace: isRebindingWorkspace,
-                        chooseCandidate: { candidate in
-                            Task {
-                                await terminalSessions.bindAndResume(
-                                    candidate,
-                                    controller: terminalController,
-                                    taskTitle: task.title
-                                )
-                            }
-                        }
+                case .rebuilding:
+                    ProgressView("正在重新连接终端…")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                case let .unavailable(message):
+                    TaskTerminalBindFailedPane(
+                        message: message,
+                        retry: requestTerminalReload
                     )
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 Divider()
                 TaskTerminalStatusBar(controller: terminalController)
             }
-        } else if isLoadingSession {
-            ProgressView("正在载入本地终端…")
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            TaskSessionSetupView(
-                task: task,
-                state: state,
-                isClosing: false,
-                isStarting: $isStarting,
-                flushTaskEdits: { await state.flushTaskEdits(taskID: taskID) },
-                onClose: requestClose
-            )
-            .onChange(of: isStarting) { wasStarting, nowStarting in
-                if wasStarting, !nowStarting {
-                    terminalController = terminalSessions.controller(for: taskID)
-                }
+            TaskEmbeddedStateContainer(
+                title: task.title,
+                subtitle: "正在打开任务终端",
+                presentation: presentation,
+                isClosing: isClosing,
+                close: requestClose
+            ) {
+                ProgressView(isLoadingSession ? "正在打开任务终端…" : "正在等待终端服务…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
 
     private func loadTerminalController() async {
-        if let existing = terminalSessions.controller(for: taskID) {
-            terminalController = existing
-            if !existing.hasLiveSurface,
-               !existing.phase.isActive,
-               let task = state.task(id: taskID) {
-                await terminalSessions.resumeIfNeeded(taskID: taskID, taskTitle: task.title)
-            }
-            return
-        }
+        guard let task = state.task(id: taskID) else { return }
+        terminalLoadGeneration &+= 1
+        let generation = terminalLoadGeneration
         isLoadingSession = true
-        defer { isLoadingSession = false }
+        hostBindError = nil
+        defer {
+            if terminalLoadGeneration == generation,
+               terminalController != nil || (
+                   !terminalSessions.isShuttingDown
+                       && !terminalSessions.isRecoveringEngine
+               )
+            {
+                isLoadingSession = false
+            }
+        }
         do {
-            terminalController = try await terminalSessions.load(taskID: taskID)
-            if terminalController?.view == nil, let task = state.task(id: taskID) {
-                if let terminalController {
-                    await terminalSessions.resumeOrLaunch(terminalController, taskTitle: task.title)
+            let loaded = try await terminalSessions.openTask(task)
+            guard !Task.isCancelled, terminalLoadGeneration == generation else { return }
+            terminalController = loaded
+        } catch is CancellationError {
+            return
+        } catch {
+            guard terminalLoadGeneration == generation else { return }
+            hostBindError = error.localizedDescription
+        }
+    }
+
+    private func requestTerminalReload() {
+        terminalReloadToken &+= 1
+    }
+}
+
+private struct TaskEmbeddedStateContainer<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let presentation: TaskWorkbenchPresentation
+    let isClosing: Bool
+    let close: () -> Void
+    let content: Content
+
+    init(
+        title: String,
+        subtitle: String,
+        presentation: TaskWorkbenchPresentation,
+        isClosing: Bool,
+        close: @escaping () -> Void,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title
+        self.subtitle = subtitle
+        self.presentation = presentation
+        self.isClosing = isClosing
+        self.close = close
+        self.content = content()
+    }
+
+    @ViewBuilder
+    var body: some View {
+        if presentation.isEmbedded {
+            VStack(spacing: 0) {
+                TaskEmbeddedStateToolbar(
+                    title: title,
+                    subtitle: subtitle,
+                    isCompact: presentation.isCompactEmbedded,
+                    isClosing: isClosing,
+                    close: close
+                )
+                Divider()
+                content
+            }
+        } else {
+            content
+        }
+    }
+}
+
+private struct TaskEmbeddedStateToolbar: View {
+    let title: String
+    let subtitle: String
+    let isCompact: Bool
+    let isClosing: Bool
+    let close: () -> Void
+
+    var body: some View {
+        HStack(spacing: 12) {
+            collapseButton
+
+            Image(systemName: "terminal")
+                .font(.body.weight(.semibold))
+                .frame(width: 28, height: 28)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(1)
+                if !isCompact {
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 }
             }
-        } catch {
-            state.errorMessage = error.localizedDescription
+
+            Spacer(minLength: 8)
         }
+        .padding(.horizontal, 16)
+        .frame(height: 54)
+        .background(.bar)
     }
 
-    private func resume(_ controller: TerminalSessionController, task: TaskItem) {
-        Task { @MainActor in
-            await terminalSessions.resumeOrLaunch(controller, taskTitle: task.title)
+    @ViewBuilder
+    private var collapseButton: some View {
+        if isClosing {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 28, height: 28)
+                .accessibilityLabel("正在收起任务终端")
+        } else {
+            Button("收起任务终端", systemImage: "sidebar.leading", action: close)
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                .help("返回任务页，终端继续运行")
+                .accessibilityHint("返回任务页，终端继续运行")
+                .accessibilityIdentifier("task.workspace.toolbar.collapse")
         }
     }
+}
 
-    private func relocateWorkspace(_ controller: TerminalSessionController, task: TaskItem) {
-        guard !isRebindingWorkspace else { return }
-        isRebindingWorkspace = true
-        workspaceRebindError = nil
-        Task { @MainActor in
-            defer { isRebindingWorkspace = false }
-            let panel = NSOpenPanel()
-            panel.canChooseFiles = false
-            panel.canChooseDirectories = true
-            panel.allowsMultipleSelection = false
-            panel.canCreateDirectories = false
-            panel.title = "重新定位 Agent 工作目录"
-            panel.message = "原目录已移动或删除。请选择这个项目现在所在的目录；原 Provider 对话绑定会保留。"
-            panel.prompt = "重新定位并恢复"
-            guard await panel.begin() == .OK, let url = panel.url else { return }
-            do {
-                try WorkspaceAuthorizationStore.save(url)
-                try await terminalSessions.rebindWorkspaceAndResume(
-                    url.path(percentEncoded: false),
-                    controller: controller,
-                    taskTitle: task.title
-                )
-            } catch is CancellationError {
-                return
-            } catch {
-                workspaceRebindError = error.localizedDescription
-            }
+private struct TaskTerminalBindFailedPane: View {
+    let message: String
+    let retry: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "terminal")
+                .font(.system(size: 34, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text("无法打开终端")
+                .font(.title3.weight(.semibold))
+            Text(message)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 520)
+            Button("重试", action: retry)
+                .buttonStyle(.borderedProminent)
         }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityIdentifier("task.terminal.bind-failed")
     }
 }
 
@@ -432,127 +826,15 @@ private struct TaskTerminalLaunchingPane: View {
     }
 }
 
-private struct TaskTerminalEndedPane: View {
-    let task: TaskItem
-    let controller: TerminalSessionController
-    let resume: () -> Void
-    let relocateWorkspace: () -> Void
-    let isRebindingWorkspace: Bool
-    let chooseCandidate: (TerminalResumeCandidate) -> Void
-
-    var body: some View {
-        VStack(spacing: 18) {
-            Image(systemName: "terminal")
-                .font(.system(size: 34, weight: .medium))
-                .foregroundStyle(.secondary)
-            Text(heading)
-                .font(.title3.weight(.semibold))
-            Text(detail)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 520)
-
-            if !controller.workingDirectoryIsAvailable {
-                VStack(spacing: 10) {
-                    Button("重新定位工作目录", systemImage: "folder.badge.questionmark") {
-                        relocateWorkspace()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(isRebindingWorkspace)
-                    if isRebindingWorkspace {
-                        ProgressView("正在重新绑定并恢复…")
-                            .controlSize(.small)
-                    }
-                    Text("会保留这个任务绑定的 \(controller.session.runtimeKind.title) Provider 对话；TodoAgent 不会自动猜测同名目录。")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 560)
-                }
-            } else if controller.isLoadingResumeCandidates {
-                ProgressView("正在查找这个工作目录的会话…")
-            } else if controller.requiresProviderSelection,
-                      controller.didLoadResumeCandidates,
-                      !controller.resumeCandidates.isEmpty {
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("选择要永久绑定的 Provider 会话")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    ForEach(controller.resumeCandidates) { candidate in
-                        Button {
-                            chooseCandidate(candidate)
-                        } label: {
-                            HStack {
-                                Image(systemName: "bubble.left.and.text.bubble.right")
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(candidate.providerSessionID)
-                                        .font(.system(.callout, design: .monospaced))
-                                    if let createdAt = candidate.createdAt {
-                                        Text(createdAt)
-                                            .font(.caption2)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                                Spacer()
-                            }
-                            .contentShape(.rect)
-                        }
-                        .buttonStyle(.bordered)
-                    }
-                }
-                .frame(maxWidth: 560)
-            } else {
-                Button(controller.requiresProviderSelection ? "查找可恢复会话" : "恢复会话") {
-                    resume()
-                }
-                .buttonStyle(.borderedProminent)
-            }
-
-            if controller.requiresProviderSelection,
-               controller.didLoadResumeCandidates,
-               controller.resumeCandidates.isEmpty,
-               !controller.isLoadingResumeCandidates {
-                Text(controller.resumeErrorMessage ?? "没有找到可精确确认的会话。TodoAgent 不会猜测“最近会话”；请先用该 Agent 在此目录创建会话后重试。")
-                    .font(.caption)
-                    .foregroundStyle(.orange)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 560)
-            }
-        }
-        .padding(40)
-        .accessibilityIdentifier("task.terminal.ended")
-    }
-
-    private var heading: String {
-        if !controller.workingDirectoryIsAvailable { return "原工作目录已移动或删除" }
-        if case .failed = controller.phase { return "终端启动失败" }
-        if controller.activeRun == nil { return "终端尚未启动" }
-        return "Agent 已退出"
-    }
-
-    private var detail: String {
-        if !controller.workingDirectoryIsAvailable {
-            return "这个 Session 原来绑定到 \(controller.session.workingDirectory)。请选择项目现在所在的目录后继续原对话。"
-        }
-        if case let .failed(message) = controller.phase { return message }
-        if controller.activeRun == nil {
-            return "启动后 \(controller.session.runtimeKind.title) 将直接在所选目录中运行，不会自动发送任务标题、备注或附件。"
-        }
-        if controller.requiresProviderSelection {
-            return "恢复前需要确认 \(controller.session.runtimeKind.title) 的原会话。绑定后这个任务将始终恢复同一段对话。"
-        }
-        return "终端滚屏不会跨应用重启保存；恢复后会由 \(controller.session.runtimeKind.title) 继续原 Provider 对话。"
-    }
-}
-
 private struct TaskWorkbenchContent<TerminalPane: View>: View {
     private static var resizeCoordinateSpace: String { "task-workbench-details-resize" }
-    private static var terminalMinimumWidth: CGFloat { 560 }
 
     let task: TaskItem
     let state: AppState
     let layoutState: TaskWorkbenchLayoutState
+    let terminalMinimumWidth: CGFloat
+    let minimumDetailsWidth: CGFloat
+    let allowsTaskDetails: Bool
     let terminalPane: (TaskItem) -> TerminalPane
 
     @State private var detailDraft: TaskDetailDraft
@@ -562,20 +844,27 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
         task: TaskItem,
         state: AppState,
         layoutState: TaskWorkbenchLayoutState,
+        terminalMinimumWidth: CGFloat,
+        minimumDetailsWidth: CGFloat,
+        allowsTaskDetails: Bool,
         @ViewBuilder terminalPane: @escaping (TaskItem) -> TerminalPane
     ) {
         self.task = task
         self.state = state
         self.layoutState = layoutState
+        self.terminalMinimumWidth = terminalMinimumWidth
+        self.minimumDetailsWidth = minimumDetailsWidth
+        self.allowsTaskDetails = allowsTaskDetails
         self.terminalPane = terminalPane
         _detailDraft = State(initialValue: TaskDetailDraft(task: task))
     }
 
     var body: some View {
         GeometryReader { proxy in
+            let detailsPresented = layoutState.detailsPresented && allowsTaskDetails
             let maximumAvailableDetailsWidth = max(
-                TaskWorkbenchLayoutState.minimumDetailsWidth,
-                proxy.size.width - Self.terminalMinimumWidth - TaskDetailsResizeDivider.width
+                minimumDetailsWidth,
+                proxy.size.width - terminalMinimumWidth - TaskDetailsResizeDivider.width
             )
             let presentedWidth = min(layoutState.detailsWidth, maximumAvailableDetailsWidth)
 
@@ -586,22 +875,22 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
                     focusedTextField: $focusedTextField,
                     state: state
                 )
-                .frame(width: layoutState.detailsPresented ? presentedWidth : 0)
+                .frame(width: detailsPresented ? presentedWidth : 0)
                 .clipped()
-                .opacity(layoutState.detailsPresented ? 1 : 0)
-                .allowsHitTesting(layoutState.detailsPresented)
-                .accessibilityHidden(!layoutState.detailsPresented)
+                .opacity(detailsPresented ? 1 : 0)
+                .allowsHitTesting(detailsPresented)
+                .accessibilityHidden(!detailsPresented)
 
                 TaskDetailsResizeDivider(
                     detailsWidth: presentedWidth,
-                    isPresented: layoutState.detailsPresented,
+                    isPresented: detailsPresented,
                     coordinateSpace: Self.resizeCoordinateSpace,
                     onResize: layoutState.recordDetailsWidth
                 )
 
                 terminalPane(task)
                     .frame(
-                        minWidth: Self.terminalMinimumWidth,
+                        minWidth: terminalMinimumWidth,
                         maxWidth: .infinity,
                         maxHeight: .infinity
                     )
@@ -731,35 +1020,41 @@ private struct TaskTerminalToolbar: View {
     let task: TaskItem
     let controller: TerminalSessionController
     let detailsPresented: Bool
+    let presentation: TaskWorkbenchPresentation
+    let isClosing: Bool
     let toggleTaskDetails: () -> Void
     let close: () -> Void
-    let resumeSession: () -> Void
-    let endSession: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
-            Button(
-                detailsPresented ? "隐藏任务详情" : "显示任务详情",
-                systemImage: "sidebar.leading",
-                action: toggleTaskDetails
-            )
-            .labelStyle(.iconOnly)
-            .help(detailsPresented ? "隐藏任务详情（⌃⌘S）" : "显示任务详情（⌃⌘S）")
-            .accessibilityValue(detailsPresented ? "已展开" : "已收起")
-            .accessibilityIdentifier("task.details.toggle")
+            if case .embedded = presentation {
+                collapseButton
+            }
+
+            if presentation.allowsTaskDetails {
+                Button(
+                    detailsPresented ? "隐藏任务详情" : "显示任务详情",
+                    systemImage: "sidebar.leading",
+                    action: toggleTaskDetails
+                )
+                .labelStyle(.iconOnly)
+                .help(detailsPresented ? "隐藏任务详情（⌃⌘S）" : "显示任务详情（⌃⌘S）")
+                .accessibilityValue(detailsPresented ? "已展开" : "已收起")
+                .accessibilityIdentifier("task.details.toggle")
+            }
 
             RuntimeIconView(kind: controller.session.runtimeKind, fallbackSymbol: "terminal")
                 .frame(width: 28, height: 28)
             VStack(alignment: .leading, spacing: 2) {
                 Text(task.title).font(.headline).lineLimit(1)
-                Text("\(controller.session.runtimeKind.title) 本地终端")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if !isCompactEmbedded {
+                    Text("\(controller.session.runtimeKind.title) 终端")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
             Spacer()
-            Label(controller.phase.title, systemImage: phaseSymbol)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(controller.needsAttention ? .orange : .secondary)
+            phaseLabel
             if controller.hasLiveSurface {
                 Button("聚焦终端", systemImage: "cursorarrow.click") {
                     controller.focusIfAppropriate()
@@ -767,41 +1062,57 @@ private struct TaskTerminalToolbar: View {
                 .labelStyle(.iconOnly)
                 .help("聚焦终端")
             }
-            if controller.phase.isActive {
-                Button("结束 Session…", systemImage: "stop.circle", role: .destructive) {
-                    confirmEndSession()
-                }
-                .labelStyle(.iconOnly)
-                .help("结束 Session")
-            } else {
-                Button("恢复会话", systemImage: "arrow.clockwise.circle", action: resumeSession)
+            if presentation == .window {
+                Button("关闭", systemImage: "xmark", action: close)
                     .labelStyle(.iconOnly)
-                    .help(controller.workingDirectoryIsAvailable ? "恢复会话" : "请在中间区域重新定位工作目录")
-                    .disabled(!controller.workingDirectoryIsAvailable)
+                    .help("关闭工作台，终端继续运行")
             }
-            Button("关闭", systemImage: "xmark", action: close)
-                .labelStyle(.iconOnly)
-                .help("关闭工作台，Session 继续运行")
         }
         .padding(.horizontal, 16)
         .frame(height: 54)
         .background(.bar)
     }
 
+    @ViewBuilder
+    private var phaseLabel: some View {
+        if isCompactEmbedded {
+            Label(controller.phase.title, systemImage: phaseSymbol)
+                .labelStyle(.iconOnly)
+                .help(controller.phase.title)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(controller.needsAttention ? .orange : .secondary)
+        } else {
+            Label(controller.phase.title, systemImage: phaseSymbol)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(controller.needsAttention ? .orange : .secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var collapseButton: some View {
+        if isClosing {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 28, height: 28)
+                .accessibilityLabel("正在收起任务终端")
+        } else {
+            Button("收起任务终端", systemImage: "sidebar.leading", action: close)
+                .labelStyle(.iconOnly)
+                .buttonStyle(.borderless)
+                .help("返回任务页，终端继续运行")
+                .accessibilityHint("返回任务页，终端继续运行")
+                .accessibilityIdentifier("task.workspace.toolbar.collapse")
+        }
+    }
+
+    private var isCompactEmbedded: Bool {
+        if case let .embedded(compact) = presentation { return compact }
+        return false
+    }
+
     private var phaseSymbol: String {
         if controller.needsAttention { return "bell.badge.fill" }
         return controller.phase.isActive ? "circle.dotted.circle" : "terminal"
-    }
-
-    private func confirmEndSession() {
-        let alert = NSAlert()
-        alert.alertStyle = .warning
-        alert.messageText = "结束这个 Session？"
-        alert.informativeText = "这会终止正在运行的 Agent 和它的子进程。任务不会被删除。"
-        alert.addButton(withTitle: "结束 Session")
-        alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
-        endSession()
     }
 }
 

@@ -1323,10 +1323,126 @@ struct AssistantViewStateTests {
         #expect(state.selectedDraft?.body == "stale")
 
         await state.consumeAssistantEvent(EngineEvent(name: "engine.ready", data: Data("{}".utf8)))
+        await repository.waitUntilAssistantStatusRequestCount(1)
+        await repository.waitUntilKeyInjectionCount(1)
+        await waitUntil { state.loadState == .loaded }
 
         #expect(await repository.keyInjectionCount() == 1)
         #expect(state.selectedDraft == nil)
         #expect(state.status?.configured == true)
+        #expect(state.loadState == .loaded)
+    }
+
+    @Test("a dropped Engine event reloads authoritative Assistant state")
+    func droppedEventReloadsAssistantState() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)]
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { "key-from-keychain" })
+
+        await state.consumeAssistantEvent(try sessionChangedEvent(session))
+        await state.selectSession(session.id)
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "stale"))
+        #expect(state.selectedDraft?.body == "stale")
+
+        await state.consumeAssistantEvent(.authoritativeResyncRequired(episode: 9))
+        await repository.waitUntilAssistantStatusRequestCount(1)
+        await repository.waitUntilKeyInjectionCount(1)
+        await waitUntil { state.loadState == .loaded }
+
+        #expect(state.selectedDraft == nil)
+        #expect(state.status?.configured == true)
+        #expect(state.loadState == .loaded)
+    }
+
+    @Test("a newer dropped-event episode waits for the active Assistant recovery")
+    func newerDroppedEventQueuesAssistantRecovery() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)],
+            suspendHistoryAfterRequestCount: 0
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { "key-from-keychain" })
+
+        let first = Task { @MainActor in
+            await state.consumeAssistantEvent(.authoritativeResyncRequired(episode: 12))
+        }
+        await repository.waitUntilHistoryRequestCount(1)
+        await state.consumeAssistantEvent(.authoritativeResyncRequired(episode: 13))
+        await repository.releaseSuspendedHistory(with: AssistantSessionBundle(session: session))
+        await repository.waitUntilHistoryRequestCount(2)
+        await repository.releaseSuspendedHistory(with: AssistantSessionBundle(session: session))
+        await first.value
+
+        #expect(await repository.keyInjectionCount() == 2)
+        #expect(await repository.historyRequests().count == 2)
+        #expect(state.loadState == .loaded)
+    }
+
+    @Test("one engine.ready retries a failed Assistant reload without blocking events")
+    func engineReadyRetriesAssistantReloadAndReturnsPromptly() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)],
+            assistantStatusFailuresRemaining: 1
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { "key-from-keychain" })
+
+        await state.consumeAssistantEvent(try sessionChangedEvent(session))
+        await state.selectSession(session.id)
+        let readyHandler = Task { @MainActor in
+            await state.consumeAssistantEvent(EngineEvent(name: "engine.ready", data: Data("{}".utf8)))
+            return true
+        }
+        #expect(await readyHandler.value)
+
+        await state.consumeAssistantEvent(try deltaEvent(attempt: 1, delta: "event-stream-alive"))
+        #expect(state.selectedDraft?.body == "event-stream-alive")
+
+        await repository.waitUntilAssistantStatusRequestCount(2)
+        await repository.waitUntilKeyInjectionCount(2)
+        await waitUntil { state.loadState == .loaded }
+        #expect(state.status?.configured == true)
+        #expect(state.loadState == .loaded)
+    }
+
+    @Test("one engine.ready retries a failed credential restore")
+    func engineReadyRetriesCredentialRestore() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)],
+            keyInjectionFailuresRemaining: 1
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { "key-from-keychain" })
+
+        await state.consumeAssistantEvent(EngineEvent(name: "engine.ready", data: Data("{}".utf8)))
+
+        await repository.waitUntilKeyInjectionCount(2)
+        await repository.waitUntilAssistantStatusRequestCount(2)
+        await waitUntil { state.errorMessage == nil && state.loadState == .loaded }
+        #expect(await repository.keyInjectionCount() == 2)
+        #expect(state.status?.configured == true)
+    }
+
+    @Test("duplicate dropped-event signals coalesce while the retry worker is active")
+    func duplicateDroppedEventSignalsCoalesceDuringRetry() async throws {
+        let session = sessionDescriptor()
+        let repository = AssistantTestRepository(
+            bundles: [session.id: AssistantSessionBundle(session: session)],
+            assistantStatusFailuresRemaining: 1
+        )
+        let state = AssistantViewState(repository: repository, keyLoader: { "key-from-keychain" })
+        let dropped = EngineEvent.authoritativeResyncRequired(episode: 21)
+
+        await state.consumeAssistantEvent(dropped)
+        await state.consumeAssistantEvent(dropped)
+        await state.consumeAssistantEvent(dropped)
+
+        await repository.waitUntilAssistantStatusRequestCount(2)
+        await repository.waitUntilKeyInjectionCount(2)
+        await waitUntil { state.loadState == .loaded }
+        #expect(await repository.assistantStatusRequestCount() == 2)
         #expect(state.loadState == .loaded)
     }
 
@@ -1364,6 +1480,15 @@ struct AssistantViewStateTests {
         #expect(attachments.first?["mediaType"] as? String == "text/markdown")
         #expect(attachments.first?["content"] as? String == "# Plan")
         #expect(attachments.first?["byteCount"] as? Int == 6)
+    }
+
+    private func waitUntil(_ predicate: () -> Bool) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while !predicate(), clock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(predicate())
     }
 
     @Test("an attachment-only message reaches the repository")
@@ -1479,12 +1604,21 @@ actor AssistantTestRepository: AppRepository {
         (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
     ] = []
     private var injectedKeys = 0
+    private var keyInjectionFailuresRemaining: Int
+    private var keyInjectionWaiters: [
+        (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
     private var sentMessages = 0
     private var sentIDs: [UUID] = []
     private var sentAttachments: [AssistantTextAttachment] = []
     private var loadCallCount = 0
     private var sendFailuresRemaining: Int
     private var createSessionFailuresRemaining: Int
+    private var assistantStatusFailuresRemaining: Int
+    private var assistantStatusRequests = 0
+    private var assistantStatusRequestWaiters: [
+        (targetCount: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
     private let persistFailedSend: Bool
     private let historyPageSize: Int
     private let suspendHistoryAfterRequestCount: Int?
@@ -1500,6 +1634,8 @@ actor AssistantTestRepository: AppRepository {
         historyPageSize: Int = .max,
         sendFailuresRemaining: Int = 0,
         createSessionFailuresRemaining: Int = 0,
+        keyInjectionFailuresRemaining: Int = 0,
+        assistantStatusFailuresRemaining: Int = 0,
         persistFailedSend: Bool = false,
         suspendLoad: Bool = false,
         suspendHistoryAfterRequestCount: Int? = nil
@@ -1508,6 +1644,8 @@ actor AssistantTestRepository: AppRepository {
         self.historyPageSize = historyPageSize
         self.sendFailuresRemaining = sendFailuresRemaining
         self.createSessionFailuresRemaining = createSessionFailuresRemaining
+        self.keyInjectionFailuresRemaining = keyInjectionFailuresRemaining
+        self.assistantStatusFailuresRemaining = assistantStatusFailuresRemaining
         self.persistFailedSend = persistFailedSend
         self.suspendHistoryAfterRequestCount = suspendHistoryAfterRequestCount
         shouldSuspendLoad = suspendLoad
@@ -1547,14 +1685,40 @@ actor AssistantTestRepository: AppRepository {
     func history(sessionID: String, after sequence: Int64) async throws -> SessionBundle { throw AppRepositoryError.sessionNotFound }
     func markRead(sessionID: String, through sequence: Int64) async throws {}
     func cancelTurn(sessionID: String) async throws {}
-    func injectGeminiKey(_ key: String) async throws { injectedKeys += 1 }
+    func injectGeminiKey(_ key: String) async throws {
+        injectedKeys += 1
+        let readyWaiters = keyInjectionWaiters.filter { injectedKeys >= $0.targetCount }
+        keyInjectionWaiters.removeAll { injectedKeys >= $0.targetCount }
+        for waiter in readyWaiters { waiter.continuation.resume() }
+        if keyInjectionFailuresRemaining > 0 {
+            keyInjectionFailuresRemaining -= 1
+            throw AppRepositoryError.runtimeUnavailable
+        }
+    }
     func clearGeminiKey() async throws {}
     func testGeminiConnection(model: String) async throws -> GeminiConnectionResult {
         GeminiConnectionResult(ok: true, model: model, displayName: "Gemini Test", version: "test")
     }
 
     func assistantStatus() async throws -> AssistantStatus {
-        AssistantStatus(configured: true, available: true, model: "gemini-3.6-flash", reason: nil)
+        assistantStatusRequests += 1
+        let readyWaiters = assistantStatusRequestWaiters.filter {
+            assistantStatusRequests >= $0.targetCount
+        }
+        assistantStatusRequestWaiters.removeAll {
+            assistantStatusRequests >= $0.targetCount
+        }
+        for waiter in readyWaiters { waiter.continuation.resume() }
+        if assistantStatusFailuresRemaining > 0 {
+            assistantStatusFailuresRemaining -= 1
+            throw AppRepositoryError.runtimeUnavailable
+        }
+        return AssistantStatus(
+            configured: true,
+            available: true,
+            model: "gemini-3.6-flash",
+            reason: nil
+        )
     }
 
     func assistantSessions(includeArchived: Bool) async throws -> [AssistantSessionDescriptor] {
@@ -1681,6 +1845,19 @@ actor AssistantTestRepository: AppRepository {
         }
     }
     func keyInjectionCount() -> Int { injectedKeys }
+    func waitUntilKeyInjectionCount(_ targetCount: Int) async {
+        guard injectedKeys < targetCount else { return }
+        await withCheckedContinuation { continuation in
+            keyInjectionWaiters.append((targetCount, continuation))
+        }
+    }
+    func assistantStatusRequestCount() -> Int { assistantStatusRequests }
+    func waitUntilAssistantStatusRequestCount(_ targetCount: Int) async {
+        guard assistantStatusRequests < targetCount else { return }
+        await withCheckedContinuation { continuation in
+            assistantStatusRequestWaiters.append((targetCount, continuation))
+        }
+    }
     func sendCount() -> Int { sentMessages }
     func sentClientMessageIDs() -> [UUID] { sentIDs }
     func lastSentAttachments() -> [AssistantTextAttachment] { sentAttachments }

@@ -20,10 +20,49 @@ struct GhosttyPolicyTests {
         }
     }
 
+    @Test func hostShellCommandUsesLoginShellAndRejectsUnknownBinaries() throws {
+        #expect(
+            try GhosttyCommandBuilder.hostShellCommand(environment: ["SHELL": "/bin/zsh"])
+                == "'/bin/zsh' '-l'"
+        )
+        #expect(
+            try GhosttyCommandBuilder.hostShellCommand(
+                workingDirectory: "/Users/me/My Project",
+                environment: ["SHELL": "/bin/zsh"]
+            ) == "'/bin/zsh' '-l' '-c' 'cd -- '\\''/Users/me/My Project'\\'' && exec '\\''/bin/zsh'\\'''"
+        )
+        #expect(throws: GhosttyTerminalError.invalidLaunchPlan) {
+            try GhosttyCommandBuilder.hostShellCommand(environment: ["SHELL": "/usr/bin/python3"])
+        }
+        #expect(throws: GhosttyTerminalError.invalidLaunchPlan) {
+            try GhosttyCommandBuilder.hostShellCommand(environment: ["SHELL": "zsh"])
+        }
+        #expect(throws: GhosttyTerminalError.invalidLaunchPlan) {
+            try GhosttyCommandBuilder.hostShellCommand(
+                workingDirectory: "relative/project",
+                environment: ["SHELL": "/bin/zsh"]
+            )
+        }
+    }
+
+    @Test func officialLaunchCommandChangesDirectoryBeforeTheRunner() throws {
+        #expect(
+            try GhosttyCommandBuilder.officialLaunchCommand(
+                executable: "/Applications/TodoAgent.app/Contents/Resources/todoagent-terminal-runner",
+                arguments: ["--descriptor", "/tmp/a b'c.json"],
+                workingDirectory: "/Users/me/My Project"
+            ) == "cd -- '/Users/me/My Project' && '/Applications/TodoAgent.app/Contents/Resources/todoagent-terminal-runner' '--descriptor' '/tmp/a b'\\''c.json'"
+        )
+        #expect(throws: GhosttyTerminalError.invalidLaunchPlan) {
+            try GhosttyCommandBuilder.changeDirectoryCommand(workingDirectory: "relative/project")
+        }
+    }
+
     @Test("missing bound workspace is rejected before a terminal surface is created")
     func missingBoundWorkspaceFailsBeforeSurfaceCreation() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("todoagent-working-directory-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         defer { try? FileManager.default.removeItem(at: directory) }
 
@@ -44,6 +83,7 @@ struct GhosttyPolicyTests {
     func symlinkWorkspaceMatchesEnginePreflightPolicy() throws {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("todoagent-symlink-workspace-\(UUID().uuidString)", isDirectory: true)
+            .resolvingSymlinksInPath()
         let target = root.appendingPathComponent("target", isDirectory: true)
         let link = root.appendingPathComponent("linked", isDirectory: true)
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: true)

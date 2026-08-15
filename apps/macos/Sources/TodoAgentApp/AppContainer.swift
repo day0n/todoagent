@@ -8,7 +8,7 @@ final class AppContainer {
     let repository: any AppRepository
     let state: AppState
     let terminalSessions: TerminalSessionRegistry
-    let taskWorkbenches: TaskWorkbenchWindowRegistry
+    let taskWorkspace: TaskWorkspaceCoordinator
 
     private init() {
         do {
@@ -24,11 +24,11 @@ final class AppContainer {
                 repository: repository,
                 surfaceFactory: GhosttyTerminalSurfaceFactory()
             )
-            taskWorkbenches = TaskWorkbenchWindowRegistry(
+            taskWorkspace = TaskWorkspaceCoordinator(
                 state: state,
                 terminalSessions: terminalSessions
             )
-            state.taskWorkspacePresenter = taskWorkbenches
+            state.taskWorkspacePresenter = taskWorkspace
             state.terminalSessions = terminalSessions
         } catch {
             client = nil
@@ -39,11 +39,11 @@ final class AppContainer {
                 inspectorPresented: UserDefaults.standard.bool(forKey: "showAssistantAtLaunch")
             )
             terminalSessions = TerminalSessionRegistry(repository: repository)
-            taskWorkbenches = TaskWorkbenchWindowRegistry(
+            taskWorkspace = TaskWorkspaceCoordinator(
                 state: state,
                 terminalSessions: terminalSessions
             )
-            state.taskWorkspacePresenter = taskWorkbenches
+            state.taskWorkspacePresenter = taskWorkspace
             state.terminalSessions = terminalSessions
         }
     }
