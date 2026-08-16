@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TodoAgent · 我的一天</title>
+  <style>
+    :root {
+      --canvas: #1e1e1d;
+      --sidebar: #252523;
+      --surface: #2e2e2b;
+      --select: #3b3b37;
+      --card: #32322e;
+      --hover: #3a3a36;
+      --line: #494945;
+      --text: #f0f0ec;
+      --muted: #adada6;
+      --faint: #8a8a84;
+      --blue: #0a84ff;
+      --blue-soft: rgba(10, 132, 255, 0.18);
+      --green: #30d158;
+      --red: #ff453a;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+      --mono: "SF Mono", ui-monospace, Menlo, monospace;
+      --fold: 280ms cubic-bezier(0.22, 1, 0.36, 1);
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #0d0d0c; color: var(--text); font: 13px/1.45 var(--font); }
+    button, input { font: inherit; color: inherit; }
+    button { border: 0; background: none; cursor: pointer; text-align: left; }
+    input { border: 0; background: none; outline: none; }
+
+    .page {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto 1fr;
+      padding: 16px 18px 18px;
+      gap: 12px;
+    }
+    .coach {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .coach b { color: var(--text); font-weight: 600; }
+    .chip {
+      padding: 3px 8px;
+      border-radius: 6px;
+      background: #1a1a18;
+      border: 1px solid var(--line);
+      color: var(--muted);
+    }
+    .toast {
+      margin-left: auto;
+      color: #cfe4ff;
+      min-height: 1.2em;
+    }
+
+    .window {
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--canvas);
+      border: 1px solid #3a3a36;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .titlebar {
+      height: 44px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 14px;
+      background: var(--sidebar);
+      border-bottom: 1px solid var(--line);
+    }
+    .dots { display: flex; gap: 6px; }
+    .dots i { width: 10px; height: 10px; border-radius: 99px; display: block; }
+    .dots .r { background: #ff5f57; }
+    .dots .y { background: #febc2e; }
+    .dots .g { background: #28c840; }
+    .titlebar h1 { margin: 0; font-size: 13px; font-weight: 600; }
+    .titlebar .sub { color: var(--muted); font-size: 12px; }
+
+    .app {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 228px minmax(0, 1fr);
+    }
+
+    .side {
+      background: var(--sidebar);
+      border-right: 1px solid var(--line);
+      display: flex;
+      flex-direction: column;
+      padding: 12px 10px 10px;
+    }
+    .date-label { padding: 4px 8px 12px; }
+    .date-label .d { font-size: 15px; font-weight: 650; }
+    .date-label .w { color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .nav {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 8px;
+      border-radius: 8px;
+      color: var(--text);
+    }
+    .nav:hover { background: var(--hover); }
+    .nav.on { background: var(--blue-soft); color: #8ec2ff; }
+    .nav .count { margin-left: auto; color: var(--faint); font-variant-numeric: tabular-nums; font-size: 12px; }
+    .nav.on .count { color: #8ec2ff; }
+    .sec { color: var(--faint); font-size: 11px; padding: 14px 8px 6px; }
+    .dot { width: 8px; height: 8px; border-radius: 99px; background: var(--blue); flex: none; }
+    .foot {
+      margin-top: auto;
+      padding: 10px 8px 4px;
+      color: var(--muted);
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 7px;
+    }
+    .live { width: 6px; height: 6px; border-radius: 99px; background: var(--green); }
+
+    .board {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--canvas);
+    }
+    .head {
+      height: 50px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    .head h2 { margin: 0; font-size: 15px; font-weight: 650; }
+    .head .hint { color: var(--muted); font-size: 12px; }
+
+    .workspace {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 0fr;
+      transition: grid-template-columns var(--fold);
+    }
+    .workspace.split { grid-template-columns: 320px minmax(0, 1fr); }
+    .workspace.collapsing { grid-template-columns: minmax(0, 1fr) 0fr; }
+
+    .list-pane {
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      background: var(--canvas);
+      transition: background var(--fold);
+    }
+    .workspace.split .list-pane,
+    .workspace.collapsing .list-pane { background: var(--sidebar); }
+    .workspace.split .list-pane { border-right: 1px solid var(--line); }
+
+    .cards {
+      flex: 1;
+      min-height: 0;
+      overflow: auto;
+      padding: 16px 20px 8px;
+      max-width: 820px;
+      transition: padding var(--fold), max-width var(--fold);
+    }
+    .workspace.split .cards,
+    .workspace.collapsing .cards {
+      padding: 12px;
+      max-width: none;
+    }
+
+    .card {
+      width: 100%;
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 11px 12px;
+      margin-bottom: 8px;
+      border-radius: 11px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      transition: border-color 160ms ease, background 160ms ease;
+    }
+    .workspace.split .card { border-color: transparent; }
+    .card:hover { background: var(--hover); }
+    .card.on { background: var(--select); border-color: rgba(10, 132, 255, 0.45); }
+    .card.parked { border-color: rgba(48, 209, 88, 0.35); }
+    .card.done b { color: var(--faint); text-decoration: line-through; font-weight: 500; }
+    .check {
+      width: 16px;
+      height: 16px;
+      border-radius: 99px;
+      border: 1.5px solid #6e6e68;
+      flex: none;
+      margin-top: 2px;
+      display: grid;
+      place-items: center;
+    }
+    .check.on { background: var(--green); border-color: var(--green); }
+    .check.on::after {
+      content: "";
+      width: 7px;
+      height: 4px;
+      border-left: 1.6px solid #113;
+      border-bottom: 1.6px solid #113;
+      transform: rotate(-45deg) translate(0, -1px);
+    }
+    .card b { display: block; font-size: 13px; }
+    .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .meta.bad { color: var(--red); }
+    .row-actions { margin-left: auto; display: flex; gap: 6px; flex: none; }
+    .mini {
+      padding: 4px 8px;
+      border-radius: 6px;
+      background: #252523;
+      color: var(--muted);
+      font-size: 11px;
+      border: 1px solid var(--line);
+    }
+    .mini:hover { color: var(--text); }
+    .mini.primary { color: #8ec2ff; border-color: rgba(10, 132, 255, 0.35); }
+    .agent { color: var(--green); font-size: 11px; margin-top: 4px; }
+    .sec-label {
+      color: var(--faint);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 8px 4px 6px;
+    }
+
+    .composer {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin: 0 20px 16px;
+      max-width: 780px;
+      padding: 0 10px;
+      min-height: 44px;
+      border-radius: 8px;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      transition: margin var(--fold), max-width var(--fold), min-height var(--fold);
+    }
+    .workspace.split .composer,
+    .workspace.collapsing .composer {
+      margin: 0 12px 12px;
+      max-width: none;
+      min-height: 36px;
+    }
+    .composer input { flex: 1; min-width: 0; }
+    .composer input::placeholder { color: var(--faint); }
+
+    .term-slot {
+      min-width: 0;
+      min-height: 0;
+      overflow: hidden;
+    }
+    .term {
+      width: max(100%, 420px);
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      background: #141413;
+      opacity: 0;
+      transform: translateX(18px);
+      transition: opacity 200ms ease, transform var(--fold);
+    }
+    .workspace.split .term {
+      opacity: 1;
+      transform: translateX(0);
+    }
+    .workspace.collapsing .term {
+      opacity: 0;
+      transform: translateX(22px);
+    }
+    .term-head {
+      height: 46px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 0 10px 0 8px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .fold {
+      width: 28px;
+      height: 28px;
+      border-radius: 8px;
+      display: grid;
+      place-items: center;
+      color: var(--muted);
+      flex: none;
+    }
+    .fold:hover { background: var(--hover); color: var(--text); }
+    .fold svg { display: block; }
+    .term-head strong { color: var(--text); font-weight: 600; }
+    .term-head .esc {
+      margin-left: auto;
+      font-size: 11px;
+      color: var(--faint);
+      letter-spacing: 0.02em;
+    }
+    .term pre {
+      flex: 1;
+      margin: 0;
+      padding: 14px 16px;
+      overflow: auto;
+      font: 12.5px/1.55 var(--mono);
+      white-space: pre-wrap;
+      color: #d8d8d2;
+    }
+    .term-foot {
+      height: 28px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 12px;
+      border-top: 1px solid var(--line);
+      color: var(--faint);
+      font-size: 11.5px;
+    }
+    .ok { color: var(--green); }
+
+    .dock {
+      display: none;
+      margin: 0 20px 16px;
+      max-width: 780px;
+    }
+    .workspace.list .dock.visible { display: block; }
+    .dock button {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: var(--surface);
+      border: 1px solid rgba(48, 209, 88, 0.28);
+    }
+    .dock button:hover { background: var(--hover); }
+    .dock .pulse {
+      width: 8px;
+      height: 8px;
+      border-radius: 99px;
+      background: var(--green);
+      box-shadow: 0 0 0 4px rgba(48, 209, 88, 0.12);
+      flex: none;
+    }
+    .dock b { display: block; font-size: 13px; }
+    .dock small { display: block; color: var(--muted); font-size: 12px; margin-top: 2px; }
+    .dock .open-hint { margin-left: auto; color: #8ec2ff; font-size: 12px; }
+
+    .empty {
+      color: var(--muted);
+      text-align: center;
+      padding: 48px 16px;
+    }
+    .empty b { display: block; color: var(--text); margin-bottom: 6px; }
+
+    @media (prefers-reduced-motion: reduce) {
+      .workspace, .list-pane, .cards, .composer, .term { transition: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <div class="coach">
+      <b>收起可以这样试：</b>
+      <span class="chip">打开一条进行中的任务</span>
+      <span class="chip">点终端左上角折起，或再点同一张卡片</span>
+      <span class="chip">看底部「壳还在」细条</span>
+      <span class="toast" id="toast"></span>
+    </div>
+
+    <section class="window" aria-label="TodoAgent 原型">
+      <div class="titlebar">
+        <div class="dots" aria-hidden="true"><i class="r"></i><i class="y"></i><i class="g"></i></div>
+        <h1>TodoAgent</h1>
+        <span class="sub" id="titleSub">我的一天 · 点任务不换房间</span>
+      </div>
+      <div class="app">
+        <aside class="side">
+          <div class="date-label">
+            <div class="d">8月16日</div>
+            <div class="w">星期日 · 只显示今天，不是月历</div>
+          </div>
+          <button class="nav" data-nav="myday" type="button">我的一天 <span class="count" id="count-myday">0</span></button>
+          <button class="nav" data-nav="tasks" type="button">任务 <span class="count" id="count-tasks">0</span></button>
+          <div class="sec">清单</div>
+          <button class="nav" data-nav="list-work" type="button"><span class="dot"></span>工作 <span class="count" id="count-work">0</span></button>
+          <div class="sec">状态</div>
+          <button class="nav" data-nav="running" type="button">进行中 <span class="count" id="count-running">0</span></button>
+          <button class="nav" data-nav="done" type="button">已完成 <span class="count" id="count-done">0</span></button>
+          <div class="foot"><span class="live"></span>本机模式</div>
+        </aside>
+        <main class="board">
+          <div class="head">
+            <h2 id="boardTitle">我的一天</h2>
+            <span class="hint" id="boardHint">今天要干的活。点开后左栏还是今天。</span>
+          </div>
+          <div class="workspace list" id="workspace"></div>
+        </main>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const tasks = [
+      {
+        id: "resume",
+        title: "写完 Agent 恢复验收",
+        note: "对 Codex 跑三轮恢复",
+        list: "work",
+        inToday: true,
+        overdue: true,
+        done: false,
+        running: true,
+        path: "~/Desktop/todoagent",
+        term: "$ cd ~/Desktop/todoagent\n$ claude --dangerously-skip-permissions\n\n这个壳只属于「写完 Agent 恢复验收」。\n收起终端不会结束它。\n\n› 正在恢复上次的 Provider Session…"
+      },
+      {
+        id: "notes",
+        title: "整理发布说明",
+        note: "预览版边界写清楚",
+        list: "work",
+        inToday: true,
+        overdue: false,
+        done: false,
+        running: false,
+        path: "~/Desktop/todoagent",
+        term: "$ cd ~/Desktop/todoagent\n$ ls docs\nARCHITECTURE.md   RUNTIMES.md\n\n这条没有在跑。收起后不会出现「壳还在」细条，只是列表铺回来。"
+      },
+      {
+        id: "mail",
+        title: "回复设计同步邮件",
+        note: "",
+        list: "work",
+        inToday: true,
+        overdue: false,
+        done: false,
+        running: false,
+        path: "~",
+        term: "$ pwd\n/Users/niuzj\n\n再点同一张卡片，终端会折回去。"
+      },
+      {
+        id: "skill",
+        title: "完善中英文 skill 教程",
+        note: "",
+        list: "work",
+        inToday: true,
+        overdue: false,
+        done: true,
+        running: false,
+        path: "~/Desktop/todoagent",
+        term: ""
+      },
+      {
+        id: "points",
+        title: "agent 积分外显",
+        note: "还没安排进今天",
+        list: "work",
+        inToday: false,
+        overdue: false,
+        done: false,
+        running: false,
+        path: "~/Desktop/todoagent",
+        term: "$ cd ~/Desktop/todoagent\n\n从任务点进来，左栏还是「任务」。"
+      },
+      {
+        id: "inbox",
+        title: "想一个菜单栏空状态文案",
+        note: "先记下来",
+        list: null,
+        inToday: false,
+        overdue: false,
+        done: false,
+        running: false,
+        path: "~",
+        term: "$ echo inbox\n\n库存里的任务也可以有自己的壳。"
+      }
+    ];
+
+    const navMeta = {
+      myday: { title: "我的一天", hint: "今天要干的活。点开后左栏还是今天。" },
+      tasks: { title: "任务", hint: "全部库存。主操作是加入今天，不是立刻进终端。" },
+      "list-work": { title: "工作", hint: "这个清单里的任务。点开后左栏还是工作。" },
+      running: { title: "进行中", hint: "正在跑的本地 Session。" },
+      done: { title: "已完成", hint: "完成的任务。" }
+    };
+
+    let nav = "myday";
+    let selected = null;
+    let parked = null;
+    let closing = false;
+    let draft = "";
+    let toastTimer = 0;
+    let closeTimer = 0;
+
+    const workspace = document.getElementById("workspace");
+    const toastEl = document.getElementById("toast");
+
+    function visibleTasks() {
+      return tasks.filter((task) => {
+        if (nav === "myday") return task.inToday;
+        if (nav === "tasks") return true;
+        if (nav === "list-work") return task.list === "work";
+        if (nav === "running") return task.running && !task.done;
+        if (nav === "done") return task.done;
+        return false;
+      });
+    }
+
+    function toast(text) {
+      toastEl.textContent = text;
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => { toastEl.textContent = ""; }, 4200);
+    }
+
+    function parkedTask() {
+      const task = tasks.find((item) => item.id === parked);
+      if (!task || task.done || !task.running || selected) return null;
+      return task;
+    }
+
+    function setNav(next) {
+      if (closing) return;
+      nav = next;
+      if (selected && !visibleTasks().some((task) => task.id === selected)) {
+        selected = null;
+      }
+      render();
+    }
+
+    function openTask(id) {
+      const task = tasks.find((item) => item.id === id);
+      if (!task || task.done || closing) return;
+      if (selected === id) {
+        closeWorkspace();
+        return;
+      }
+      selected = id;
+      parked = null;
+      toast("终端从右侧展开。再点这张卡片，或点左上角折起。");
+      render({ expand: true });
+    }
+
+    function closeWorkspace() {
+      if (!selected || closing) return;
+      const task = tasks.find((item) => item.id === selected);
+      closing = true;
+      parked = task && task.running ? task.id : null;
+      workspace.classList.remove("split");
+      workspace.classList.add("collapsing");
+      document.getElementById("boardHint").textContent = task && task.running
+        ? "终端折回去了。壳还在跑。"
+        : "终端折回去了。列表铺开。";
+      document.getElementById("titleSub").textContent = `${navMeta[nav].title} · 终端已收起`;
+      toast(task && task.running
+        ? "终端收起，Agent 还在跑。底部细条可以再打开。"
+        : "终端收起。没有在跑的壳，所以不留细条。");
+      clearTimeout(closeTimer);
+      closeTimer = setTimeout(() => {
+        selected = null;
+        closing = false;
+        render();
+      }, 280);
+    }
+
+    function toggleDone(id, event) {
+      event.stopPropagation();
+      const task = tasks.find((item) => item.id === id);
+      if (!task) return;
+      task.done = !task.done;
+      if (task.done) {
+        task.running = false;
+        if (selected === id) selected = null;
+        if (parked === id) parked = null;
+        toast("已完成。");
+      }
+      render();
+    }
+
+    function addToToday(id, event) {
+      event.stopPropagation();
+      const task = tasks.find((item) => item.id === id);
+      if (!task) return;
+      task.inToday = true;
+      toast("已加入今天。");
+      render();
+    }
+
+    function removeFromToday(id, event) {
+      event.stopPropagation();
+      const task = tasks.find((item) => item.id === id);
+      if (!task) return;
+      task.inToday = false;
+      if (nav === "myday" && selected === id) selected = null;
+      toast("已移出今天。");
+      render();
+    }
+
+    function submitDraft() {
+      const title = draft.trim();
+      if (!title) return;
+      const id = "new-" + Date.now();
+      const toToday = nav === "myday";
+      tasks.unshift({
+        id,
+        title,
+        note: "",
+        list: nav === "list-work" ? "work" : null,
+        inToday: toToday,
+        overdue: false,
+        done: false,
+        running: false,
+        path: "~",
+        term: `$ echo ${JSON.stringify(title)}\n\n${toToday ? "这条直接进了今天。" : "这条在库存里。"}`
+      });
+      draft = "";
+      toast(toToday ? "新任务进了今天。" : "新任务进了库存。");
+      render();
+      const input = document.getElementById("composer");
+      if (input) input.focus();
+    }
+
+    function card(task, selectedId) {
+      const meta = [];
+      if (task.overdue && !task.done) meta.push(["逾期", "bad"]);
+      else if (task.note) meta.push([task.note, ""]);
+      else if (task.inToday) meta.push(["今天", ""]);
+      else meta.push(["未安排进今天", ""]);
+      if (task.list === "work") meta.push(["工作", ""]);
+
+      const actions = [];
+      if (!task.done && !task.inToday) {
+        actions.push(`<button class="mini primary" data-add="${task.id}" type="button">加入今天</button>`);
+      } else if (!task.done && task.inToday && nav !== "myday") {
+        actions.push(`<button class="mini" data-remove="${task.id}" type="button">移出今天</button>`);
+      }
+
+      const parkedLive = parked === task.id && task.running && !selected;
+      const klass = [
+        "card",
+        selectedId === task.id ? "on" : "",
+        parkedLive ? "parked" : "",
+        task.done ? "done" : ""
+      ].filter(Boolean).join(" ");
+
+      if (task.done) {
+        return `<div class="${klass}"><span class="check on" data-done="${task.id}"></span><span><b>${task.title}</b><div class="meta">${task.note || "已完成"}</div></span></div>`;
+      }
+      return `<button class="${klass}" data-open="${task.id}" type="button">
+        <span class="check" data-done="${task.id}"></span>
+        <span>
+          <b>${task.title}</b>
+          <div class="meta ${meta[0][1]}">${meta.map((item) => item[0]).join(" · ")}</div>
+          ${task.running ? `<div class="agent">${parkedLive ? "● 壳还在跑" : "● Codex 进行中"}</div>` : ""}
+        </span>
+        ${actions.length ? `<span class="row-actions">${actions.join("")}</span>` : ""}
+      </button>`;
+    }
+
+    function listBody(list, selectedId) {
+      const open = list.filter((task) => !task.done);
+      const done = list.filter((task) => task.done);
+      if (!list.length) {
+        const empty = {
+          myday: ["今天还没有安排", "从下面添加，或去「任务」把一条加入今天。"],
+          tasks: ["没有任务", "先记到库存里，需要今天做再加入。"],
+          "list-work": ["这个清单是空的", "在下面添加一条。"],
+          running: ["没有正在运行的 Session", "打开一条任务后在终端里启动 Agent。"],
+          done: ["还没有完成的任务", "勾选圆圈就会出现在这里。"]
+        }[nav];
+        return `<div class="empty"><b>${empty[0]}</b>${empty[1]}</div>`;
+      }
+      return `
+        ${open.map((task) => card(task, selectedId)).join("")}
+        ${done.length ? `<div class="sec-label">已完成</div>${done.map((task) => card(task, selectedId)).join("")}` : ""}
+      `;
+    }
+
+    function composerPlaceholder() {
+      if (nav === "myday") return "添加今天的任务";
+      if (nav === "list-work") return "添加到工作";
+      if (nav === "tasks") return "添加到任务库存";
+      return "";
+    }
+
+    function render(options = {}) {
+      const list = visibleTasks();
+      const meta = navMeta[nav];
+      const working = Boolean(selected) || closing;
+      const current = tasks.find((item) => item.id === (selected || parked)) || list[0];
+      const dock = parkedTask();
+      const expand = Boolean(options.expand && selected);
+
+      document.querySelectorAll("[data-nav]").forEach((el) => {
+        el.classList.toggle("on", el.dataset.nav === nav);
+      });
+      document.getElementById("count-myday").textContent = tasks.filter((task) => task.inToday && !task.done).length;
+      document.getElementById("count-tasks").textContent = tasks.filter((task) => !task.done).length;
+      document.getElementById("count-work").textContent = tasks.filter((task) => task.list === "work" && !task.done).length;
+      document.getElementById("count-running").textContent = tasks.filter((task) => task.running && !task.done).length;
+      document.getElementById("count-done").textContent = tasks.filter((task) => task.done).length;
+
+      document.getElementById("boardTitle").textContent = meta.title;
+      document.getElementById("boardHint").textContent = working
+        ? "左栏还在这里。折起终端，不要离开这个房间。"
+        : meta.hint;
+      document.getElementById("titleSub").textContent = selected
+        ? `${meta.title} · 终端已打开`
+        : dock
+          ? `${meta.title} · 有壳收在下面`
+          : `${meta.title} · 点任务不换房间`;
+
+      const showComposer = nav === "myday" || nav === "tasks" || nav === "list-work";
+      const composer = showComposer
+        ? `<div class="composer"><span style="color:var(--faint)">+</span><input id="composer" placeholder="${composerPlaceholder()}" value="${draft.replace(/"/g, "&quot;")}" /></div>`
+        : "";
+
+      workspace.className = "workspace " + (closing ? "collapsing" : selected && !expand ? "split" : "list");
+      workspace.innerHTML = `
+        <div class="list-pane">
+          <div class="cards">${listBody(list, selected)}</div>
+          ${composer}
+          <div class="dock ${dock ? "visible" : ""}">
+            ${dock ? `<button data-reopen="${dock.id}" type="button">
+              <span class="pulse"></span>
+              <span><b>${dock.title}</b><small>壳还在跑 · 收起不是结束</small></span>
+              <span class="open-hint">打开</span>
+            </button>` : ""}
+          </div>
+        </div>
+        <div class="term-slot">
+          <div class="term">
+            <div class="term-head">
+              <button class="fold" id="fold" type="button" title="收起终端，壳继续跑" aria-label="收起终端">
+                <svg width="14" height="14" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+                  <path d="M8.2 2.6 4.4 7l3.8 4.4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </button>
+              <strong>${current ? current.title : ""}</strong>
+              <span>${current && current.running ? "Codex · 进行中" : "本机终端"}</span>
+              <span class="esc">Esc</span>
+            </div>
+            <pre>${current && current.term ? current.term : "$"}</pre>
+            <div class="term-foot"><span>${current ? current.path : ""}</span><span class="ok">本机直连</span></div>
+          </div>
+        </div>
+      `;
+      bind();
+      if (expand) {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => {
+            if (!selected || closing) return;
+            workspace.classList.remove("list");
+            workspace.classList.add("split");
+          });
+        });
+      }
+    }
+
+    function bind() {
+      document.querySelectorAll("[data-open]").forEach((el) => {
+        el.addEventListener("click", (event) => {
+          if (event.target.closest("[data-done], [data-add], [data-remove]")) return;
+          openTask(el.dataset.open);
+        });
+      });
+      document.querySelectorAll("[data-done]").forEach((el) => {
+        el.addEventListener("click", (event) => toggleDone(el.dataset.done, event));
+      });
+      document.querySelectorAll("[data-add]").forEach((el) => {
+        el.addEventListener("click", (event) => addToToday(el.dataset.add, event));
+      });
+      document.querySelectorAll("[data-remove]").forEach((el) => {
+        el.addEventListener("click", (event) => removeFromToday(el.dataset.remove, event));
+      });
+      document.querySelectorAll("[data-reopen]").forEach((el) => {
+        el.addEventListener("click", () => openTask(el.dataset.reopen));
+      });
+      const fold = document.getElementById("fold");
+      if (fold) fold.addEventListener("click", closeWorkspace);
+      const input = document.getElementById("composer");
+      if (input) {
+        input.addEventListener("input", () => { draft = input.value; });
+        input.addEventListener("keydown", (event) => {
+          if (event.key === "Enter") {
+            event.preventDefault();
+            submitDraft();
+          }
+        });
+      }
+    }
+
+    document.querySelectorAll("[data-nav]").forEach((el) => {
+      el.addEventListener("click", () => setNav(el.dataset.nav));
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && selected) {
+        event.preventDefault();
+        closeWorkspace();
+      }
+    });
+
+    render();
+  </script>
+</body>
+</html>

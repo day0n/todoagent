@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TodoAgent · 工作台交互目录</title>
+  <style>
+    :root {
+      --bg: #1c1c1e;
+      --elev: #2c2c2e;
+      --card: #2a2a2c;
+      --hover: #3a3a3c;
+      --line: rgba(255,255,255,.08);
+      --text: #f5f5f7;
+      --muted: #8e8e93;
+      --blue: #0a84ff;
+      --blue-soft: rgba(10,132,255,.18);
+      --green: #30d158;
+      --red: #ff453a;
+      --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", sans-serif;
+      --mono: "SF Mono", ui-monospace, Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #0b0b0d; color: var(--text); font: 13px/1.4 var(--font); }
+    button { font: inherit; color: inherit; cursor: pointer; border: 0; background: none; text-align: left; }
+    .shell { height: 100%; display: grid; grid-template-columns: 280px minmax(0, 1fr); }
+    .catalog {
+      border-right: 1px solid var(--line);
+      background: #111113;
+      overflow: auto;
+      padding: 14px 10px 24px;
+    }
+    .catalog h1 { font-size: 14px; margin: 0 8px 6px; }
+    .catalog p { color: var(--muted); margin: 0 8px 14px; font-size: 12px; }
+    .idea {
+      width: 100%;
+      padding: 10px 10px;
+      border-radius: 10px;
+      margin-bottom: 4px;
+    }
+    .idea:hover { background: #1d1d20; }
+    .idea[aria-current="true"] { background: var(--blue-soft); }
+    .idea b { display: block; font-size: 13px; }
+    .idea span { display: block; color: var(--muted); font-size: 11.5px; margin-top: 3px; }
+
+    .stage { min-width: 0; display: flex; flex-direction: column; background: #0e0e10; }
+    .why {
+      padding: 10px 16px;
+      color: var(--muted);
+      font-size: 12px;
+      border-bottom: 1px solid var(--line);
+      background: #141416;
+    }
+    .app {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 200px minmax(0, 1fr) 300px;
+      background: var(--bg);
+    }
+    .app.no-chat { grid-template-columns: 200px minmax(0, 1fr); }
+    .app.no-chat .chat { display: none; }
+    .side, .chat { background: #1a1a1c; }
+    .side { border-right: 1px solid var(--line); padding: 12px 8px; }
+    .chat { border-left: 1px solid var(--line); display: flex; flex-direction: column; }
+    .nav { display: block; width: 100%; padding: 7px 8px; border-radius: 8px; }
+    .nav.on { background: var(--blue-soft); color: #8ec2ff; }
+    .board { min-width: 0; display: flex; flex-direction: column; background: #242426; }
+    .head {
+      height: 46px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 0 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .head h2 { font-size: 15px; margin: 0; font-weight: 650; }
+    .seg { display: flex; background: #1c1c1e; border-radius: 8px; padding: 2px; }
+    .seg button { padding: 4px 10px; border-radius: 6px; color: var(--muted); }
+    .seg button.on { background: var(--elev); color: var(--text); }
+    .tabs { display: flex; gap: 4px; flex: 1; overflow: auto; }
+    .tab { padding: 5px 10px; border-radius: 8px; background: #1c1c1e; color: var(--muted); }
+    .tab.on { background: var(--elev); color: var(--text); }
+    .pill { margin-left: auto; color: var(--muted); font-size: 12px; }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--green); margin-right: 5px; }
+
+    .cards { overflow: auto; padding: 12px; }
+    .card {
+      width: 100%;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 11px;
+      margin-bottom: 8px;
+      display: flex;
+      gap: 10px;
+    }
+    .card:hover, .card.on { background: var(--hover); }
+    .card.on { border-color: rgba(10,132,255,.4); }
+    .check { width: 15px; height: 15px; border: 1.5px solid #6e6e73; border-radius: 50%; flex: none; margin-top: 2px; }
+    .card b { display: block; }
+    .meta { color: var(--muted); font-size: 12px; margin-top: 3px; }
+    .meta.bad { color: var(--red); }
+    .live { color: var(--green); font-size: 11px; margin-top: 4px; }
+
+    .term {
+      background: #141416;
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      min-height: 0;
+    }
+    .term pre {
+      flex: 1;
+      margin: 0;
+      padding: 12px 14px;
+      font: 12.5px/1.5 var(--mono);
+      white-space: pre-wrap;
+      overflow: auto;
+    }
+    .foot {
+      height: 28px;
+      border-top: 1px solid var(--line);
+      display: flex;
+      justify-content: space-between;
+      padding: 0 10px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 11.5px;
+    }
+    .ok { color: var(--green); }
+
+    .row { flex: 1; min-height: 0; display: grid; }
+    .overlay {
+      position: absolute;
+      inset: 46px auto 0 0;
+      width: 280px;
+      background: rgba(28,28,30,.96);
+      border-right: 1px solid var(--line);
+      z-index: 2;
+    }
+    .board { position: relative; }
+    .mini { height: 88px; border-radius: 8px; overflow: hidden; margin-top: 8px; border: 1px solid var(--line); }
+    .room-chip { background: var(--elev); border-radius: 8px; padding: 5px 10px; }
+    .meta-col { padding: 14px; border-right: 1px solid var(--line); background: #1f1f21; }
+    .chat-body { flex: 1; display: grid; place-items: center; color: var(--muted); text-align: center; }
+    .chat-in { margin: 10px; background: var(--elev); border-radius: 12px; padding: 10px; color: var(--muted); }
+    .hide { display: none !important; }
+    .ghost { color: var(--blue); }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="catalog">
+      <h1>10 个完全不同的交互</h1>
+      <p>左边换方案，右边点任务。这是本地文件，没有上线。</p>
+      <div id="ideas"></div>
+    </aside>
+    <section class="stage">
+      <div class="why" id="why"></div>
+      <div class="app" id="app"></div>
+    </section>
+  </div>
+
+  <script>
+    const tasks = [
+      { id: "claude", title: "claude 上下文管理能复述", meta: "8月13日 周四", bad: true, path: "/Users/niuzj/Desktop/claude-code-src", term: "$ ~/Desktop/claude-code-src\nclaude --dangerously-skip-permissions\n\n这个壳只属于当前任务。" },
+      { id: "points", title: "agent 积分外显", meta: "清单 · agent 积分外显", path: "/Users/niuzj/Desktop/todoagent", term: "$ ~/Desktop/todoagent\nls apps\nengine-rs   macos" },
+      { id: "done", title: "完善中英文 skill 教程", meta: "已完成", done: true }
+    ];
+
+    const ideas = [
+      { id: "modes", name: "1 规划 / 干活", why: "应用有两个模式。规划就是现在的任务页；干活才进入 Warp 式 session 轨 + 大终端。点任务不是跳页，是切换工作模式。" },
+      { id: "desktop", name: "2 终端当桌面", why: "中间永远是终端。任务清单是盖在上面的浮层，像 Spotlight。选完任务浮层收起，你一直待在壳里。" },
+      { id: "right", name: "3 右边变工作台", why: "中间清单永远不动。点任务后，右侧从对话变成「备注 + 终端」。对话和工作台是同一栏的两个身份。" },
+      { id: "tabs", name: "4 浏览器标签", why: "「任务」是主页标签。点开一个任务就多一个标签，壳挂在标签上。关标签不等于删任务。" },
+      { id: "runway", name: "5 今日跑道", why: "上面是待办摘要，下面每个进行中的任务自带一条终端带。像多 Agent 看板，不是先选再进。" },
+      { id: "tri", name: "6 三态渐进", why: "点一下：选中并露出 4 行预览。再点一下：终端铺满。Esc 退回。不一下子抢走整页。" },
+      { id: "room", name: "7 任务房间", why: "点任务 = 整页变成这个任务的房间。只留一颗任务芯片用来换房间。最沉浸，也最需要返回。" },
+      { id: "finder", name: "8 Finder 四栏", why: "导航 | 任务 | 任务信息 | 终端。目录感最强，信息一层层往右走，不互相覆盖。" },
+      { id: "split", name: "9 并排双开", why: "两个进行中的任务并排，各有自己的壳。学 Claude Code / Arc 的平行工作，而不是一次只进一个。" },
+      { id: "mail", name: "10 邮件式", why: "对照方案：清单当轨，点选只换绑定。经典，但你已经觉得一般。" }
+    ];
+
+    let mode = "modes";
+    let selected = "claude";
+    let workMode = "plan";
+    let overlay = false;
+    let rightTab = "work";
+    let openTabs = ["home"];
+    let activeTab = "home";
+    let tri = "list";
+
+    const t = (id) => tasks.find((x) => x.id === id);
+    const openTasks = () => tasks.filter((x) => !x.done);
+
+    function card(task, on, extra = "") {
+      if (task.done) {
+        return `<div class="card"><span class="check"></span><span><b style="text-decoration:line-through;color:#c7c7cc">${task.title}</b><div class="meta">${task.meta}</div></span></div>`;
+      }
+      return `<button class="card ${on ? "on" : ""}" data-pick="${task.id}" type="button"><span class="check"></span><span><b>${task.title}</b><div class="meta ${task.bad ? "bad" : ""}">${task.meta}</div>${extra}</span></button>`;
+    }
+    function termBox(task, empty) {
+      const text = task ? task.term : empty;
+      const path = task ? task.path : "未选择";
+      return `<div class="term"><pre>${text}</pre><div class="foot"><span>${path}</span><span class="ok">本机直连</span></div></div>`;
+    }
+    function chrome(board, opts = {}) {
+      const chat = opts.hideChat ? "" : `<aside class="chat"><div class="head"><h2 style="font-size:13px;font-weight:500">新对话</h2></div><div class="chat-body">右侧对话</div><div class="chat-in">告诉 TodoAgent…</div></aside>`;
+      return `<aside class="side"><button class="nav" type="button">时间线</button><button class="nav on" type="button">任务</button></aside><main class="board">${board}</main>${chat}`;
+    }
+
+    function view() {
+      const task = t(selected);
+      if (mode === "modes") {
+        if (workMode === "plan") {
+          return chrome(`<div class="head"><div class="seg"><button class="on" data-work="plan">规划</button><button data-work="work">干活</button></div><h2>任务</h2></div><div class="cards">${tasks.map((x) => card(x, false, `<div class="live">点「干活」才进终端</div>`)).join("")}</div>`);
+        }
+        return chrome(`<div class="head"><div class="seg"><button data-work="plan">规划</button><button class="on" data-work="work">干活</button></div><span class="pill"><span class="dot"></span>session 轨</span></div><div class="row" style="grid-template-columns:220px 1fr">${`<div class="cards">${openTasks().map((x) => card(x, selected === x.id, `<div class="live">● 壳还在</div>`)).join("")}</div>`}${termBox(task, "")}</div>`);
+      }
+      if (mode === "desktop") {
+        return chrome(`<div class="head"><button class="ghost" data-overlay="1" type="button">⌘K 任务</button><h2>${task && !task.done ? task.title : "本地终端"}</h2></div>${termBox(task && !task.done ? task : openTasks()[0], "")}${overlay ? `<div class="overlay cards">${tasks.map((x) => card(x, selected === x.id)).join("")}</div>` : ""}`);
+      }
+      if (mode === "right") {
+        const right = rightTab === "chat"
+          ? `<div class="chat-body">对话</div><div class="chat-in">告诉 TodoAgent…</div>`
+          : `<div class="meta-col"><b>${task.title}</b><div class="meta ${task.bad ? "bad" : ""}">${task.meta}</div></div>${termBox(task, "")}`;
+        return `<aside class="side"><button class="nav on" type="button">任务</button></aside><main class="board"><div class="head"><h2>任务</h2></div><div class="cards">${tasks.map((x) => card(x, selected === x.id)).join("")}</div></main><aside class="chat"><div class="head"><div class="seg"><button class="${rightTab === "chat" ? "on" : ""}" data-right="chat">对话</button><button class="${rightTab === "work" ? "on" : ""}" data-right="work">工作台</button></div></div>${right}</aside>`;
+      }
+      if (mode === "tabs") {
+        const labels = { home: "任务", claude: "claude 上下文…", points: "agent 积分…" };
+        const tabs = openTabs.map((id) => `<button class="tab ${activeTab === id ? "on" : ""}" data-tab="${id}" type="button">${labels[id]}</button>`).join("");
+        if (activeTab === "home") {
+          return chrome(`<div class="head"><div class="tabs">${tabs}</div></div><div class="cards">${tasks.map((x) => card(x, false, x.done ? "" : `<div class="live">点开会变成新标签</div>`)).join("")}</div>`);
+        }
+        return chrome(`<div class="head"><div class="tabs">${tabs}</div></div>${termBox(t(activeTab), "")}`);
+      }
+      if (mode === "runway") {
+        return chrome(`<div class="head"><h2>今天在跑的任务</h2></div><div class="cards" style="padding-bottom:8px">${tasks.filter((x) => x.done).map((x) => card(x, false)).join("")}<div class="meta" style="margin:8px 0">进行中 · 每条任务自带终端</div></div><div class="row" style="grid-template-rows:1fr 1fr">${openTasks().map((x) => termBox(x, "")).join("")}</div>`);
+      }
+      if (mode === "tri") {
+        if (tri === "full" && task && !task.done) {
+          return chrome(`<div class="head"><button class="ghost" data-tri="list" type="button">‹ 任务</button><h2>${task.title}</h2></div>${termBox(task, "")}`);
+        }
+        return chrome(`<div class="head"><h2>任务</h2><span class="pill">点一下预览，再点进入</span></div><div class="cards">${tasks.map((x) => {
+          const on = selected === x.id && !x.done;
+          const preview = on && tri === "preview" ? `<div class="mini">${termBox(x, "")}</div>` : "";
+          return `${card(x, on)}${preview}`;
+        }).join("")}</div>`);
+      }
+      if (mode === "room") {
+        if (!task || task.done) {
+          return chrome(`<div class="head"><h2>任务</h2></div><div class="cards">${tasks.map((x) => card(x, false)).join("")}</div>`);
+        }
+        return chrome(`<div class="head"><button class="room-chip" data-room="1" type="button">${task.title} ▾</button><span class="pill"><span class="dot"></span>房间内</span></div>${termBox(task, "")}`, { hideChat: true });
+      }
+      if (mode === "finder") {
+        return chrome(`<div class="head"><h2>任务</h2></div><div class="row" style="grid-template-columns:240px 200px 1fr"><div class="cards">${tasks.map((x) => card(x, selected === x.id)).join("")}</div><div class="meta-col"><h3 style="margin:0 0 8px">${task.title}</h3><div class="meta ${task.bad ? "bad" : ""}">${task.meta}</div><p class="meta" style="margin-top:12px">备注、截止日期、清单都停在这一栏，不跟终端抢。</p></div>${termBox(task.done ? null : task, "选一个未完成任务")}</div>`);
+      }
+      if (mode === "split") {
+        return chrome(`<div class="head"><h2>平行工作</h2></div><div class="row" style="grid-template-columns:1fr 1fr">${openTasks().map((x) => `<div style="display:flex;flex-direction:column;min-width:0;border-right:1px solid var(--line)"><div class="head"><h2 style="font-size:13px">${x.title}</h2></div>${termBox(x, "")}</div>`).join("")}</div>`);
+      }
+      return chrome(`<div class="head"><h2>任务</h2></div><div class="row" style="grid-template-columns:260px 1fr"><div class="cards">${tasks.map((x) => card(x, selected === x.id)).join("")}</div>${termBox(task && !task.done ? task : null, "点左侧任务，只换绑定。")}</div>`);
+    }
+
+    function render() {
+      document.getElementById("ideas").innerHTML = ideas.map((i) =>
+        `<button class="idea" data-mode="${i.id}" aria-current="${mode === i.id}" type="button"><b>${i.name}</b><span>${i.why}</span></button>`
+      ).join("");
+      document.getElementById("why").textContent = ideas.find((i) => i.id === mode).why;
+      const app = document.getElementById("app");
+      app.className = "app" + (mode === "room" && selected && !t(selected).done ? " no-chat" : "");
+      app.innerHTML = view();
+      bind(app);
+    }
+
+    function bind(root) {
+      root.querySelectorAll("[data-pick]").forEach((el) => el.addEventListener("click", () => {
+        const id = el.dataset.pick;
+        if (mode === "tabs") {
+          if (!openTabs.includes(id)) openTabs.push(id);
+          activeTab = id;
+        } else if (mode === "tri") {
+          if (selected === id && tri === "preview") tri = "full";
+          else { selected = id; tri = "preview"; }
+        } else if (mode === "desktop") {
+          selected = id;
+          overlay = false;
+        } else if (mode === "right") {
+          selected = id;
+          rightTab = "work";
+        } else {
+          selected = id;
+        }
+        render();
+      }));
+      root.querySelectorAll("[data-work]").forEach((el) => el.addEventListener("click", () => { workMode = el.dataset.work; render(); }));
+      root.querySelectorAll("[data-overlay]").forEach((el) => el.addEventListener("click", () => { overlay = !overlay; render(); }));
+      root.querySelectorAll("[data-right]").forEach((el) => el.addEventListener("click", () => { rightTab = el.dataset.right; render(); }));
+      root.querySelectorAll("[data-tab]").forEach((el) => el.addEventListener("click", () => { activeTab = el.dataset.tab; render(); }));
+      root.querySelectorAll("[data-tri]").forEach((el) => el.addEventListener("click", () => { tri = "list"; render(); }));
+      root.querySelectorAll("[data-room]").forEach((el) => el.addEventListener("click", () => { selected = "done"; render(); }));
+    }
+
+    document.getElementById("ideas").addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-mode]");
+      if (!btn) return;
+      mode = btn.dataset.mode;
+      overlay = false;
+      workMode = "plan";
+      activeTab = "home";
+      tri = "list";
+      selected = "claude";
+      render();
+    });
+
+    render();
+  </script>
+</body>
+</html>
