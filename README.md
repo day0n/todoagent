@@ -14,7 +14,7 @@ TodoAgent 是一款本地优先的原生 macOS 待办与 Agent 工作台。它�
 > DMG 使用 ad-hoc 签名，尚未经过 Developer ID 签名和 Apple 公证，不是面向公众的
 > 正式发行包。
 
-[快速开始](#本地构建与运行) · [公开 TODO](TODO.md) ·
+[官网](https://todoagent.space/) · [快速开始](#本地构建与运行) · [公开 TODO](TODO.md) ·
 [架构](docs/ARCHITECTURE.md) · [Runtime 集成](docs/RUNTIMES.md) ·
 [贡献指南](CONTRIBUTING.md) · [安全策略](SECURITY.md)
 

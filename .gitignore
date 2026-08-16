@@ -9,6 +9,9 @@ dist/
 .env
 .env.local
 
+# Vercel link metadata. Production deploys from GitHub, not this folder.
+.vercel/
+
 # Local agent instructions. Keep machine- and assistant-specific guidance out
 # of the public repository.
 AGENTS.md

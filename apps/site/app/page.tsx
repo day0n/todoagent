@@ -1,7 +1,16 @@
+import { SiteNav } from "./site-nav";
+
 const githubUrl = "https://github.com/day0n/todoagent";
 const buildUrl = `${githubUrl}#本地构建与运行`;
 
 const runtimes = ["Codex", "Claude Code", "Cursor Agent", "Kiro CLI"];
+
+const navLinks = [
+  { href: "#overview", label: "Overview" },
+  { href: "#experience", label: "Experience" },
+  { href: "#privacy", label: "Privacy" },
+  { href: githubUrl, label: "GitHub", external: true },
+];
 
 function AppPreview() {
   return (
@@ -57,7 +66,7 @@ function AppPreview() {
           </div>
           <div className="terminal-copy" aria-hidden="true">
             <p><span className="prompt">~</span> codex</p>
-            <p className="terminal-muted">╭──────────────────────────────────────╮</p>
+            <p className="terminal-rule">╭──────────────────────────────────────╮</p>
             <p><span className="terminal-accent">›</span> What are we working on?</p>
             <p className="terminal-bright">  Refine the TodoAgent launch experience</p>
             <p className="terminal-muted">  using the existing macOS workspace.</p>
@@ -74,22 +83,77 @@ function AppPreview() {
   );
 }
 
+function AppPreviewPhone() {
+  return (
+    <div className="phone-shell" aria-label="TodoAgent product preview">
+      <div className="phone-bar">
+        <div className="traffic-lights" aria-hidden="true">
+          <span />
+          <span />
+          <span />
+        </div>
+        <span className="window-title">TodoAgent</span>
+        <span className="window-status"><i /> Local</span>
+      </div>
+
+      <div className="phone-today">
+        <header>
+          <div>
+            <span className="eyebrow">TODAY</span>
+            <h2>Make the work visible.</h2>
+          </div>
+          <span className="demo-add" aria-hidden="true">+</span>
+        </header>
+        <article className="phone-task selected">
+          <span className="task-check" />
+          <div>
+            <strong>Polish the public preview</strong>
+            <small>TodoAgent · today</small>
+          </div>
+          <span className="run-state">Running</span>
+        </article>
+        <article className="phone-task">
+          <span className="task-check" />
+          <div>
+            <strong>Review terminal recovery</strong>
+            <small>TodoAgent · today</small>
+          </div>
+        </article>
+        <article className="phone-task done">
+          <span className="task-check checked">✓</span>
+          <div>
+            <strong>Shape the launch story</strong>
+            <small>Completed</small>
+          </div>
+        </article>
+      </div>
+
+      <section className="phone-terminal">
+        <div className="terminal-toolbar">
+          <span>Polish the public preview</span>
+          <span className="terminal-pill">Codex</span>
+        </div>
+        <div className="terminal-copy" aria-hidden="true">
+          <p><span className="prompt">~</span> codex</p>
+          <p><span className="terminal-accent">›</span> Refine the launch experience</p>
+          <p><span className="terminal-success">✓</span> Read the current product surface</p>
+          <p><span className="terminal-success">✓</span> Kept the task workspace attached</p>
+          <p><span className="terminal-accent">●</span> Working in the real project directory</p>
+          <p className="cursor-line"><span>›</span><i /></p>
+        </div>
+        <div className="terminal-footer">
+          <span>~/Desktop/todoagent</span>
+          <span><i /> Session active</span>
+        </div>
+      </section>
+    </div>
+  );
+}
+
 export default function Home() {
   return (
     <main>
-      <nav className="site-nav" aria-label="Primary navigation">
-        <a className="brand" href="#top" aria-label="TodoAgent home">
-          <img src="/todoagent-icon.png" alt="" />
-          <span>TodoAgent</span>
-        </a>
-        <div className="nav-links">
-          <a href="#overview">Overview</a>
-          <a href="#experience">Experience</a>
-          <a href="#privacy">Privacy</a>
-          <a href={githubUrl} target="_blank" rel="noreferrer">GitHub</a>
-        </div>
-        <a className="nav-cta" href={githubUrl} target="_blank" rel="noreferrer">View preview</a>
-      </nav>
+      <SiteNav githubUrl={githubUrl} links={navLinks} />
 
       <section className="hero" id="top">
         <div className="aurora" aria-hidden="true" />
@@ -106,8 +170,12 @@ export default function Home() {
           <div className="hero-note">Built for Apple silicon · macOS 26+</div>
         </div>
 
-        <div className="preview-wrap">
+        <div className="preview-wrap desktop-preview">
           <AppPreview />
+        </div>
+
+        <div className="phone-preview">
+          <AppPreviewPhone />
         </div>
       </section>
 
