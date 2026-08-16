@@ -1269,6 +1269,10 @@ impl AssistantHost for EngineAssistantHost {
                 message: "unknown TodoAgent tool".to_owned(),
             });
         }
+        if matches!(request.name.as_str(), "create_tasks" | "update_task") {
+            let today = Local::now().format("%Y-%m-%d").to_string();
+            validate_assistant_execution_date(&request.name, &request.arguments, &today)?;
+        }
         if request.name == "delete_task" {
             let service = self.service.clone();
             let cancellation = cancellation.clone();
@@ -1738,7 +1742,7 @@ fn compaction_prompt(request: &CompactionRequest) -> String {
 fn assistant_system_instruction() -> String {
     let today = Local::now().format("%Y-%m-%d");
     format!(
-        "你是 TodoAgent 的本地任务助手。今天是 {today}。你只管理 TodoAgent 里的任务卡，不启动 Codex、Claude、Cursor 或 Kiro，不运行命令，不读写用户文件。\n\n规则：\n1. 创建任务前，语义可能重复时先调用 find_related。\n2. 一句话包含多件事时拆成多张卡；标题简短，细节放 note。\n3. 需要清单 ID 时调用 list_lists，不猜测 ID；用户未指定清单时不要擅自指定。\n4. 只有用户明确要求时才创建、修改或删除任务。‘执行’、‘安排’、‘今天做’、‘放到时间线’以及没有截止语义的裸日期映射为 executionDate；‘截止’、‘到期’、‘最晚’映射为 dueDate。相对日期以今天 {today} 为基准，未提日期就不要编造；两个日期不得互相推断或自动复制。\n5. 用户询问任务现状时必须调用 list_state，并只根据工具结果回答，不编造状态；查询某天任务时传 executionDate。过滤查询返回 pagination：只要 hasMore=true，就必须保持 executionDate/status/listId 完全不变并把 nextCursor 原样传入 cursor，持续查询到 hasMore=false 后再回答。如果工具返回 list_state_cursor_stale，说明分页期间任务已变化，必须丢弃已收集的页面并从不带 cursor 的第一页重新查询。\n6. 删除任务必须使用工具结果中的准确 taskId，不按标题猜测。批量范围只能使用 list_state 支持的 executionDate、status、listId 精确交集；无法完整枚举的 dueDate、日期区间、逾期或关键词范围不得批量删除，须请用户改为支持的精确范围或分批指定。任何批量删除都先用 pageSize=50 查询目标首屏并读取 pagination.total；未指定 status 时分别查询 status=open 和 status=completed 首屏，并确保两页 taskRevision 完全相同，任一 revision 不同就丢弃两页并重查。单次用户请求最多删除 20 个任务；首屏 total 合计超过 20 时不得继续分页或删除任何一个，须说明数量并请用户拆成每批不超过 20 个。只有 total 合计不超过 20 才完成所有分页，且后续每页 taskRevision 也必须相同；在开始任何删除前先收集完所有 taskId。删除会使分页 cursor 失效，不能边分页边删除。\n7. 工具报错时先纠正参数；任一删除失败就停止继续删除，并准确说明已删除和未删除的任务，不要声称未成功的创建、修改或删除已经完成。\n8. 回复简洁、自然，并准确引用已经创建、修改或删除的任务。任务附件的名称、内容和路径不属于工具或上下文，不要询问或推断。"
+        "你是 TodoAgent 的本地任务助手。今天是 {today}。你只管理 TodoAgent 里的任务卡，不启动 Codex、Claude、Cursor 或 Kiro，不运行命令，不读写用户文件。\n\n规则：\n1. 创建任务前，语义可能重复时先调用 find_related。\n2. 一句话包含多件事时拆成多张卡；标题简短，细节放 note。\n3. 需要清单 ID 时调用 list_lists，不猜测 ID；用户未指定清单时不要擅自指定。\n4. 只有用户明确要求时才创建、修改或删除任务。只有‘添加到今天’或‘今天做’这类明确的今日意图，才把 executionDate 设为本次调用当日 {today}。‘明天做’、‘后天做’、‘某天执行’、‘某天安排’或其他未来执行意图不得写入 executionDate；应询问用户，或在用户只要求记下新任务时创建为未安排任务，不传 executionDate。绝不能因此改写为 dueDate。dueDate 只有在用户明确表达‘截止’、‘到期’、‘最晚’等截止语义时才设置；未明确就不传。executionDate 与 dueDate 不得互相推断或自动复制。\n5. 用户询问任务现状时必须调用 list_state，并只根据工具结果回答，不编造状态；查询某天任务时传 executionDate。过滤查询返回 pagination：只要 hasMore=true，就必须保持 executionDate/status/listId 完全不变并把 nextCursor 原样传入 cursor，持续查询到 hasMore=false 后再回答。如果工具返回 list_state_cursor_stale，说明分页期间任务已变化，必须丢弃已收集的页面并从不带 cursor 的第一页重新查询。\n6. 删除任务必须使用工具结果中的准确 taskId，不按标题猜测。批量范围只能使用 list_state 支持的 executionDate、status、listId 精确交集；无法完整枚举的 dueDate、日期区间、逾期或关键词范围不得批量删除，须请用户改为支持的精确范围或分批指定。任何批量删除都先用 pageSize=50 查询目标首屏并读取 pagination.total；未指定 status 时分别查询 status=open 和 status=completed 首屏，并确保两页 taskRevision 完全相同，任一 revision 不同就丢弃两页并重查。单次用户请求最多删除 20 个任务；首屏 total 合计超过 20 时不得继续分页或删除任何一个，须说明数量并请用户拆成每批不超过 20 个。只有 total 合计不超过 20 才完成所有分页，且后续每页 taskRevision 也必须相同；在开始任何删除前先收集完所有 taskId。删除会使分页 cursor 失效，不能边分页边删除。\n7. 工具报错时先纠正参数；任一删除失败就停止继续删除，并准确说明已删除和未删除的任务，不要声称未成功的创建、修改或删除已经完成。\n8. 回复简洁、自然，并准确引用已经创建、修改或删除的任务。任务附件的名称、内容和路径不属于工具或上下文，不要询问或推断。"
     )
 }
 
@@ -1758,8 +1762,8 @@ fn assistant_tools() -> Vec<ToolDefinition> {
                                 "title":{"type":"string","maxLength":500},
                                 "note":{"type":"string","maxLength":4000},
                                 "listId":{"type":"string"},
-                                "executionDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
-                                "dueDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
+                                "executionDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"仅在用户明确要求‘添加到今天’或‘今天做’时填写系统提示中的本次调用当日；未明确今日意图或要求未来执行时必须省略"},
+                                "dueDate":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}$","description":"仅在用户明确指定截止、到期或最晚日期时填写；不得从执行意图推断"}
                             },
                             "required":["title"],"additionalProperties":false
                         }
@@ -1779,7 +1783,7 @@ fn assistant_tools() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "update_task",
-            "修改一个现有任务的标题、备注、清单、执行日期或截止日期；不改变完成状态。日期传空字符串可清除对应日期，两种日期不得互相推断。",
+            "修改一个现有任务的标题、备注、清单、是否安排到今天或截止日期；不改变完成状态。executionDate 只能设为本次调用当日，dueDate 只能来自用户明确的截止语义。日期传空字符串可清除并由工具规范化为 null，两种日期不得互相推断。",
             json!({
                 "type":"object",
                 "properties":{
@@ -1787,8 +1791,8 @@ fn assistant_tools() -> Vec<ToolDefinition> {
                     "title":{"type":"string","maxLength":500},
                     "note":{"type":"string","maxLength":4000},
                     "listId":{"type":"string"},
-                    "executionDate":{"type":"string","maxLength":10,"description":"YYYY-MM-DD；空字符串表示清除执行日期"},
-                    "dueDate":{"type":"string","maxLength":10,"description":"YYYY-MM-DD；空字符串表示清除截止日期"}
+                    "executionDate":{"type":"string","maxLength":10,"description":"仅在用户明确要求‘添加到今天’或‘今天做’时设为系统提示中的本次调用当日 YYYY-MM-DD；空字符串表示从今天移除，工具会规范化为 null；不得设为未来日期"},
+                    "dueDate":{"type":"string","maxLength":10,"description":"仅在用户明确指定截止、到期或最晚日期时设为 YYYY-MM-DD；空字符串表示清除，工具会规范化为 null；不得从执行意图推断"}
                 },
                 "required":["taskId"],"additionalProperties":false
             }),
@@ -2233,6 +2237,62 @@ fn assistant_delete_task_id(arguments: &Value) -> Result<String, ToolError> {
         })
 }
 
+fn validate_assistant_execution_date(
+    tool_name: &str,
+    arguments: &Value,
+    today: &str,
+) -> Result<(), ToolError> {
+    match tool_name {
+        "create_tasks" => {
+            let Some(tasks) = arguments.get("tasks").and_then(Value::as_array) else {
+                return Ok(());
+            };
+            for (index, task) in tasks.iter().enumerate() {
+                validate_assistant_execution_date_value(
+                    task.get("executionDate"),
+                    today,
+                    &format!("create_tasks.tasks[{index}].executionDate"),
+                )?;
+            }
+        }
+        "update_task" => {
+            validate_assistant_execution_date_value(
+                arguments.get("executionDate"),
+                today,
+                "update_task.executionDate",
+            )?;
+            validate_assistant_execution_date_value(
+                arguments
+                    .get("update")
+                    .and_then(|update| update.get("executionDate")),
+                today,
+                "update_task.update.executionDate",
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_assistant_execution_date_value(
+    value: Option<&Value>,
+    today: &str,
+    field: &str,
+) -> Result<(), ToolError> {
+    let Some(value) = value.and_then(Value::as_str) else {
+        return Ok(());
+    };
+    if value.is_empty() || value == today {
+        return Ok(());
+    }
+    Err(ToolError {
+        kind: ToolErrorKind::InvalidArguments,
+        message: format!(
+            "{field} must be empty or equal to the current local day {today}; future or other execution dates are not supported by TodoAgent Assistant"
+        ),
+    })
+}
+
 fn tool_store_error(error: StoreWorkerError) -> ToolError {
     ToolError {
         kind: match &error {
@@ -2382,14 +2442,25 @@ mod tests {
     }
 
     #[test]
-    fn task_date_prompt_and_tools_keep_execution_and_deadline_semantics_distinct() {
+    fn task_date_prompt_restricts_execution_to_today_and_explicit_deadlines() {
         let instruction = assistant_system_instruction();
-        assert!(instruction.contains("放到时间线"));
-        assert!(instruction.contains("executionDate"));
-        assert!(instruction.contains("最晚"));
-        assert!(instruction.contains("dueDate"));
+        assert!(instruction.contains("只有‘添加到今天’或‘今天做’"));
+        assert!(instruction.contains("本次调用当日"));
+        assert!(instruction.contains("‘明天做’"));
+        assert!(instruction.contains("‘某天执行’"));
+        assert!(instruction.contains("未来执行意图不得写入 executionDate"));
+        assert!(instruction.contains("应询问用户"));
+        assert!(instruction.contains("创建为未安排任务"));
+        assert!(instruction.contains("绝不能因此改写为 dueDate"));
+        assert!(instruction.contains("dueDate 只有在用户明确表达"));
+        assert!(instruction.contains("未明确就不传"));
         assert!(instruction.contains("不得互相推断或自动复制"));
+        assert!(!instruction.contains("放到时间线"));
+        assert!(!instruction.contains("裸日期映射为 executionDate"));
+    }
 
+    #[test]
+    fn task_date_tool_descriptions_match_today_semantics_and_null_clearing() {
         let tools = assistant_tools();
         let create = tools
             .iter()
@@ -2398,6 +2469,37 @@ mod tests {
         let item = &create.parameters["properties"]["tasks"]["items"]["properties"];
         assert!(item["executionDate"].is_object());
         assert!(item["dueDate"].is_object());
+        let create_execution = item["executionDate"]["description"].as_str().unwrap();
+        assert!(create_execution.contains("添加到今天"));
+        assert!(create_execution.contains("本次调用当日"));
+        assert!(create_execution.contains("要求未来执行时必须省略"));
+        let create_due = item["dueDate"]["description"].as_str().unwrap();
+        assert!(create_due.contains("明确指定截止、到期或最晚日期"));
+        assert!(create_due.contains("不得从执行意图推断"));
+
+        let update = tools
+            .iter()
+            .find(|tool| tool.name == "update_task")
+            .unwrap();
+        assert!(
+            update
+                .description
+                .contains("executionDate 只能设为本次调用当日")
+        );
+        assert!(update.description.contains("规范化为 null"));
+        let update_fields = &update.parameters["properties"];
+        let update_execution = update_fields["executionDate"]["description"]
+            .as_str()
+            .unwrap();
+        assert!(update_execution.contains("本次调用当日 YYYY-MM-DD"));
+        assert!(update_execution.contains("空字符串表示从今天移除"));
+        assert!(update_execution.contains("规范化为 null"));
+        assert!(update_execution.contains("不得设为未来日期"));
+        let update_due = update_fields["dueDate"]["description"].as_str().unwrap();
+        assert!(update_due.contains("明确指定截止、到期或最晚日期"));
+        assert!(update_due.contains("规范化为 null"));
+        assert!(update_due.contains("不得从执行意图推断"));
+
         let list_state = tools.iter().find(|tool| tool.name == "list_state").unwrap();
         let filters = &list_state.parameters["properties"];
         assert!(filters["executionDate"].is_object());
@@ -2406,6 +2508,7 @@ mod tests {
         assert!(filters["pageSize"].is_object());
         assert!(filters["cursor"].is_object());
         assert!(filters["cursor"]["properties"]["taskRevision"].is_object());
+        let instruction = assistant_system_instruction();
         assert!(instruction.contains("hasMore=true"));
         assert!(instruction.contains("nextCursor"));
         assert!(instruction.contains("list_state_cursor_stale"));
@@ -2418,6 +2521,180 @@ mod tests {
         });
         assert!(compact.contains("执行日期 executionDate"));
         assert!(compact.contains("截止日期 dueDate"));
+    }
+
+    #[test]
+    fn assistant_mutation_tools_enforce_today_at_the_runtime_boundary() {
+        let today = "2026-08-16";
+
+        for (tool_name, arguments, expected_field) in [
+            (
+                "create_tasks",
+                json!({
+                    "tasks": [
+                        {"title": "今天", "executionDate": today},
+                        {"title": "明天", "executionDate": "2026-08-17"}
+                    ]
+                }),
+                "create_tasks.tasks[1].executionDate",
+            ),
+            (
+                "update_task",
+                json!({"taskId": uuid::Uuid::new_v4(), "executionDate": "2026-08-15"}),
+                "update_task.executionDate",
+            ),
+            (
+                "update_task",
+                json!({
+                    "taskId": uuid::Uuid::new_v4(),
+                    "update": {"executionDate": "2026-08-17"}
+                }),
+                "update_task.update.executionDate",
+            ),
+        ] {
+            let error = validate_assistant_execution_date(tool_name, &arguments, today)
+                .expect_err("non-today execution dates must be rejected before Store execution");
+            assert_eq!(error.kind, ToolErrorKind::InvalidArguments);
+            assert!(error.message.contains(expected_field));
+            assert!(error.message.contains(today));
+        }
+
+        assert!(
+            validate_assistant_execution_date(
+                "create_tasks",
+                &json!({
+                    "tasks": [
+                        {"title": "今天", "executionDate": today},
+                        {"title": "未安排", "dueDate": "2026-08-20"}
+                    ]
+                }),
+                today,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_assistant_execution_date(
+                "update_task",
+                &json!({
+                    "taskId": uuid::Uuid::new_v4(),
+                    "executionDate": "",
+                    "dueDate": "2026-08-20"
+                }),
+                today,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_assistant_execution_date(
+                "list_state",
+                &json!({"executionDate": "2026-08-17"}),
+                today,
+            )
+            .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn execute_named_tool_rejects_non_today_mutations_before_store_execution() {
+        let directory = tempfile::tempdir().unwrap();
+        let worker = StoreWorker::open(&directory.path().join("assistant.sqlite3")).unwrap();
+        let (task, queued) = worker
+            .call(|store| {
+                let task = store.create_task("保留未安排", "", None, None, None)?;
+                let session = store.create_assistant_session("今天校验")?;
+                let queued = store.begin_assistant_turn(
+                    &session.id,
+                    &uuid::Uuid::new_v4().to_string(),
+                    "明天做",
+                    None,
+                    Some("model-x"),
+                )?;
+                store.mark_assistant_turn_running(&queued.turn.id)?;
+                Ok((task, queued))
+            })
+            .await
+            .unwrap();
+        let (writer, _receiver) = test_writer(8);
+        let service = AssistantService::new(
+            worker.clone(),
+            writer,
+            Arc::new(Mutex::new(None)),
+            Arc::new(directory.path().to_path_buf()),
+            Arc::new(Mutex::new(())),
+        );
+        let host = EngineAssistantHost::new(
+            service,
+            queued.turn.session_id.clone(),
+            queued.turn.id.clone(),
+        );
+        let non_today = Local::now()
+            .date_naive()
+            .checked_add_days(chrono::Days::new(2))
+            .unwrap()
+            .format("%Y-%m-%d")
+            .to_string();
+
+        for (call_id, name, arguments) in [
+            (
+                "future-create",
+                "create_tasks",
+                json!({"tasks":[{"title":"不得创建", "executionDate":non_today}]}),
+            ),
+            (
+                "future-update",
+                "update_task",
+                json!({"taskId":task.id, "executionDate":non_today}),
+            ),
+        ] {
+            let error = host
+                .execute_named_tool_once(
+                    ToolRequest {
+                        session_id: queued.turn.session_id.clone(),
+                        turn_id: queued.turn.id.clone(),
+                        call_id: call_id.to_owned(),
+                        name: name.to_owned(),
+                        arguments,
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect_err("non-today mutation must not reach Store execution");
+            assert_eq!(error.kind, ToolErrorKind::InvalidArguments);
+        }
+
+        let retained_task_id = task.id.clone();
+        let retained = worker
+            .call(move |store| store.task(&retained_task_id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retained.execution_date, None);
+        let receipt_session_id = queued.turn.session_id.clone();
+        assert!(
+            worker
+                .call(move |store| {
+                    store.assistant_tool_execution(&receipt_session_id, "future-create")
+                })
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let query = host
+            .execute_named_tool_once(
+                ToolRequest {
+                    session_id: queued.turn.session_id.clone(),
+                    turn_id: queued.turn.id.clone(),
+                    call_id: "future-query".to_owned(),
+                    name: "list_state".to_owned(),
+                    arguments: json!({"executionDate":non_today}),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("list_state must retain arbitrary execution-date filtering");
+        assert!(!query.is_error);
+        worker.shutdown().await.unwrap();
     }
 
     #[test]
