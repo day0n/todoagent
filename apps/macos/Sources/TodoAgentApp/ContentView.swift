@@ -1,4 +1,5 @@
 import AppKit
+import Observation
 import SwiftUI
 
 struct ContentView: View {
@@ -6,12 +7,21 @@ struct ContentView: View {
     @State private var taskWorkspace: TaskWorkspaceCoordinator
     @State private var assistantResizeStartWidth: CGFloat?
     @State private var assistantLiveWidth: CGFloat?
+    @State private var taskWorkspaceVisuallyMounted = false
+    @State private var workspaceChrome: MainWorkspaceChromeCoordinator
     @AppStorage(AssistantPanePreferences.widthKey) private var storedAssistantWidth = 0.0
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    init(state: AppState, taskWorkspace: TaskWorkspaceCoordinator) {
+    init(
+        state: AppState,
+        taskWorkspace: TaskWorkspaceCoordinator,
+        workspaceChrome: MainWorkspaceChromeCoordinator? = nil
+    ) {
+        let workspaceChrome = workspaceChrome ?? MainWorkspaceChromeCoordinator(state: state)
+        taskWorkspace.presentationPreparer = workspaceChrome
         _state = State(initialValue: state)
         _taskWorkspace = State(initialValue: taskWorkspace)
+        _workspaceChrome = State(initialValue: workspaceChrome)
     }
 
     init(repository: any AppRepository) {
@@ -21,14 +31,23 @@ struct ContentView: View {
             state: state,
             terminalSessions: terminalSessions
         )
+        let workspaceChrome = MainWorkspaceChromeCoordinator(state: state)
         state.taskWorkspacePresenter = taskWorkspace
         state.terminalSessions = terminalSessions
+        taskWorkspace.presentationPreparer = workspaceChrome
         _state = State(initialValue: state)
         _taskWorkspace = State(initialValue: taskWorkspace)
+        _workspaceChrome = State(initialValue: workspaceChrome)
     }
 
     var body: some View {
-        NavigationSplitView {
+        @Bindable var workspaceChrome = workspaceChrome
+        let navigationColumnVisibility = Binding(
+            get: { workspaceChrome.navigationColumnVisibility },
+            set: { workspaceChrome.acceptSystemNavigationVisibility($0) }
+        )
+
+        NavigationSplitView(columnVisibility: navigationColumnVisibility) {
             SidebarView(state: state)
                 .navigationSplitViewColumnWidth(
                     min: 210,
@@ -41,32 +60,26 @@ struct ContentView: View {
                     availableWidth: proxy.size.width,
                     preferredWidth: assistantLiveWidth ?? persistedAssistantWidth
                 )
-                let taskWorkspacePresented = taskWorkspace.presentedTaskID != nil
+                let taskWorkspacePresented = taskWorkspaceIsVisuallyActive
+                let externalChromeLocked = taskWorkspaceExternalChromeLocked
                 let assistantPlacement = AssistantPanePlacementPolicy.resolve(
                     inspectorPresented: state.inspectorPresented,
                     taskWorkspacePresented: taskWorkspacePresented
                 )
                 let assistantIsVisible = assistantPlacement != .hidden
                 let assistantDrawerWidth = assistantWidth + MainWorkspaceLayoutPolicy.dividerWidth
-                let assistantReservedWidth = assistantPlacement == .sideBySide
-                    ? assistantDrawerWidth
-                    : 0
+                let assistantLayoutTarget = AssistantWorkspaceLayoutTarget.resolve(
+                    placement: assistantPlacement,
+                    drawerWidth: assistantDrawerWidth
+                )
 
-                ZStack(alignment: .trailing) {
-                    HStack(spacing: 0) {
-                        boardWorkspace
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-
-                        Color.clear
-                            .frame(width: assistantReservedWidth)
-                            .accessibilityHidden(true)
-                    }
-                    .animation(
-                        AssistantWorkspaceMotion.animation(
-                            reduceMotion: reduceMotion || taskWorkspacePresented
-                        ),
-                        value: assistantReservedWidth
-                    )
+                AssistantWorkspaceSynchronizedLayout(
+                    reservedWidth: assistantLayoutTarget.reservedWidth,
+                    visibleDrawerWidth: assistantLayoutTarget.visibleDrawerWidth,
+                    drawerWidth: assistantDrawerWidth
+                ) {
+                    boardWorkspace
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                     HStack(spacing: 0) {
                         AssistantResizeDivider(
@@ -100,8 +113,6 @@ struct ContentView: View {
                         radius: 18,
                         x: -5
                     )
-                    .offset(x: assistantIsVisible ? 0 : assistantDrawerWidth)
-                    .opacity(assistantIsVisible ? 1 : 0)
                     .allowsHitTesting(assistantIsVisible)
                     .accessibilityHidden(!assistantIsVisible)
                     .accessibilityIdentifier(
@@ -109,12 +120,14 @@ struct ContentView: View {
                             ? "assistant.task-overlay"
                             : "assistant.side-pane"
                     )
-                    .animation(
-                        AssistantWorkspaceMotion.animation(reduceMotion: reduceMotion),
-                        value: assistantIsVisible
-                    )
                     .zIndex(2)
                 }
+                .animation(
+                    AssistantWorkspaceMotion.animation(
+                        reduceMotion: reduceMotion || externalChromeLocked
+                    ),
+                    value: assistantPlacement
+                )
                 // The divider itself moves while it is being dragged. Keep
                 // the gesture in this fixed workspace coordinate space so
                 // its translation does not feed back into the next event.
@@ -122,14 +135,40 @@ struct ContentView: View {
                 .clipped()
             }
         }
-        .navigationSplitViewStyle(.balanced)
+        // Unlike `.balanced`, prominent-detail keeps Board/Ghostty geometry
+        // stable while the native Sidebar slides over the leading edge.
+        .navigationSplitViewStyle(.prominentDetail)
         .tint(TodoAgentUI.primaryText)
-        .disabled(state.loadState == .loading || state.isPreparingToTerminate)
+        .background {
+            GeometryReader { proxy in
+                Color.clear
+                    .onAppear {
+                        workspaceChrome.updateRootWidth(proxy.size.width)
+                    }
+                    .onChange(of: proxy.size.width) { _, width in
+                        workspaceChrome.updateRootWidth(width)
+                    }
+                    .onDisappear {
+                        workspaceChrome.updateRootWidth(0)
+                    }
+            }
+        }
+        .disabled(
+            state.loadState == .loading
+                || state.isPreparingToTerminate
+                || taskWorkspaceExternalChromeLocked
+        )
+        .onAppear {
+            taskWorkspace.presentationPreparer = workspaceChrome
+            taskWorkspace.mainWindowDidMount()
+        }
         .task { await state.load() }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentToggleInspector)) { _ in
+            guard taskWorkspaceExternalChromeLocked == false else { return }
             Task { await state.toggleAssistant() }
         }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewAssistantConversation)) { _ in
+            guard taskWorkspaceExternalChromeLocked == false else { return }
             Task { await state.openNewAssistantConversation() }
         }
         .onChange(of: state.inspectorPresented) { wasPresented, isPresented in
@@ -191,22 +230,31 @@ struct ContentView: View {
 
     private var boardWorkspace: some View {
         let floatingButtonIsVisible = !state.inspectorPresented
-        let taskWorkspacePresented = taskWorkspace.presentedTaskID != nil
+        let taskWorkspacePresented = taskWorkspaceIsVisuallyActive
 
         return ZStack(alignment: .bottomTrailing) {
-            BoardView(state: state, taskWorkspace: taskWorkspace)
+            BoardView(
+                state: state,
+                taskWorkspace: taskWorkspace,
+                workspaceVisuallyMounted: $taskWorkspaceVisuallyMounted,
+                geometryRequestGeneration: workspaceChrome.geometryRequestGeneration,
+                onAvailableWidthChange: workspaceChrome.updateBoardWidth
+            )
 
             AssistantFloatingButton(isOverTaskTerminal: taskWorkspacePresented) {
+                guard taskWorkspaceExternalChromeLocked == false else { return }
                 Task { await state.openAssistant() }
             }
-            .padding(.trailing, 22)
-            .padding(.bottom, taskWorkspacePresented ? 48 : 24)
+            .padding(.trailing, TodoAgentUI.floatingButtonTrailingPadding)
+            .padding(.bottom, TodoAgentUI.floatingButtonBottomPadding)
             .scaleEffect(floatingButtonIsVisible ? 1 : 0.88, anchor: .bottomTrailing)
             .opacity(floatingButtonIsVisible ? 1 : 0)
-            .allowsHitTesting(floatingButtonIsVisible)
+            .allowsHitTesting(floatingButtonIsVisible && !taskWorkspaceExternalChromeLocked)
             .accessibilityHidden(!floatingButtonIsVisible)
             .animation(
-                reduceMotion ? nil : .easeInOut(duration: 0.22),
+                reduceMotion || taskWorkspaceExternalChromeLocked
+                    ? nil
+                    : .easeInOut(duration: 0.22),
                 value: floatingButtonIsVisible
             )
         }
@@ -215,6 +263,22 @@ struct ContentView: View {
 
     private var persistedAssistantWidth: CGFloat? {
         storedAssistantWidth > 0 ? CGFloat(storedAssistantWidth) : nil
+    }
+
+    /// The coordinator completes its save before the board finishes sliding
+    /// the terminal away. Keep the assistant in overlay mode until that visual
+    /// transition unmounts, otherwise its reserved side-pane width would
+    /// resize Ghostty during the close animation.
+    private var taskWorkspaceIsVisuallyActive: Bool {
+        taskWorkspace.presentedTaskID != nil || taskWorkspaceVisuallyMounted
+    }
+
+    /// Keep the chrome closed across the small hand-off between the geometry
+    /// preflight and the coordinator publishing its selected task. Otherwise a
+    /// toolbar action can reopen a side pane in the exact frame Ghostty mounts.
+    private var taskWorkspaceExternalChromeLocked: Bool {
+        workspaceChrome.isPreparingTaskWorkspace
+            || (taskWorkspace.pendingTaskID != nil && taskWorkspace.presentedTaskID == nil)
     }
 
     private func resizeAssistantPane(
@@ -261,6 +325,270 @@ struct ContentView: View {
     }
 }
 
+@MainActor
+@Observable
+final class MainWorkspaceChromeCoordinator: TaskWorkspacePresentationPreparing {
+    var navigationColumnVisibility = MainWorkspaceNavigationPolicy.visibleColumns
+    private(set) var isPreparingTaskWorkspace = false
+    private(set) var geometryRequestGeneration: UInt64 = 0
+
+    @ObservationIgnored private weak var state: AppState?
+    @ObservationIgnored private var rootWidth: CGFloat = 0
+    @ObservationIgnored private var boardWidth: CGFloat = 0
+    @ObservationIgnored private var boardGeometryRevision: UInt64 = 0
+    @ObservationIgnored private var preparationSessionCounter: UInt64 = 0
+    @ObservationIgnored private var preparationSession: ExternalChromePreparationSession?
+    @ObservationIgnored private var geometryWaiters: [UUID: BoardGeometryWaiter] = [:]
+    @ObservationIgnored private let preparationTimeout: TimeInterval
+
+    init(
+        state: AppState,
+        preparationTimeout: TimeInterval = TaskWorkspaceExternalChromePreparationPolicy.timeout
+    ) {
+        self.state = state
+        self.preparationTimeout = max(preparationTimeout, 0)
+    }
+
+    func updateRootWidth(_ width: CGFloat) {
+        rootWidth = max(width, 0)
+    }
+
+    /// NavigationSplitView can publish a semantically equivalent `.all` value
+    /// after its native transition. Store one concrete two-column state so that
+    /// completion does not invalidate and rebuild the workspace a second time.
+    func acceptSystemNavigationVisibility(_ visibility: NavigationSplitViewVisibility) {
+        guard isPreparingTaskWorkspace == false else { return }
+        navigationColumnVisibility = MainWorkspaceNavigationPolicy.canonicalVisibility(visibility)
+    }
+
+    func updateBoardWidth(_ width: CGFloat) {
+        boardWidth = max(width, 0)
+        boardGeometryRevision &+= 1
+        resumeCommittedGeometryWaiters()
+    }
+
+    /// The terminal must be sized from the final main-window geometry. Collapse
+    /// external chrome first, wait for its visual transaction and a stable
+    /// detail layout, and only then let the task coordinator publish a mounted
+    /// workspace.
+    func acquireTaskWorkspacePreparation() -> TaskWorkspacePresentationPreparation {
+        let requestID = UUID()
+        let sessionID = acquirePreparationSession(requestID: requestID)
+        isPreparingTaskWorkspace = true
+        return TaskWorkspacePresentationPreparation(
+            sessionID: sessionID,
+            requestID: requestID,
+            minimumBoardGeometryRevision: boardGeometryRevision,
+            isReady: false
+        )
+    }
+
+    func awaitTaskWorkspacePreparation(
+        _ preparation: TaskWorkspacePresentationPreparation
+    ) async -> TaskWorkspacePresentationPreparation {
+        let sessionID = preparation.sessionID
+        let requestID = preparation.requestID
+        let deadline = Date().addingTimeInterval(preparationTimeout)
+        geometryRequestGeneration &+= 1
+
+        while !Task.isCancelled,
+              ownsPreparationRequest(sessionID: sessionID, requestID: requestID),
+              Date() < deadline
+        {
+            let chromeAlreadyCollapsed = navigationColumnVisibility == .detailOnly
+                && state?.inspectorPresented != true
+            let hasFreshBoardGeometry = boardGeometryRevision
+                > preparation.minimumBoardGeometryRevision
+            if chromeAlreadyCollapsed, hasFreshBoardGeometry, boardGeometryIsReady {
+                return TaskWorkspacePresentationPreparation(
+                    sessionID: sessionID,
+                    requestID: requestID,
+                    minimumBoardGeometryRevision: preparation.minimumBoardGeometryRevision,
+                    isReady: true
+                )
+            }
+
+            let revisionBeforeCollapse = boardGeometryRevision
+            applyExternalChrome(
+                navigationVisibility: .detailOnly,
+                inspectorPresented: false
+            )
+
+            // Ask the live Board GeometryReader to commit a sample even when
+            // macOS presents the Sidebar as an overlay and its width is
+            // unchanged. The terminal remains unmounted until this ack.
+            geometryRequestGeneration &+= 1
+            let committed = await waitForBoardGeometry(
+                after: revisionBeforeCollapse,
+                timeout: max(deadline.timeIntervalSinceNow, 0)
+            )
+            if committed == false { break }
+        }
+
+        return TaskWorkspacePresentationPreparation(
+            sessionID: sessionID,
+            requestID: requestID,
+            minimumBoardGeometryRevision: preparation.minimumBoardGeometryRevision,
+            isReady: false
+        )
+    }
+
+    func finishTaskWorkspacePreparation(
+        _ preparation: TaskWorkspacePresentationPreparation,
+        didPresent: Bool
+    ) {
+        guard var session = preparationSession,
+              session.id == preparation.sessionID,
+              session.requestIDs.remove(preparation.requestID) != nil
+        else { return }
+
+        if didPresent, preparation.isReady {
+            preparationSession = nil
+            isPreparingTaskWorkspace = false
+            return
+        }
+
+        if session.requestIDs.isEmpty {
+            preparationSession = nil
+            applyExternalChrome(
+                navigationVisibility: session.originalNavigationVisibility,
+                inspectorPresented: session.originalInspectorPresented
+            )
+            geometryRequestGeneration &+= 1
+            isPreparingTaskWorkspace = false
+        } else {
+            preparationSession = session
+        }
+    }
+
+    private var boardGeometryIsReady: Bool {
+        navigationColumnVisibility == .detailOnly
+            && state?.inspectorPresented != true
+            && rootWidth > 0
+            && boardWidth > 0
+            // NavigationSplitView can retain a device-pixel separator/inset
+            // even in detail-only mode. A two-point tolerance still rejects
+            // every real Sidebar or Assistant pane while avoiding a false
+            // timeout on those native rounding differences.
+            && abs(rootWidth - boardWidth)
+                <= TaskWorkspaceExternalChromePreparationPolicy.geometryTolerance
+    }
+
+    private func applyExternalChrome(
+        navigationVisibility: NavigationSplitViewVisibility,
+        inspectorPresented: Bool
+    ) {
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            navigationColumnVisibility = MainWorkspaceNavigationPolicy.canonicalVisibility(
+                navigationVisibility
+            )
+            state?.inspectorPresented = inspectorPresented
+        }
+    }
+
+    private func acquirePreparationSession(requestID: UUID) -> UInt64 {
+        var session: ExternalChromePreparationSession
+        if let current = preparationSession {
+            session = current
+        } else {
+            preparationSessionCounter &+= 1
+            session = ExternalChromePreparationSession(
+                id: preparationSessionCounter,
+                originalNavigationVisibility: MainWorkspaceNavigationPolicy.canonicalVisibility(
+                    navigationColumnVisibility
+                ),
+                originalInspectorPresented: state?.inspectorPresented == true,
+                requestIDs: []
+            )
+        }
+        session.requestIDs.insert(requestID)
+        preparationSession = session
+        return session.id
+    }
+
+    private func ownsPreparationRequest(sessionID: UInt64, requestID: UUID) -> Bool {
+        preparationSession?.id == sessionID
+            && preparationSession?.requestIDs.contains(requestID) == true
+    }
+
+    private func waitForBoardGeometry(
+        after revision: UInt64,
+        timeout: TimeInterval
+    ) async -> Bool {
+        guard boardGeometryRevision <= revision else { return true }
+        guard timeout > 0 else { return false }
+        let waiterID = UUID()
+        let timeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(timeout))
+            guard Task.isCancelled == false else { return }
+            self?.resolveGeometryWaiter(waiterID, committed: false)
+        }
+        let committed = await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled || boardGeometryRevision > revision {
+                    continuation.resume(returning: !Task.isCancelled)
+                } else {
+                    geometryWaiters[waiterID] = BoardGeometryWaiter(
+                        minimumRevision: revision,
+                        continuation: continuation
+                    )
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.resolveGeometryWaiter(waiterID, committed: false)
+            }
+        }
+        timeoutTask.cancel()
+        return committed
+    }
+
+    private func resumeCommittedGeometryWaiters() {
+        let readyIDs = geometryWaiters.compactMap { id, waiter in
+            boardGeometryRevision > waiter.minimumRevision ? id : nil
+        }
+        for id in readyIDs {
+            resolveGeometryWaiter(id, committed: true)
+        }
+    }
+
+    private func resolveGeometryWaiter(_ id: UUID, committed: Bool) {
+        geometryWaiters.removeValue(forKey: id)?.continuation.resume(returning: committed)
+    }
+}
+
+private struct BoardGeometryWaiter {
+    let minimumRevision: UInt64
+    let continuation: CheckedContinuation<Bool, Never>
+}
+
+private struct ExternalChromePreparationSession {
+    let id: UInt64
+    let originalNavigationVisibility: NavigationSplitViewVisibility
+    let originalInspectorPresented: Bool
+    var requestIDs: Set<UUID>
+}
+
+enum TaskWorkspaceExternalChromePreparationPolicy {
+    static let timeout: TimeInterval = 2
+    static let geometryTolerance: CGFloat = 2
+}
+
+enum MainWorkspaceNavigationPolicy {
+    /// This is the concrete visible state for a two-column split. `.all` has
+    /// the same meaning, but retaining two representations creates an avoidable
+    /// observation update when AppKit commits its native Sidebar transition.
+    static let visibleColumns: NavigationSplitViewVisibility = .doubleColumn
+
+    static func canonicalVisibility(
+        _ visibility: NavigationSplitViewVisibility
+    ) -> NavigationSplitViewVisibility {
+        visibility == .all ? visibleColumns : visibility
+    }
+}
+
 enum MainWorkspaceLayout: Equatable, Sendable {
     case boardOnly
     case sideBySide(assistantWidth: CGFloat)
@@ -282,15 +610,129 @@ enum AssistantPanePlacementPolicy {
     }
 }
 
+struct AssistantWorkspaceLayoutTarget: Equatable, Sendable {
+    let reservedWidth: CGFloat
+    let visibleDrawerWidth: CGFloat
+
+    static func resolve(
+        placement: AssistantPanePlacement,
+        drawerWidth: CGFloat
+    ) -> AssistantWorkspaceLayoutTarget {
+        let drawerWidth = max(drawerWidth, 0)
+        switch placement {
+        case .hidden:
+            return AssistantWorkspaceLayoutTarget(reservedWidth: 0, visibleDrawerWidth: 0)
+        case .sideBySide:
+            return AssistantWorkspaceLayoutTarget(
+                reservedWidth: drawerWidth,
+                visibleDrawerWidth: drawerWidth
+            )
+        case .taskOverlay:
+            return AssistantWorkspaceLayoutTarget(
+                reservedWidth: 0,
+                visibleDrawerWidth: drawerWidth
+            )
+        }
+    }
+}
+
+struct AssistantWorkspaceLayoutGeometry: Equatable, Sendable {
+    let boardFrame: CGRect
+    let drawerFrame: CGRect
+}
+
+enum AssistantWorkspaceSynchronizedLayoutPolicy {
+    static func resolve(
+        in bounds: CGRect,
+        reservedWidth: CGFloat,
+        visibleDrawerWidth: CGFloat,
+        drawerWidth: CGFloat
+    ) -> AssistantWorkspaceLayoutGeometry {
+        let drawerWidth = max(drawerWidth, 0)
+        let reservedWidth = min(max(reservedWidth, 0), bounds.width)
+        let visibleDrawerWidth = min(
+            max(visibleDrawerWidth, 0),
+            min(drawerWidth, bounds.width)
+        )
+        return AssistantWorkspaceLayoutGeometry(
+            boardFrame: CGRect(
+                x: bounds.minX,
+                y: bounds.minY,
+                width: max(bounds.width - reservedWidth, 0),
+                height: bounds.height
+            ),
+            drawerFrame: CGRect(
+                x: bounds.maxX - visibleDrawerWidth,
+                y: bounds.minY,
+                width: drawerWidth,
+                height: bounds.height
+            )
+        )
+    }
+}
+
+/// Places Board and the Assistant from one animatable pair. Side-by-side mode
+/// keeps `reservedWidth == visibleDrawerWidth` at every frame, so their shared
+/// boundary cannot drift. Overlay mode changes only visible width, preserving
+/// the Board (and any mounted Ghostty surface) at a fixed proposal.
+struct AssistantWorkspaceSynchronizedLayout: Layout {
+    var reservedWidth: CGFloat
+    var visibleDrawerWidth: CGFloat
+    let drawerWidth: CGFloat
+
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(reservedWidth, visibleDrawerWidth) }
+        set {
+            reservedWidth = newValue.first
+            visibleDrawerWidth = newValue.second
+        }
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews _: Subviews,
+        cache _: inout ()
+    ) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal _: ProposedViewSize,
+        subviews: Subviews,
+        cache _: inout ()
+    ) {
+        guard subviews.count >= 2 else { return }
+        let geometry = AssistantWorkspaceSynchronizedLayoutPolicy.resolve(
+            in: bounds,
+            reservedWidth: reservedWidth,
+            visibleDrawerWidth: visibleDrawerWidth,
+            drawerWidth: drawerWidth
+        )
+        subviews[0].place(
+            at: geometry.boardFrame.origin,
+            anchor: .topLeading,
+            proposal: ProposedViewSize(
+                width: geometry.boardFrame.width,
+                height: geometry.boardFrame.height
+            )
+        )
+        subviews[1].place(
+            at: geometry.drawerFrame.origin,
+            anchor: .topLeading,
+            proposal: ProposedViewSize(
+                width: geometry.drawerFrame.width,
+                height: geometry.drawerFrame.height
+            )
+        )
+    }
+}
+
 enum MainWorkspaceLayoutPolicy {
     static let dividerWidth: CGFloat = 10
     static let assistantMinimumWidth: CGFloat = 260
-    static let boardMinimumVisibleWidth = TimelineColumnLayoutPolicy.viewportWidth(
-        showingDayCount: 1
-    )
-    static let defaultBoardWidth = TimelineColumnLayoutPolicy.viewportWidth(
-        showingDayCount: 2
-    )
+    static let boardMinimumVisibleWidth: CGFloat = 360
+    static let defaultBoardWidth: CGFloat = 560
 
     static func resolve(
         availableWidth: CGFloat,
@@ -343,9 +785,9 @@ enum MainWorkspaceLayoutPolicy {
 }
 
 enum AssistantPanePreferences {
-    // v3 aligns the default divider with the midpoint between timeline days.
-    // Once the user drags it, the custom width remains persistent as usual.
-    static let widthKey = "assistantPaneWidth.v3"
+    // Today uses a normal task list rather than fixed day columns. Start the
+    // pane from the new list-friendly width, then preserve user resizing.
+    static let widthKey = "assistantPaneWidth.v4"
 }
 
 enum AssistantWorkspaceMotion {

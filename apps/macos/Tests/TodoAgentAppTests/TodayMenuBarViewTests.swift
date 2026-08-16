@@ -5,8 +5,8 @@ import Testing
 
 @Suite("Today menu bar projection")
 struct TodayMenuBarViewTests {
-    @Test("execution date selects all of today's tasks and keeps completed items")
-    func filtersExecutionDayAndKeepsCompletedTasks() throws {
+    @Test("Today selects today's execution date and keeps completed items")
+    func myDayFiltersExecutionDateAndKeepsCompletedTasks() throws {
         let calendar = shanghaiCalendar()
         let now = try date(2026, 8, 9, 12, 0, calendar: calendar)
         let today = LocalDay(now, calendar: calendar)
@@ -46,8 +46,8 @@ struct TodayMenuBarViewTests {
         #expect(projection.tasks.map(\.id) == [openToday.id, completedToday.id])
     }
 
-    @Test("an empty or non-today execution set produces no rows")
-    func emptyProjection() throws {
+    @Test("tasks outside Today produce no menu rows")
+    func emptyMyDayProjection() throws {
         let calendar = shanghaiCalendar()
         let now = try date(2026, 8, 9, 12, 0, calendar: calendar)
         let yesterday = LocalDay(try date(2026, 8, 8, 23, 59, calendar: calendar), calendar: calendar)
@@ -63,8 +63,8 @@ struct TodayMenuBarViewTests {
         #expect(projection.tasks.isEmpty)
     }
 
-    @Test("local day matching follows the supplied time zone")
-    func respectsLocalCalendarTimeZone() throws {
+    @Test("Today matching follows the supplied local time zone")
+    func myDayRespectsLocalCalendarTimeZone() throws {
         let calendar = shanghaiCalendar()
         let now = try #require(ISO8601DateFormatter().date(from: "2026-08-09T00:30:00Z"))
         let shanghaiToday = LocalDay(now, calendar: calendar)
@@ -143,8 +143,8 @@ struct TodayMenuBarViewTests {
         let tenTaskHeight = TodayMenuBarTaskAreaMetrics.height(taskCount: 10)
 
         #expect(TodayMenuBarTaskAreaMetrics.maximumVisibleTaskCount == 10)
-        #expect(!TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 0))
-        #expect(!TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 10))
+        #expect(TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 0) == false)
+        #expect(TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 10) == false)
         #expect(TodayMenuBarTaskAreaMetrics.requiresScrolling(taskCount: 11))
         #expect(TodayMenuBarTaskAreaMetrics.height(taskCount: 0) == 0)
         #expect(TodayMenuBarTaskAreaMetrics.height(taskCount: 11) == tenTaskHeight)

@@ -10,6 +10,25 @@ protocol TaskWorkspacePresenting: AnyObject {
     func commitTaskWorkspaceInput()
 }
 
+struct TaskWorkspacePresentationPreparation: Equatable, Sendable {
+    let sessionID: UInt64
+    let requestID: UUID
+    let minimumBoardGeometryRevision: UInt64
+    let isReady: Bool
+}
+
+@MainActor
+protocol TaskWorkspacePresentationPreparing: AnyObject {
+    func acquireTaskWorkspacePreparation() -> TaskWorkspacePresentationPreparation
+    func awaitTaskWorkspacePreparation(
+        _ preparation: TaskWorkspacePresentationPreparation
+    ) async -> TaskWorkspacePresentationPreparation
+    func finishTaskWorkspacePreparation(
+        _ preparation: TaskWorkspacePresentationPreparation,
+        didPresent: Bool
+    )
+}
+
 @MainActor
 @Observable
 final class TaskWorkbenchLayoutState {
@@ -44,16 +63,17 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
     let terminalSessions: TerminalSessionRegistry
     @ObservationIgnored private var layoutStates: [UUID: TaskWorkbenchLayoutState] = [:]
     @ObservationIgnored private var composerStates: [InlineAddTaskDestination: InlineAddTaskComposerState] = [:]
-    @ObservationIgnored private var timelineComposerStates: [LocalDay: InlineAddTaskComposerState] = [:]
     @ObservationIgnored private var transitionTask: Task<Void, Never>?
     @ObservationIgnored private var transitionGeneration: UInt64 = 0
     @ObservationIgnored private var detailsTransitionInFlight = false
+    @ObservationIgnored weak var presentationPreparer: (any TaskWorkspacePresentationPreparing)?
 
     private(set) var selectedTaskID: UUID?
     private(set) var isPresented = false
     private(set) var pendingTaskID: UUID?
     private(set) var closingTaskID: UUID?
     private(set) var activeWorkspaceIsCompact = false
+    private(set) var dormantTaskID: UUID?
 
     var presentedTaskID: UUID? {
         isPresented ? selectedTaskID : nil
@@ -66,6 +86,72 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
 
     func showTaskWorkspace(taskID: UUID) {
         guard state.task(id: taskID) != nil else { return }
+        dormantTaskID = nil
+
+        // Acquire the successor lease synchronously before cancelling an older
+        // preflight. This keeps the external-chrome lock and its original
+        // snapshot continuous across rapid A -> B requests.
+        let preparationRequest: (
+            preparer: any TaskWorkspacePresentationPreparing,
+            preparation: TaskWorkspacePresentationPreparation
+        )? = if !isPresented, let presentationPreparer {
+            (
+                presentationPreparer,
+                presentationPreparer.acquireTaskWorkspacePreparation()
+            )
+        } else {
+            nil
+        }
+
+        transitionGeneration &+= 1
+        let generation = transitionGeneration
+        transitionTask?.cancel()
+        transitionTask = nil
+        closingTaskID = nil
+
+        if let preparationRequest {
+            pendingTaskID = taskID
+            transitionTask = Task { @MainActor [weak self] in
+                let presentationPreparer = preparationRequest.preparer
+                let preparation = await presentationPreparer.awaitTaskWorkspacePreparation(
+                    preparationRequest.preparation
+                )
+                var didPresent = false
+                defer {
+                    presentationPreparer.finishTaskWorkspacePreparation(
+                        preparation,
+                        didPresent: didPresent
+                    )
+                }
+                guard let self,
+                      preparation.isReady,
+                      !Task.isCancelled,
+                      self.transitionGeneration == generation,
+                      self.pendingTaskID == taskID,
+                      self.state.task(id: taskID) != nil
+                else {
+                    if let self,
+                       preparation.isReady == false,
+                       !Task.isCancelled,
+                       self.transitionGeneration == generation,
+                       self.pendingTaskID == taskID
+                    {
+                        self.transitionTask = nil
+                        self.pendingTaskID = nil
+                        self.state.errorMessage = "无法准备终端布局，请重试。"
+                    }
+                    return
+                }
+                self.transitionTask = nil
+                self.pendingTaskID = nil
+                self.selectedTaskID = taskID
+                self.isPresented = true
+                didPresent = true
+                self.layoutState(for: taskID).requestHostRefresh()
+                self.focusTerminalAfterMount(taskID: taskID, generation: generation)
+            }
+            return
+        }
 
         if !isPresented, state.inspectorPresented {
             var transaction = Transaction()
@@ -74,12 +160,6 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
                 state.inspectorPresented = false
             }
         }
-
-        transitionGeneration &+= 1
-        let generation = transitionGeneration
-        transitionTask?.cancel()
-        transitionTask = nil
-        closingTaskID = nil
 
         if selectedTaskID == taskID {
             pendingTaskID = nil
@@ -135,7 +215,11 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
                   self.transitionGeneration == generation,
                   self.selectedTaskID == taskID
             else {
-                if self.closingTaskID == taskID { self.closingTaskID = nil }
+                if self.transitionGeneration == generation,
+                   self.closingTaskID == taskID
+                {
+                    self.closingTaskID = nil
+                }
                 return
             }
             self.transitionTask = nil
@@ -156,6 +240,9 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
     }
 
     func destroyTaskWorkspace(taskID: UUID) {
+        if dormantTaskID == taskID {
+            dormantTaskID = nil
+        }
         if pendingTaskID == taskID {
             transitionGeneration &+= 1
             transitionTask?.cancel()
@@ -164,6 +251,17 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
         }
         layoutStates[taskID] = nil
         guard selectedTaskID == taskID else { return }
+
+        // A newer task may already own the transition. Removing the outgoing
+        // task must not cancel that successor and leave its pending ID locked.
+        if let successorTaskID = pendingTaskID, successorTaskID != taskID {
+            selectedTaskID = nil
+            isPresented = false
+            closingTaskID = nil
+            activeWorkspaceIsCompact = false
+            return
+        }
+
         transitionGeneration &+= 1
         transitionTask?.cancel()
         transitionTask = nil
@@ -190,17 +288,6 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
         let created = InlineAddTaskComposerState()
         composerStates[destination] = created
         return created
-    }
-
-    func timelineComposerState(for day: LocalDay) -> InlineAddTaskComposerState {
-        if let existing = timelineComposerStates[day] { return existing }
-        let created = InlineAddTaskComposerState()
-        timelineComposerStates[day] = created
-        return created
-    }
-
-    var activeWorkspaceShowsTaskRail: Bool {
-        presentedTaskID != nil && !activeWorkspaceIsCompact
     }
 
     func updateActiveWorkspaceCompactState(taskID: UUID, isCompact: Bool) {
@@ -263,9 +350,51 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
         terminalSessions.controller(for: taskID)?.focusIfAppropriate()
     }
 
+    func mainWindowDidMount() {
+        guard let taskID = dormantTaskID else { return }
+        dormantTaskID = nil
+        guard state.task(id: taskID) != nil else { return }
+        showTaskWorkspace(taskID: taskID)
+    }
+
     func mainWindowWillClose() {
+        if isPresented == false, let pendingTaskID {
+            if selectedTaskID == pendingTaskID {
+                // A retained workspace may be waiting for fresh geometry
+                // after a window remount. Preserve that intent if the user
+                // closes the window again before the acknowledgement arrives.
+                dormantTaskID = pendingTaskID
+            }
+            transitionGeneration &+= 1
+            transitionTask?.cancel()
+            transitionTask = nil
+            self.pendingTaskID = nil
+            return
+        }
+
         guard let taskID = presentedTaskID else { return }
         commitInput(taskID: taskID)
+
+        // The AppKit/PTY controller remains retained, but a reopened window
+        // must reacquire final Board geometry before reattaching its surface.
+        // Do not mark an explicit in-flight collapse for automatic remount.
+        if closingTaskID == nil {
+            transitionGeneration &+= 1
+            transitionTask?.cancel()
+            transitionTask = nil
+            pendingTaskID = nil
+            dormantTaskID = taskID
+            isPresented = false
+            closingTaskID = nil
+            activeWorkspaceIsCompact = false
+        } else {
+            // The user already chose to collapse this workspace. Hide it from
+            // a rapidly reopened window immediately, while allowing the
+            // existing save/close transition to finish without remounting.
+            isPresented = false
+            activeWorkspaceIsCompact = false
+        }
+
         Task { @MainActor [weak self] in
             await Task.yield()
             _ = await self?.state.flushTaskEdits(taskID: taskID)
@@ -528,6 +657,30 @@ struct TaskWorkbenchView: View {
     @State private var terminalReloadToken = 0
     @State private var hostBindError: String?
 
+    init(
+        taskID: UUID,
+        state: AppState,
+        terminalSessions: TerminalSessionRegistry,
+        layoutState: TaskWorkbenchLayoutState,
+        toggleTaskDetails: @escaping () -> Void,
+        requestClose: @escaping () -> Void,
+        presentation: TaskWorkbenchPresentation = .window,
+        isClosing: Bool = false
+    ) {
+        self.taskID = taskID
+        self.state = state
+        self.terminalSessions = terminalSessions
+        self.layoutState = layoutState
+        self.toggleTaskDetails = toggleTaskDetails
+        self.requestClose = requestClose
+        self.presentation = presentation
+        self.isClosing = isClosing
+
+        let retainedController = terminalSessions.controller(for: taskID)
+        _terminalController = State(initialValue: retainedController)
+        _isLoadingSession = State(initialValue: retainedController == nil)
+    }
+
     var body: some View {
         Group {
             if let task = state.task(id: taskID) {
@@ -767,19 +920,7 @@ private struct TaskEmbeddedStateToolbar: View {
 
     @ViewBuilder
     private var collapseButton: some View {
-        if isClosing {
-            ProgressView()
-                .controlSize(.small)
-                .frame(width: 28, height: 28)
-                .accessibilityLabel("正在收起任务终端")
-        } else {
-            Button("收起任务终端", systemImage: "sidebar.leading", action: close)
-                .labelStyle(.iconOnly)
-                .buttonStyle(.borderless)
-                .help("返回任务页，终端继续运行")
-                .accessibilityHint("返回任务页，终端继续运行")
-                .accessibilityIdentifier("task.workspace.toolbar.collapse")
-        }
+        TaskTerminalCollapseButton(isClosing: isClosing, close: close)
     }
 }
 
@@ -860,8 +1001,36 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
     }
 
     var body: some View {
+        Group {
+            if allowsTaskDetails {
+                resizableWorkbench
+            } else {
+                terminalPane(task)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .id(task.id)
+            }
+        }
+        .onChange(of: task) { _, authoritativeTask in
+            reconcileDetailDraft(with: authoritativeTask)
+        }
+        .onChange(of: state.taskSaveState(taskID: task.id)) { _, _ in
+            guard let authoritativeTask = state.task(id: task.id) else { return }
+            reconcileDetailDraft(with: authoritativeTask)
+        }
+        .onChange(of: focusedTextField) { _, field in
+            Task { @MainActor in
+                await Task.yield()
+                guard focusedTextField == field else { return }
+                if field == nil { _ = await state.flushTaskEdits(taskID: task.id) }
+                guard let authoritativeTask = state.task(id: task.id) else { return }
+                reconcileDetailDraft(with: authoritativeTask)
+            }
+        }
+    }
+
+    private var resizableWorkbench: some View {
         GeometryReader { proxy in
-            let detailsPresented = layoutState.detailsPresented && allowsTaskDetails
+            let detailsPresented = layoutState.detailsPresented
             let maximumAvailableDetailsWidth = max(
                 minimumDetailsWidth,
                 proxy.size.width - terminalMinimumWidth - TaskDetailsResizeDivider.width
@@ -897,22 +1066,6 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
                     .id(task.id)
             }
             .coordinateSpace(name: Self.resizeCoordinateSpace)
-        }
-        .onChange(of: task) { _, authoritativeTask in
-            reconcileDetailDraft(with: authoritativeTask)
-        }
-        .onChange(of: state.taskSaveState(taskID: task.id)) { _, _ in
-            guard let authoritativeTask = state.task(id: task.id) else { return }
-            reconcileDetailDraft(with: authoritativeTask)
-        }
-        .onChange(of: focusedTextField) { _, field in
-            Task { @MainActor in
-                await Task.yield()
-                guard focusedTextField == field else { return }
-                if field == nil { _ = await state.flushTaskEdits(taskID: task.id) }
-                guard let authoritativeTask = state.task(id: task.id) else { return }
-                reconcileDetailDraft(with: authoritativeTask)
-            }
         }
     }
 
@@ -1090,19 +1243,7 @@ private struct TaskTerminalToolbar: View {
 
     @ViewBuilder
     private var collapseButton: some View {
-        if isClosing {
-            ProgressView()
-                .controlSize(.small)
-                .frame(width: 28, height: 28)
-                .accessibilityLabel("正在收起任务终端")
-        } else {
-            Button("收起任务终端", systemImage: "sidebar.leading", action: close)
-                .labelStyle(.iconOnly)
-                .buttonStyle(.borderless)
-                .help("返回任务页，终端继续运行")
-                .accessibilityHint("返回任务页，终端继续运行")
-                .accessibilityIdentifier("task.workspace.toolbar.collapse")
-        }
+        TaskTerminalCollapseButton(isClosing: isClosing, close: close)
     }
 
     private var isCompactEmbedded: Bool {
@@ -1113,6 +1254,33 @@ private struct TaskTerminalToolbar: View {
     private var phaseSymbol: String {
         if controller.needsAttention { return "bell.badge.fill" }
         return controller.phase.isActive ? "circle.dotted.circle" : "terminal"
+    }
+}
+
+private struct TaskTerminalCollapseButton: View {
+    let isClosing: Bool
+    let close: () -> Void
+
+    @ViewBuilder
+    var body: some View {
+        if isClosing {
+            ProgressView()
+                .controlSize(.small)
+                .frame(width: 28, height: 28)
+                .accessibilityLabel("正在收起任务终端")
+        } else {
+            Button(action: close) {
+                Image(systemName: "chevron.left")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 28, height: 28)
+                    .contentShape(.rect)
+            }
+            .buttonStyle(.borderless)
+            .help("收起终端，终端继续运行")
+            .accessibilityLabel("收起任务终端")
+            .accessibilityHint("返回当前任务列表，终端继续运行")
+            .accessibilityIdentifier("task.workspace.toolbar.collapse")
+        }
     }
 }
 

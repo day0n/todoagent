@@ -14,9 +14,9 @@ struct TaskStatusSections: Equatable, Sendable {
     var hasCompletedSection: Bool { completedTasks.isEmpty == false }
 }
 
-/// The single projection over the authoritative task rows. Timeline, task,
-/// list, sidebar and menu-bar surfaces never own task copies; they only select
-/// the same `TaskItem.id` values by execution date, list or status.
+/// The single projection over the authoritative task rows. Today, task, list,
+/// sidebar and menu-bar surfaces never own task copies; they only select the
+/// same `TaskItem.id` values by execution date, list or status.
 struct TaskProjection: Equatable, Sendable {
     static let empty = TaskProjection(tasks: [], today: .today())
 
@@ -50,7 +50,8 @@ struct TaskProjection: Equatable, Sendable {
 
     func count(for view: SmartView, sessions: [TaskSessionDescriptor]) -> Int {
         switch view {
-        case .timeline: tasks(executingOn: today).count
+        case .myDay:
+            tasks(executingOn: today).count(where: { $0.status == .open })
         case .tasks: tasks.count(where: { $0.status == .open })
         case .running: sessions.count(where: { $0.state.isBusy })
         case .done: tasks.count(where: { $0.status == .completed })
@@ -68,7 +69,9 @@ struct TaskProjection: Equatable, Sendable {
         switch selection {
         case let .smart(view):
             switch view {
-            case .timeline, .tasks:
+            case .myDay:
+                return tasks(executingOn: today)
+            case .tasks:
                 return tasks
             case .running:
                 let busyTaskIDs = Set(
@@ -88,28 +91,6 @@ struct TaskProjection: Equatable, Sendable {
     }
 
     func todayTasks() -> [TaskItem] { tasks(executingOn: today) }
-
-    func timelineDays(
-        startingAt selectedDay: LocalDay,
-        calendar: Calendar = .todoAgentLocal
-    ) -> [TimelineDay] {
-        (0 ..< 4).compactMap { offset in
-            selectedDay.advanced(by: offset, calendar: calendar).map { day in
-                TimelineDay(day: day, tasks: tasks(executingOn: day))
-            }
-        }
-    }
-
-    func timelineBuckets(
-        selectedDay: LocalDay,
-        calendar: Calendar = .todoAgentLocal
-    ) -> [BoardBucket: [TaskItem]] {
-        let buckets = BoardBucket.allCases
-        return Dictionary(uniqueKeysWithValues: buckets.enumerated().map { offset, bucket in
-            let day = selectedDay.advanced(by: offset, calendar: calendar) ?? selectedDay
-            return (bucket, tasks(executingOn: day))
-        })
-    }
 
     func isOverdue(_ task: TaskItem) -> Bool { task.isOverdue(on: today) }
 

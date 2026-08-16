@@ -3,6 +3,7 @@ import Darwin
 import Dispatch
 import Foundation
 import Observation
+import QuartzCore
 
 enum TerminalSurfaceEvent: Equatable, Sendable {
     case started
@@ -1586,23 +1587,76 @@ final class TerminalSurfaceHostView: NSView {
 
     override var acceptsFirstResponder: Bool { false }
 
+    override func setFrameSize(_ newSize: NSSize) {
+        performWithoutGeometryAnimation {
+            setFrameSizeOnSuperclass(newSize)
+            synchronizeTerminalFrameInCurrentTransaction()
+        }
+    }
+
+    override func layout() {
+        super.layout()
+        synchronizeTerminalFrame()
+    }
+
     func attach(_ view: NSView) {
-        guard terminalView !== view else { return }
+        guard terminalView !== view else {
+            synchronizeTerminalFrame()
+            return
+        }
         detach()
         terminalView = view
         view.removeFromSuperview()
-        view.translatesAutoresizingMaskIntoConstraints = false
+        view.translatesAutoresizingMaskIntoConstraints = true
+        // Host resizing is synchronized explicitly below. An AppKit flexible
+        // autoresizing mask would first apply its delta to the retained old
+        // frame (producing an oversized intermediate framebuffer) before our
+        // final assignment.
+        view.autoresizingMask = []
         addSubview(view)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: trailingAnchor),
-            view.topAnchor.constraint(equalTo: topAnchor),
-            view.bottomAnchor.constraint(equalTo: bottomAnchor),
-        ])
+        synchronizeTerminalFrame()
     }
 
     func detach() {
         terminalView?.removeFromSuperview()
         terminalView = nil
+    }
+
+    private func synchronizeTerminalFrame() {
+        performWithoutGeometryAnimation {
+            synchronizeTerminalFrameInCurrentTransaction()
+        }
+    }
+
+    private func synchronizeTerminalFrameInCurrentTransaction() {
+        guard let terminalView, terminalView.superview === self else { return }
+        let targetFrame = bounds
+        // NSViewRepresentable creates its host before SwiftUI assigns the
+        // final proposal. Preserve a retained Ghostty surface's last useful
+        // framebuffer size instead of forcing old -> zero -> final during
+        // reparenting; the first nonzero setFrameSize/layout performs the one
+        // real synchronization.
+        guard targetFrame.width > 0, targetFrame.height > 0 else { return }
+        guard terminalView.frame != targetFrame else { return }
+        // A terminal framebuffer must track the divider's model geometry on
+        // every event. Do not inherit a surrounding SwiftUI/AppKit animation
+        // transaction: Ghostty's view is layer-backed, so an implicit frame
+        // animation would visually lag behind the divider and snap at the end.
+        terminalView.frame = targetFrame
+    }
+
+    private func setFrameSizeOnSuperclass(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+    }
+
+    private func performWithoutGeometryAnimation(_ updates: () -> Void) {
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0
+            context.allowsImplicitAnimation = false
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            updates()
+            CATransaction.commit()
+        }
     }
 }

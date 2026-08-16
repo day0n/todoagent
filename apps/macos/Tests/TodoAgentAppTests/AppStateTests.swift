@@ -57,8 +57,395 @@ struct AppStateTests {
         ) == .taskOverlay)
     }
 
-    @Test("TodoAgent defaults to the boundary after two timeline days")
-    func assistantWorkspaceAdaptsWithoutOverlayingSidebar() {
+    @Test("main workspace keeps one concrete native Sidebar state")
+    func mainWorkspaceNavigationVisibilityIsCanonical() {
+        #expect(MainWorkspaceNavigationPolicy.visibleColumns == .doubleColumn)
+        #expect(MainWorkspaceNavigationPolicy.canonicalVisibility(.all) == .doubleColumn)
+        #expect(MainWorkspaceNavigationPolicy.canonicalVisibility(.doubleColumn) == .doubleColumn)
+        #expect(MainWorkspaceNavigationPolicy.canonicalVisibility(.detailOnly) == .detailOnly)
+    }
+
+    @Test("native Sidebar writes cannot interrupt terminal geometry preparation")
+    func nativeSidebarWriteIsLockedDuringTerminalPreparation() {
+        let state = AppState(repository: AssistantTestRepository())
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        let preparation = chrome.acquireTaskWorkspacePreparation()
+
+        chrome.acceptSystemNavigationVisibility(.detailOnly)
+        #expect(chrome.navigationColumnVisibility == .doubleColumn)
+
+        chrome.finishTaskWorkspacePreparation(preparation, didPresent: false)
+        chrome.acceptSystemNavigationVisibility(.all)
+        #expect(chrome.navigationColumnVisibility == .doubleColumn)
+
+        chrome.acceptSystemNavigationVisibility(.detailOnly)
+        #expect(chrome.navigationColumnVisibility == .detailOnly)
+    }
+
+    @Test("cold task terminal waits for external chrome and live Board geometry")
+    func taskWorkspacePreparationCollapsesSidebarAndAssistant() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository, inspectorPresented: true)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        workspace.presentationPreparer = chrome
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: task.id)
+
+        #expect(workspace.presentedTaskID == nil)
+        #expect(workspace.pendingTaskID == task.id)
+
+        // Merely changing the requested chrome state is not enough. The
+        // terminal remains unmounted until the live Board reports the final
+        // full-detail width.
+        await drainMainActorTasks()
+        #expect(chrome.isPreparingTaskWorkspace)
+        #expect(workspace.presentedTaskID == nil)
+
+        // This is the cold menu-bar order: the request exists before the main
+        // window mounts, then root and Board geometry arrive from ContentView.
+        chrome.updateRootWidth(900)
+        chrome.updateBoardWidth(900)
+
+        await drainMainActorTasks()
+
+        #expect(chrome.navigationColumnVisibility == .detailOnly)
+        #expect(state.inspectorPresented == false)
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == task.id)
+        #expect(chrome.isPreparingTaskWorkspace == false)
+    }
+
+    @Test("cancelled task preflight restores chrome and never mounts a terminal")
+    func cancellingTaskWorkspacePreparationRestoresExternalChrome() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository, inspectorPresented: true)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        chrome.updateRootWidth(900)
+        workspace.presentationPreparer = chrome
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: task.id)
+        await drainMainActorTasks()
+        #expect(chrome.navigationColumnVisibility == .detailOnly)
+        #expect(state.inspectorPresented == false)
+        #expect(workspace.pendingTaskID == task.id)
+
+        workspace.destroyTaskWorkspace(taskID: task.id)
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == nil)
+        #expect(chrome.isPreparingTaskWorkspace == false)
+        #expect(chrome.navigationColumnVisibility == .doubleColumn)
+        #expect(state.inspectorPresented)
+    }
+
+    @Test("superseded task preflights preserve the first external chrome snapshot")
+    func supersededTaskWorkspacePreparationRestoresOriginalChrome() async {
+        let first = taskFixture()
+        let second = TaskItem(
+            id: UUID(uuidString: "00000000-0000-4000-8000-000000000410")!,
+            listID: nil,
+            title: "第二个等待中的终端",
+            note: "",
+            status: .open,
+            dueDate: nil,
+            completedAt: nil,
+            createdAt: .distantPast,
+            updatedAt: "2026-08-16T00:00:00Z"
+        )
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [first, second],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository, inspectorPresented: true)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        chrome.updateRootWidth(900)
+        workspace.presentationPreparer = chrome
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: first.id)
+        await drainMainActorTasks()
+        workspace.showTaskWorkspace(taskID: second.id)
+        await drainMainActorTasks()
+        #expect(workspace.pendingTaskID == second.id)
+
+        workspace.destroyTaskWorkspace(taskID: second.id)
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == nil)
+        #expect(chrome.isPreparingTaskWorkspace == false)
+        #expect(chrome.navigationColumnVisibility == .doubleColumn)
+        #expect(state.inspectorPresented)
+    }
+
+    @Test("missing Board geometry times out without locking the main window")
+    func taskWorkspacePreparationTimeoutRestoresExternalChrome() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository, inspectorPresented: true)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let chrome = MainWorkspaceChromeCoordinator(state: state, preparationTimeout: 0.01)
+        chrome.updateRootWidth(900)
+        workspace.presentationPreparer = chrome
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: task.id)
+        try? await Task.sleep(for: .milliseconds(30))
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == nil)
+        #expect(chrome.isPreparingTaskWorkspace == false)
+        #expect(chrome.navigationColumnVisibility == .doubleColumn)
+        #expect(state.inspectorPresented)
+        #expect(state.errorMessage == "无法准备终端布局，请重试。")
+    }
+
+    @Test("native one-point detail inset does not block terminal preparation")
+    func taskWorkspacePreparationAcceptsNativeGeometryRounding() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        chrome.updateRootWidth(900)
+        workspace.presentationPreparer = chrome
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: task.id)
+        await drainMainActorTasks()
+        chrome.updateBoardWidth(899)
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == task.id)
+        #expect(chrome.isPreparingTaskWorkspace == false)
+        #expect(TaskWorkspaceExternalChromePreparationPolicy.geometryTolerance == 2)
+    }
+
+    @Test("cached geometry cannot mount a terminal before a fresh Board ack")
+    func taskWorkspacePreparationRequiresFreshBoardGeometry() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        chrome.navigationColumnVisibility = .detailOnly
+        chrome.updateRootWidth(900)
+        chrome.updateBoardWidth(900)
+        workspace.presentationPreparer = chrome
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: task.id)
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == task.id)
+        #expect(workspace.presentedTaskID == nil)
+
+        chrome.updateBoardWidth(900)
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == task.id)
+    }
+
+    @Test("reopening the main window reacquires geometry before reattaching a terminal")
+    func reopenedMainWindowPreparesDormantWorkspace() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        await state.load()
+        workspace.showTaskWorkspace(taskID: task.id)
+        #expect(workspace.presentedTaskID == task.id)
+
+        workspace.mainWindowWillClose()
+        #expect(workspace.presentedTaskID == nil)
+        #expect(workspace.selectedTaskID == task.id)
+        #expect(workspace.dormantTaskID == task.id)
+
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        chrome.navigationColumnVisibility = .detailOnly
+        chrome.updateRootWidth(1_100)
+        chrome.updateBoardWidth(0)
+        workspace.presentationPreparer = chrome
+        workspace.mainWindowDidMount()
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == task.id)
+        #expect(workspace.presentedTaskID == nil)
+
+        // Close once more before the fresh geometry ack. A third window must
+        // still remember and resume the retained workspace.
+        workspace.mainWindowWillClose()
+        await drainMainActorTasks()
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.dormantTaskID == task.id)
+
+        workspace.mainWindowDidMount()
+        await drainMainActorTasks()
+        #expect(workspace.pendingTaskID == task.id)
+        #expect(workspace.presentedTaskID == nil)
+
+        chrome.updateBoardWidth(1_100)
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == task.id)
+        #expect(workspace.dormantTaskID == nil)
+    }
+
+    @Test("closing the main window cannot remount a task already collapsing")
+    func mainWindowCloseDoesNotRemountCollapsingWorkspace() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        await state.load()
+        workspace.showTaskWorkspace(taskID: task.id)
+
+        workspace.closeTaskWorkspace(taskID: task.id)
+        #expect(workspace.closingTaskID == task.id)
+        workspace.mainWindowWillClose()
+
+        #expect(workspace.presentedTaskID == nil)
+        #expect(workspace.dormantTaskID == nil)
+        workspace.mainWindowDidMount()
+        #expect(workspace.presentedTaskID == nil)
+
+        await drainMainActorTasks()
+        #expect(workspace.presentedTaskID == nil)
+    }
+
+    @Test("scope-driven workspace close retries only after a failed save becomes idle")
+    func scopeCloseRetryPolicy() {
+        let taskID = UUID()
+        let visibleTaskIDs: Set<UUID> = []
+
+        #expect(TaskWorkspaceScopeClosePolicy.didLeaveScope(
+            taskID: taskID,
+            previousVisibleTaskIDs: [taskID],
+            visibleTaskIDs: visibleTaskIDs
+        ))
+        #expect(TaskWorkspaceScopeClosePolicy.didLeaveScope(
+            taskID: taskID,
+            previousVisibleTaskIDs: visibleTaskIDs,
+            visibleTaskIDs: [UUID()]
+        ) == false)
+
+        #expect(TaskWorkspaceScopeClosePolicy.shouldRetryAutomaticClose(
+            pendingTaskID: taskID,
+            presentedTaskID: taskID,
+            visibleTaskIDs: visibleTaskIDs,
+            saveState: .idle
+        ))
+        #expect(TaskWorkspaceScopeClosePolicy.shouldRetryAutomaticClose(
+            pendingTaskID: taskID,
+            presentedTaskID: taskID,
+            visibleTaskIDs: visibleTaskIDs,
+            saveState: .saving
+        ) == false)
+        #expect(TaskWorkspaceScopeClosePolicy.shouldRetryAutomaticClose(
+            pendingTaskID: taskID,
+            presentedTaskID: taskID,
+            visibleTaskIDs: [taskID],
+            saveState: .idle
+        ) == false)
+        #expect(TaskWorkspaceScopeClosePolicy.shouldRetryAutomaticClose(
+            pendingTaskID: taskID,
+            presentedTaskID: UUID(),
+            visibleTaskIDs: visibleTaskIDs,
+            saveState: .idle
+        ) == false)
+    }
+
+    @Test("TodoAgent keeps a fixed board width when space allows")
+    func assistantWorkspaceUsesFixedBoardWidth() {
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 640,
             assistantRequested: false
@@ -72,6 +459,7 @@ struct AppStateTests {
             return
         }
         #expect(assistantWidth == 260)
+        #expect(640 - assistantWidth - MainWorkspaceLayoutPolicy.dividerWidth == 370)
 
         guard case let .sideBySide(proportionalWidth) = MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 960,
@@ -80,38 +468,69 @@ struct AppStateTests {
             Issue.record("常规宽度应继续保持右侧双栏")
             return
         }
-        #expect(proportionalWidth == 378)
+        #expect(proportionalWidth == 390)
         #expect(
             960 - proportionalWidth - MainWorkspaceLayoutPolicy.dividerWidth
-                == TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 2)
+                == MainWorkspaceLayoutPolicy.defaultBoardWidth
         )
-        #expect(TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 2) == 572)
+        #expect(MainWorkspaceLayoutPolicy.defaultBoardWidth == 560)
+        #expect(MainWorkspaceLayoutPolicy.boardMinimumVisibleWidth == 360)
 
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 1_340,
             assistantRequested: true
-        ) == .sideBySide(assistantWidth: 758))
+        ) == .sideBySide(assistantWidth: 770))
 
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 500,
             assistantRequested: true
-        ) == .sideBySide(assistantWidth: 200))
+        ) == .sideBySide(assistantWidth: 130))
     }
 
-    @Test("timeline scroller stays hidden until the pointer reaches its track")
-    func timelineScrollerUsesHoverVisibility() {
-        #expect(
-            TimelineScrollIndicatorPolicy.showsIndicators(pointerNearIndicator: false) == false
+    @Test("assistant Board and drawer share one continuous layout boundary")
+    func assistantWorkspaceLayoutStaysSynchronized() {
+        #expect(AssistantWorkspaceLayoutTarget.resolve(
+            placement: .hidden,
+            drawerWidth: 140
+        ) == AssistantWorkspaceLayoutTarget(reservedWidth: 0, visibleDrawerWidth: 0))
+        #expect(AssistantWorkspaceLayoutTarget.resolve(
+            placement: .sideBySide,
+            drawerWidth: 140
+        ) == AssistantWorkspaceLayoutTarget(reservedWidth: 140, visibleDrawerWidth: 140))
+        #expect(AssistantWorkspaceLayoutTarget.resolve(
+            placement: .taskOverlay,
+            drawerWidth: 140
+        ) == AssistantWorkspaceLayoutTarget(reservedWidth: 0, visibleDrawerWidth: 140))
+
+        let bounds = CGRect(x: 10, y: 20, width: 500, height: 400)
+        let sideBySideMidpoint = AssistantWorkspaceSynchronizedLayoutPolicy.resolve(
+            in: bounds,
+            reservedWidth: 70,
+            visibleDrawerWidth: 70,
+            drawerWidth: 140
         )
-        #expect(TimelineScrollIndicatorPolicy.showsIndicators(pointerNearIndicator: true))
-        #expect(
-            TimelineScrollIndicatorPolicy.coverOpacity(pointerNearIndicator: false) == 0.96
+        #expect(sideBySideMidpoint.boardFrame.maxX == sideBySideMidpoint.drawerFrame.minX)
+
+        let overlayMidpoint = AssistantWorkspaceSynchronizedLayoutPolicy.resolve(
+            in: bounds,
+            reservedWidth: 0,
+            visibleDrawerWidth: 70,
+            drawerWidth: 140
         )
-        #expect(TimelineScrollIndicatorPolicy.coverOpacity(pointerNearIndicator: true) == 0)
-        #expect(TimelineScrollIndicatorPolicy.hoverZoneHeight > TimelineScrollIndicatorPolicy.coverHeight)
+        #expect(overlayMidpoint.boardFrame == bounds)
+        #expect(overlayMidpoint.drawerFrame.minX == 440)
+
+        let hidden = AssistantWorkspaceSynchronizedLayoutPolicy.resolve(
+            in: bounds,
+            reservedWidth: 0,
+            visibleDrawerWidth: 0,
+            drawerWidth: 140
+        )
+        #expect(hidden.boardFrame == bounds)
+        #expect(hidden.drawerFrame.minX == bounds.maxX)
     }
 
-    @Test("assistant divider resizes in both directions and preserves one timeline day")
+    @Test("assistant divider resizes while preserving the minimum board width")
     func assistantDividerClampsResize() {
         #expect(MainWorkspaceLayoutPolicy.resizedAssistantWidth(
             availableWidth: 960,
@@ -127,7 +546,7 @@ struct AppStateTests {
             availableWidth: 960,
             startingWidth: 378,
             dividerTranslation: -2_000
-        ) == 660)
+        ) == 590)
         #expect(MainWorkspaceLayoutPolicy.resolve(
             availableWidth: 960,
             assistantRequested: true,
@@ -135,7 +554,7 @@ struct AppStateTests {
         ) == .sideBySide(assistantWidth: 430))
     }
 
-    @Test("main timeline uses compact native toolbar chrome")
+    @Test("main window uses compact native toolbar chrome")
     @MainActor
     func mainWindowToolbarIsCompact() {
         let window = NSWindow()
@@ -149,33 +568,11 @@ struct AppStateTests {
     func assistantWorkspaceMotionIsPerceptible() {
         #expect(AssistantWorkspaceMotion.duration >= 0.30)
         #expect(AssistantWorkspaceMotion.duration <= 0.40)
-        #expect(MainWorkspaceLayoutPolicy.assistantWidth(availableWidth: 960) == 378)
-    }
-
-    @Test("timeline columns resize continuously without breakpoint jumps")
-    func timelineColumnWidthHasNoBreakpointJumps() {
-        let widths = [
-            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 819),
-            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 820),
-            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 1_179),
-            TimelineColumnLayoutPolicy.columnWidth(availableWidth: 1_180),
-        ]
-
-        #expect(abs(widths[1] - widths[0]) <= 0.25)
-        #expect(abs(widths[3] - widths[2]) <= 0.25)
-        #expect(widths.allSatisfy {
-            $0 >= TodoAgentUI.columnMinimumWidth
-                && $0 <= TodoAgentUI.columnMaximumWidth
-        })
-
-        let launchDetailWidth: CGFloat = 896
-        let launchColumnWidth = TimelineColumnLayoutPolicy.columnWidth(
-            availableWidth: launchDetailWidth
-        )
-        let fourthDayLeadingEdge = TodoAgentUI.boardPadding
-            + (launchColumnWidth * 3)
-            + (TodoAgentUI.boardSpacing * 3)
-        #expect(fourthDayLeadingEdge > launchDetailWidth)
+        #expect(AssistantWorkspaceMotion.animation(reduceMotion: true) == nil)
+        #expect(AssistantWorkspaceMotion.animation(reduceMotion: false) != nil)
+        #expect(MainWorkspaceLayoutPolicy.assistantWidth(availableWidth: 960) == 390)
+        #expect(TodoAgentUI.floatingButtonTrailingPadding == 22)
+        #expect(TodoAgentUI.floatingButtonBottomPadding == 48)
     }
 
     @Test("right-click menu keeps its task highlighted through nested submenus")
@@ -200,13 +597,12 @@ struct AppStateTests {
     @Test("first window placement stays medium sized on large and small displays")
     func firstWindowPlacementCapsItsContentSize() {
         #expect(
-            TodoAgentMainWindowPlacement.preferredTimelineWidth
-                == TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 3)
+            TodoAgentMainWindowPlacement.preferredWorkspaceWidth == 854
         )
         #expect(
             TodoAgentMainWindowPlacement.preferredContentSize.width
                 - TodoAgentUI.sidebarIdealWidth
-                == TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 3)
+                == TodoAgentMainWindowPlacement.preferredWorkspaceWidth
         )
         #expect(TodoAgentMainWindowPlacement.contentSize(
             for: CGRect(x: 0, y: 0, width: 2_048, height: 1_260)
@@ -214,7 +610,7 @@ struct AppStateTests {
 
         #expect(TodoAgentMainWindowPlacement.contentSize(
             for: CGRect(x: 0, y: 0, width: 900, height: 650)
-        ) == CGSize(width: 760, height: 560))
+        ) == CGSize(width: 900, height: 560))
 
         #expect(TodoAgentMainWindowPlacement.windowOrigin(
             for: CGSize(width: 1_114, height: 848),
@@ -222,21 +618,16 @@ struct AppStateTests {
         ) == CGPoint(x: 467, y: 412))
     }
 
-    @Test("default window shows three days and the assistant replaces exactly one")
-    func defaultWindowAndAssistantShareTimelineColumns() {
-        let detailWidth = TodoAgentMainWindowPlacement.preferredTimelineWidth
-        let threeDays = TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 3)
-        let twoDays = TimelineColumnLayoutPolicy.viewportWidth(showingDayCount: 2)
-
-        #expect(detailWidth == threeDays)
-
+    @Test("default window reserves the fixed board width beside TodoAgent")
+    func defaultWindowAndAssistantShareWorkspaceWidth() {
+        let detailWidth = TodoAgentMainWindowPlacement.preferredWorkspaceWidth
         let assistantWidth = MainWorkspaceLayoutPolicy.assistantWidth(
             availableWidth: detailWidth
         )
-        #expect(assistantWidth == 272)
+        #expect(assistantWidth == 284)
         #expect(
             detailWidth - assistantWidth - MainWorkspaceLayoutPolicy.dividerWidth
-                == twoDays
+                == MainWorkspaceLayoutPolicy.defaultBoardWidth
         )
     }
 
@@ -310,6 +701,41 @@ struct AppStateTests {
         #expect(await state.createTask(title: "收件箱任务"))
 
         #expect(await repository.taskCreateCalls().first?.listID == nil)
+    }
+
+    @Test("Today and All Tasks keep independent composer drafts")
+    func myDayAndAllTasksComposerDraftsAreIsolated() {
+        let repository = TaskOpenSpyRepository(snapshot: emptySnapshot())
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let myDayComposer = workspace.composerState(for: .myDay)
+        let allTasksComposer = workspace.composerState(for: .allTasks)
+
+        myDayComposer.draft = "今天处理"
+        allTasksComposer.draft = "稍后规划"
+
+        #expect(myDayComposer !== allTasksComposer)
+        #expect(workspace.composerState(for: .myDay) === myDayComposer)
+        #expect(workspace.composerState(for: .allTasks) === allTasksComposer)
+        #expect(myDayComposer.draft == "今天处理")
+        #expect(allTasksComposer.draft == "稍后规划")
+    }
+
+    @Test("only the Today composer assigns today's execution date")
+    func inlineAddTaskDestinationDateSemantics() throws {
+        let today = try #require(LocalDay(rawValue: "2026-08-16"))
+        let listID = try #require(UUID(uuidString: "00000000-0000-4000-8000-000000000506"))
+        let myDay = InlineAddTaskDestination.myDay
+        let allTasks = InlineAddTaskDestination.allTasks
+        let list = InlineAddTaskDestination.list(listID)
+
+        #expect(myDay.listID == nil)
+        #expect(myDay.executionDate(today: today) == today)
+        #expect(allTasks.listID == nil)
+        #expect(allTasks.executionDate(today: today) == nil)
+        #expect(list.listID == listID)
+        #expect(list.executionDate(today: today) == nil)
     }
 
     @Test("creating a list persists it and selects the new destination")
@@ -1207,7 +1633,7 @@ struct AppStateTests {
         let projection = TaskProjection(tasks: [task], now: now)
         let session = TaskSessionDescriptor(id: UUID().uuidString, taskID: task.id, runtimeKind: .claude, workingDirectory: "/tmp", providerSessionID: nil, providerEngine: nil, state: .running, lastAgentSequence: 3, lastReadSequence: 2, lastErrorCode: nil, lastErrorMessage: nil, createdAt: "", updatedAt: "")
 
-        #expect(projection.count(for: .timeline, sessions: [session]) == 1)
+        #expect(projection.count(for: .myDay, sessions: [session]) == 1)
         #expect(projection.count(for: .running, sessions: [session]) == 1)
         #expect(projection.count(for: .done, sessions: [session]) == 0)
         #expect(session.hasUnread)
@@ -1257,8 +1683,6 @@ struct AppStateTests {
 
         let composerDraft = workspace.composerState(for: .allTasks)
         composerDraft.draft = "切换后仍保留的任务草稿"
-        let timelineComposerDraft = workspace.timelineComposerState(for: state.selectedDay)
-        timelineComposerDraft.draft = "时间线里尚未提交的任务草稿"
 
         workspace.closeTaskWorkspace(taskID: second.id)
         await drainMainActorTasks()
@@ -1267,11 +1691,6 @@ struct AppStateTests {
         #expect(workspace.contains(taskID: second.id))
         #expect(workspace.composerState(for: .allTasks) === composerDraft)
         #expect(workspace.composerState(for: .allTasks).draft == "切换后仍保留的任务草稿")
-        #expect(workspace.timelineComposerState(for: state.selectedDay) === timelineComposerDraft)
-        #expect(
-            workspace.timelineComposerState(for: state.selectedDay).draft
-                == "时间线里尚未提交的任务草稿"
-        )
         #expect(workspace.closingTaskID == nil)
     }
 
@@ -1314,6 +1733,46 @@ struct AppStateTests {
 
         #expect(workspace.presentedTaskID == first.id)
         #expect(workspace.pendingTaskID == nil)
+    }
+
+    @Test("deleting an outgoing task keeps its pending successor alive")
+    func deletingOutgoingWorkspaceKeepsPendingSuccessor() async {
+        let first = taskFixture()
+        let second = TaskItem(
+            id: UUID(uuidString: "00000000-0000-4000-8000-000000000411")!,
+            listID: nil,
+            title: "继续打开的任务",
+            note: "",
+            status: .open,
+            dueDate: nil,
+            completedAt: nil,
+            createdAt: .distantPast,
+            updatedAt: "2026-08-16T00:00:00Z"
+        )
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [first, second],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: first.id)
+        workspace.showTaskWorkspace(taskID: second.id)
+        #expect(workspace.pendingTaskID == second.id)
+
+        workspace.destroyTaskWorkspace(taskID: first.id)
+        await drainMainActorTasks()
+
+        #expect(workspace.pendingTaskID == nil)
+        #expect(workspace.presentedTaskID == second.id)
     }
 
     private func taskFixture() -> TaskItem {

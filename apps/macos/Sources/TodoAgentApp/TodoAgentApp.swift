@@ -33,7 +33,8 @@ struct TodoAgentApp: App {
         Window("TodoAgent", id: TodoAgentMainWindow.sceneID) {
             ContentView(
                 state: AppContainer.shared.state,
-                taskWorkspace: AppContainer.shared.taskWorkspace
+                taskWorkspace: AppContainer.shared.taskWorkspace,
+                workspaceChrome: AppContainer.shared.workspaceChrome
             )
                 .frame(
                     minWidth: TodoAgentMainWindowPlacement.minimumContentSize.width,
@@ -105,7 +106,7 @@ struct TodoAgentApp: App {
             }
         }
 
-        MenuBarExtra("TodoAgent 今日任务", systemImage: "checklist") {
+        MenuBarExtra("TodoAgent 今天", systemImage: "sun.max") {
             TodayMenuBarView(state: AppContainer.shared.state)
         }
         .menuBarExtraStyle(.window)

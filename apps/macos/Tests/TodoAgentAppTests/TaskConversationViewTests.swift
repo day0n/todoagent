@@ -270,7 +270,7 @@ struct TaskConversationViewTests {
         #expect(secondTask.detailsWidth == TaskWorkbenchLayoutState.idealDetailsWidth)
     }
 
-    @Test("embedded task rail uses hysteresis around the default window width")
+    @Test("embedded task rail remains visible at compact and regular widths")
     func embeddedTaskRailLayoutPolicy() {
         #expect(
             TaskWorkspaceLayoutPolicy.railVisibility(
@@ -308,8 +308,12 @@ struct TaskConversationViewTests {
                 previous: .compact
             ) == .split
         )
-        #expect(TaskWorkspaceLayoutPolicy.railWidth == 320)
-        #expect(TaskWorkspaceLayoutPolicy.terminalMinimumWidth == 500)
+        #expect(TaskWorkspaceLayoutPolicy.regularRailWidth == 320)
+        #expect(TaskWorkspaceLayoutPolicy.compactRailWidth == 252)
+        #expect(TaskWorkspaceLayoutPolicy.railWidth(for: .split) == 320)
+        #expect(TaskWorkspaceLayoutPolicy.railWidth(for: .compact) == 252)
+        #expect(TaskWorkspaceLayoutPolicy.terminalPreferredMinimumWidth == 500)
+        #expect(TaskWorkspaceLayoutPolicy.terminalAbsoluteMinimumWidth == 320)
         #expect(TaskWorkbenchPresentation.embedded(compact: true).allowsTaskDetails == false)
         #expect(TaskWorkbenchPresentation.embedded(compact: false).allowsTaskDetails == false)
         #expect(
@@ -324,6 +328,287 @@ struct TaskConversationViewTests {
                 previous: nil
             ) == .compact
         )
+    }
+
+    @Test("task content adaptively shrinks with the terminal drawer")
+    func taskContentTrackLayoutPolicy() {
+        #expect(TaskListContentTrackLayoutPolicy.maximumCardWidth == 780)
+        #expect(TaskListContentTrackLayoutPolicy.horizontalPadding == 20)
+        #expect(TaskListContentTrackLayoutPolicy.maximumTrackWidth == 820)
+        #expect(TaskListContentTrackLayoutPolicy.contentWidth(availableWidth: 1_100) == 780)
+        #expect(TaskListContentTrackLayoutPolicy.trackWidth(availableWidth: 1_100) == 820)
+        #expect(TaskListContentTrackLayoutPolicy.contentWidth(availableWidth: 320) == 280)
+        #expect(TaskListContentTrackLayoutPolicy.trackWidth(availableWidth: 320) == 320)
+        #expect(TaskListContentTrackLayoutPolicy.contentWidth(availableWidth: 252) == 212)
+        #expect(TaskListContentTrackLayoutPolicy.trackWidth(availableWidth: 252) == 252)
+        #expect(TaskListContentTrackLayoutPolicy.contentWidth(availableWidth: 40) == 0)
+        #expect(TaskListContentTrackLayoutPolicy.trackWidth(availableWidth: 40) == 40)
+        #expect(TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
+            paneWidth: 1_100,
+            expandedPaneWidth: 1_100,
+            collapsedPaneWidth: 320
+        ) == 780)
+        #expect(TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
+            paneWidth: 710,
+            expandedPaneWidth: 1_100,
+            collapsedPaneWidth: 320
+        ) == 530)
+        #expect(TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
+            paneWidth: 320,
+            expandedPaneWidth: 1_100,
+            collapsedPaneWidth: 320
+        ) == 280)
+    }
+
+    @Test("workspace reveal moves a fixed-width terminal instead of resizing it")
+    func workspaceRevealLayoutPolicy() {
+        let regular = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 1_100,
+            railVisibility: .split
+        )
+        #expect(regular.railWidth == 320)
+        #expect(regular.terminalWidth == 779)
+        #expect(regular.terminalX(revealProgress: 0) == 1_101)
+        #expect(regular.terminalX(revealProgress: 0.5) == 711)
+        #expect(regular.terminalX(revealProgress: 1) == 321)
+        #expect(regular.taskPaneWidth(isPresented: false) == 1_100)
+        #expect(regular.taskPaneWidth(isPresented: true) == 320)
+        #expect(regular.terminalReservedWidth(isPresented: false) == 0)
+        #expect(regular.terminalReservedWidth(isPresented: true) == 780)
+        #expect(regular.dividerX(isPresented: false) == 1_100)
+        #expect(regular.dividerX(isPresented: true) == 320)
+
+        for progress in [CGFloat(0), 0.25, 0.5, 0.75, 1] {
+            let taskPaneWidth = regular.taskPaneWidth(revealProgress: progress)
+            #expect(regular.dividerX(revealProgress: progress) == taskPaneWidth)
+            #expect(
+                regular.terminalX(revealProgress: progress)
+                    == taskPaneWidth + TaskWorkspaceLayoutPolicy.dividerWidth
+            )
+            #expect(
+                taskPaneWidth + regular.terminalReservedWidth(revealProgress: progress)
+                    == 1_100
+            )
+            #expect(regular.terminalWidth == 779)
+        }
+
+        let compact = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 700,
+            railVisibility: .compact
+        )
+        #expect(compact.railWidth == 252)
+        #expect(compact.terminalWidth == 447)
+        #expect(compact.terminalX(revealProgress: -1) == 701)
+        #expect(compact.terminalX(revealProgress: 2) == 253)
+        #expect(compact.taskPaneWidth(isPresented: true) == 252)
+        #expect(compact.terminalReservedWidth(isPresented: true) == 448)
+
+        let narrow = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 550,
+            railVisibility: .compact
+        )
+        #expect(narrow.railWidth == 229)
+        #expect(narrow.terminalWidth == 320)
+        #expect(narrow.terminalShownX == 230)
+        #expect(narrow.terminalHiddenX == 551)
+        #expect(TaskWorkspaceMotion.duration == 0.34)
+    }
+
+    @Test("terminal resize policy preserves usable split and compact panes")
+    func workspaceTerminalResizeLayoutPolicy() {
+        let splitRange = TaskWorkspaceRevealLayoutPolicy.terminalWidthRange(
+            availableWidth: 1_100,
+            railVisibility: .split
+        )
+        #expect(splitRange == 320 ... 847)
+
+        let compactRange = TaskWorkspaceRevealLayoutPolicy.terminalWidthRange(
+            availableWidth: 700,
+            railVisibility: .compact
+        )
+        #expect(compactRange == 320 ... 447)
+
+        let narrowRange = TaskWorkspaceRevealLayoutPolicy.terminalWidthRange(
+            availableWidth: 550,
+            railVisibility: .compact
+        )
+        #expect(narrowRange == 320 ... 320)
+        #expect(
+            TaskWorkspaceRevealLayoutPolicy.terminalWidthRange(
+                availableWidth: 300,
+                railVisibility: .compact
+            ) == 299 ... 299
+        )
+
+        #expect(
+            TaskWorkspaceRevealLayoutPolicy.resizedTerminalWidth(
+                availableWidth: 1_100,
+                railVisibility: .split,
+                startingWidth: 650,
+                dividerTranslation: 100
+            ) == 550
+        )
+        #expect(
+            TaskWorkspaceRevealLayoutPolicy.resizedTerminalWidth(
+                availableWidth: 1_100,
+                railVisibility: .split,
+                startingWidth: 650,
+                dividerTranslation: -200
+            ) == 847
+        )
+        #expect(
+            TaskWorkspaceRevealLayoutPolicy.resizedTerminalWidth(
+                availableWidth: 1_100,
+                railVisibility: .split,
+                startingWidth: 650,
+                dividerTranslation: 400
+            ) == 320
+        )
+
+        let preferred = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 1_100,
+            railVisibility: .split,
+            preferredTerminalWidth: 650
+        )
+        #expect(preferred.terminalWidth == 650)
+        #expect(preferred.railWidth == 449)
+
+        // A smaller window clamps presentation only. Supplying the same saved
+        // preference after the window grows restores the user's width.
+        let constrained = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 900,
+            railVisibility: .split,
+            preferredTerminalWidth: 650
+        )
+        let compact = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 700,
+            railVisibility: .compact,
+            preferredTerminalWidth: 650
+        )
+        let restored = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 1_100,
+            railVisibility: .split,
+            preferredTerminalWidth: 650
+        )
+        #expect(constrained.terminalWidth == 647)
+        #expect(constrained.railWidth == 252)
+        #expect(compact.terminalWidth == 447)
+        #expect(compact.railWidth == 252)
+        #expect(restored.terminalWidth == 650)
+        #expect(TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetWidth == 12)
+        #expect(TaskWorkspaceTerminalResizeInteractionPolicy.accessibilityStep == 24)
+    }
+
+    @Test("terminal resize interaction anchors every update to the drag start")
+    func workspaceTerminalResizeInteractionState() {
+        var state = TaskWorkspaceTerminalResizeInteractionState()
+
+        let firstWidth = state.update(
+            currentWidth: 650,
+            dividerTranslation: 20
+        )
+        let secondWidth = state.update(
+            currentWidth: firstWidth,
+            dividerTranslation: 50
+        )
+        #expect(firstWidth == 630)
+        #expect(secondWidth == 600)
+        #expect(state.startingWidth == 650)
+        #expect(state.latestWidth == 600)
+        #expect(state.isDragging)
+
+        #expect(state.end(currentWidth: secondWidth) == 600)
+        #expect(state.startingWidth == nil)
+        #expect(state.latestWidth == nil)
+        #expect(state.isDragging == false)
+
+        let nextDragWidth = state.update(
+            currentWidth: 700,
+            dividerTranslation: -10
+        )
+        #expect(nextDragWidth == 710)
+        #expect(state.startingWidth == 700)
+        state.reset()
+        #expect(state.isDragging == false)
+    }
+
+    @Test("workspace switch veil coalesces rapid requests onto the newest task")
+    func workspaceSwitchVeilUsesNewestTask() throws {
+        let taskB = UUID()
+        let taskC = UUID()
+        var state = TaskWorkspaceSwitchState()
+
+        state.request(taskB)
+        let coverRequest = state.beginVeilAnimation(to: true)
+        let cover = try #require(coverRequest)
+        state.setVeilPresented(true)
+
+        state.request(taskC)
+        let duplicateCover = state.beginVeilAnimation(to: true)
+        let coverCompleted = state.completeVeilAnimation(cover)
+        let requestedTaskID = state.takeRequestedTaskID()
+        #expect(duplicateCover == nil)
+        #expect(coverCompleted)
+        #expect(state.isFullyCovered)
+        #expect(requestedTaskID == taskC)
+        #expect(state.requestedTaskID == nil)
+    }
+
+    @Test("a newer switch invalidates an in-flight veil reveal")
+    func workspaceSwitchVeilRetargetsDuringReveal() throws {
+        let taskB = UUID()
+        let taskC = UUID()
+        var state = TaskWorkspaceSwitchState()
+
+        state.request(taskB)
+        let initialCoverRequest = state.beginVeilAnimation(to: true)
+        let initialCover = try #require(initialCoverRequest)
+        state.setVeilPresented(true)
+        let initialCoverCompleted = state.completeVeilAnimation(initialCover)
+        let initiallyRequestedTaskID = state.takeRequestedTaskID()
+        #expect(initialCoverCompleted)
+        #expect(initiallyRequestedTaskID == taskB)
+
+        let revealRequest = state.beginVeilAnimation(to: false)
+        let reveal = try #require(revealRequest)
+        state.setVeilPresented(false)
+        state.request(taskC)
+        let recoveryCoverRequest = state.beginVeilAnimation(to: true)
+        let recoveryCover = try #require(recoveryCoverRequest)
+        state.setVeilPresented(true)
+
+        let staleRevealCompleted = state.completeVeilAnimation(reveal)
+        let recoveryCoverCompleted = state.completeVeilAnimation(recoveryCover)
+        let requestedTaskID = state.takeRequestedTaskID()
+        #expect(staleRevealCompleted == false)
+        #expect(recoveryCoverCompleted)
+        #expect(state.isFullyCovered)
+        #expect(requestedTaskID == taskC)
+    }
+
+    @Test("closing cancels a pending workspace switch and invalidates its completion")
+    func workspaceSwitchVeilCancelsForClose() throws {
+        var state = TaskWorkspaceSwitchState()
+
+        state.request(UUID())
+        let staleCoverRequest = state.beginVeilAnimation(to: true)
+        let staleCover = try #require(staleCoverRequest)
+        state.setVeilPresented(true)
+
+        state.cancel()
+        let closeRevealRequest = state.beginVeilAnimation(to: false)
+        let closeReveal = try #require(closeRevealRequest)
+        state.setVeilPresented(false)
+
+        let staleCoverCompleted = state.completeVeilAnimation(staleCover)
+        let closeRevealCompleted = state.completeVeilAnimation(closeReveal)
+        #expect(staleCoverCompleted == false)
+        #expect(closeRevealCompleted)
+        #expect(state.requestedTaskID == nil)
+        #expect(state.isActive == false)
+        #expect(state.isFullyCovered == false)
+        #expect(TaskWorkspaceSwitchMotion.coverDuration == 0.07)
+        #expect(TaskWorkspaceSwitchMotion.revealDuration == 0.11)
     }
 
     @Test("a live terminal stays visible except while an automatic command is preparing")

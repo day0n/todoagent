@@ -64,7 +64,7 @@ struct TodayMenuBarView: View {
     private var header: some View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
-                Text("今日任务")
+                Text("今天")
                     .font(.headline)
                 Text(Date.now.formatted(.dateTime.month().day().weekday(.wide)))
                     .font(.caption)
@@ -79,7 +79,7 @@ struct TodayMenuBarView: View {
                 .padding(.horizontal, 8)
                 .padding(.vertical, 3)
                 .background(TodoAgentUI.selectionBackground, in: .capsule)
-                .accessibilityLabel("今日任务 \(projection.tasks.count) 项")
+                .accessibilityLabel("今天的任务 \(projection.tasks.count) 项")
         }
         .padding(.bottom, 8)
         .accessibilityIdentifier("menubar.today.header")
@@ -92,7 +92,7 @@ struct TodayMenuBarView: View {
             HStack(spacing: 8) {
                 ProgressView()
                     .controlSize(.small)
-                Text("正在载入今日任务…")
+                Text("正在载入今天的任务…")
                     .foregroundStyle(TodoAgentUI.secondaryText)
             }
             .frame(maxWidth: .infinity, minHeight: 86)
@@ -122,7 +122,7 @@ struct TodayMenuBarView: View {
                     .foregroundStyle(.secondary)
                 Text("今天还没有安排")
                     .font(.callout.weight(.medium))
-                Text("在时间线中安排任务后会显示在这里。")
+                Text("从主窗口添加，或把“任务”中的一项加入今天。")
                     .font(.caption)
                     .foregroundStyle(TodoAgentUI.secondaryText)
             }
@@ -132,6 +132,7 @@ struct TodayMenuBarView: View {
 
         case .loaded:
             TodayMenuTaskList(tasks: projection.tasks) { task in
+                state.selection = .smart(.myDay)
                 state.openTask(task)
                 TodoAgentMainWindow.show(using: openWindow)
             }
@@ -290,14 +291,14 @@ enum TodoAgentMainWindow {
 /// without fighting the user's later window moves or resizes. New and migrated
 /// windows are horizontally centered at the usable screen's top edge.
 enum TodoAgentMainWindowPlacement {
-    static let layoutVersion = 3
+    static let layoutVersion = 4
     static let appliedVersionKey = "TodoAgentMainWindowCenteredLayoutVersion"
-    // Keep launch sizing independent from the live SwiftUI layout graph. The
-    // value matches a 260-point sidebar plus three complete 270-point day
-    // columns, their gaps, and the board padding.
-    static let preferredTimelineWidth: CGFloat = 854
+    // Keep launch sizing independent from the live SwiftUI layout graph. This
+    // leaves room for the global sidebar plus a 320-point task rail and a
+    // useful terminal viewport when a task is opened.
+    static let preferredWorkspaceWidth: CGFloat = 854
     static let preferredContentSize = CGSize(width: 1_114, height: 820)
-    static let minimumContentSize = CGSize(width: 760, height: 560)
+    static let minimumContentSize = CGSize(width: 900, height: 560)
     static let maximumVisibleFraction: CGFloat = 0.82
 
     static func contentSize(for visibleFrame: CGRect) -> CGSize {

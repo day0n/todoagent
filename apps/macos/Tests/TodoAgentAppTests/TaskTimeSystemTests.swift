@@ -50,27 +50,25 @@ struct TaskTimeSystemTests {
         #expect(Calendar.todoAgentLocal.timeZone.identifier == TimeZone.autoupdatingCurrent.identifier)
     }
 
-    @Test("four timeline days use execution date only and retain completed tasks")
-    func fourDayProjection() throws {
-        let start = try day("2026-08-09")
-        let dueOnly = task("仅截止", due: try day("2026-08-09"))
-        let first = task("今天执行", execution: start)
-        let completed = task("今天完成", status: .completed, execution: start)
-        let fourth = task("第四天", execution: try day("2026-08-12"))
-        let outside = task("第五天", execution: try day("2026-08-13"))
+    @Test("Today uses today's execution date, retains completed rows, and counts only open tasks")
+    func myDayProjection() throws {
+        let today = try day("2026-08-09")
+        let dueOnly = task("仅截止", due: today)
+        let openToday = task("今天执行", execution: today)
+        let completedToday = task("今天完成", status: .completed, execution: today)
+        let future = task("未来执行", execution: try day("2026-08-12"))
         let projection = TaskProjection(
-            tasks: [dueOnly, first, completed, fourth, outside],
-            today: start
+            tasks: [dueOnly, openToday, completedToday, future],
+            today: today
         )
 
-        let days = projection.timelineDays(startingAt: start, calendar: calendar())
-        #expect(days.map(\.day.rawValue) == ["2026-08-09", "2026-08-10", "2026-08-11", "2026-08-12"])
-        #expect(Set(days[0].tasks.map(\.title)) == ["今天执行", "今天完成"])
-        #expect(days[0].completedCount == 1)
-        #expect(days[0].progress == 0.5)
-        #expect(days[3].tasks.map(\.title) == ["第四天"])
-        #expect(days.flatMap(\.tasks).contains(where: { $0.id == dueOnly.id }) == false)
-        #expect(days.flatMap(\.tasks).contains(where: { $0.id == outside.id }) == false)
+        let myDay = projection.visibleTasks(for: .smart(.myDay), sessions: [])
+        #expect(Set(myDay.map(\.id)) == [openToday.id, completedToday.id])
+        #expect(projection.count(for: .myDay, sessions: []) == 1)
+
+        let allTasks = projection.visibleTasks(for: .smart(.tasks), sessions: [])
+        #expect(Set(allTasks.map(\.id)) == [dueOnly.id, openToday.id, completedToday.id, future.id])
+        #expect(projection.count(for: .tasks, sessions: []) == 3)
     }
 
     @Test("every task surface groups open rows first and hides an empty completed section")
@@ -93,7 +91,7 @@ struct TaskTimeSystemTests {
         #expect(openOnly.hasCompletedSection == false)
     }
 
-    @Test("one authoritative task row drives timeline, tasks and list surfaces")
+    @Test("one authoritative task row drives Today, tasks and list surfaces")
     func oneAuthoritativeTaskAcrossSurfaces() async throws {
         let list = TodoList(
             id: UUID(),
@@ -159,7 +157,7 @@ struct TaskTimeSystemTests {
         #expect(state.tasks.isEmpty)
     }
 
-    @Test("overdue and timeline ordering share the documented rule")
+    @Test("deadline overdue and Today ordering share the documented rule")
     func overdueOrdering() throws {
         let today = try day("2026-08-09")
         let execution = today
@@ -187,7 +185,7 @@ struct TaskTimeSystemTests {
         ])
     }
 
-    @Test("task cards surface a past execution day when no deadline explains the warning")
+    @Test("only a past deadline marks a task card overdue")
     func taskCardDatePresentation() throws {
         let today = try day("2026-08-10")
         let pastExecution = try day("2026-08-07")
@@ -197,21 +195,23 @@ struct TaskTimeSystemTests {
 
         let executionOnly = task("错过执行日", execution: pastExecution)
         let executionPresentation = try #require(executionOnly.cardDatePresentation(on: today))
-        #expect(executionOnly.isOverdue(on: today))
+        #expect(executionOnly.isOverdue(on: today) == false)
         #expect(executionPresentation.kind == .execution)
         #expect(executionPresentation.day == pastExecution)
-        #expect(executionPresentation.isOverdue)
+        #expect(executionPresentation.isOverdue == false)
 
         let futureDeadline = task(
             "执行日已过但截止日未到",
             execution: pastExecution,
             due: futureDue
         )
-        let missedExecutionPresentation = try #require(
+        let futureDuePresentation = try #require(
             futureDeadline.cardDatePresentation(on: today)
         )
-        #expect(missedExecutionPresentation.kind == .execution)
-        #expect(missedExecutionPresentation.isOverdue)
+        #expect(futureDeadline.isOverdue(on: today) == false)
+        #expect(futureDuePresentation.kind == .due)
+        #expect(futureDuePresentation.day == futureDue)
+        #expect(futureDuePresentation.isOverdue == false)
 
         let overdueDeadline = task(
             "两个日期都已过",
@@ -385,6 +385,44 @@ struct TaskTimeSystemTests {
         #expect(await state.flushAndDismissTaskSession(taskID: item.id))
         #expect(state.presentedSheet == nil)
         #expect(await repository.updateCallCount() == 2)
+    }
+
+    @Test("a stale close cannot cancel a newer terminal collapse")
+    func staleCloseCannotCancelNewerTerminalCollapse() async {
+        let item = task("快速重新打开")
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item]),
+            gatedUpdateCalls: [1]
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: item.id)
+        state.scheduleTaskUpdate(
+            taskID: item.id,
+            patch: TaskPatch(note: "等待保存的终端草稿")
+        )
+        workspace.closeTaskWorkspace(taskID: item.id)
+        await repository.waitUntilUpdateStarted(1)
+        #expect(workspace.closingTaskID == item.id)
+
+        // Reopening cancels the first close. A second collapse owns a newer
+        // generation and must not be cleared when the stale waiter resumes.
+        workspace.showTaskWorkspace(taskID: item.id)
+        #expect(workspace.presentedTaskID == item.id)
+        #expect(workspace.closingTaskID == nil)
+        workspace.closeTaskWorkspace(taskID: item.id)
+        #expect(workspace.closingTaskID == item.id)
+
+        await repository.releaseUpdate(1)
+        for _ in 0..<20 { await Task.yield() }
+
+        #expect(workspace.presentedTaskID == nil)
+        #expect(workspace.selectedTaskID == item.id)
+        #expect(workspace.closingTaskID == nil)
+        #expect(await repository.persistedTask(id: item.id)?.note == "等待保存的终端草稿")
     }
 
     @Test("same-run-loop date edit is durable before task details close")
@@ -1429,7 +1467,7 @@ struct TaskTimeSystemTests {
         #expect(state.tasks.first?.title == "新快照")
     }
 
-    @Test("timeline following today advances across midnight with every today consumer")
+    @Test("Today advances across midnight with every today consumer")
     func localDayRefresh() async throws {
         var calendar = calendar()
         calendar.timeZone = shanghai
@@ -1439,41 +1477,143 @@ struct TaskTimeSystemTests {
         let repository = TaskMutationSpyRepository(snapshot: snapshot(tasks: [task]))
         let state = AppState(repository: repository, now: augustNinth, calendar: calendar)
         await state.load()
-        #expect(state.count(for: .timeline) == 0)
+        #expect(state.selection == .smart(.myDay))
+        #expect(state.count(for: .myDay) == 0)
+        #expect(state.visibleTasks().isEmpty)
 
         state.refreshLocalDay(now: augustTenth)
 
         let expectedDay = try day("2026-08-10")
         #expect(state.currentDay == expectedDay)
-        #expect(state.selectedDay == expectedDay)
-        #expect(state.timelineDays().first?.day == expectedDay)
         #expect(state.todayTasks().map(\.id) == [task.id])
-        #expect(state.count(for: .timeline) == state.todayTasks().count)
+        #expect(state.visibleTasks().map(\.id) == [task.id])
+        #expect(state.count(for: .myDay) == 1)
+        #expect(state.title(for: .smart(.myDay)) == "今天")
     }
 
-    @Test("midnight refresh preserves a date the user deliberately browsed")
-    func localDayRefreshPreservesBrowsedDate() throws {
+    @Test("midnight refresh preserves future execution dates outside Today")
+    func localDayRefreshPreservesFutureExecutionDate() async throws {
         var calendar = calendar()
         calendar.timeZone = shanghai
         let augustNinth = try date("2026-08-09T08:00:00+08:00")
         let augustTenth = try date("2026-08-10T00:00:01+08:00")
         let currentDay = try day("2026-08-10")
-        let browsedDay = try day("2026-08-12")
+        let futureDay = try day("2026-08-12")
+        let futureTask = task("未来执行", execution: futureDay)
         let state = AppState(
-            repository: TaskMutationSpyRepository(snapshot: snapshot()),
+            repository: TaskMutationSpyRepository(snapshot: snapshot(tasks: [futureTask])),
             now: augustNinth,
             calendar: calendar
         )
-        state.selectedDay = browsedDay
+        await state.load()
 
         state.refreshLocalDay(now: augustTenth)
 
         #expect(state.currentDay == currentDay)
-        #expect(state.selectedDay == browsedDay)
-        #expect(state.timelineDays().first?.day == browsedDay)
+        #expect(state.task(id: futureTask.id)?.executionDate == futureDay)
+        #expect(state.visibleTasks(for: .smart(.myDay)).isEmpty)
+        #expect(state.visibleTasks(for: .smart(.tasks)).map(\.id) == [futureTask.id])
     }
 
-    @Test("task context menu exposes status, dates, destinations, and stable accessibility ids")
+    @Test("Today helper adds today, removes today, and never clears a future date by mistake")
+    func setTaskInMyDay() async throws {
+        var calendar = calendar()
+        calendar.timeZone = shanghai
+        let now = try date("2026-08-09T08:00:00+08:00")
+        let today = try day("2026-08-09")
+        let futureDay = try day("2026-08-12")
+        let futureTask = task("未来执行", execution: futureDay)
+        let repository = TaskMutationSpyRepository(snapshot: snapshot(tasks: [futureTask]))
+        let state = AppState(repository: repository, now: now, calendar: calendar)
+        await state.load()
+
+        let loadedFutureTask = try #require(state.task(id: futureTask.id))
+        #expect(state.isTaskInMyDay(loadedFutureTask) == false)
+        state.setTask(loadedFutureTask, inMyDay: false)
+        #expect(state.task(id: futureTask.id)?.executionDate == futureDay)
+
+        state.setTask(loadedFutureTask, inMyDay: true)
+        #expect(state.task(id: futureTask.id)?.executionDate == today)
+        #expect(await state.flushTaskEdits(taskID: futureTask.id))
+
+        let taskInMyDay = try #require(state.task(id: futureTask.id))
+        #expect(state.isTaskInMyDay(taskInMyDay))
+        state.setTask(taskInMyDay, inMyDay: false)
+        #expect(state.task(id: futureTask.id)?.executionDate == nil)
+        #expect(await state.flushTaskEdits(taskID: futureTask.id))
+    }
+
+    @Test("failed Today removal stays visible for retry and unpins after success")
+    func failedMyDayRemovalVisibilityPin() async throws {
+        var calendar = calendar()
+        calendar.timeZone = shanghai
+        let now = try date("2026-08-09T08:00:00+08:00")
+        let today = try day("2026-08-09")
+        let item = task("失败后仍可重试", execution: today)
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item]),
+            failuresRemaining: 1
+        )
+        let state = AppState(repository: repository, now: now, calendar: calendar)
+        await state.load()
+
+        state.setTask(item, inMyDay: false)
+        #expect(state.myDayVisibilityPinnedTaskIDs == [item.id])
+        #expect(await state.flushTaskEdits(taskID: item.id) == false)
+        #expect(state.task(id: item.id)?.executionDate == nil)
+        #expect(state.visibleTasks().isEmpty)
+        #expect(state.displayedTasks(for: .smart(.myDay)).map(\.id) == [item.id])
+        #expect(state.myDayVisibilityPinnedTaskIDs == [item.id])
+        guard case .failed = state.taskSaveState(taskID: item.id) else {
+            Issue.record("Expected the failed removal to retain a retry state.")
+            return
+        }
+
+        #expect(await state.retryTaskEdits(taskID: item.id))
+        #expect(state.myDayVisibilityPinnedTaskIDs.isEmpty)
+        #expect(state.displayedTasks(for: .smart(.myDay)).isEmpty)
+        #expect(state.taskSaveState(taskID: item.id) == .idle)
+        #expect(await repository.persistedTask(id: item.id)?.executionDate == nil)
+    }
+
+    @Test("Today removal pin spans every mutation queued in the same drain")
+    func myDayRemovalPinWaitsForWholeDrain() async throws {
+        var calendar = calendar()
+        calendar.timeZone = shanghai
+        let now = try date("2026-08-09T08:00:00+08:00")
+        let today = try day("2026-08-09")
+        let due = try day("2026-08-12")
+        let item = task("整条保存队列完成后再消失", execution: today)
+        let repository = TaskMutationSpyRepository(
+            snapshot: snapshot(tasks: [item]),
+            gatedUpdateCalls: [1],
+            failingUpdateCalls: [2]
+        )
+        let state = AppState(repository: repository, now: now, calendar: calendar)
+        await state.load()
+
+        state.setTask(item, inMyDay: false)
+        await repository.waitUntilUpdateStarted(1)
+        state.enqueueImmediateTaskUpdate(
+            taskID: item.id,
+            patch: TaskPatch(dueDate: .set(due))
+        )
+        await repository.releaseUpdate(1)
+
+        #expect(await state.flushTaskEdits(taskID: item.id) == false)
+        #expect(await repository.updateCallCount() == 2)
+        #expect(state.myDayVisibilityPinnedTaskIDs == [item.id])
+        #expect(state.displayedTasks(for: .smart(.myDay)).map(\.id) == [item.id])
+
+        #expect(await state.retryTaskEdits(taskID: item.id))
+        #expect(await repository.updateCallCount() == 3)
+        #expect(state.myDayVisibilityPinnedTaskIDs.isEmpty)
+        #expect(state.displayedTasks(for: .smart(.myDay)).isEmpty)
+        #expect(await repository.persistedTask(id: item.id)?.executionDate == nil)
+        #expect(await repository.persistedTask(id: item.id)?.dueDate == due)
+    }
+
+    @Test("task context menu exposes status, Today, due date, destinations, and stable accessibility ids")
     func taskContextMenuPresentation() throws {
         let firstList = TodoList(
             id: UUID(),
@@ -1498,12 +1638,9 @@ struct TaskTimeSystemTests {
             task: openTask,
             lists: [firstList, secondList]
         )
-        let expectedExecutionDate = try day("2026-08-10")
         let expectedDueDate = try day("2026-08-12")
         #expect(open.completionTitle == "标记为完成")
-        #expect(open.currentDate(for: .execution) == expectedExecutionDate)
         #expect(open.currentDate(for: .due) == expectedDueDate)
-        #expect(open.dateMenuTitle(for: .execution) == "执行日期 · 8月10日")
         #expect(open.dateMenuTitle(for: .due) == "截止日期 · 8月12日")
         #expect(open.moveDestinations.count == 3)
         #expect(open.moveDestinations.first?.title == "任务（无清单）")
@@ -1515,12 +1652,12 @@ struct TaskTimeSystemTests {
 
         let identifiers = [
             TaskContextMenuAccessibility.completion,
-            TaskContextMenuAccessibility.dateMenu(.execution),
-            TaskContextMenuAccessibility.dateToday(.execution),
-            TaskContextMenuAccessibility.dateTomorrow(.execution),
-            TaskContextMenuAccessibility.dateChoose(.execution),
-            TaskContextMenuAccessibility.dateClear(.execution),
+            TaskContextMenuAccessibility.myDay,
             TaskContextMenuAccessibility.dateMenu(.due),
+            TaskContextMenuAccessibility.dateToday(.due),
+            TaskContextMenuAccessibility.dateTomorrow(.due),
+            TaskContextMenuAccessibility.dateChoose(.due),
+            TaskContextMenuAccessibility.dateClear(.due),
             TaskContextMenuAccessibility.createList,
             TaskContextMenuAccessibility.moveMenu,
             TaskContextMenuAccessibility.moveDestination(nil),
@@ -1847,6 +1984,7 @@ private actor TaskMutationSpyRepository: AppRepository {
     private let deleteError: EngineClientError?
     private let updateDelay: Duration
     private let gatedUpdateCalls: Set<Int>
+    private let failingUpdateCalls: Set<Int>
     private let gatedAttachmentCalls: Set<Int>
     private let gatedSyncCalls: Set<Int>
     private let gatedDeleteCalls: Set<Int>
@@ -1893,6 +2031,7 @@ private actor TaskMutationSpyRepository: AppRepository {
         deleteError: EngineClientError? = nil,
         updateDelay: Duration = .zero,
         gatedUpdateCalls: Set<Int> = [],
+        failingUpdateCalls: Set<Int> = [],
         gatedAttachmentCalls: Set<Int> = [],
         gatedSyncCalls: Set<Int> = [],
         gatedDeleteCalls: Set<Int> = [],
@@ -1912,6 +2051,7 @@ private actor TaskMutationSpyRepository: AppRepository {
         self.deleteError = deleteError
         self.updateDelay = updateDelay
         self.gatedUpdateCalls = gatedUpdateCalls
+        self.failingUpdateCalls = failingUpdateCalls
         self.gatedAttachmentCalls = gatedAttachmentCalls
         self.gatedSyncCalls = gatedSyncCalls
         self.gatedDeleteCalls = gatedDeleteCalls
@@ -1992,6 +2132,9 @@ private actor TaskMutationSpyRepository: AppRepository {
             }
         }
         if updateDelay != .zero { try await Task.sleep(for: updateDelay) }
+        if failingUpdateCalls.contains(call) {
+            throw AppRepositoryError.runtimeUnavailable
+        }
         if failuresRemaining > 0 {
             failuresRemaining -= 1
             throw AppRepositoryError.runtimeUnavailable

@@ -1,11 +1,86 @@
 import AppKit
 import Darwin
 import Foundation
+import QuartzCore
 import Testing
 @testable import TodoAgentApp
 
 @MainActor
 struct TerminalSessionControllerTests {
+    @Test("terminal host keeps a retained surface at the current host size")
+    func terminalHostSynchronizesRetainedSurfaceSize() {
+        let host = TerminalSurfaceHostView(
+            frame: NSRect(x: 0, y: 0, width: 320, height: 240)
+        )
+        let surface = TerminalResizeProbeView(frame: .zero)
+
+        host.attach(surface)
+        #expect(surface.frame == host.bounds)
+
+        host.setFrameSize(NSSize(width: 920, height: 640))
+        host.layoutSubtreeIfNeeded()
+        #expect(surface.frame == host.bounds)
+        #expect(surface.observedSizes.contains(NSSize(width: 920, height: 640)))
+
+        // SwiftUI may call updateNSView with the same retained surface after
+        // a layout change. That update must repair any stale AppKit frame.
+        surface.frame = .zero
+        host.attach(surface)
+        #expect(surface.frame == host.bounds)
+    }
+
+    @Test("zero-sized SwiftUI host never collapses a retained terminal surface")
+    func zeroSizedHostDefersRetainedSurfaceResize() {
+        let host = TerminalSurfaceHostView(frame: .zero)
+        let retainedSize = NSSize(width: 760, height: 520)
+        let finalSize = NSSize(width: 980, height: 680)
+        let surface = TerminalResizeProbeView(
+            frame: NSRect(origin: .zero, size: retainedSize)
+        )
+        surface.resetObservedSizes()
+
+        host.attach(surface)
+
+        #expect(surface.frame.size == retainedSize)
+        #expect(surface.observedSizes.isEmpty)
+
+        host.setFrameSize(finalSize)
+        host.layoutSubtreeIfNeeded()
+
+        #expect(surface.frame == host.bounds)
+        #expect(surface.observedSizes == [finalSize])
+    }
+
+    @Test("live terminal resizing is immediate and keeps the retained surface mounted")
+    func terminalHostLiveResizeDisablesInheritedAnimation() {
+        let host = TerminalSurfaceHostView(
+            frame: NSRect(x: 0, y: 0, width: 420, height: 300)
+        )
+        let surface = TerminalResizeProbeView(frame: .zero)
+        host.attach(surface)
+        surface.resetObservations()
+
+        let firstSize = NSSize(width: 560, height: 360)
+        let finalSize = NSSize(width: 740, height: 420)
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.8
+            context.allowsImplicitAnimation = true
+
+            host.setFrameSize(firstSize)
+            // SwiftUI may update the representable during a live resize. The
+            // retained Ghostty view must not be removed and added again.
+            host.attach(surface)
+            host.setFrameSize(finalSize)
+        }
+
+        #expect(surface.observedSizes == [firstSize, finalSize])
+        #expect(surface.observedImplicitAnimationFlags == [false, false])
+        #expect(surface.observedCATransactionDisableActions == [true, true])
+        #expect(surface.superview === host)
+        #expect(surface.superviewChangeCount == 0)
+        #expect(surface.frame == host.bounds)
+    }
+
     @Test(
         "a lost prepare response reconciles and durably fails the committed run",
         .timeLimit(.minutes(1))
@@ -1232,6 +1307,37 @@ struct TerminalSessionControllerTests {
         #expect(await repository.deletedSessionIDs() == [sessionID])
     }
 
+}
+
+@MainActor
+private final class TerminalResizeProbeView: NSView {
+    private(set) var observedSizes: [NSSize] = []
+    private(set) var observedImplicitAnimationFlags: [Bool] = []
+    private(set) var observedCATransactionDisableActions: [Bool] = []
+    private(set) var superviewChangeCount = 0
+
+    func resetObservedSizes() {
+        observedSizes = []
+    }
+
+    func resetObservations() {
+        observedSizes = []
+        observedImplicitAnimationFlags = []
+        observedCATransactionDisableActions = []
+        superviewChangeCount = 0
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        observedSizes.append(newSize)
+        observedImplicitAnimationFlags.append(NSAnimationContext.current.allowsImplicitAnimation)
+        observedCATransactionDisableActions.append(CATransaction.disableActions())
+    }
+
+    override func viewDidMoveToSuperview() {
+        super.viewDidMoveToSuperview()
+        superviewChangeCount += 1
+    }
 }
 
 @MainActor

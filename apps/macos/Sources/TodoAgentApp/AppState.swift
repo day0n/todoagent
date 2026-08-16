@@ -104,15 +104,15 @@ final class AppState {
     private(set) var loadingSessionTaskID: UUID?
     private(set) var taskSessionErrorMessage: String?
     private(set) var taskSaveStates: [UUID: TaskSaveState] = [:]
+    /// Keeps an optimistically removed Today row reachable until its
+    /// execution-date mutation is durably acknowledged. A failed write can
+    /// therefore show its inline error and retry action instead of making the
+    /// task look as though it was removed successfully.
+    private(set) var myDayVisibilityPinnedTaskIDs: Set<UUID> = []
     let assistant: AssistantViewState
 
-    var selection: SidebarSelection? = .smart(.timeline)
-    var selectedDay: LocalDay
+    var selection: SidebarSelection? = .smart(.myDay)
     private(set) var currentDay: LocalDay
-    var selectedDate: Date {
-        get { selectedDay.date(in: calendar) ?? .now }
-        set { selectedDay = LocalDay(newValue, calendar: calendar) }
-    }
     var inspectorPresented: Bool
     var presentedSheet: AppSheet?
     var loadState: AppLoadState = .loading
@@ -131,7 +131,6 @@ final class AppState {
         self.taskTextAutosaveDelay = taskTextAutosaveDelay
         self.inspectorPresented = inspectorPresented
         let today = LocalDay(now, calendar: calendar)
-        selectedDay = today
         currentDay = today
         assistant = AssistantViewState(repository: repository)
         installCalendarObservers()
@@ -1245,25 +1244,60 @@ final class AppState {
     func task(id: UUID) -> TaskItem? { projection.task(id: id) }
     func tasks(executingOn day: LocalDay) -> [TaskItem] { projection.tasks(executingOn: day) }
     func todayTasks() -> [TaskItem] { projection.todayTasks() }
-    func timelineDays() -> [TimelineDay] {
-        projection.timelineDays(startingAt: selectedDay, calendar: calendar)
-    }
-    func shiftSelectedDay(by days: Int) {
-        if let day = selectedDay.advanced(by: days, calendar: calendar) {
-            selectedDay = day
-        }
-    }
-    func selectToday() { selectedDay = currentDay }
-    func timelineBuckets() -> [BoardBucket: [TaskItem]] {
-        projection.timelineBuckets(selectedDay: selectedDay, calendar: calendar)
-    }
     func isOverdue(_ task: TaskItem) -> Bool { projection.isOverdue(task) }
+    func isTaskInMyDay(_ task: TaskItem) -> Bool { task.executionDate == currentDay }
+
+    /// Adds a task to Today, or removes it only when it belongs to the current
+    /// day. A future execution date remains intact until the user explicitly
+    /// chooses to replace it by adding that task to Today.
+    func setTask(_ task: TaskItem, inMyDay included: Bool) {
+        guard !isPreparingToTerminate,
+              isTaskCommandInFlight(taskID: task.id) == false
+        else { return }
+        guard let currentTask = self.task(id: task.id) else { return }
+        let executionDate: TaskPatchField<LocalDay>
+        if included {
+            myDayVisibilityPinnedTaskIDs.remove(task.id)
+            executionDate = .set(currentDay)
+        } else {
+            guard currentTask.executionDate == currentDay else { return }
+            myDayVisibilityPinnedTaskIDs.insert(task.id)
+            executionDate = .clear
+        }
+        enqueueImmediateTaskUpdate(
+            taskID: task.id,
+            patch: TaskPatch(executionDate: executionDate)
+        )
+    }
+
     var readyRuntimeCount: Int { runtimes.count(where: \.isSelectable) }
     func visibleTasks() -> [TaskItem] {
+        visibleTasks(for: selection)
+    }
+    func visibleTasks(for selection: SidebarSelection?) -> [TaskItem] {
         projection.visibleTasks(for: selection, sessions: sessions)
     }
+    /// Board-only visibility includes a task while a Today removal is being
+    /// saved or awaits retry. The authoritative projection above remains a
+    /// pure `executionDate == currentDay` query for counts and business logic.
+    func displayedTasks(for selection: SidebarSelection?) -> [TaskItem] {
+        var displayed = visibleTasks(for: selection)
+        guard selection == .smart(.myDay),
+              myDayVisibilityPinnedTaskIDs.isEmpty == false
+        else { return displayed }
+
+        let displayedIDs = Set(displayed.map(\.id))
+        displayed.append(contentsOf: tasks.filter { task in
+            myDayVisibilityPinnedTaskIDs.contains(task.id)
+                && displayedIDs.contains(task.id) == false
+        })
+        return displayed
+    }
     func titleForSelection() -> String {
-        guard let selection else { return "时间线" }
+        title(for: selection)
+    }
+    func title(for selection: SidebarSelection?) -> String {
+        guard let selection else { return "今天" }
         return switch selection {
         case let .smart(view): view.title
         case let .list(id): lists.first(where: { $0.id == id })?.name ?? "清单"
@@ -2075,6 +2109,7 @@ final class AppState {
         inFlightTaskPatches[taskID] = nil
         pendingTaskAttachmentMutations[taskID] = nil
         taskSaveStates[taskID] = nil
+        myDayVisibilityPinnedTaskIDs.remove(taskID)
         failedTaskCommands[taskID] = nil
         bundles[taskID] = nil
         timelinePages[taskID] = nil
@@ -2316,6 +2351,12 @@ final class AppState {
             }
 
             guard let attachmentMutation = takeNextAttachmentMutation(taskID: taskID) else {
+                // A Today removal can share this drain with edits queued while
+                // its Engine call is suspended. Keep the row pinned until the
+                // complete per-task drain succeeds, so any later failure still
+                // has a visible retry target and retry success emits the final
+                // visibility change that closes an open workspace.
+                myDayVisibilityPinnedTaskIDs.remove(taskID)
                 taskSaveStates[taskID] = .idle
                 return true
             }
@@ -2491,11 +2532,7 @@ final class AppState {
     func refreshLocalDay(now: Date = .now) {
         let newDay = LocalDay(now, calendar: calendar)
         if newDay != currentDay {
-            let wasFollowingToday = selectedDay == currentDay
             currentDay = newDay
-            if wasFollowingToday {
-                selectedDay = newDay
-            }
             rebuildProjection()
         }
         scheduleLocalDayRefresh(now: now)

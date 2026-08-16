@@ -1315,15 +1315,10 @@ struct TaskItem: Identifiable, Codable, Hashable, Sendable {
         status == .open && dueDate.map { $0 < today } == true
     }
 
-    func isExecutionDateOverdue(on today: LocalDay = .today()) -> Bool {
-        status == .open && executionDate.map { $0 < today } == true
-    }
-
-    /// A task needs overdue attention when either of its explicit schedule
-    /// dates has passed while it remains open. The two dates keep their domain
-    /// meanings; this only unifies their user-facing warning state.
+    /// A task is overdue only when its deadline has passed. `executionDate`
+    /// selects whether a task appears in Today and is not a deadline.
     func isOverdue(on today: LocalDay = .today()) -> Bool {
-        isDueDateOverdue(on: today) || isExecutionDateOverdue(on: today)
+        isDueDateOverdue(on: today)
     }
 
     func cardDatePresentation(on today: LocalDay = .today()) -> TaskCardDatePresentation? {
@@ -1339,7 +1334,7 @@ struct TaskItem: Identifiable, Codable, Hashable, Sendable {
                 TaskCardDatePresentation(
                     kind: .execution,
                     day: $0,
-                    isOverdue: isExecutionDateOverdue(on: today)
+                    isOverdue: false
                 )
             },
         ].compactMap { $0 }
@@ -1541,13 +1536,13 @@ struct TodoList: Identifiable, Codable, Hashable, Sendable {
 }
 
 enum SmartView: String, CaseIterable, Identifiable, Sendable {
-    case timeline, tasks, running, done
+    case myDay, tasks, running, done
     var id: Self { self }
     var title: String {
-        switch self { case .timeline: "时间线"; case .tasks: "任务"; case .running: "进行中"; case .done: "已完成" }
+        switch self { case .myDay: "今天"; case .tasks: "任务"; case .running: "进行中"; case .done: "已完成" }
     }
     var symbol: String {
-        switch self { case .timeline: "clock"; case .tasks: "checklist"; case .running: "circle.dotted.circle"; case .done: "checkmark.circle" }
+        switch self { case .myDay: "sun.max"; case .tasks: "checklist"; case .running: "circle.dotted.circle"; case .done: "checkmark.circle" }
     }
 }
 
@@ -1569,22 +1564,4 @@ struct AppSnapshot: Codable, Equatable, Sendable {
     var runtimes: [RuntimeInfo]
     var sessions: [TaskSessionDescriptor]
     var messages: [ChatMessage]
-}
-
-struct TimelineDay: Identifiable, Equatable, Sendable {
-    let day: LocalDay
-    let tasks: [TaskItem]
-
-    var id: LocalDay { day }
-    var completedCount: Int { tasks.count(where: { $0.status == .completed }) }
-    var totalCount: Int { tasks.count }
-    var progress: Double {
-        guard totalCount > 0 else { return 0 }
-        return Double(completedCount) / Double(totalCount)
-    }
-}
-
-enum BoardBucket: String, CaseIterable, Identifiable, Sendable {
-    case today, tomorrow, dayAfter, threeDaysAfter
-    var id: Self { self }
 }

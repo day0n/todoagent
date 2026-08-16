@@ -134,13 +134,10 @@ struct TaskDetailsPane: View {
                 .textCase(.uppercase)
 
             VStack(spacing: 0) {
-                OptionalLocalDayRow(
-                    title: "执行日期",
-                    systemImage: "sun.max",
-                    day: executionDateBinding,
+                TaskMyDayRow(
+                    executionDate: draft.executionDate,
                     today: state.currentDay,
-                    tint: isDraftDateOverdue(draft.executionDate) ? .red : .primary,
-                    accessibilityIdentifier: "task.details.execution-date"
+                    isInMyDay: myDayBinding
                 )
                 .padding(10)
 
@@ -151,7 +148,7 @@ struct TaskDetailsPane: View {
                     systemImage: "calendar",
                     day: dueDateBinding,
                     today: state.currentDay,
-                    tint: isDraftDateOverdue(draft.dueDate) ? .red : .primary,
+                    tint: isDueDateOverdue(draft.dueDate) ? .red : .primary,
                     accessibilityIdentifier: "task.details.due-date"
                 )
                 .padding(10)
@@ -164,7 +161,7 @@ struct TaskDetailsPane: View {
         }
     }
 
-    private func isDraftDateOverdue(_ day: LocalDay?) -> Bool {
+    private func isDueDateOverdue(_ day: LocalDay?) -> Bool {
         draft.status == .open && day.map { $0 < state.currentDay } == true
     }
 
@@ -304,16 +301,15 @@ struct TaskDetailsPane: View {
         )
     }
 
-    private var executionDateBinding: Binding<LocalDay?> {
+    private var myDayBinding: Binding<Bool> {
         Binding(
-            get: { draft.executionDate },
-            set: { value in
+            get: { draft.executionDate == state.currentDay },
+            set: { isInMyDay in
                 guard !state.isPreparingToTerminate else { return }
-                guard value != draft.executionDate else { return }
-                draft.executionDate = value
-                saveImmediately(
-                    TaskPatch(executionDate: value.map(TaskPatchField.set) ?? .clear)
-                )
+                let executionDate = isInMyDay ? state.currentDay : nil
+                guard executionDate != draft.executionDate else { return }
+                draft.executionDate = executionDate
+                state.setTask(task, inMyDay: isInMyDay)
             }
         )
     }
@@ -373,6 +369,45 @@ struct TaskDetailsPane: View {
             taskID: task.id,
             attachmentID: attachment.id
         )
+    }
+}
+
+private struct TaskMyDayRow: View {
+    let executionDate: LocalDay?
+    let today: LocalDay
+    @Binding var isInMyDay: Bool
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: isInMyDay ? "sun.max.fill" : "sun.max")
+                .foregroundStyle(isInMyDay ? Color.accentColor : Color.primary)
+                .frame(width: 18)
+                .accessibilityHidden(true)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("今天")
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            Spacer(minLength: 8)
+
+            Toggle(isOn: $isInMyDay) { EmptyView() }
+                .toggleStyle(TodoAgentCompactSwitchStyle())
+                .accessibilityLabel("加入今天")
+                .accessibilityValue(isInMyDay ? "已加入" : "未加入")
+        }
+        .accessibilityIdentifier("task.details.my-day")
+    }
+
+    private var detail: String {
+        if isInMyDay { return "今天要处理" }
+        if let executionDate {
+            return "保留原执行日期 \(executionDate.month)月\(executionDate.day)日；加入后改为今天"
+        }
+        return "需要今天处理时加入"
     }
 }
 

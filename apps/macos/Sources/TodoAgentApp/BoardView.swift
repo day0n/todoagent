@@ -11,113 +11,259 @@ extension Notification.Name {
 struct BoardView: View {
     let state: AppState
     let taskWorkspace: TaskWorkspaceCoordinator
-    @State private var focusesComposerWhenWorkspaceCloses = false
+    @Binding var workspaceVisuallyMounted: Bool
+    let geometryRequestGeneration: UInt64
+    let onAvailableWidthChange: @MainActor (CGFloat) -> Void
+    @State private var pendingAutomaticCloseTaskID: UUID?
+    @State private var mountedWorkspaceTaskID: UUID?
+    @State private var workspaceChromePresented = false
+    @State private var workspaceRevealProgress: CGFloat = 0
+    @State private var workspaceTransitionGeneration = 0
+    @State private var workspaceDismissalTaskID: UUID?
+    @State private var workspaceDismissalAnimationCompletedTaskID: UUID?
+    @State private var workspaceChromeAnimationTarget: Bool?
+    @State private var workspaceChromeAnimationGeneration = 0
+    @State private var workspaceSwitchState = TaskWorkspaceSwitchState()
+    @State private var workspaceRailVisibility: TaskWorkspaceRailVisibility?
+    @State private var workspaceTerminalLiveWidth: CGFloat?
+    @AppStorage(TaskWorkspaceTerminalPanePreferences.widthKey)
+    private var storedWorkspaceTerminalWidth = 0.0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        Group {
-            if let taskID = taskWorkspace.presentedTaskID {
-                TaskSplitWorkspace(
-                    taskID: taskID,
+        GeometryReader { proxy in
+            let resolvedRailVisibility = TaskWorkspaceLayoutPolicy.railVisibility(
+                availableWidth: proxy.size.width,
+                previous: workspaceRailVisibility
+            )
+            let preferredTerminalWidth = workspaceTerminalLiveWidth
+                ?? persistedWorkspaceTerminalWidth
+            let resolvedWorkspaceLayout = TaskWorkspaceRevealLayoutPolicy.resolve(
+                availableWidth: proxy.size.width,
+                railVisibility: resolvedRailVisibility,
+                preferredTerminalWidth: preferredTerminalWidth
+            )
+            TaskWorkspaceSynchronizedLayout(
+                railVisibility: resolvedRailVisibility,
+                preferredTerminalWidth: preferredTerminalWidth,
+                revealProgress: workspaceRevealProgress
+            ) {
+                TaskListView(
                     state: state,
-                    taskWorkspace: taskWorkspace
+                    taskWorkspace: taskWorkspace,
+                    expandedPaneWidth: proxy.size.width,
+                    collapsedPaneWidth: resolvedWorkspaceLayout.railWidth,
+                    selectedWorkspaceTaskID: mountedWorkspaceTaskID,
+                    pendingWorkspaceTaskID: workspaceSwitchState.requestedTaskID
+                        ?? taskWorkspace.pendingTaskID,
+                    receivesComposerFocus: workspaceChromeAnimationTarget == nil
                 )
-            } else if isTimeline {
-                TimelineColumns(state: state, taskWorkspace: taskWorkspace)
-            } else {
-                TaskListView(state: state, taskWorkspace: taskWorkspace)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .allowsHitTesting(workspaceChromeAnimationTarget == nil)
+                .accessibilityHidden(workspaceChromeAnimationTarget != nil)
+
+                TaskWorkspaceTerminalSlot(
+                    taskID: mountedWorkspaceTaskID,
+                    state: state,
+                    taskWorkspace: taskWorkspace,
+                    railVisibility: resolvedRailVisibility,
+                    switchVeilPresented: workspaceSwitchState.veilPresented,
+                    terminalWidth: resolvedWorkspaceLayout.terminalWidth,
+                    onResizeChanged: { proposedWidth in
+                        updateWorkspaceTerminalWidth(
+                            proposedWidth,
+                            availableWidth: proxy.size.width,
+                            railVisibility: resolvedRailVisibility
+                        )
+                    },
+                    onResizeEnded: { proposedWidth in
+                        commitWorkspaceTerminalWidth(
+                            proposedWidth,
+                            availableWidth: proxy.size.width,
+                            railVisibility: resolvedRailVisibility
+                        )
+                    }
+                )
+                .allowsHitTesting(
+                    workspaceChromePresented
+                        && workspaceChromeAnimationTarget == nil
+                        && workspaceSwitchState.isActive == false
+                )
+                .accessibilityHidden(
+                    workspaceChromePresented == false
+                        || workspaceChromeAnimationTarget != nil
+                        || workspaceSwitchState.isActive
+                )
+                .zIndex(1)
+            }
+            // The divider moves as its width changes. Measure the drag in the
+            // stable board coordinate space so its own movement cannot feed
+            // back into subsequent gesture translations.
+            .coordinateSpace(name: TaskWorkspaceTerminalResizeCoordinateSpace.name)
+            .clipped()
+            .onAppear {
+                updateWorkspaceRailVisibility(availableWidth: proxy.size.width)
+                onAvailableWidthChange(proxy.size.width)
+            }
+            .onChange(of: proxy.size.width) { _, width in
+                updateWorkspaceRailVisibility(availableWidth: width)
+                onAvailableWidthChange(width)
+            }
+            .onChange(of: geometryRequestGeneration) { _, _ in
+                // This callback is a layout acknowledgement, not a timer. It
+                // also fires when a Sidebar overlay changes visibility without
+                // changing the Board's measured width.
+                onAvailableWidthChange(proxy.size.width)
             }
         }
+        .clipped()
         .navigationTitle(state.titleForSelection())
         .background(TodoAgentUI.canvasBackground)
-        .toolbar { timelineToolbar }
+        .onAppear {
+            workspaceVisuallyMounted = mountedWorkspaceTaskID != nil
+            updateWorkspacePresentation(taskWorkspace.presentedTaskID)
+        }
+        .onDisappear {
+            workspaceVisuallyMounted = false
+            onAvailableWidthChange(0)
+        }
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentNewTask)) { _ in
             focusComposerForCurrentContext()
         }
-        .onChange(of: taskWorkspace.presentedTaskID) { previousTaskID, taskID in
-            guard previousTaskID != nil,
-                  taskID == nil,
-                  focusesComposerWhenWorkspaceCloses
-            else { return }
-            focusesComposerWhenWorkspaceCloses = false
-            postComposerFocus()
+        .onChange(of: visibleTaskIDs) { previousTaskIDs, taskIDs in
+            requestAutomaticCloseIfNeeded(
+                previousVisibleTaskIDs: previousTaskIDs,
+                visibleTaskIDs: taskIDs
+            )
         }
-        .onChange(of: taskWorkspace.closingTaskID) { previousTaskID, taskID in
-            guard previousTaskID != nil,
-                  taskID == nil,
-                  taskWorkspace.presentedTaskID != nil
-            else { return }
-            focusesComposerWhenWorkspaceCloses = false
+        .onChange(of: automaticCloseRetryReady) { _, isReady in
+            guard isReady, let taskID = pendingAutomaticCloseTaskID else { return }
+            taskWorkspace.closeTaskWorkspace(taskID: taskID)
         }
-    }
-
-    private var isTimeline: Bool {
-        taskWorkspace.presentedTaskID == nil && state.selection == .smart(.timeline)
-    }
-
-    @ToolbarContentBuilder
-    private var timelineToolbar: some ToolbarContent {
-        if isTimeline {
-            ToolbarItemGroup(placement: .navigation) {
-                Button {
-                    shiftDate(-1)
-                } label: {
-                    Label("前一天", systemImage: "chevron.left")
-                }
-                .labelStyle(.iconOnly)
-                .help("前一天")
-                .accessibilityIdentifier("timeline.previousDay")
-
-                Text(selectedDayTitle)
-                    .font(.headline)
-                    .accessibilityIdentifier("timeline.selectedDate")
-
-                Button {
-                    shiftDate(1)
-                } label: {
-                    Label("后一天", systemImage: "chevron.right")
-                }
-                .labelStyle(.iconOnly)
-                .help("后一天")
-                .accessibilityIdentifier("timeline.nextDay")
-
-                Button("今天") {
-                    state.selectToday()
-                }
-                .disabled(state.selectedDay == state.currentDay)
-                .help("回到今天")
-                .accessibilityIdentifier("timeline.today")
+        .onChange(of: taskWorkspace.presentedTaskID) { _, taskID in
+            if taskID != pendingAutomaticCloseTaskID {
+                pendingAutomaticCloseTaskID = nil
             }
-
+            updateWorkspacePresentation(taskID)
+        }
+        .onChange(of: taskWorkspace.closingTaskID) { _, closingTaskID in
+            guard closingTaskID == mountedWorkspaceTaskID else {
+                if closingTaskID == nil {
+                    updateWorkspacePresentation(taskWorkspace.presentedTaskID)
+                }
+                return
+            }
+            hideMountedWorkspace()
         }
     }
 
-    private func shiftDate(_ days: Int) {
-        state.shiftSelectedDay(by: days)
+    private var visibleTaskIDs: Set<UUID> {
+        Set(state.displayedTasks(for: state.selection).map(\.id))
     }
 
-    private var selectedDayTitle: String {
-        guard let date = state.selectedDay.date(in: .todoAgentLocal) else {
-            return state.selectedDay.rawValue
+    private var persistedWorkspaceTerminalWidth: CGFloat? {
+        storedWorkspaceTerminalWidth > 0
+            ? CGFloat(storedWorkspaceTerminalWidth)
+            : nil
+    }
+
+    private func updateWorkspaceTerminalWidth(
+        _ proposedWidth: CGFloat,
+        availableWidth: CGFloat,
+        railVisibility: TaskWorkspaceRailVisibility
+    ) {
+        let width = TaskWorkspaceRevealLayoutPolicy.clampedTerminalWidth(
+            proposedWidth,
+            availableWidth: availableWidth,
+            railVisibility: railVisibility
+        )
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            workspaceTerminalLiveWidth = width
         }
-        return date.formatted(.dateTime.month().day().weekday(.wide))
+    }
+
+    private func commitWorkspaceTerminalWidth(
+        _ proposedWidth: CGFloat,
+        availableWidth: CGFloat,
+        railVisibility: TaskWorkspaceRailVisibility
+    ) {
+        let width = TaskWorkspaceRevealLayoutPolicy.clampedTerminalWidth(
+            proposedWidth,
+            availableWidth: availableWidth,
+            railVisibility: railVisibility
+        )
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            storedWorkspaceTerminalWidth = Double(width)
+            workspaceTerminalLiveWidth = nil
+        }
+    }
+
+    private func updateWorkspaceRailVisibility(availableWidth: CGFloat) {
+        let next = TaskWorkspaceLayoutPolicy.railVisibility(
+            availableWidth: availableWidth,
+            previous: workspaceRailVisibility
+        )
+        guard next != workspaceRailVisibility else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            workspaceRailVisibility = next
+        }
+    }
+
+    private var automaticCloseRetryReady: Bool {
+        guard let taskID = pendingAutomaticCloseTaskID else { return false }
+        return TaskWorkspaceScopeClosePolicy.shouldRetryAutomaticClose(
+            pendingTaskID: taskID,
+            presentedTaskID: taskWorkspace.presentedTaskID,
+            visibleTaskIDs: visibleTaskIDs,
+            saveState: state.taskSaveState(taskID: taskID)
+        )
+    }
+
+    private func requestAutomaticCloseIfNeeded(
+        previousVisibleTaskIDs: Set<UUID>,
+        visibleTaskIDs: Set<UUID>
+    ) {
+        guard let taskID = taskWorkspace.presentedTaskID else {
+            pendingAutomaticCloseTaskID = nil
+            return
+        }
+        guard visibleTaskIDs.contains(taskID) == false else {
+            if pendingAutomaticCloseTaskID == taskID {
+                pendingAutomaticCloseTaskID = nil
+            }
+            return
+        }
+        guard TaskWorkspaceScopeClosePolicy.didLeaveScope(
+            taskID: taskID,
+            previousVisibleTaskIDs: previousVisibleTaskIDs,
+            visibleTaskIDs: visibleTaskIDs
+        ) else { return }
+        pendingAutomaticCloseTaskID = taskID
+        taskWorkspace.closeTaskWorkspace(taskID: taskID)
     }
 
     private func focusComposerForCurrentContext() {
-        if let taskID = taskWorkspace.presentedTaskID {
-            if taskWorkspace.activeWorkspaceShowsTaskRail {
-                postComposerFocus()
-            } else {
+        if taskWorkspace.presentedTaskID != nil {
+            switch state.selection {
+            case .smart(.running), .smart(.done), nil:
                 state.selection = .smart(.tasks)
-                focusesComposerWhenWorkspaceCloses = true
-                taskWorkspace.closeTaskWorkspace(taskID: taskID)
+            case .smart(.myDay), .smart(.tasks), .list:
+                break
             }
+            postComposerFocus()
             return
         }
 
         switch state.selection {
         case .smart(.running), .smart(.done), nil:
             state.selection = .smart(.tasks)
-        case .smart(.timeline), .smart(.tasks), .list:
+        case .smart(.myDay), .smart(.tasks), .list:
             break
         }
 
@@ -131,6 +277,284 @@ struct BoardView: View {
             NotificationCenter.default.post(name: .todoAgentFocusTaskComposer, object: nil)
         }
     }
+
+    private func updateWorkspacePresentation(_ taskID: UUID?) {
+        guard let taskID else {
+            dismissMountedWorkspace()
+            return
+        }
+
+        guard mountedWorkspaceTaskID != taskID else {
+            if taskWorkspace.closingTaskID != taskID {
+                showMountedWorkspace()
+            }
+            return
+        }
+
+        transitionToWorkspace(taskID)
+    }
+
+    private func transitionToWorkspace(_ taskID: UUID) {
+        workspaceTransitionGeneration &+= 1
+        let generation = workspaceTransitionGeneration
+        guard mountedWorkspaceTaskID != nil else {
+            mountIncomingWorkspace(taskID, generation: generation)
+            return
+        }
+
+        workspaceDismissalTaskID = nil
+        workspaceDismissalAnimationCompletedTaskID = nil
+        workspaceSwitchState.request(taskID)
+
+        // A task-to-task switch keeps the terminal panel at its current
+        // position and size. If a real close was already moving it away,
+        // reverse that chrome motion while the internal veil hides the swap.
+        if workspaceChromePresented == false || workspaceChromeAnimationTarget == false {
+            animateWorkspaceChrome(to: true)
+        }
+        animateWorkspaceSwitchVeil(to: true)
+    }
+
+    private func mountIncomingWorkspace(_ taskID: UUID, generation: Int) {
+        guard workspaceTransitionGeneration == generation,
+              taskWorkspace.presentedTaskID == taskID,
+              taskWorkspace.closingTaskID != taskID
+        else { return }
+
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            mountedWorkspaceTaskID = taskID
+            workspaceVisuallyMounted = true
+            workspaceChromePresented = false
+            workspaceRevealProgress = 0
+            workspaceDismissalTaskID = nil
+            workspaceDismissalAnimationCompletedTaskID = nil
+            workspaceChromeAnimationTarget = nil
+            workspaceSwitchState.reset()
+        }
+
+        Task { @MainActor in
+            await Task.yield()
+            guard workspaceTransitionGeneration == generation,
+                  mountedWorkspaceTaskID == taskID,
+                  taskWorkspace.presentedTaskID == taskID,
+                  taskWorkspace.closingTaskID != taskID
+            else { return }
+            animateWorkspaceChrome(to: true)
+        }
+    }
+
+    private func dismissMountedWorkspace() {
+        guard let taskID = mountedWorkspaceTaskID else { return }
+        cancelWorkspaceSwitch()
+        if workspaceChromeAnimationTarget == false { return }
+        if workspaceDismissalTaskID == taskID {
+            if workspaceDismissalAnimationCompletedTaskID == taskID {
+                unmountWorkspace(taskID)
+            }
+            return
+        }
+        beginWorkspaceDismissal(taskID)
+    }
+
+    private func showMountedWorkspace() {
+        workspaceTransitionGeneration &+= 1
+        workspaceDismissalTaskID = nil
+        workspaceDismissalAnimationCompletedTaskID = nil
+        cancelWorkspaceSwitch()
+        animateWorkspaceChrome(to: true)
+    }
+
+    private func hideMountedWorkspace() {
+        guard let taskID = mountedWorkspaceTaskID else { return }
+        guard workspaceDismissalTaskID != taskID else { return }
+        beginWorkspaceDismissal(taskID)
+    }
+
+    private func beginWorkspaceDismissal(_ taskID: UUID) {
+        workspaceTransitionGeneration &+= 1
+        let generation = workspaceTransitionGeneration
+        cancelWorkspaceSwitch()
+        workspaceDismissalTaskID = taskID
+        workspaceDismissalAnimationCompletedTaskID = nil
+        guard workspaceChromeAnimationTarget != false else { return }
+        animateWorkspaceChrome(to: false)
+        guard workspaceTransitionGeneration == generation else {
+            return
+        }
+    }
+
+    private func unmountWorkspace(_ taskID: UUID) {
+        guard mountedWorkspaceTaskID == taskID,
+              taskWorkspace.presentedTaskID == nil
+        else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            mountedWorkspaceTaskID = nil
+            workspaceVisuallyMounted = false
+            workspaceRevealProgress = 0
+            workspaceDismissalTaskID = nil
+            workspaceDismissalAnimationCompletedTaskID = nil
+            workspaceChromeAnimationTarget = nil
+            workspaceSwitchState.reset()
+        }
+    }
+
+    private func cancelWorkspaceSwitch() {
+        workspaceSwitchState.cancel()
+        animateWorkspaceSwitchVeil(to: false)
+    }
+
+    private func animateWorkspaceSwitchVeil(to isPresented: Bool) {
+        guard let request = workspaceSwitchState.beginVeilAnimation(to: isPresented) else {
+            if isPresented, workspaceSwitchState.isFullyCovered {
+                swapLatestWorkspaceUnderVeil()
+            }
+            return
+        }
+
+        let complete: @MainActor @Sendable () -> Void = {
+            guard workspaceSwitchState.completeVeilAnimation(request) else { return }
+            if isPresented {
+                swapLatestWorkspaceUnderVeil()
+            } else if let taskID = mountedWorkspaceTaskID,
+                      taskWorkspace.presentedTaskID == taskID,
+                      taskWorkspace.closingTaskID != taskID,
+                      workspaceChromePresented
+            {
+                taskWorkspace.focusActiveTerminal()
+            }
+        }
+
+        guard workspaceSwitchState.veilPresented != isPresented else {
+            complete()
+            return
+        }
+        if let animation = TaskWorkspaceSwitchMotion.animation(
+            covering: isPresented,
+            reduceMotion: reduceMotion
+        ) {
+            withAnimation(animation, completionCriteria: .logicallyComplete) {
+                workspaceSwitchState.setVeilPresented(isPresented)
+            } completion: {
+                complete()
+            }
+        } else {
+            workspaceSwitchState.setVeilPresented(isPresented)
+            complete()
+        }
+    }
+
+    private func swapLatestWorkspaceUnderVeil() {
+        guard workspaceSwitchState.isFullyCovered else { return }
+        guard let taskID = workspaceSwitchState.takeRequestedTaskID() else {
+            animateWorkspaceSwitchVeil(to: false)
+            return
+        }
+        guard taskWorkspace.presentedTaskID == taskID,
+              taskWorkspace.closingTaskID != taskID
+        else {
+            if let latestTaskID = taskWorkspace.presentedTaskID,
+               taskWorkspace.closingTaskID != latestTaskID,
+               latestTaskID != mountedWorkspaceTaskID
+            {
+                workspaceSwitchState.request(latestTaskID)
+                swapLatestWorkspaceUnderVeil()
+            } else {
+                animateWorkspaceSwitchVeil(to: false)
+            }
+            return
+        }
+
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            mountedWorkspaceTaskID = taskID
+            workspaceVisuallyMounted = true
+            workspaceDismissalTaskID = nil
+            workspaceDismissalAnimationCompletedTaskID = nil
+        }
+
+        Task { @MainActor in
+            await Task.yield()
+            guard workspaceSwitchState.isFullyCovered else { return }
+            if workspaceSwitchState.requestedTaskID != nil {
+                swapLatestWorkspaceUnderVeil()
+                return
+            }
+            guard mountedWorkspaceTaskID == taskID,
+                  taskWorkspace.presentedTaskID == taskID,
+                  taskWorkspace.closingTaskID != taskID
+            else {
+                if let latestTaskID = taskWorkspace.presentedTaskID,
+                   taskWorkspace.closingTaskID != latestTaskID,
+                   latestTaskID != mountedWorkspaceTaskID
+                {
+                    workspaceSwitchState.request(latestTaskID)
+                    swapLatestWorkspaceUnderVeil()
+                } else {
+                    animateWorkspaceSwitchVeil(to: false)
+                }
+                return
+            }
+            animateWorkspaceSwitchVeil(to: false)
+        }
+    }
+
+    private func animateWorkspaceChrome(to isPresented: Bool) {
+        guard workspaceChromeAnimationTarget != isPresented else { return }
+        workspaceChromeAnimationGeneration &+= 1
+        let generation = workspaceChromeAnimationGeneration
+        workspaceChromeAnimationTarget = isPresented
+
+        let complete: @MainActor @Sendable () -> Void = {
+            guard workspaceChromeAnimationGeneration == generation,
+                  workspaceChromeAnimationTarget == isPresented
+            else { return }
+            workspaceChromeAnimationTarget = nil
+            workspaceChromeAnimationDidComplete(isPresented: isPresented)
+        }
+
+        guard workspaceChromePresented != isPresented else {
+            complete()
+            return
+        }
+        if let animation = TaskWorkspaceMotion.animation(reduceMotion: reduceMotion) {
+            withAnimation(animation, completionCriteria: .removed) {
+                workspaceChromePresented = isPresented
+                workspaceRevealProgress = isPresented ? 1 : 0
+            } completion: {
+                complete()
+            }
+        } else {
+            workspaceChromePresented = isPresented
+            workspaceRevealProgress = isPresented ? 1 : 0
+            complete()
+        }
+    }
+
+    private func workspaceChromeAnimationDidComplete(isPresented: Bool) {
+        guard isPresented == false,
+              let taskID = mountedWorkspaceTaskID
+        else { return }
+
+        workspaceDismissalTaskID = taskID
+        workspaceDismissalAnimationCompletedTaskID = taskID
+
+        guard let presentedTaskID = taskWorkspace.presentedTaskID else {
+            unmountWorkspace(taskID)
+            return
+        }
+        guard taskWorkspace.closingTaskID != presentedTaskID else { return }
+
+        if presentedTaskID == taskID {
+            showMountedWorkspace()
+        } else {
+            transitionToWorkspace(presentedTaskID)
+        }
+    }
 }
 
 enum TaskWorkspaceRailVisibility: Equatable, Sendable {
@@ -138,13 +562,43 @@ enum TaskWorkspaceRailVisibility: Equatable, Sendable {
     case compact
 }
 
+enum TaskWorkspaceScopeClosePolicy {
+    static func didLeaveScope(
+        taskID: UUID,
+        previousVisibleTaskIDs: Set<UUID>,
+        visibleTaskIDs: Set<UUID>
+    ) -> Bool {
+        previousVisibleTaskIDs.contains(taskID)
+            && visibleTaskIDs.contains(taskID) == false
+    }
+
+    static func shouldRetryAutomaticClose(
+        pendingTaskID: UUID?,
+        presentedTaskID: UUID?,
+        visibleTaskIDs: Set<UUID>,
+        saveState: TaskSaveState
+    ) -> Bool {
+        guard let pendingTaskID,
+              pendingTaskID == presentedTaskID,
+              visibleTaskIDs.contains(pendingTaskID) == false
+        else { return false }
+        return saveState == .idle
+    }
+}
+
 enum TaskWorkspaceLayoutPolicy {
-    static let railWidth: CGFloat = 320
+    static let regularRailWidth: CGFloat = 320
+    static let compactRailWidth: CGFloat = 252
     static let dividerWidth: CGFloat = 1
-    static let terminalMinimumWidth: CGFloat = 500
+    static let terminalPreferredMinimumWidth: CGFloat = 500
+    static let terminalAbsoluteMinimumWidth: CGFloat = 320
     static let initialSplitWidth: CGFloat = 830
-    static let collapseSplitBelow = railWidth + dividerWidth + terminalMinimumWidth
+    static let collapseSplitBelow = regularRailWidth + dividerWidth + terminalPreferredMinimumWidth
     static let restoreSplitAt: CGFloat = 840
+
+    static func railWidth(for visibility: TaskWorkspaceRailVisibility) -> CGFloat {
+        visibility == .split ? regularRailWidth : compactRailWidth
+    }
 
     static func railVisibility(
         availableWidth: CGFloat,
@@ -161,42 +615,422 @@ enum TaskWorkspaceLayoutPolicy {
     }
 }
 
+enum TaskListContentTrackLayoutPolicy {
+    static let maximumCardWidth: CGFloat = 780
+    static let horizontalPadding: CGFloat = 20
+    static let maximumTrackWidth = maximumCardWidth + horizontalPadding * 2
+
+    static func contentWidth(availableWidth: CGFloat) -> CGFloat {
+        let safeWidth = max(availableWidth, 0)
+        return min(
+            maximumCardWidth,
+            max(safeWidth - horizontalPadding * 2, 0)
+        )
+    }
+
+    static func trackWidth(availableWidth: CGFloat) -> CGFloat {
+        min(
+            contentWidth(availableWidth: availableWidth) + horizontalPadding * 2,
+            max(availableWidth, 0)
+        )
+    }
+
+    /// A normal max-width track does not visibly shrink until a wide pane has
+    /// crossed 820 points. During terminal reveal, interpolate the track from
+    /// its expanded width to its rail width using the pane's real layout
+    /// progress so the task UI moves from the first frame instead of catching
+    /// up at the end.
+    static func synchronizedContentWidth(
+        paneWidth: CGFloat,
+        expandedPaneWidth: CGFloat,
+        collapsedPaneWidth: CGFloat
+    ) -> CGFloat {
+        let expanded = max(expandedPaneWidth, 0)
+        let collapsed = min(max(collapsedPaneWidth, 0), expanded)
+        let travel = expanded - collapsed
+        guard travel > 0 else {
+            return contentWidth(availableWidth: paneWidth)
+        }
+
+        let progress = min(max((expanded - paneWidth) / travel, 0), 1)
+        let expandedContent = contentWidth(availableWidth: expanded)
+        let collapsedContent = contentWidth(availableWidth: collapsed)
+        return expandedContent + (collapsedContent - expandedContent) * progress
+    }
+}
+
+struct TaskWorkspaceRevealLayout: Equatable, Sendable {
+    let railWidth: CGFloat
+    let terminalWidth: CGFloat
+    let terminalShownX: CGFloat
+    let terminalHiddenX: CGFloat
+
+    private var availableWidth: CGFloat {
+        max(terminalHiddenX - TaskWorkspaceLayoutPolicy.dividerWidth, 0)
+    }
+
+    private var terminalSlotWidth: CGFloat {
+        terminalWidth + TaskWorkspaceLayoutPolicy.dividerWidth
+    }
+
+    func terminalX(revealProgress: CGFloat) -> CGFloat {
+        let progress = min(max(revealProgress, 0), 1)
+        return taskPaneWidth(revealProgress: progress)
+            + TaskWorkspaceLayoutPolicy.dividerWidth
+    }
+
+    func terminalX(isPresented: Bool) -> CGFloat {
+        terminalX(revealProgress: isPresented ? 1 : 0)
+    }
+
+    func dividerX(revealProgress: CGFloat) -> CGFloat {
+        taskPaneWidth(revealProgress: revealProgress)
+    }
+
+    func dividerX(isPresented: Bool) -> CGFloat {
+        dividerX(revealProgress: isPresented ? 1 : 0)
+    }
+
+    func taskPaneWidth(revealProgress: CGFloat) -> CGFloat {
+        let progress = min(max(revealProgress, 0), 1)
+        return max(availableWidth - terminalSlotWidth * progress, 0)
+    }
+
+    func taskPaneWidth(isPresented: Bool) -> CGFloat {
+        taskPaneWidth(revealProgress: isPresented ? 1 : 0)
+    }
+
+    func terminalReservedWidth(revealProgress: CGFloat) -> CGFloat {
+        let progress = min(max(revealProgress, 0), 1)
+        return terminalSlotWidth * progress
+    }
+
+    func terminalReservedWidth(isPresented: Bool) -> CGFloat {
+        terminalReservedWidth(revealProgress: isPresented ? 1 : 0)
+    }
+}
+
+enum TaskWorkspaceRevealLayoutPolicy {
+    static func resolve(
+        availableWidth: CGFloat,
+        railVisibility: TaskWorkspaceRailVisibility,
+        preferredTerminalWidth: CGFloat? = nil
+    ) -> TaskWorkspaceRevealLayout {
+        let safeAvailableWidth = max(availableWidth, 0)
+        let range = terminalWidthRange(
+            availableWidth: safeAvailableWidth,
+            railVisibility: railVisibility
+        )
+        let contentWidth = max(
+            safeAvailableWidth - TaskWorkspaceLayoutPolicy.dividerWidth,
+            0
+        )
+        let automaticTerminalWidth = max(
+            contentWidth - TaskWorkspaceLayoutPolicy.railWidth(for: railVisibility),
+            0
+        )
+        let requestedTerminalWidth = preferredTerminalWidth ?? automaticTerminalWidth
+        let terminalWidth = min(
+            max(requestedTerminalWidth, range.lowerBound),
+            range.upperBound
+        )
+        let railWidth = max(
+            safeAvailableWidth
+                - TaskWorkspaceLayoutPolicy.dividerWidth
+                - terminalWidth,
+            0
+        )
+        return TaskWorkspaceRevealLayout(
+            railWidth: railWidth,
+            terminalWidth: terminalWidth,
+            terminalShownX: railWidth + TaskWorkspaceLayoutPolicy.dividerWidth,
+            terminalHiddenX: safeAvailableWidth + TaskWorkspaceLayoutPolicy.dividerWidth
+        )
+    }
+
+    static func terminalWidthRange(
+        availableWidth: CGFloat,
+        railVisibility: TaskWorkspaceRailVisibility
+    ) -> ClosedRange<CGFloat> {
+        let contentWidth = max(
+            max(availableWidth, 0) - TaskWorkspaceLayoutPolicy.dividerWidth,
+            0
+        )
+        let minimumTerminalWidth = min(
+            TaskWorkspaceLayoutPolicy.terminalAbsoluteMinimumWidth,
+            contentWidth
+        )
+        let maximumWithUsableTaskRail = max(
+            contentWidth - TaskWorkspaceLayoutPolicy.compactRailWidth,
+            0
+        )
+        // A user-resized split may take the task rail down to its compact
+        // width. Without a saved preference, resolve() still starts from the
+        // regular or compact default for the current visibility mode.
+        // On very narrow windows the terminal's absolute minimum wins.
+        let maximumTerminalWidth = max(
+            minimumTerminalWidth,
+            maximumWithUsableTaskRail
+        )
+        return minimumTerminalWidth ... maximumTerminalWidth
+    }
+
+    static func clampedTerminalWidth(
+        _ proposedWidth: CGFloat,
+        availableWidth: CGFloat,
+        railVisibility: TaskWorkspaceRailVisibility
+    ) -> CGFloat {
+        let range = terminalWidthRange(
+            availableWidth: availableWidth,
+            railVisibility: railVisibility
+        )
+        return min(max(proposedWidth, range.lowerBound), range.upperBound)
+    }
+
+    static func resizedTerminalWidth(
+        availableWidth: CGFloat,
+        railVisibility: TaskWorkspaceRailVisibility,
+        startingWidth: CGFloat,
+        dividerTranslation: CGFloat
+    ) -> CGFloat {
+        clampedTerminalWidth(
+            startingWidth - dividerTranslation,
+            availableWidth: availableWidth,
+            railVisibility: railVisibility
+        )
+    }
+}
+
+struct TaskWorkspaceTerminalResizeInteractionState: Equatable, Sendable {
+    private(set) var startingWidth: CGFloat?
+    private(set) var latestWidth: CGFloat?
+
+    var isDragging: Bool {
+        startingWidth != nil
+    }
+
+    mutating func update(
+        currentWidth: CGFloat,
+        dividerTranslation: CGFloat
+    ) -> CGFloat {
+        let start = startingWidth ?? currentWidth
+        startingWidth = start
+        let width = start - dividerTranslation
+        latestWidth = width
+        return width
+    }
+
+    mutating func end(currentWidth: CGFloat) -> CGFloat {
+        let width = latestWidth ?? currentWidth
+        reset()
+        return width
+    }
+
+    mutating func reset() {
+        startingWidth = nil
+        latestWidth = nil
+    }
+}
+
+enum TaskWorkspaceTerminalResizeInteractionPolicy {
+    static let hitTargetWidth: CGFloat = 12
+    static let accessibilityStep: CGFloat = 24
+}
+
+enum TaskWorkspaceTerminalPanePreferences {
+    static let widthKey = "taskWorkspaceTerminalWidth.v1"
+}
+
+/// Owns the complete drawer geometry. Task width and terminal position are
+/// placed from one animatable value, so the shared boundary cannot drift even
+/// though the task list performs real responsive layout. Ghostty keeps one
+/// fixed final proposal throughout reveal; an explicit divider drag can update
+/// that final proposal without becoming a second reveal animation value.
+struct TaskWorkspaceSynchronizedLayout: Layout {
+    let railVisibility: TaskWorkspaceRailVisibility
+    let preferredTerminalWidth: CGFloat?
+    var revealProgress: CGFloat
+
+    var animatableData: CGFloat {
+        get { revealProgress }
+        set { revealProgress = newValue }
+    }
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews _: Subviews,
+        cache _: inout ()
+    ) -> CGSize {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal _: ProposedViewSize,
+        subviews: Subviews,
+        cache _: inout ()
+    ) {
+        guard subviews.count >= 2 else { return }
+        let layout = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: bounds.width,
+            railVisibility: railVisibility,
+            preferredTerminalWidth: preferredTerminalWidth
+        )
+        let progress = min(max(revealProgress, 0), 1)
+        let taskPaneWidth = layout.taskPaneWidth(revealProgress: progress)
+        let terminalSlotWidth = layout.terminalWidth
+            + TaskWorkspaceLayoutPolicy.dividerWidth
+
+        subviews[0].place(
+            at: bounds.origin,
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: taskPaneWidth, height: bounds.height)
+        )
+        subviews[1].place(
+            at: CGPoint(x: bounds.minX + taskPaneWidth, y: bounds.minY),
+            anchor: .topLeading,
+            proposal: ProposedViewSize(width: terminalSlotWidth, height: bounds.height)
+        )
+    }
+}
+
+enum TaskWorkspaceMotion {
+    static let duration: TimeInterval = 0.34
+
+    static func animation(reduceMotion: Bool) -> Animation? {
+        reduceMotion ? nil : .smooth(duration: duration)
+    }
+}
+
+struct TaskWorkspaceSwitchAnimationRequest: Equatable, Sendable {
+    let veilPresented: Bool
+    let generation: UInt64
+}
+
+struct TaskWorkspaceSwitchState: Equatable, Sendable {
+    private(set) var requestedTaskID: UUID?
+    private(set) var veilPresented = false
+    private(set) var animationTarget: Bool?
+    private var animationGeneration: UInt64 = 0
+
+    var isActive: Bool {
+        requestedTaskID != nil || veilPresented || animationTarget != nil
+    }
+
+    var isFullyCovered: Bool {
+        veilPresented && animationTarget == nil
+    }
+
+    mutating func request(_ taskID: UUID) {
+        requestedTaskID = taskID
+    }
+
+    mutating func cancel() {
+        requestedTaskID = nil
+    }
+
+    mutating func takeRequestedTaskID() -> UUID? {
+        defer { requestedTaskID = nil }
+        return requestedTaskID
+    }
+
+    mutating func beginVeilAnimation(
+        to isPresented: Bool
+    ) -> TaskWorkspaceSwitchAnimationRequest? {
+        guard animationTarget != isPresented else { return nil }
+        guard animationTarget != nil || veilPresented != isPresented else { return nil }
+        animationGeneration &+= 1
+        animationTarget = isPresented
+        return TaskWorkspaceSwitchAnimationRequest(
+            veilPresented: isPresented,
+            generation: animationGeneration
+        )
+    }
+
+    mutating func setVeilPresented(_ isPresented: Bool) {
+        veilPresented = isPresented
+    }
+
+    mutating func completeVeilAnimation(
+        _ request: TaskWorkspaceSwitchAnimationRequest
+    ) -> Bool {
+        guard animationGeneration == request.generation,
+              animationTarget == request.veilPresented
+        else { return false }
+        animationTarget = nil
+        return true
+    }
+
+    mutating func reset() {
+        animationGeneration &+= 1
+        requestedTaskID = nil
+        veilPresented = false
+        animationTarget = nil
+    }
+}
+
+enum TaskWorkspaceSwitchMotion {
+    static let coverDuration: TimeInterval = 0.07
+    static let revealDuration: TimeInterval = 0.11
+
+    static func animation(covering: Bool, reduceMotion: Bool) -> Animation? {
+        guard reduceMotion == false else { return nil }
+        return .easeOut(duration: covering ? coverDuration : revealDuration)
+    }
+}
+
+private struct TaskWorkspaceTerminalSlot: View {
+    let taskID: UUID?
+    let state: AppState
+    let taskWorkspace: TaskWorkspaceCoordinator
+    let railVisibility: TaskWorkspaceRailVisibility
+    let switchVeilPresented: Bool
+    let terminalWidth: CGFloat
+    let onResizeChanged: (CGFloat) -> Void
+    let onResizeEnded: (CGFloat) -> Void
+
+    var body: some View {
+        Group {
+            if let taskID {
+                TaskSplitWorkspace(
+                    taskID: taskID,
+                    state: state,
+                    taskWorkspace: taskWorkspace,
+                    railVisibility: railVisibility,
+                    switchVeilPresented: switchVeilPresented,
+                    terminalWidth: terminalWidth,
+                    onResizeChanged: onResizeChanged,
+                    onResizeEnded: onResizeEnded
+                )
+            } else {
+                Color.clear
+                    .accessibilityHidden(true)
+            }
+        }
+    }
+}
+
 private struct TaskSplitWorkspace: View {
     let taskID: UUID
     let state: AppState
     let taskWorkspace: TaskWorkspaceCoordinator
-
-    @State private var railVisibility: TaskWorkspaceRailVisibility?
-    @State private var chromePresented = false
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    let railVisibility: TaskWorkspaceRailVisibility
+    let switchVeilPresented: Bool
+    let terminalWidth: CGFloat
+    let onResizeChanged: (CGFloat) -> Void
+    let onResizeEnded: (CGFloat) -> Void
 
     var body: some View {
-        GeometryReader { proxy in
-            let resolvedVisibility = TaskWorkspaceLayoutPolicy.railVisibility(
-                availableWidth: proxy.size.width,
-                previous: railVisibility
-            )
-            let layoutState = taskWorkspace.layoutState(for: taskID)
-            let showsRail = resolvedVisibility == .split
-            let isClosing = taskWorkspace.closingTaskID == taskID
+        let layoutState = taskWorkspace.layoutState(for: taskID)
+        let isClosing = taskWorkspace.closingTaskID == taskID
 
-            HStack(spacing: 0) {
-                if showsRail {
-                    taskRail
-                        .frame(width: TaskWorkspaceLayoutPolicy.railWidth)
-                        .opacity(chromePresented && !isClosing ? 1 : 0)
-                        .offset(x: chromePresented && !isClosing ? 0 : -10)
-                        .animation(
-                            reduceMotion ? nil : .easeInOut(duration: 0.18),
-                            value: chromePresented && !isClosing
-                        )
+        HStack(spacing: 0) {
+            Rectangle()
+                .fill(TodoAgentUI.hairline)
+                .frame(width: TaskWorkspaceLayoutPolicy.dividerWidth)
+                .accessibilityHidden(true)
 
-                    Rectangle()
-                        .fill(TodoAgentUI.hairline)
-                        .frame(width: TaskWorkspaceLayoutPolicy.dividerWidth)
-                        .accessibilityHidden(true)
-                }
-
+            ZStack {
                 TaskWorkbenchView(
                     taskID: taskID,
                     state: state,
@@ -206,431 +1040,177 @@ private struct TaskSplitWorkspace: View {
                     requestClose: {
                         taskWorkspace.closeTaskWorkspace(taskID: taskID)
                     },
-                    presentation: .embedded(compact: resolvedVisibility == .compact),
+                    presentation: .embedded(compact: railVisibility == .compact),
                     isClosing: isClosing
                 )
                 .id(taskID)
-                // Ghostty must jump directly to its final AppKit frame. A
-                // per-frame width animation sends a resize on every frame and
-                // makes terminal input visibly stutter.
+                // Reveal changes only the slot's position. A divider drag may
+                // update its final width, but never replaces the Ghostty view.
                 .transaction { transaction in
                     transaction.animation = nil
                 }
+
+                Rectangle()
+                    .fill(Color(nsColor: NSColor(srgbRed: 0.10, green: 0.11, blue: 0.13, alpha: 1)))
+                    .opacity(switchVeilPresented ? 1 : 0)
+                    .allowsHitTesting(switchVeilPresented)
+                    .accessibilityHidden(true)
             }
-            .onAppear {
-                railVisibility = resolvedVisibility
-                taskWorkspace.updateActiveWorkspaceCompactState(
-                    taskID: taskID,
-                    isCompact: resolvedVisibility == .compact
-                )
-                presentChrome()
-            }
-            .onChange(of: proxy.size.width) { _, width in
-                let next = TaskWorkspaceLayoutPolicy.railVisibility(
-                    availableWidth: width,
-                    previous: railVisibility
-                )
-                guard next != railVisibility else { return }
-                var transaction = Transaction()
-                transaction.disablesAnimations = true
-                withTransaction(transaction) {
-                    railVisibility = next
-                }
-                taskWorkspace.updateActiveWorkspaceCompactState(
-                    taskID: taskID,
-                    isCompact: next == .compact
-                )
-            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(TodoAgentUI.canvasBackground)
         }
-        .background(TodoAgentUI.canvasBackground)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .overlay(alignment: .leading) {
+            TaskWorkspaceTerminalResizeDivider(
+                terminalWidth: terminalWidth,
+                onResizeChanged: onResizeChanged,
+                onResizeEnded: onResizeEnded
+            )
+        }
+        .onAppear {
+            taskWorkspace.updateActiveWorkspaceCompactState(
+                taskID: taskID,
+                isCompact: railVisibility == .compact
+            )
+        }
+        .onChange(of: railVisibility) { _, next in
+            taskWorkspace.updateActiveWorkspaceCompactState(
+                taskID: taskID,
+                isCompact: next == .compact
+            )
+        }
+        .onChange(of: taskID) { _, nextTaskID in
+            taskWorkspace.updateActiveWorkspaceCompactState(
+                taskID: nextTaskID,
+                isCompact: railVisibility == .compact
+            )
+        }
         .accessibilityIdentifier("task.workspace.split")
     }
-
-    private var taskRail: some View {
-        VStack(spacing: 0) {
-            HStack(spacing: 10) {
-                Text("任务")
-                    .font(.title3.weight(.semibold))
-                Spacer(minLength: 8)
-            }
-            .padding(.horizontal, 14)
-            .frame(height: 50)
-
-            Rectangle()
-                .fill(TodoAgentUI.hairline)
-                .frame(height: 1)
-
-            TaskListView(
-                state: state,
-                taskWorkspace: taskWorkspace,
-                selectedWorkspaceTaskID: taskID,
-                pendingWorkspaceTaskID: taskWorkspace.pendingTaskID,
-                usesWorkspaceRailLayout: true
-            )
-        }
-        .background(TodoAgentUI.sidebarBackground)
-    }
-
-    private func presentChrome() {
-        guard !reduceMotion else {
-            chromePresented = true
-            return
-        }
-        Task { @MainActor in
-            await Task.yield()
-            withAnimation(.easeInOut(duration: 0.22)) {
-                chromePresented = true
-            }
-        }
-    }
 }
 
-private struct TimelineColumns: View {
-    let state: AppState
-    let taskWorkspace: TaskWorkspaceCoordinator
+private enum TaskWorkspaceTerminalResizeCoordinateSpace {
+    static let name = "todoagent.task-workspace-resize"
+}
 
-    @State private var pointerNearScrollIndicator = false
+private struct TaskWorkspaceTerminalResizeDivider: View {
+    let terminalWidth: CGFloat
+    let onResizeChanged: (CGFloat) -> Void
+    let onResizeEnded: (CGFloat) -> Void
+
+    @State private var interactionState = TaskWorkspaceTerminalResizeInteractionState()
+    @State private var pointerInside = false
 
     var body: some View {
-        let days = state.timelineDays()
-
-        GeometryReader { proxy in
-            ScrollView(.horizontal) {
-                LazyHStack(alignment: .top, spacing: TodoAgentUI.boardSpacing) {
-                    ForEach(Array(days.enumerated()), id: \.element.id) { offset, timelineDay in
-                        TimelineColumn(
-                            offset: offset,
-                            timelineDay: timelineDay,
-                            selectedDateIsToday: state.selectedDay == state.currentDay,
-                            state: state,
-                            taskWorkspace: taskWorkspace
-                        )
-                        .frame(width: columnWidth(for: proxy.size.width))
-                    }
-                }
-                .padding(TodoAgentUI.boardPadding)
-            }
-            .scrollIndicators(
-                TimelineScrollIndicatorPolicy.showsIndicators(
-                    pointerNearIndicator: pointerNearScrollIndicator
+        Rectangle()
+            .fill(.clear)
+            .frame(width: TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetWidth)
+            .frame(maxHeight: .infinity)
+            .contentShape(.rect)
+            .gesture(
+                DragGesture(
+                    minimumDistance: 0,
+                    coordinateSpace: .named(TaskWorkspaceTerminalResizeCoordinateSpace.name)
                 )
-                    ? .visible
-                    : .hidden,
-                axes: .horizontal
-            )
-            .onContinuousHover { phase in
-                switch phase {
-                case let .active(location):
-                    pointerNearScrollIndicator = location.y
-                        >= proxy.size.height - TimelineScrollIndicatorPolicy.hoverZoneHeight
-                case .ended:
-                    pointerNearScrollIndicator = false
-                }
-            }
-            .overlay(alignment: .bottom) {
-                // macOS can force scrollbars to remain visible system-wide.
-                // This quiet cover preserves scrolling while making the track
-                // visually disappear until the pointer enters the timeline.
-                Rectangle()
-                    .fill(TodoAgentUI.canvasBackground)
-                    .frame(height: TimelineScrollIndicatorPolicy.coverHeight)
-                    .opacity(
-                        TimelineScrollIndicatorPolicy.coverOpacity(
-                            pointerNearIndicator: pointerNearScrollIndicator
-                        )
+                .onChanged { value in
+                    let width = interactionState.update(
+                        currentWidth: terminalWidth,
+                        dividerTranslation: value.translation.width
                     )
-                    .allowsHitTesting(false)
-            }
-            .animation(.easeOut(duration: 0.18), value: pointerNearScrollIndicator)
-        }
-        .background(TodoAgentUI.canvasBackground)
-    }
-
-    private func columnWidth(for availableWidth: CGFloat) -> CGFloat {
-        TimelineColumnLayoutPolicy.columnWidth(availableWidth: availableWidth)
-    }
-}
-
-enum TimelineScrollIndicatorPolicy {
-    static let coverHeight: CGFloat = 18
-    static let hoverZoneHeight: CGFloat = 26
-
-    static func showsIndicators(pointerNearIndicator: Bool) -> Bool {
-        pointerNearIndicator
-    }
-
-    static func coverOpacity(pointerNearIndicator: Bool) -> Double {
-        pointerNearIndicator ? 0 : 0.96
-    }
-}
-
-enum TimelineColumnLayoutPolicy {
-    static let dayCount: CGFloat = 4
-    static let preferredVisibleDayCount: CGFloat = 3
-
-    static func viewportWidth(showingDayCount visibleDayCount: Int) -> CGFloat {
-        let totalDayCount = Int(dayCount)
-        let safeDayCount = min(max(visibleDayCount, 1), totalDayCount)
-        let columns = CGFloat(safeDayCount) * TodoAgentUI.columnMinimumWidth
-        let spacing = CGFloat(safeDayCount - 1) * TodoAgentUI.boardSpacing
-
-        if safeDayCount == totalDayCount {
-            return (TodoAgentUI.boardPadding * 2) + columns + spacing
-        }
-
-        // The viewport ends in the middle of the following inter-column gap.
-        // This lets the Assistant rail meet the timeline cleanly between two
-        // complete days without revealing a sliver of the next card.
-        return TodoAgentUI.boardPadding
-            + columns
-            + spacing
-            + (TodoAgentUI.boardSpacing / 2)
-    }
-
-    /// Day cards grow continuously so a medium launch window ends in the gap
-    /// after the third complete day instead of exposing a distracting sliver
-    /// of day four. Once the minimum width is reached, a narrower viewport
-    /// naturally reveals two days; wider windows can eventually reveal all
-    /// four without a breakpoint-sized jump.
-    static func columnWidth(availableWidth: CGFloat) -> CGFloat {
-        let gapAllowance = TodoAgentUI.boardSpacing * (preferredVisibleDayCount - 0.5)
-        let proposed = (
-            availableWidth - TodoAgentUI.boardPadding - gapAllowance
-        ) / preferredVisibleDayCount
-        return min(
-            max(proposed, TodoAgentUI.columnMinimumWidth),
-            TodoAgentUI.columnMaximumWidth
-        )
-    }
-}
-
-private struct TimelineColumn: View {
-    let offset: Int
-    let timelineDay: TimelineDay
-    let selectedDateIsToday: Bool
-    let state: AppState
-    let taskWorkspace: TaskWorkspaceCoordinator
-
-    var body: some View {
-        let sections = TaskStatusSections(tasks: timelineDay.tasks)
-
-        VStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
-            HStack {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(dayTitle)
-                        .font(.title3)
-                        .bold()
-                    Text(daySubtitle)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
+                    NSCursor.resizeLeftRight.set()
+                    onResizeChanged(width)
                 }
-                Spacer()
-                if offset == 0 {
-                    Text(selectedDateIsToday ? "今天" : "所选")
-                        .font(.caption)
-                        .bold()
-                        .foregroundStyle(Color.accentColor)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.accentColor.opacity(0.1), in: .capsule)
-                }
-            }
-
-            if timelineDay.tasks.isEmpty {
-                Spacer().frame(height: 4)
-            } else {
-                ProgressView(value: timelineDay.progress)
-                    .tint(.green)
-                    .accessibilityLabel("\(daySubtitle)任务进度")
-                    .accessibilityValue("完成 \(timelineDay.completedCount) 项，共 \(timelineDay.totalCount) 项")
-            }
-
-            Group {
-                if timelineDay.tasks.isEmpty {
-                    TimelineEmptyState()
-                        .frame(maxHeight: .infinity)
-                } else {
-                    ScrollView(.vertical) {
-                        LazyVStack(alignment: .leading, spacing: TodoAgentUI.standardSpacing) {
-                            ForEach(sections.openTasks) { task in
-                                TaskCard(task: task, state: state)
-                            }
-
-                            if sections.hasCompletedSection {
-                                CompletedTasksSectionHeader(
-                                    hasOpenTasks: sections.openTasks.isEmpty == false,
-                                    accessibilityIdentifier: "timeline.\(timelineDay.day.description).completed-section"
-                                )
-
-                                ForEach(sections.completedTasks) { task in
-                                    TaskCard(task: task, state: state)
-                                }
-                            }
-                        }
-                        .frame(maxWidth: .infinity)
+                .onEnded { value in
+                    _ = interactionState.update(
+                        currentWidth: terminalWidth,
+                        dividerTranslation: value.translation.width
+                    )
+                    let width = interactionState.end(currentWidth: terminalWidth)
+                    onResizeEnded(width)
+                    if pointerInside == false {
+                        NSCursor.arrow.set()
                     }
-                    .scrollIndicators(.visible)
+                }
+            )
+            .onHover { isInside in
+                pointerInside = isInside
+                (isInside || interactionState.isDragging
+                    ? NSCursor.resizeLeftRight
+                    : NSCursor.arrow).set()
+            }
+            .onDisappear {
+                let shouldRestoreArrow = pointerInside || interactionState.isDragging
+                if interactionState.isDragging {
+                    onResizeEnded(interactionState.end(currentWidth: terminalWidth))
+                }
+                if shouldRestoreArrow {
+                    NSCursor.arrow.set()
                 }
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-
-            TimelineInlineTaskComposer(
-                state: state,
-                executionDay: timelineDay.day,
-                focusesForNewTaskCommand: offset == 0,
-                composerState: taskWorkspace.timelineComposerState(for: timelineDay.day)
-            )
-        }
-        .padding(TodoAgentUI.sectionSpacing)
-        .frame(maxHeight: .infinity, alignment: .top)
-        .background(
-            offset == 0 ? TodoAgentUI.selectionBackground : TodoAgentUI.surfaceBackground,
-            in: .rect(cornerRadius: TodoAgentUI.panelRadius)
-        )
-        .overlay {
-            RoundedRectangle(cornerRadius: TodoAgentUI.panelRadius)
-                .stroke(
-                    offset == 0 ? TodoAgentUI.primaryText.opacity(0.14) : TodoAgentUI.hairline,
-                    lineWidth: 1
-                )
-        }
-        .shadow(
-            color: offset == 0 ? TodoAgentUI.shadowColor.opacity(0.45) : .clear,
-            radius: 10,
-            y: 3
-        )
-        .accessibilityIdentifier("timeline.day-\(offset).column")
-    }
-
-    private var displayDate: Date? {
-        timelineDay.day.date(in: .todoAgentLocal)
-    }
-
-    private var dayTitle: String {
-        displayDate?.formatted(.dateTime.weekday(.wide)) ?? timelineDay.day.rawValue
-    }
-
-    private var daySubtitle: String {
-        displayDate?.formatted(.dateTime.month().day()) ?? timelineDay.day.rawValue
-    }
-}
-
-private struct TimelineEmptyState: View {
-    var body: some View {
-        VStack(spacing: TodoAgentUI.compactSpacing) {
-            Image(systemName: "checkmark.circle")
-                .font(.title2)
-                .foregroundStyle(.tertiary)
-            Text("这一天还没有安排")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 28)
-        .accessibilityElement(children: .combine)
-    }
-}
-
-private struct TimelineInlineTaskComposer: View {
-    let state: AppState
-    let executionDay: LocalDay
-    let focusesForNewTaskCommand: Bool
-    @Bindable var composerState: InlineAddTaskComposerState
-
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        HStack(spacing: TodoAgentUI.compactSpacing) {
-            Image(systemName: "plus.circle")
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
-
-            TextField("添加任务", text: $composerState.draft)
-                .textFieldStyle(.plain)
-                .focused($isFocused)
-                .onSubmit(submit)
-                .onExitCommand(perform: cancelEditing)
-                .accessibilityLabel("添加当天任务")
-                .accessibilityHint("输入标题并按回车创建，按 Escape 清空")
-                .accessibilityIdentifier("timeline.\(executionDay.description).add-task")
-
-            if composerState.isSubmitting {
-                ProgressView()
-                    .controlSize(.small)
-                    .accessibilityLabel("正在添加任务")
+            .accessibilityElement()
+            .accessibilityLabel("调整终端宽度")
+            .accessibilityValue("宽度 \(Int(terminalWidth)) 点")
+            .accessibilityHint("左右拖动调整终端大小")
+            .accessibilityIdentifier("task.workspace.resize-divider")
+            .accessibilityAdjustableAction { direction in
+                switch direction {
+                case .increment:
+                    onResizeEnded(
+                        terminalWidth
+                            + TaskWorkspaceTerminalResizeInteractionPolicy.accessibilityStep
+                    )
+                case .decrement:
+                    onResizeEnded(
+                        terminalWidth
+                            - TaskWorkspaceTerminalResizeInteractionPolicy.accessibilityStep
+                    )
+                @unknown default:
+                    break
+                }
             }
-        }
-        .font(.callout)
-        .foregroundStyle(TodoAgentUI.primaryText)
-        .padding(.horizontal, TodoAgentUI.compactSpacing)
-        .frame(minHeight: 36)
-        .background(TodoAgentUI.surfaceBackground.opacity(0.78), in: .rect(cornerRadius: 8))
-        .overlay {
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isFocused ? Color.accentColor.opacity(0.55) : .clear, lineWidth: 1)
-        }
-        .onTapGesture { isFocused = true }
-        .onReceive(NotificationCenter.default.publisher(for: .todoAgentFocusTaskComposer)) { _ in
-            if focusesForNewTaskCommand {
-                isFocused = true
-            }
-        }
-    }
-
-    private func submit() {
-        let submittedDraft = composerState.draft
-        let title = submittedDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !title.isEmpty, !composerState.isSubmitting else { return }
-
-        composerState.isSubmitting = true
-        Task { @MainActor in
-            let succeeded = await state.createTask(
-                title: title,
-                listID: nil,
-                executionDate: executionDay,
-                dueDate: nil
-            )
-            composerState.isSubmitting = false
-            if succeeded, composerState.draft == submittedDraft {
-                composerState.draft = ""
-            }
-            isFocused = true
-        }
-    }
-
-    private func cancelEditing() {
-        composerState.draft = ""
-        isFocused = false
     }
 }
 
 private struct TaskListView: View {
     let state: AppState
     let taskWorkspace: TaskWorkspaceCoordinator
+    let expandedPaneWidth: CGFloat
+    let collapsedPaneWidth: CGFloat
     var selectedWorkspaceTaskID: UUID?
     var pendingWorkspaceTaskID: UUID?
-    var usesWorkspaceRailLayout: Bool
+    var receivesComposerFocus: Bool
 
     init(
         state: AppState,
         taskWorkspace: TaskWorkspaceCoordinator,
+        expandedPaneWidth: CGFloat,
+        collapsedPaneWidth: CGFloat,
         selectedWorkspaceTaskID: UUID? = nil,
         pendingWorkspaceTaskID: UUID? = nil,
-        usesWorkspaceRailLayout: Bool = false
+        receivesComposerFocus: Bool = true
     ) {
         self.state = state
         self.taskWorkspace = taskWorkspace
+        self.expandedPaneWidth = expandedPaneWidth
+        self.collapsedPaneWidth = collapsedPaneWidth
         self.selectedWorkspaceTaskID = selectedWorkspaceTaskID
         self.pendingWorkspaceTaskID = pendingWorkspaceTaskID
-        self.usesWorkspaceRailLayout = usesWorkspaceRailLayout
+        self.receivesComposerFocus = receivesComposerFocus
     }
 
     var body: some View {
-        let tasks = state.visibleTasks()
+        let tasks = displayedTasks
         let sections = TaskStatusSections(tasks: tasks)
 
-        VStack(spacing: 0) {
-            ScrollViewReader { scrollProxy in
+        GeometryReader { proxy in
+            let contentWidth = TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
+                paneWidth: proxy.size.width,
+                expandedPaneWidth: expandedPaneWidth,
+                collapsedPaneWidth: collapsedPaneWidth
+            )
+
+            VStack(spacing: 0) {
                 ScrollView {
                     LazyVStack(spacing: TodoAgentUI.standardSpacing) {
                         if tasks.isEmpty {
@@ -669,33 +1249,38 @@ private struct TaskListView: View {
                             }
                         }
                     }
-                    .frame(maxWidth: usesWorkspaceRailLayout ? .infinity : 780)
-                    .padding(usesWorkspaceRailLayout ? 14 : 20)
+                    .frame(width: contentWidth)
+                    .padding(.horizontal, TaskListContentTrackLayoutPolicy.horizontalPadding)
+                    .padding(.vertical, TaskListContentTrackLayoutPolicy.horizontalPadding)
+                    .frame(maxWidth: .infinity, alignment: .center)
                 }
-                .onAppear { scrollSelectedTaskToVisible(using: scrollProxy) }
-                .onChange(of: selectedWorkspaceTaskID) { _, _ in
-                    scrollSelectedTaskToVisible(using: scrollProxy)
-                }
-            }
 
-            if let addTaskDestination {
-                InlineAddTaskComposer(
-                    state: state,
-                    destination: addTaskDestination,
-                    composerState: taskWorkspace.composerState(for: addTaskDestination),
-                    horizontalPadding: usesWorkspaceRailLayout ? 14 : 20
-                )
+                if let addTaskDestination {
+                    InlineAddTaskComposer(
+                        state: state,
+                        destination: addTaskDestination,
+                        composerState: taskWorkspace.composerState(for: addTaskDestination),
+                        contentWidth: contentWidth,
+                        receivesFocusNotifications: receivesComposerFocus
+                    )
                     .id(addTaskDestination)
+                }
+
+                if let parkedTask {
+                    ParkedTerminalDock(task: parkedTask) {
+                        state.openTask(parkedTask)
+                    }
+                }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(TodoAgentUI.canvasBackground)
         }
-        .frame(maxWidth: .infinity)
-        .background(TodoAgentUI.canvasBackground)
     }
 
     private var addTaskDestination: InlineAddTaskDestination? {
         switch state.selection {
-        case .smart where usesWorkspaceRailLayout:
-            .allTasks
+        case .smart(.myDay):
+            .myDay
         case .smart(.tasks):
             .allTasks
         case let .list(id):
@@ -705,18 +1290,32 @@ private struct TaskListView: View {
         }
     }
 
-    private func scrollSelectedTaskToVisible(using proxy: ScrollViewProxy) {
-        guard usesWorkspaceRailLayout, let selectedWorkspaceTaskID else { return }
-        Task { @MainActor in
-            await Task.yield()
-            proxy.scrollTo(selectedWorkspaceTaskID, anchor: .center)
-        }
+    private var parkedTask: TaskItem? {
+        guard taskWorkspace.presentedTaskID == nil,
+              let taskID = taskWorkspace.selectedTaskID,
+              let task = state.task(id: taskID),
+              state.session(for: task)?.state.isBusy == true
+        else { return nil }
+        return task
+    }
+
+    private var displayedTasks: [TaskItem] {
+        let scopedTasks = state.displayedTasks(for: state.selection)
+        guard let selectedWorkspaceTaskID,
+              scopedTasks.contains(where: { $0.id == selectedWorkspaceTaskID }) == false,
+              let selectedTask = state.task(id: selectedWorkspaceTaskID)
+        else { return scopedTasks }
+
+        // A Today/filter mutation is optimistic. Keep the open card reachable
+        // until the workspace flush succeeds so a failed save still exposes
+        // its inline retry action instead of stranding an unlisted terminal.
+        return [selectedTask] + scopedTasks
     }
 
     private var completedSectionIdentifier: String {
         switch state.selection {
-        case .smart(.timeline):
-            "timeline.completed-section"
+        case .smart(.myDay):
+            "my-day.completed-section"
         case .smart(.tasks):
             "task-list.completed-section"
         case .smart(.running):
@@ -732,6 +1331,8 @@ private struct TaskListView: View {
 
     private var emptyDescription: String {
         switch state.selection {
+        case .smart(.myDay):
+            "今天还没有安排。使用下方的“添加任务”创建，或从“任务”加入。"
         case .smart(.running):
             "当前没有正在运行的本地 Session。"
         case .smart(.done):
@@ -741,6 +1342,50 @@ private struct TaskListView: View {
         default:
             "当前列表为空。"
         }
+    }
+}
+
+private struct ParkedTerminalDock: View {
+    let task: TaskItem
+    let reopen: () -> Void
+
+    var body: some View {
+        Button(action: reopen) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 8, height: 8)
+                    .shadow(color: Color.green.opacity(0.8), radius: 4)
+                    .accessibilityHidden(true)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(task.title)
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                    Text("终端仍在运行 · 收起不是结束")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer(minLength: 8)
+
+                Text("打开")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .padding(.horizontal, 14)
+            .frame(minHeight: 48)
+            .contentShape(.rect)
+        }
+        .buttonStyle(.plain)
+        .background(TodoAgentUI.sidebarBackground)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(TodoAgentUI.hairline)
+                .frame(height: 1)
+        }
+        .accessibilityLabel("重新打开 \(task.title) 的终端，终端仍在运行")
+        .accessibilityIdentifier("task.workspace.parked-terminal")
     }
 }
 
@@ -765,18 +1410,25 @@ private struct CompletedTasksSectionHeader: View {
 }
 
 enum InlineAddTaskDestination: Hashable {
+    case myDay
     case allTasks
     case list(UUID)
 
     var listID: UUID? {
         switch self {
-        case .allTasks: nil
+        case .myDay, .allTasks: nil
         case let .list(id): id
         }
     }
 
+    func executionDate(today: LocalDay) -> LocalDay? {
+        self == .myDay ? today : nil
+    }
+
     var accessibilityIdentifier: String {
         switch self {
+        case .myDay:
+            "my-day.add-task"
         case .allTasks:
             "task-list.add-task"
         case let .list(id):
@@ -796,7 +1448,8 @@ private struct InlineAddTaskComposer: View {
     let state: AppState
     let destination: InlineAddTaskDestination
     @Bindable var composerState: InlineAddTaskComposerState
-    let horizontalPadding: CGFloat
+    let contentWidth: CGFloat
+    let receivesFocusNotifications: Bool
 
     @FocusState private var isFocused: Bool
 
@@ -830,18 +1483,21 @@ private struct InlineAddTaskComposer: View {
             .font(.callout)
             .foregroundStyle(TodoAgentUI.primaryText)
             .padding(.horizontal, TodoAgentUI.cardPadding)
-            .frame(maxWidth: 780, minHeight: 44)
+            .frame(width: contentWidth)
+            .frame(minHeight: 44)
             .background(TodoAgentUI.surfaceBackground, in: .rect(cornerRadius: TodoAgentUI.cardRadius))
             .overlay {
                 RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
                     .stroke(TodoAgentUI.hairline, lineWidth: 1)
             }
-            .padding(.horizontal, horizontalPadding)
+            .padding(.horizontal, TaskListContentTrackLayoutPolicy.horizontalPadding)
             .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .center)
         }
         .frame(maxWidth: .infinity)
         .background(TodoAgentUI.canvasBackground)
         .onReceive(NotificationCenter.default.publisher(for: .todoAgentFocusTaskComposer)) { _ in
+            guard receivesFocusNotifications else { return }
             isFocused = true
         }
     }
@@ -856,7 +1512,7 @@ private struct InlineAddTaskComposer: View {
             let succeeded = await state.createTask(
                 title: title,
                 listID: destination.listID,
-                executionDate: nil,
+                executionDate: destination.executionDate(today: state.currentDay),
                 dueDate: nil
             )
             composerState.isSubmitting = false
@@ -978,7 +1634,17 @@ struct TaskCard: View {
 
         Divider()
 
-        taskDateMenu(field: .execution, presentation: presentation)
+        Button {
+            state.setTask(task, inMyDay: state.isTaskInMyDay(task) == false)
+        } label: {
+            Label(
+                state.isTaskInMyDay(task) ? "移出今天" : "加入今天",
+                systemImage: state.isTaskInMyDay(task) ? "sun.max.fill" : "sun.max"
+            )
+        }
+        .disabled(state.isTaskCommandInFlight(taskID: task.id))
+        .accessibilityIdentifier(TaskContextMenuAccessibility.myDay)
+
         taskDateMenu(field: .due, presentation: presentation)
 
         Divider()
@@ -1072,18 +1738,10 @@ struct TaskCard: View {
 
     private func setDate(_ day: LocalDay?, for field: TaskContextDateField) {
         let value = day.map(TaskPatchField.set) ?? .clear
-        switch field {
-        case .execution:
-            state.enqueueImmediateTaskUpdate(
-                taskID: task.id,
-                patch: TaskPatch(executionDate: value)
-            )
-        case .due:
-            state.enqueueImmediateTaskUpdate(
-                taskID: task.id,
-                patch: TaskPatch(dueDate: value)
-            )
-        }
+        state.enqueueImmediateTaskUpdate(
+            taskID: task.id,
+            patch: TaskPatch(dueDate: value)
+        )
     }
 
     private func moveTask(to listID: UUID?) {
@@ -1299,13 +1957,12 @@ struct TaskContextHighlightState: Equatable, Sendable {
 }
 
 enum TaskContextDateField: String, Identifiable, Sendable {
-    case execution
     case due
 
     var id: String { rawValue }
-    var menuTitle: String { self == .execution ? "执行日期" : "截止日期" }
-    var clearTitle: String { self == .execution ? "清除执行日期" : "清除截止日期" }
-    var systemImage: String { self == .execution ? "calendar.badge.clock" : "calendar.badge.exclamationmark" }
+    var menuTitle: String { "截止日期" }
+    var clearTitle: String { "清除截止日期" }
+    var systemImage: String { "calendar.badge.exclamationmark" }
 }
 
 struct TaskMoveDestination: Identifiable, Equatable, Sendable {
@@ -1343,10 +2000,7 @@ struct TaskContextMenuPresentation: Equatable, Sendable {
     }
 
     func currentDate(for field: TaskContextDateField) -> LocalDay? {
-        switch field {
-        case .execution: task.executionDate
-        case .due: task.dueDate
-        }
+        task.dueDate
     }
 
     func dateMenuTitle(for field: TaskContextDateField) -> String {
@@ -1357,6 +2011,7 @@ struct TaskContextMenuPresentation: Equatable, Sendable {
 
 enum TaskContextMenuAccessibility {
     static let completion = "task.context.completion"
+    static let myDay = "task.context.my-day"
     static let createList = "task.context.create-list"
     static let moveMenu = "task.context.move-menu"
     static let delete = "task.context.delete"

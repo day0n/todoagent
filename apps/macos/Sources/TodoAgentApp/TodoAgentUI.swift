@@ -60,6 +60,8 @@ enum TodoAgentUI {
     static let sidebarFooterGradientHeight: CGFloat = 64
     static let sidebarNavigationTopSpacing: CGFloat = 8
     static let floatingButtonSize: CGFloat = 46
+    static let floatingButtonTrailingPadding: CGFloat = 22
+    static let floatingButtonBottomPadding: CGFloat = 48
     static let composerRadius: CGFloat = 16
 
     static let glassHighlight = adaptiveColor(

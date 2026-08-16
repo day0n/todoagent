@@ -9,6 +9,7 @@ final class AppContainer {
     let state: AppState
     let terminalSessions: TerminalSessionRegistry
     let taskWorkspace: TaskWorkspaceCoordinator
+    let workspaceChrome: MainWorkspaceChromeCoordinator
 
     private init() {
         do {
@@ -28,6 +29,8 @@ final class AppContainer {
                 state: state,
                 terminalSessions: terminalSessions
             )
+            workspaceChrome = MainWorkspaceChromeCoordinator(state: state)
+            taskWorkspace.presentationPreparer = workspaceChrome
             state.taskWorkspacePresenter = taskWorkspace
             state.terminalSessions = terminalSessions
         } catch {
@@ -43,6 +46,8 @@ final class AppContainer {
                 state: state,
                 terminalSessions: terminalSessions
             )
+            workspaceChrome = MainWorkspaceChromeCoordinator(state: state)
+            taskWorkspace.presentationPreparer = workspaceChrome
             state.taskWorkspacePresenter = taskWorkspace
             state.terminalSessions = terminalSessions
         }
