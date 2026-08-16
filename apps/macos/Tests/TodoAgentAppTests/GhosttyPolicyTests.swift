@@ -121,6 +121,10 @@ struct GhosttyPolicyTests {
             fileExists: { expected.contains($0.path) }
         ).resolve()
         #expect(found == root.appendingPathComponent("ghostty", isDirectory: true))
+        #expect(
+            GhosttyBundledResources.terminfoDirectory() == nil
+                || GhosttyBundledResources.terminfoDirectory()?.lastPathComponent == "terminfo"
+        )
         let missing = GhosttyResourceResolver(
             candidates: [root.appendingPathComponent("ghostty", isDirectory: true)],
             isDirectory: { expected.contains($0.path) },
@@ -142,6 +146,44 @@ struct GhosttyPolicyTests {
         #expect(configuration.contains("clipboard-read = ask"))
         #expect(configuration.contains("clipboard-paste-protection = true"))
         #expect(configuration.contains("title-report = false"))
+        #expect(configuration.contains("env = NO_COLOR="))
+        #expect(configuration.contains("env = NODE_DISABLE_COLORS="))
+        #expect(configuration.contains("env = COLORTERM=truecolor"))
+        #expect(configuration.contains("env = FORCE_COLOR=3"))
+        #expect(configuration.contains("env = TERM_PROGRAM=ghostty"))
+    }
+
+    @Test func launchEnvironmentAdvertisesTruecolorAndClearsInheritedDisableFlags() {
+        let environment = GhosttyTerminalEnvironment.launchEnvironment(
+            base: [
+                "NO_COLOR": "1",
+                "NODE_DISABLE_COLORS": "1",
+                "FORCE_COLOR": "0",
+                "COLORTERM": "yes",
+                "TERM_PROGRAM": "vscode",
+                "PATH": "/usr/bin",
+            ],
+            inherited: ["HOME": "/Users/me", "NO_COLOR": "1"],
+            terminfoDirectory: "/bundle/terminfo"
+        )
+        #expect(environment["HOME"] == "/Users/me")
+        #expect(environment["NO_COLOR"] == "")
+        #expect(environment["NODE_DISABLE_COLORS"] == "")
+        #expect(environment["FORCE_COLOR"] == "3")
+        #expect(environment["COLORTERM"] == "truecolor")
+        #expect(environment["TERM_PROGRAM"] == "ghostty")
+        #expect(environment["TERMINFO"] == "/bundle/terminfo")
+        #expect(environment["PATH"] == "/usr/bin")
+    }
+
+    @Test func launchEnvironmentOmitsTerminfoWhenTheBundleHasNone() {
+        let environment = GhosttyTerminalEnvironment.launchEnvironment(
+            base: [:],
+            inherited: [:],
+            terminfoDirectory: nil
+        )
+        #expect(environment["TERMINFO"] == nil)
+        #expect(environment["COLORTERM"] == "truecolor")
     }
 
     @Test func ghosttyOcclusionAPIReceivesVisibilityPolarity() {

@@ -13,7 +13,7 @@ final class GhosttyTerminalSurfaceFactory: TerminalSurfaceFactory {
         let configuration = GhosttyTerminalConfiguration(
             command: command,
             workingDirectory: plan.workingDirectory,
-            environment: plan.environment
+            environment: GhosttyTerminalEnvironment.launchEnvironment(base: plan.environment)
         )
         return try GhosttyTerminalSession(configuration: configuration)
     }
@@ -28,7 +28,7 @@ final class GhosttyTerminalSurfaceFactory: TerminalSurfaceFactory {
         let configuration = GhosttyTerminalConfiguration(
             command: try GhosttyCommandBuilder.hostShellCommand(),
             workingDirectory: initialDirectory,
-            environment: environment
+            environment: GhosttyTerminalEnvironment.launchEnvironment(base: environment)
         )
         return try GhosttyTerminalSession(configuration: configuration)
     }

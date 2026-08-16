@@ -26,6 +26,35 @@ struct GhosttyTerminalConfiguration: Sendable, Equatable {
     }
 }
 
+/// Environment Ghostty should inject so TUI agents keep their real palette.
+///
+/// Claude Code (and other chalk/Ink apps) disable color when `NO_COLOR` is
+/// present, when `FORCE_COLOR=0`, or when `xterm-ghostty` has no terminfo.
+/// TodoAgent is often launched from an IDE that exports those disable flags,
+/// and the bundled terminfo is not on the default search path.
+enum GhosttyTerminalEnvironment {
+    static func launchEnvironment(
+        base: [String: String],
+        inherited: [String: String] = ProcessInfo.processInfo.environment,
+        terminfoDirectory: String? = GhosttyBundledResources.terminfoDirectory()?.path
+    ) -> [String: String] {
+        var environment = inherited
+        environment.merge(base) { _, new in new }
+        environment["COLORTERM"] = "truecolor"
+        environment["FORCE_COLOR"] = "3"
+        environment["TERM_PROGRAM"] = "ghostty"
+        // Empty values neutralize inherited disable flags. Ghostty's config
+        // `env = KEY=` form also deletes the key; the surface map must still
+        // override a parent `NO_COLOR=1` if that deletion is skipped.
+        environment["NO_COLOR"] = ""
+        environment["NODE_DISABLE_COLORS"] = ""
+        if let terminfoDirectory, !terminfoDirectory.isEmpty {
+            environment["TERMINFO"] = terminfoDirectory
+        }
+        return environment
+    }
+}
+
 enum TerminalWorkingDirectoryPolicy {
     static func isAvailable(
         _ path: String,

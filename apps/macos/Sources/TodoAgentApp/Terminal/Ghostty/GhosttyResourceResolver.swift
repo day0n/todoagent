@@ -46,4 +46,13 @@ enum GhosttyBundledResources {
             fileExists: { fileManager.fileExists(atPath: $0.path) }
         ).resolve()
     }
+
+    /// Sibling of `GHOSTTY_RESOURCES_DIR`. libghostty derives this path the
+    /// same way; exposing it lets the PTY child find `xterm-ghostty` even
+    /// when the system terminfo database does not include that entry.
+    static func terminfoDirectory(bundle: Bundle? = nil) -> URL? {
+        resolve(bundle: bundle)?
+            .deletingLastPathComponent()
+            .appendingPathComponent("terminfo", isDirectory: true)
+    }
 }

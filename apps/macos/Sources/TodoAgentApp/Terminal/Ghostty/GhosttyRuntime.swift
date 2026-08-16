@@ -14,7 +14,7 @@ final class GhosttyRuntime {
     static let shared = GhosttyRuntime()
 
     private(set) var app: ghostty_app_t?
-    private var config: ghostty_config_t?
+    private(set) var config: ghostty_config_t?
     let callbacks = GhosttyCallbacks()
     private var resourcePath: String?
     private(set) var startupError: GhosttyTerminalError?
@@ -103,6 +103,28 @@ final class GhosttyRuntime {
         ghostty_app_tick(app)
     }
 
+    func reloadConfig(reloadApp: Bool, surface: ghostty_surface_t?) {
+        guard let config else { return }
+        if reloadApp, let app {
+            ghostty_app_update_config(app, config)
+        }
+        if let surface {
+            ghostty_surface_update_config(surface, config)
+        }
+    }
+
+    func applyColorScheme(_ scheme: ghostty_color_scheme_e, to surface: ghostty_surface_t?) {
+        if let config, let surface {
+            ghostty_surface_update_config(surface, config)
+        }
+        if let app {
+            ghostty_app_set_color_scheme(app, scheme)
+        }
+        if let surface {
+            ghostty_surface_set_color_scheme(surface, scheme)
+        }
+    }
+
 }
 
 /// C callbacks may arrive on Ghostty worker threads. Values owned by the C call
@@ -178,6 +200,16 @@ final class GhosttyCallbacks: @unchecked Sendable {
             guard let view = view(from: target) else { return true }
             let selected = action.action.search_selected.selected
             DispatchQueue.main.async { view.updateFindSelection(selected: selected) }
+            return true
+        case GHOSTTY_ACTION_RELOAD_CONFIG:
+            // `set_color_scheme` asks the embedder to push the current config
+            // back onto the app/surface. Without this, the ANSI palette can
+            // stay unset and TUI apps render as default white.
+            let reloadApp = target.tag == GHOSTTY_TARGET_APP
+            let surface = target.tag == GHOSTTY_TARGET_SURFACE ? target.target.surface : nil
+            DispatchQueue.main.async {
+                GhosttyRuntime.shared.reloadConfig(reloadApp: reloadApp, surface: surface)
+            }
             return true
         case GHOSTTY_ACTION_SHOW_CHILD_EXITED:
             // Consume Ghostty's "press any key" fallback. TodoAgent owns the

@@ -49,6 +49,7 @@ struct ContentView: View {
 
         NavigationSplitView(columnVisibility: navigationColumnVisibility) {
             SidebarView(state: state)
+                .tint(TodoAgentUI.primaryText)
                 .navigationSplitViewColumnWidth(
                     min: 210,
                     ideal: TodoAgentUI.sidebarIdealWidth,
@@ -102,6 +103,7 @@ struct ContentView: View {
                         )
 
                         TodoAgentInspector(state: state)
+                            .tint(TodoAgentUI.primaryText)
                             .frame(width: assistantWidth)
                     }
                     .frame(width: assistantDrawerWidth)
@@ -138,7 +140,6 @@ struct ContentView: View {
         // Unlike `.balanced`, prominent-detail keeps Board/Ghostty geometry
         // stable while the native Sidebar slides over the leading edge.
         .navigationSplitViewStyle(.prominentDetail)
-        .tint(TodoAgentUI.primaryText)
         .background {
             GeometryReader { proxy in
                 Color.clear
@@ -153,10 +154,14 @@ struct ContentView: View {
                     }
             }
         }
+        // Workspace chrome lock must not disable this subtree. SwiftUI's
+        // disabled styling can attach a washed filter to Ghostty's Metal
+        // layer and leave Claude Code's yellow/orange palette looking white.
         .disabled(
-            state.loadState == .loading
-                || state.isPreparingToTerminate
-                || taskWorkspaceExternalChromeLocked
+            MainWorkspaceInteractionPolicy.disablesContent(
+                loadState: state.loadState,
+                isPreparingToTerminate: state.isPreparingToTerminate
+            )
         )
         .onAppear {
             taskWorkspace.presentationPreparer = workspaceChrome
@@ -322,6 +327,20 @@ struct ContentView: View {
             get: { state.errorMessage != nil },
             set: { if !$0 { state.errorMessage = nil } }
         )
+    }
+}
+
+enum MainWorkspaceInteractionPolicy {
+    static func disablesContent(
+        loadState: AppLoadState,
+        isPreparingToTerminate: Bool
+    ) -> Bool {
+        switch loadState {
+        case .loading:
+            true
+        case .loaded, .failed:
+            isPreparingToTerminate
+        }
     }
 }
 

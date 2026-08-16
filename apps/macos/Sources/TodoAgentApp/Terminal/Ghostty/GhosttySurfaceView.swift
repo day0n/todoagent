@@ -47,6 +47,7 @@ final class GhosttySurfaceView: NSView {
         self.configuration = configuration
         super.init(frame: .zero)
         wantsLayer = true
+        layer?.isOpaque = true
         registerForDraggedTypes([.fileURL, .string, .URL])
         observeLifecycle()
     }
@@ -96,11 +97,7 @@ final class GhosttySurfaceView: NSView {
 
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
-        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        ghostty_app_set_color_scheme(app, dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
-        if let surface {
-            ghostty_surface_set_color_scheme(surface, dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
-        }
+        applyColorScheme()
     }
 
     override func becomeFirstResponder() -> Bool {
@@ -209,19 +206,25 @@ final class GhosttySurfaceView: NSView {
                 return ghostty_surface_new(app, &config)
             }
         }
-        guard let surface else {
+        guard surface != nil else {
             pendingCreation = true
             return
         }
-        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
-        ghostty_app_set_color_scheme(app, dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
-        ghostty_surface_set_color_scheme(surface, dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT)
+        applyColorScheme()
         updateDisplay()
         updateGeometry()
         updateOcclusion()
         updateGhosttyFocus()
         accessibilityExposureDidChange()
         report(.started)
+    }
+
+    private func applyColorScheme() {
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        GhosttyRuntime.shared.applyColorScheme(
+            dark ? GHOSTTY_COLOR_SCHEME_DARK : GHOSTTY_COLOR_SCHEME_LIGHT,
+            to: surface
+        )
     }
 
     private func duplicate(_ value: String) -> UnsafeMutablePointer<CChar>? {

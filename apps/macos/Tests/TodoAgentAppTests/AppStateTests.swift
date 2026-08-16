@@ -65,6 +65,28 @@ struct AppStateTests {
         #expect(MainWorkspaceNavigationPolicy.canonicalVisibility(.detailOnly) == .detailOnly)
     }
 
+    @Test("workspace chrome lock does not disable the Ghostty surface")
+    func workspaceChromeLockDoesNotDisableContent() {
+        #expect(
+            MainWorkspaceInteractionPolicy.disablesContent(
+                loadState: .loaded,
+                isPreparingToTerminate: false
+            ) == false
+        )
+        #expect(
+            MainWorkspaceInteractionPolicy.disablesContent(
+                loadState: .loading,
+                isPreparingToTerminate: false
+            )
+        )
+        #expect(
+            MainWorkspaceInteractionPolicy.disablesContent(
+                loadState: .loaded,
+                isPreparingToTerminate: true
+            )
+        )
+    }
+
     @Test("native Sidebar writes cannot interrupt terminal geometry preparation")
     func nativeSidebarWriteIsLockedDuringTerminalPreparation() {
         let state = AppState(repository: AssistantTestRepository())
