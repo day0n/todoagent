@@ -26,8 +26,8 @@ Coding Agent 已经能在终端里工作，但任务管理、工作目录、会�
 
 ## 当前能力
 
-- 管理任务、清单、执行日期、截止日期、状态和本地附件；支持四日时间线、逾期提示、
-  菜单栏今日任务和原生右键操作。
+- 管理任务、清单、彼此独立的执行日期与截止日期、状态和本地附件；支持“今天”、
+  截止日期逾期提示、菜单栏入口和原生右键操作。
 - 在主窗口内为每个任务保留独立的 Ghostty PTY；收起或切换任务只重新挂载界面，
   不会结束仍在运行的终端。
 - 检测并验证 Codex、Claude Code、Cursor Agent、Kiro CLI；单个 Runtime 未安装或
@@ -55,6 +55,27 @@ CLI 的对话正文，也不保存旧终端滚屏；为精确绑定与恢复，�
 标题也不会作为 Prompt；Claude fresh Run 会把标题作为 `--name` Session 名称交给
 Claude CLI 处理。Gemini 任务助手没有 shell、任意文件读写或 CLI 派发权限。自动派发、
 结果回收和跨 Agent 编排是独立的[后续路线](TODO.md)，不能与现有终端能力混为一谈。
+
+## “今天”与主窗口工作流
+
+当前开发预览已经实现以下行为：
+
+- “今天”是动态投影，只显示 `executionDate == 本地 currentDay` 的任务；全部任务仍在
+  独立的任务总库存中，不会因为离开“今天”而消失。
+- 执行日期快捷操作“加入今天”只把任务的 `executionDate` 设为本地当天，“移出今天”
+  只清除该字段；
+  两者都不复制或删除任务，也不结束任务对应的 Agent、PTY 或 scrollback。
+- `dueDate` 始终与 `executionDate` 独立。已有数据库中的未来 `executionDate` 会原样保留
+  以兼容旧数据，但不会继续生成“明天/后天”的时间线列。
+- 主窗口保持左侧任务 rail、右侧真实终端；从“今天”打开任务时，rail 只显示当天
+  范围，从任务库存或清单打开时使用对应的紧凑任务范围。
+- 终端上的左箭头只负责 detach/收起终端界面；Controller、Agent 进程、PTY 和当前
+  scrollback 都继续保留，右侧不再提供重复的 `Esc` 收起入口。
+- Gemini 任务助手的 mutation 只允许把执行日设为本地当天或清空；明确的未来日期仍可
+  独立作为截止日期表达，查询旧数据中的任意执行日不受影响。
+
+数据与生命周期边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) 和
+[`docs/DATA_AND_PRIVACY.md`](docs/DATA_AND_PRIVACY.md)。
 
 ## 支持的本地 Runtime
 
@@ -112,7 +133,7 @@ Runtime。普通 shell 中手动启动的 CLI 不会自动登记成可跨 App �
 
 ```text
 SwiftUI / AppKit
-  ├─ 任务、清单、时间线与菜单栏
+  ├─ 任务、清单、日期投影与菜单栏
   ├─ 主窗口任务栏 + 每任务唯一终端
   │    └─ retained Ghostty PTY ── Codex / Claude Code / Cursor Agent / Kiro CLI
   └─ Gemini 任务助手

@@ -7,10 +7,11 @@
 
 ```text
 TodoAgent macOS App
-  ├─ SwiftUI：任务、清单、时间线、设置、Gemini 助手
+  ├─ SwiftUI：任务、清单、日期投影、设置、Gemini 助手
   ├─ AppKit：窗口、菜单、文件授权与原生交互
-  ├─ Task Workbench Window
-  │    └─ GhosttyKit Surface / PTY
+  ├─ Main Window Task Workspace
+  │    ├─ compact task rail
+  │    └─ retained GhosttyKit Surface / PTY
   │         └─ todoagent-terminal-runner
   │              └─ Codex / Claude Code / Cursor Agent / Kiro CLI
   └─ EngineClient
@@ -121,12 +122,29 @@ Engine 会先为 v5 数据库创建另一份 `0600` 备份，再在事务中为
 ## 任务与编辑一致性
 
 - `Task.status` 只有 `open | completed`。
-- `executionDate` 与 `dueDate` 是彼此独立的本地日历日；只有执行日期决定时间线和
-  “今日任务”投影。
+- `executionDate` 与 `dueDate` 是彼此独立的本地日历日；当前“今天”投影只由
+  `executionDate == 本地 currentDay` 决定。
 - 标题与备注使用 800ms trailing autosave。文本控件聚焦或存在 IME composition 时，
   本地 draft 保持权威；失焦、关闭、启动 Session 和退出 App 时强制 flush。
 - 日期、状态和附件立即保存。
 - 任务附件被复制为 Engine 管理的本地副本；原文件不会被修改。
+
+## “今天”视图架构
+
+当前 UI、Assistant 和 Store 遵循以下契约：
+
+- “今天”不新增任务表或复制任务记录，而是把
+  `executionDate == 本地 currentDay` 作为动态查询条件；任务总库存独立存在。
+- 加入或移出“今天”只分别设置当天 `executionDate` 或清除该字段。该 mutation 不改
+  `dueDate`、任务 ID、TerminalSession、TerminalRun 或 Controller 生命周期。
+- 旧数据库中的未来 `executionDate` 继续按原值读取和写回，不做批量清除或迁移；新 UI
+  不再把这些值投影为明天、后天等未来时间线列。
+- 主窗口仍由左侧任务 rail 和右侧 retained terminal 组成。rail 根据打开来源使用
+  “今天”或任务/清单的紧凑范围，切换 rail 项只重新挂载对应 surface。
+- 左箭头收起终端时只 detach surface；活动 Agent、PTY 和同一 App 生命周期内的
+  scrollback 保持不变。右侧不提供重复的 `Esc` 收起 affordance。
+- Gemini 助手的任务 mutation 在 Store 前拒绝非本地当天的非空 `executionDate`；
+  `dueDate` 仍可独立表达将来的截止日期，日期查询保持向后兼容。
 
 ## Gemini 任务助手
 

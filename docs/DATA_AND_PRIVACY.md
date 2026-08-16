@@ -28,6 +28,19 @@ owner、多个硬链接或过宽权限。
 - Gemini 助手的用户消息、模型结果、工具 receipt、上下文摘要和用户显式附加的文本；
 - schema migration 和幂等 mutation receipt。
 
+## “今天”数据语义
+
+“今天”不会引入另一份任务副本或新的终端所有权，当前数据契约如下：
+
+- “今天”是 `executionDate == 本地 currentDay` 的动态视图；任务总库存仍保存全部
+  任务，包括今天不显示的任务。
+- 加入“今天”只把现有任务的 `executionDate` 设为当天，移出只清除该字段；不会复制、
+  删除或完成任务，也不会停止其 TerminalSession、Agent、PTY 或清空同一 App 生命周期
+  内的 scrollback。
+- `dueDate` 是独立字段，不因加入或移出“今天”而改变。
+- 已有的未来 `executionDate` 原样保留以兼容旧数据库，不执行批量迁移或删除；它们不再
+  作为未来时间线列展示。Gemini 助手的新 mutation 不得创建未来执行日。
+
 ## 不保存或不自动发送的内容
 
 - Coding Agent PTY 字节和旧终端 scrollback 不写入 SQLite；

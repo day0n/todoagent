@@ -20,11 +20,20 @@ CLI 适配器迁移为 Ghostty PTY/TUI，这种单文件结构产生了重复和
 
 - `master` 是原生 macOS 产品主线；`legacy/web` 保留旧 Web + Node.js 实现。
 - 当前工作树使用 SwiftUI/AppKit、Ghostty PTY、Rust Engine、IPC v4 和 SQLite
-  schema v5。
+  schema v6。
+- “今天”按本地当天动态投影任务；任务总库存、截止日期和 retained terminal
+  生命周期保持独立，旧的未来执行日期无损保留。
 - 四家 Coding Agent CLI 通过真实 TUI 由用户直接操作；TodoAgent 负责启动、恢复、
   状态与进程生命周期，不解析终端对话。
 - 长期语义记忆、跨 Agent 接力和 TodoAgent 自动派发 CLI 尚未实现，详见
   [`TODO.md`](TODO.md)。
+
+## 当前“今天”工作流基线
+
+“今天”使用 `executionDate == 本地 currentDay` 的动态视图替代旧多日时间线。主窗口
+打开任务后由来源任务 rail 和 retained terminal 组成；左箭头只 detach surface，不结束
+Controller、Agent 或 PTY。任务总库存、`dueDate` 和 Terminal 生命周期相互独立，旧的
+未来 `executionDate` 无损保留。完整边界见 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)。
 
 ## 历史说明
 

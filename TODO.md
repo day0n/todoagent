@@ -15,6 +15,27 @@
 
 ## Now — 开发预览稳定化
 
+### [Shipped] “今天”与主窗口任务终端工作流
+
+把旧的多日时间线收敛为当天执行视图，并完成主窗口任务 rail 与 retained terminal 的
+一致交互。底层任务、日期和终端是独立生命周期，不能用 UI 投影变化代替数据删除或
+进程结束。
+
+- [x] 将“今天”定义为 `executionDate == 本地 currentDay` 的动态投影，并保持任务
+  总库存独立可访问。
+- [x] 将执行日期快捷菜单收敛为“加入今天 / 移出今天”，移除明天、后天和未来
+  时间线回放入口。
+- [x] 加入/移出只设置或清除 `executionDate`；验证不复制、不删除、不自动完成任务，
+  也不结束 TerminalSession、Agent 或 PTY。
+- [x] 保持 `dueDate` 独立，并对旧数据库中的未来 `executionDate` 做无损兼容，不执行
+  批量清除或迁移。
+- [x] 从“今天”打开任务时，左侧 rail 只显示当天任务；从总任务或清单打开时，使用
+  对应来源的紧凑任务列表，右侧显示所选任务终端。
+- [x] 使用左箭头作为唯一终端收起入口，移除右侧 `Esc`；验证 detach 后 Controller、
+  Agent、PTY 和同一 App 进程内的 scrollback 全部保持。
+- [x] 限制 Gemini 助手不创建未来 `executionDate`，并补齐 Swift、Rust、IPC 与旧数据
+  回归测试。
+
 ### [In progress] 四个 Coding Agent CLI 的直接操控
 
 TodoAgent 已经能够在每个任务的嵌入式 PTY 中启动和恢复 Codex、Claude Code、
@@ -74,7 +95,7 @@ Cursor Agent 或 Kiro CLI，并回收可验证的结果。这与当前“用户�
   已做决策、产物和来源 Agent。
 - [ ] 保留每个 Provider 的原生 Session，不伪造或合并供应商历史。
 - [ ] 定义并发所有权，以及多个 Agent 修改同一工作目录时的冲突策略。
-- [ ] 在可见时间线中记录每次派发、交接、审批、结果、取消和失败。
+- [ ] 在可见活动记录中记录每次派发、交接、审批、结果、取消和失败。
 - [ ] 接收方执行有副作用操作前要求明确授权。
 - [ ] 定义失败回滚、部分完成、超时、重复交接和用户中止语义。
 - [ ] 验证 Claude Code、Codex、Cursor Agent、Kiro CLI 之间的双向交接。
