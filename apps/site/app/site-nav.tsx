@@ -35,10 +35,10 @@ export function SiteNav({
   }, [open]);
 
   return (
-    <nav className={open ? "site-nav is-open" : "site-nav"} aria-label="Primary navigation">
+    <nav className={open ? "site-nav is-open" : "site-nav"} aria-label="主导航">
       <div className="nav-bar">
-        <a className="brand" href="#top" aria-label="TodoAgent home" onClick={() => setOpen(false)}>
-          <img src="/todoagent-icon.png" alt="" />
+        <a className="brand" href="#top" aria-label="TodoAgent 首页" onClick={() => setOpen(false)}>
+          <img src="/todoagent-icon.png" alt="" width={28} height={28} />
           <span>TodoAgent</span>
         </a>
 
@@ -61,13 +61,13 @@ export function SiteNav({
             className="nav-toggle"
             aria-expanded={open}
             aria-controls={menuId}
-            aria-label={open ? "Close menu" : "Open menu"}
+            aria-label={open ? "关闭菜单" : "打开菜单"}
             onClick={() => setOpen((value) => !value)}
           >
             <i />
           </button>
           <a className="nav-cta" href={githubUrl} target="_blank" rel="noreferrer">
-            View preview
+            源码
           </a>
         </div>
       </div>
@@ -90,7 +90,7 @@ export function SiteNav({
         <button
           type="button"
           className="nav-backdrop"
-          aria-label="Close menu"
+          aria-label="关闭菜单"
           onClick={() => setOpen(false)}
         />
       ) : null}
