@@ -1,6 +1,7 @@
 import { SiteNav } from "./site-nav";
 
 const githubUrl = "https://github.com/day0n/todoagent";
+const downloadUrl = `${githubUrl}/releases/tag/v0.1.0`;
 const buildUrl = `${githubUrl}#本地构建与运行`;
 
 const navLinks = [
@@ -15,7 +16,7 @@ const runtimes = ["Codex", "Claude Code", "Cursor Agent", "Kiro CLI"];
 export default function Home() {
   return (
     <main>
-      <SiteNav githubUrl={githubUrl} links={navLinks} />
+      <SiteNav downloadUrl={downloadUrl} links={navLinks} />
 
       <header className="hero" id="top">
         <div className="hero-copy">
@@ -32,13 +33,16 @@ export default function Home() {
             Kiro CLI。清单交给 TodoAgent。
           </p>
           <div className="actions">
-            <a className="button primary" href={buildUrl} target="_blank" rel="noreferrer">
+            <a className="button primary" href={downloadUrl} target="_blank" rel="noreferrer">
+              下载开发预览
+            </a>
+            <a className="button ghost" href={buildUrl} target="_blank" rel="noreferrer">
               从源码构建
             </a>
-            <a className="button ghost" href={githubUrl} target="_blank" rel="noreferrer">
-              查看仓库
-            </a>
           </div>
+          <p className="download-note">
+            macOS 26+ · Apple 芯片 · ad-hoc 签名，Gatekeeper 会拦截首次打开。
+          </p>
         </div>
         <aside className="hero-meta" aria-label="产品要点">
           <p>每个任务一条 Ghostty PTY</p>
@@ -135,16 +139,17 @@ export default function Home() {
       <section className="close">
         <img src="/todoagent-icon.png" alt="" width={72} height={72} />
         <p className="kicker">开发预览</p>
-        <h2>构建这个 Agent 工作台。</h2>
+        <h2>先用这个 0.1.0 预览。</h2>
         <p>
-          macOS 26+，Apple 芯片。任务和会话元数据留在本机 SQLite。签名公证的下载包还没有。
+          macOS 26+，Apple 芯片。任务和会话元数据留在本机 SQLite。预览 DMG 已经可以下载；它是
+          ad-hoc 签名，尚未公证。
         </p>
         <div className="actions">
-          <a className="button primary" href={buildUrl} target="_blank" rel="noreferrer">
-            从源码构建
+          <a className="button primary" href={downloadUrl} target="_blank" rel="noreferrer">
+            下载 0.1.0
           </a>
-          <a className="button ghost" href={githubUrl} target="_blank" rel="noreferrer">
-            查看仓库
+          <a className="button ghost" href={buildUrl} target="_blank" rel="noreferrer">
+            从源码构建
           </a>
         </div>
       </section>
@@ -156,6 +161,9 @@ export default function Home() {
         </a>
         <p>一个任务。一条终端。一个 Agent。</p>
         <div className="footer-links">
+          <a href={downloadUrl} target="_blank" rel="noreferrer">
+            下载
+          </a>
           <a href={githubUrl} target="_blank" rel="noreferrer">
             GitHub
           </a>

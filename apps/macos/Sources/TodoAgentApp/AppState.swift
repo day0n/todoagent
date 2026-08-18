@@ -93,6 +93,7 @@ final class AppState {
     private var workspaceCalendarObserver: NSObjectProtocol?
     @ObservationIgnored weak var taskWorkspacePresenter: (any TaskWorkspacePresenting)?
     @ObservationIgnored var terminalSessions: TerminalSessionRegistry?
+    @ObservationIgnored weak var replyNotifier: AgentReplyNotifier?
     private var preferredWorkspaces: [UUID: String] = [:]
 
     private(set) var revision: Int64 = 0
@@ -202,6 +203,7 @@ final class AppState {
             guard loadGeneration == generation else { return }
             hasLoaded = true
             loadState = .loaded
+            replyNotifier?.deliverPendingOpenIfNeeded()
             if inspectorPresented {
                 _ = await assistant.ensureDefaultSession()
             }

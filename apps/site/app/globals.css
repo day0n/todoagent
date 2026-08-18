@@ -239,6 +239,13 @@ button { font: inherit; }
 
 .button.ghost:hover { background: rgb(255 255 255 / 46%); }
 
+.download-note {
+  max-width: 36em;
+  margin: 12px 0 0;
+  color: var(--quiet);
+  font-size: var(--t-sm);
+}
+
 .stage {
   padding: 56px var(--pad) 64px;
   background: var(--field);

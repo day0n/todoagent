@@ -1,13 +1,32 @@
 # Changelog
 
-TodoAgent 的重要变化将记录在这里。项目目前处于 developer preview，尚未创建正式
-release tag；在首个版本发布前，变更统一记录在 `Unreleased`。
+TodoAgent 的重要变化将记录在这里。项目目前处于 developer preview；第一个公开预览
+tag 是 [`v0.1.0`](https://github.com/day0n/todoagent/releases/tag/v0.1.0)。
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，版本发布后将使用
 [Semantic Versioning](https://semver.org/) 记录兼容性，但预览阶段的 schema、IPC 和
 CLI 集成仍可能发生破坏性变化。
 
 ## [Unreleased]
+
+### Added
+
+- 任务卡片和终端工作台用 Hook 状态显示未读/需关注标记；系统通知通路已接入，但
+  ad-hoc 签名构建无法完成授权。
+- 根据任务 PTY 前台进程的可执行文件（及脚本宿主的绝对脚本路径）识别实际运行的
+  Agent，不再从终端标题或桌面通知文本猜测。
+- 用户在任务终端里手动启动的 Agent 可通过账户级 Hook 回报状态；Claude 在用户确认
+  后合并用户级 `settings.json` 的 hooks 段，重复事件按 ID 去重。
+
+### Changed
+
+- Ghostty 允许桌面通知，同时继续关闭 title-report，避免用标题探测 Agent。
+
+## [0.1.0] - 2026-08-18
+
+第一个公开开发预览。发布包为 ad-hoc 签名的
+[TodoAgent-0.1.0-arm64.dmg](https://github.com/day0n/todoagent/releases/download/v0.1.0/TodoAgent-0.1.0-arm64.dmg)，
+对应 `c501436`，尚未经过 Developer ID 签名和 Apple 公证。
 
 ### Added
 
@@ -20,6 +39,7 @@ CLI 集成仍可能发生破坏性变化。
 - 固定 Ghostty 源码、构建脚本、第三方许可、hash 与 provenance 校验。
 - 公开 TODO、架构、Runtime、数据隐私、贡献、安全和社区行为文档。
 - “今天”动态视图、菜单栏入口和直接加入/移出快捷操作。
+- 在 GitHub Releases 发布第一个 arm64 开发预览 DMG。
 
 ### Changed
 
@@ -56,3 +76,6 @@ CLI 集成仍可能发生破坏性变化。
 
 2026-08-10 以前的 IPC v3/schema v4 结构化 CLI 实现没有正式发布 tag。相关 Git 历史
 仍可用于考察设计演进，但旧测试数量、性能采样和 Runtime smoke 不能代表当前版本。
+
+[Unreleased]: https://github.com/day0n/todoagent/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/day0n/todoagent/releases/tag/v0.1.0

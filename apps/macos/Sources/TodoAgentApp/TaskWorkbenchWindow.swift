@@ -446,6 +446,7 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
                   self.transitionGeneration == generation,
                   self.presentedTaskID == taskID
             else { return }
+            self.terminalSessions.controller(for: taskID)?.markSeenIfNeeded()
             self.terminalSessions.controller(for: taskID)?.focusIfAppropriate()
         }
     }
@@ -1196,25 +1197,26 @@ private struct TaskTerminalToolbar: View {
                 .accessibilityIdentifier("task.details.toggle")
             }
 
-            RuntimeIconView(kind: controller.session.runtimeKind, fallbackSymbol: "terminal")
-                .frame(width: 28, height: 28)
+            // A host shell with no Agent gets the neutral terminal glyph rather
+            // than a brand mark for a CLI that is not running.
+            if let runtime = controller.displayRuntime {
+                RuntimeIconView(kind: runtime, fallbackSymbol: "terminal")
+                    .frame(width: 28, height: 28)
+            } else {
+                Image(systemName: "terminal")
+                    .font(.title3)
+                    .frame(width: 28, height: 28)
+            }
             VStack(alignment: .leading, spacing: 2) {
                 Text(task.title).font(.headline).lineLimit(1)
                 if !isCompactEmbedded {
-                    Text("\(controller.session.runtimeKind.title) 终端")
+                    Text(controller.displayRuntime.map { "\($0.title) 终端" } ?? "本机终端")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
             Spacer()
             phaseLabel
-            if controller.hasLiveSurface {
-                Button("聚焦终端", systemImage: "cursorarrow.click") {
-                    controller.focusIfAppropriate()
-                }
-                .labelStyle(.iconOnly)
-                .help("聚焦终端")
-            }
             if presentation == .window {
                 Button("关闭", systemImage: "xmark", action: close)
                     .labelStyle(.iconOnly)
@@ -1289,7 +1291,7 @@ private struct TaskTerminalStatusBar: View {
 
     var body: some View {
         HStack(spacing: 16) {
-            Label(controller.session.runtimeKind.title, systemImage: "cpu")
+            Label(controller.displayRuntime.displayTitle, systemImage: "cpu")
             Label(controller.workingDirectory, systemImage: "folder")
                 .lineLimit(1)
                 .truncationMode(.middle)

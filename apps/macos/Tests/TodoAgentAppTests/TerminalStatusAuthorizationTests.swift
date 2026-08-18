@@ -21,12 +21,15 @@ struct TerminalStatusAuthorizationTests {
         #expect(TerminalStatusAuthorization.state(for: .cursor, defaults: defaults) == .notAuthorized)
     }
 
-    @Test("Claude authorization is run scoped and uninstall returns to skipped")
-    func claudeRunScopedAuthorization() throws {
+    @Test("Claude authorization installs user level hooks and uninstall returns to skipped")
+    func claudeAuthorization() throws {
         let (defaults, suite) = try isolatedDefaults()
         defer { defaults.removePersistentDomain(forName: suite) }
         let fixture = try StatusHookFixture()
         defer { fixture.cleanup() }
+        let settings = fixture.home
+            .appendingPathComponent(".claude", isDirectory: true)
+            .appendingPathComponent("settings.json")
 
         try TerminalStatusAuthorization.enable(
             for: .claude,
@@ -41,6 +44,10 @@ struct TerminalStatusAuthorizationTests {
                 manager: fixture.manager
             ).isHealthy
         )
+        // Claude reads hooks from its user-level settings document, so enabling
+        // has to leave one behind. A run-scoped file could not reach a `claude`
+        // the user starts by hand.
+        #expect(FileManager.default.fileExists(atPath: settings.path))
 
         try TerminalStatusAuthorization.uninstall(
             for: .claude,
@@ -48,7 +55,52 @@ struct TerminalStatusAuthorizationTests {
             manager: fixture.manager
         )
         #expect(TerminalStatusAuthorization.state(for: .claude, defaults: defaults) == .skipped)
-        #expect(FileManager.default.fileExists(atPath: fixture.home.path) == false)
+        #expect(
+            TerminalStatusAuthorization.presentation(
+                for: .claude,
+                defaults: defaults,
+                manager: fixture.manager
+            ).isHealthy == false
+        )
+    }
+
+    /// An account that authorized Claude under the older run-scoped integration
+    /// has `enabled` stored while nothing exists on disk, because that version
+    /// passed `--settings` per Run and installed no files. Without re-prompting,
+    /// such an account would never get the user-level hooks a host shell needs,
+    /// and its terminals would stay silent forever.
+    @Test("consent is re-requested when enabled is stored but nothing is installed")
+    func consentPromptReopensForUninstalledEnabledState() {
+        for health in [ProviderStatusHookHealth.notInstalled, .needsRepair("missing wrapper")] {
+            #expect(
+                TerminalStatusAuthorization.needsConsentPrompt(state: .enabled, health: health)
+            )
+        }
+
+        // A working install must never nag.
+        for health in [ProviderStatusHookHealth.installed, .installedRequiresProviderReview] {
+            #expect(
+                TerminalStatusAuthorization
+                    .needsConsentPrompt(state: .enabled, health: health) == false
+            )
+        }
+
+        // A declined prompt stays declined, whatever the disk says.
+        for health in [
+            ProviderStatusHookHealth.notInstalled,
+            .needsRepair("missing wrapper"),
+            .installed,
+        ] {
+            #expect(
+                TerminalStatusAuthorization
+                    .needsConsentPrompt(state: .skipped, health: health) == false
+            )
+        }
+
+        #expect(
+            TerminalStatusAuthorization
+                .needsConsentPrompt(state: .notAuthorized, health: .notInstalled)
+        )
     }
 
     @Test("unsupported Kiro cannot be represented as enabled")
@@ -114,7 +166,12 @@ struct StatusHookFixture {
         ProviderStatusHookManager(
             homeDirectoryURL: home,
             supportDirectoryURL: support,
-            runnerExecutableURL: runner
+            runnerExecutableURL: runner,
+            // Passed explicitly. The production default reads
+            // `CLAUDE_CONFIG_DIR` from the environment, which would send these
+            // writes to the developer's real Claude settings file instead of
+            // the fixture home whenever that variable happens to be set.
+            claudeConfigurationDirectoryURL: nil
         )
     }
 

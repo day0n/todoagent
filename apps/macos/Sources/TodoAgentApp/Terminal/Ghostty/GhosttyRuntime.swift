@@ -161,7 +161,15 @@ final class GhosttyCallbacks: @unchecked Sendable {
             let path = String(cString: pointer)
             DispatchQueue.main.async { view.report(.workingDirectoryChanged(path)) }
             return true
-        case GHOSTTY_ACTION_DESKTOP_NOTIFICATION, GHOSTTY_ACTION_RING_BELL:
+        case GHOSTTY_ACTION_DESKTOP_NOTIFICATION:
+            guard let view = view(from: target) else { return true }
+            let title = action.action.desktop_notification.title.map(String.init(cString:)) ?? ""
+            let body = action.action.desktop_notification.body.map(String.init(cString:)) ?? ""
+            DispatchQueue.main.async {
+                view.report(.desktopNotification(title: title, body: body))
+            }
+            return true
+        case GHOSTTY_ACTION_RING_BELL:
             guard let view = view(from: target) else { return true }
             DispatchQueue.main.async { view.report(.attentionRequested) }
             return true

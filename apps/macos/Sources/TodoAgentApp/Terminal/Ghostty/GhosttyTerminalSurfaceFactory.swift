@@ -41,6 +41,8 @@ final class GhosttyTerminalSession: TerminalSurfaceSession {
 
     var view: NSView { surfaceView }
 
+    var foregroundProcessID: pid_t? { surfaceView.foregroundProcessID }
+
     init(configuration: GhosttyTerminalConfiguration) throws {
         let app = try GhosttyRuntime.shared.requireApp()
         surfaceView = GhosttySurfaceView(app: app, configuration: configuration)

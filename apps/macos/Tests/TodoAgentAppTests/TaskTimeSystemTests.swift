@@ -1227,11 +1227,139 @@ struct TaskTimeSystemTests {
             lastReadSequence: 4
         ).session
 
+        // These fixtures carry no `lastStartedAt`, so they describe a task that
+        // only ever had a host shell. Their stored `runtimeKind` is the default
+        // a session is created with, not evidence an Agent ran, so no icon is
+        // shown until something proves otherwise.
         #expect(TaskCardAgentStatus(session: nil) == .init(isRunning: false, hasUnread: false))
-        #expect(TaskCardAgentStatus(session: idle) == .init(isRunning: false, hasUnread: false))
-        #expect(TaskCardAgentStatus(session: running) == .init(isRunning: true, hasUnread: false))
-        #expect(TaskCardAgentStatus(session: unread) == .init(isRunning: false, hasUnread: true))
-        #expect(TaskCardAgentStatus(session: runningUnread) == .init(isRunning: true, hasUnread: true))
+        #expect(
+            TaskCardAgentStatus(session: idle)
+                == .init(isRunning: false, hasUnread: false, runtimeKind: nil)
+        )
+        #expect(
+            TaskCardAgentStatus(session: running)
+                == .init(isRunning: true, hasUnread: false, runtimeKind: .codex)
+        )
+        #expect(
+            TaskCardAgentStatus(session: unread)
+                == .init(isRunning: false, hasUnread: true, runtimeKind: nil)
+        )
+        #expect(
+            TaskCardAgentStatus(session: runningUnread)
+                == .init(isRunning: true, hasUnread: true, runtimeKind: .codex)
+        )
+
+        // Regression guard for the bug where every task showed the Claude mark.
+        // A host shell nobody launched an Agent in must show no runtime at all,
+        // even though the session records Claude as its default.
+        let hostOnly = TaskSessionDescriptor(
+            id: "session-host",
+            taskID: taskID,
+            runtimeKind: .claude,
+            workingDirectory: "/Users/niuzj"
+        )
+        #expect(TaskCardAgentStatus(session: hostOnly).runtimeKind == nil)
+        #expect(TaskCardAgentStatus(session: hostOnly).showsRuntime == false)
+
+        // An official run is different: TodoAgent launched exactly this CLI, so
+        // the stored kind stays meaningful even after the run ends.
+        let official = TaskSessionDescriptor(
+            id: "session-official",
+            taskID: taskID,
+            runtimeKind: .claude,
+            workingDirectory: "/tmp/project",
+            lastStartedAt: "2026-08-17T00:00:00Z"
+        )
+        #expect(TaskCardAgentStatus(session: official).runtimeKind == .claude)
+        #expect(TaskCardAgentStatus(session: official).hasUnread == false)
+
+        // A live probe overrides the stored default in both directions.
+        #expect(
+            TaskCardAgentStatus(
+                session: hostOnly,
+                displayRuntime: .codex,
+                hasHostAttention: true
+            ) == .init(isRunning: false, hasUnread: true, runtimeKind: .codex)
+        )
+    }
+
+    @Test("foreground executables identify the running local agent")
+    func hostAgentRuntimeProbeExecutables() {
+        func detect(_ path: String, arguments: [String] = []) -> RuntimeKind? {
+            HostAgentRuntimeProbe.detect(
+                pid: 42,
+                executablePath: { _ in path },
+                arguments: { _ in [path] + arguments }
+            )
+        }
+
+        #expect(detect("/Users/niuzj/.local/bin/claude") == .claude)
+        #expect(detect("/opt/homebrew/bin/codex") == .codex)
+        #expect(detect("/usr/local/bin/cursor-agent") == .cursor)
+        #expect(detect("/usr/local/bin/kiro") == .kiro)
+
+        // A plain shell runs no Agent.
+        #expect(detect("/bin/zsh") == nil)
+        // An unrelated binary is not claimed just because its name contains an
+        // Agent's name.
+        #expect(detect("/usr/local/bin/claude-helper") == nil)
+    }
+
+    /// The two syscall readers are what `detect` uses in production, while every
+    /// other probe test injects them. Exercised against this process so the
+    /// C-string handling is covered: `proc_pidpath` reports the length without
+    /// the terminator, and including it would leave a NUL inside the String and
+    /// break every path comparison downstream.
+    @Test("the executable path of a live process is read without a terminator")
+    func hostAgentRuntimeProbeReadsLiveExecutablePath() throws {
+        let path = try #require(HostAgentRuntimeProbe.executablePath(of: getpid()))
+
+        #expect(path.contains("\0") == false)
+        #expect(path.hasPrefix("/"))
+        #expect(FileManager.default.fileExists(atPath: path))
+        #expect((path as NSString).lastPathComponent.isEmpty == false)
+    }
+
+    @Test("the argument vector of a live process starts with its own path")
+    func hostAgentRuntimeProbeReadsLiveArguments() throws {
+        let arguments = try #require(HostAgentRuntimeProbe.arguments(of: getpid()))
+        let first = try #require(arguments.first)
+
+        #expect(first.contains("\0") == false)
+        #expect(first.hasPrefix("/"))
+    }
+
+    @Test("an unreadable process yields no runtime", arguments: [pid_t(0), -1])
+    func hostAgentRuntimeProbeRejectsInvalidPID(pid: pid_t) {
+        #expect(HostAgentRuntimeProbe.executablePath(of: pid) == nil)
+        #expect(HostAgentRuntimeProbe.detect(pid: pid) == nil)
+    }
+
+    @Test("script hosts are identified from the script path only")
+    func hostAgentRuntimeProbeScriptHosts() {
+        func detect(_ path: String, arguments: [String]) -> RuntimeKind? {
+            HostAgentRuntimeProbe.detect(
+                pid: 42,
+                executablePath: { _ in path },
+                arguments: { _ in [path] + arguments }
+            )
+        }
+
+        // npm-installed CLIs appear as their interpreter plus a script path.
+        #expect(
+            detect(
+                "/opt/homebrew/bin/node",
+                arguments: ["/Users/niuzj/.npm/@anthropic-ai/claude-code/cli.js"]
+            ) == .claude
+        )
+        #expect(detect("/usr/bin/env", arguments: ["/opt/homebrew/bin/codex"]) == .codex)
+
+        // The regression this replaces: content the user typed or named must
+        // never be read as an Agent. Relative arguments are ignored outright,
+        // and a directory that merely contains an Agent's name does not match.
+        #expect(detect("/bin/zsh", arguments: ["-c", "claude --version"]) == nil)
+        #expect(detect("/bin/zsh", arguments: ["/Users/niuzj/dev/claude-notes/run.sh"]) == nil)
+        #expect(detect("/opt/homebrew/bin/node", arguments: ["/tmp/server.js"]) == nil)
     }
 
     @Test("task cards stay compact when a local Agent session exists")

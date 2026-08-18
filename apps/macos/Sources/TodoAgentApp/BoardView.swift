@@ -589,6 +589,8 @@ enum TaskWorkspaceScopeClosePolicy {
 enum TaskWorkspaceLayoutPolicy {
     static let regularRailWidth: CGFloat = 320
     static let compactRailWidth: CGFloat = 252
+    static let defaultOpenRailWidth = compactRailWidth
+    static let minimumResizableRailWidth: CGFloat = 200
     static let dividerWidth: CGFloat = 1
     static let terminalPreferredMinimumWidth: CGFloat = 500
     static let terminalAbsoluteMinimumWidth: CGFloat = 320
@@ -726,7 +728,7 @@ enum TaskWorkspaceRevealLayoutPolicy {
             0
         )
         let automaticTerminalWidth = max(
-            contentWidth - TaskWorkspaceLayoutPolicy.railWidth(for: railVisibility),
+            contentWidth - TaskWorkspaceLayoutPolicy.defaultOpenRailWidth,
             0
         )
         let requestedTerminalWidth = preferredTerminalWidth ?? automaticTerminalWidth
@@ -761,12 +763,12 @@ enum TaskWorkspaceRevealLayoutPolicy {
             contentWidth
         )
         let maximumWithUsableTaskRail = max(
-            contentWidth - TaskWorkspaceLayoutPolicy.compactRailWidth,
+            contentWidth - TaskWorkspaceLayoutPolicy.minimumResizableRailWidth,
             0
         )
-        // A user-resized split may take the task rail down to its compact
-        // width. Without a saved preference, resolve() still starts from the
-        // regular or compact default for the current visibility mode.
+        // The default rail stays at the screenshot-derived compact width in
+        // both density modes. Explicit resizing may take it down to 200pt,
+        // which still preserves the completion control and task-open target.
         // On very narrow windows the terminal's absolute minimum wins.
         let maximumTerminalWidth = max(
             minimumTerminalWidth,
@@ -838,7 +840,9 @@ enum TaskWorkspaceTerminalResizeInteractionPolicy {
 }
 
 enum TaskWorkspaceTerminalPanePreferences {
-    static let widthKey = "taskWorkspaceTerminalWidth.v1"
+    // v1 was used only by local previews. Reset it so the narrower default is
+    // visible on first launch instead of inheriting an experimental drag.
+    static let widthKey = "taskWorkspaceTerminalWidth.v2"
 }
 
 /// Owns the complete drawer geometry. Task width and terminal position are
@@ -1226,7 +1230,8 @@ private struct TaskListView: View {
                                     task: task,
                                     state: state,
                                     isWorkspaceSelected: task.id == selectedWorkspaceTaskID,
-                                    isWorkspacePending: task.id == pendingWorkspaceTaskID
+                                    isWorkspacePending: task.id == pendingWorkspaceTaskID,
+                                    liveSession: taskWorkspace.terminalSessions.controller(for: task.id)
                                 )
                                 .id(task.id)
                             }
@@ -1242,7 +1247,8 @@ private struct TaskListView: View {
                                         task: task,
                                         state: state,
                                         isWorkspaceSelected: task.id == selectedWorkspaceTaskID,
-                                        isWorkspacePending: task.id == pendingWorkspaceTaskID
+                                        isWorkspacePending: task.id == pendingWorkspaceTaskID,
+                                        liveSession: taskWorkspace.terminalSessions.controller(for: task.id)
                                     )
                                     .id(task.id)
                                 }
@@ -1528,22 +1534,63 @@ private struct InlineAddTaskComposer: View {
     }
 }
 
+enum TaskCardTextTruncation: Equatable, Sendable {
+    case tail
+}
+
+enum TaskCardNarrowLayoutPolicy {
+    static let textLineLimit = 1
+    static let textTruncation: TaskCardTextTruncation = .tail
+    static let allowsTextTightening = false
+    static let completionControlSize: CGFloat = 22
+
+    static var swiftUITruncationMode: Text.TruncationMode {
+        switch textTruncation {
+        case .tail:
+            .tail
+        }
+    }
+
+    static func reservesAgentIndicatorSpace(
+        isWorkspacePending: Bool,
+        isRunning: Bool,
+        hasUnread: Bool,
+        showsRuntime: Bool = false
+    ) -> Bool {
+        isWorkspacePending || isRunning || hasUnread || showsRuntime
+    }
+
+    static func sessionTargetWidth(railWidth: CGFloat) -> CGFloat {
+        let cardWidth = TaskListContentTrackLayoutPolicy.contentWidth(
+            availableWidth: railWidth
+        )
+        let innerWidth = max(cardWidth - TodoAgentUI.cardPadding * 2, 0)
+        return max(
+            innerWidth - completionControlSize - TodoAgentUI.standardSpacing,
+            0
+        )
+    }
+}
+
 struct TaskCard: View {
     let task: TaskItem
     let state: AppState
     let isWorkspaceSelected: Bool
     let isWorkspacePending: Bool
+    let liveSession: TerminalSessionController?
 
     init(
         task: TaskItem,
         state: AppState,
         isWorkspaceSelected: Bool = false,
-        isWorkspacePending: Bool = false
+        isWorkspacePending: Bool = false,
+        liveSession: TerminalSessionController? = nil
     ) {
         self.task = task
         self.state = state
         self.isWorkspaceSelected = isWorkspaceSelected
         self.isWorkspacePending = isWorkspacePending
+        self.liveSession = liveSession
     }
 
     @State private var datePickerRequest: TaskDatePickerRequest?
@@ -1552,7 +1599,21 @@ struct TaskCard: View {
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     private var agentStatus: TaskCardAgentStatus {
-        TaskCardAgentStatus(session: state.session(for: task))
+        let session = liveSession?.session ?? state.session(for: task)
+        return TaskCardAgentStatus(
+            session: session,
+            displayRuntime: liveSession?.displayRuntime,
+            hasHostAttention: liveSession?.needsAttention == true
+        )
+    }
+
+    private var reservesAgentIndicatorSpace: Bool {
+        TaskCardNarrowLayoutPolicy.reservesAgentIndicatorSpace(
+            isWorkspacePending: isWorkspacePending,
+            isRunning: agentStatus.isRunning,
+            hasUnread: agentStatus.hasUnread,
+            showsRuntime: agentStatus.showsRuntime
+        )
     }
 
     var body: some View {
@@ -1794,12 +1855,18 @@ struct TaskCard: View {
             Image(systemName: task.status == .completed ? "checkmark.circle.fill" : "circle")
                 .font(.title3)
                 .foregroundStyle(task.status == .completed ? Color.green : Color.secondary)
+                .frame(
+                    width: TaskCardNarrowLayoutPolicy.completionControlSize,
+                    height: TaskCardNarrowLayoutPolicy.completionControlSize
+                )
         }
         .labelStyle(.iconOnly)
         .buttonStyle(.plain)
         .disabled(state.isTaskCommandInFlight(taskID: task.id))
         .accessibilityLabel(task.status == .completed ? "重新打开" : "标记完成")
         .help(task.status == .completed ? "重新打开任务" : "标记任务为已完成")
+        .fixedSize(horizontal: true, vertical: true)
+        .layoutPriority(2)
     }
 
     private var sessionButton: some View {
@@ -1810,17 +1877,26 @@ struct TaskCard: View {
                         .font(.body)
                         .bold()
                         .strikethrough(task.status == .completed)
-                        .lineLimit(1)
+                        .lineLimit(TaskCardNarrowLayoutPolicy.textLineLimit)
+                        .truncationMode(TaskCardNarrowLayoutPolicy.swiftUITruncationMode)
+                        .allowsTightening(TaskCardNarrowLayoutPolicy.allowsTextTightening)
+                        .layoutPriority(2)
 
                     taskMetadata
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .layoutPriority(1)
 
-                Spacer(minLength: TodoAgentUI.compactSpacing)
-                agentIndicators
+                if reservesAgentIndicatorSpace {
+                    agentIndicators
+                        .fixedSize(horizontal: true, vertical: false)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(.rect)
         }
         .buttonStyle(.plain)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -1829,24 +1905,48 @@ struct TaskCard: View {
         if let datePresentation, datePresentation.isOverdue {
             taskDateLabel(datePresentation)
         } else if !task.note.isEmpty {
-            Label(task.note, systemImage: "note.text")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
+            taskMetadataLine(
+                task.note,
+                systemImage: "note.text",
+                color: TodoAgentUI.secondaryText
+            )
         } else if let datePresentation {
             taskDateLabel(datePresentation)
         }
     }
 
     private func taskDateLabel(_ presentation: TaskCardDatePresentation) -> some View {
-        Label(dateText(presentation.day), systemImage: "calendar")
-            .font(.caption)
-            .foregroundStyle(presentation.isOverdue ? Color.red : Color.secondary)
+        taskMetadataLine(
+            dateText(presentation.day),
+            systemImage: "calendar",
+            color: presentation.isOverdue ? .red : TodoAgentUI.secondaryText
+        )
             .accessibilityLabel(dateAccessibilityLabel(presentation))
             .accessibilityIdentifier(
                 "task.\(task.id.uuidString).\(presentation.kind.rawValue)-date"
             )
-            .lineLimit(1)
+    }
+
+    private func taskMetadataLine(
+        _ text: String,
+        systemImage: String,
+        color: Color
+    ) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+                .fixedSize(horizontal: true, vertical: true)
+                .accessibilityHidden(true)
+
+            Text(text)
+                .lineLimit(TaskCardNarrowLayoutPolicy.textLineLimit)
+                .truncationMode(TaskCardNarrowLayoutPolicy.swiftUITruncationMode)
+                .allowsTightening(TaskCardNarrowLayoutPolicy.allowsTextTightening)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .font(.caption)
+        .foregroundStyle(color)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .layoutPriority(0)
     }
 
     private var agentIndicators: some View {
@@ -1855,6 +1955,15 @@ struct TaskCard: View {
                 ProgressView()
                     .controlSize(.small)
                     .accessibilityLabel("正在切换到此任务")
+            }
+
+            if let runtimeKind = agentStatus.runtimeKind {
+                RuntimeIconView(
+                    kind: runtimeKind,
+                    fallbackSymbol: runtimeKind.fallbackSymbol,
+                    glyphSize: 15
+                )
+                .accessibilityLabel(runtimeKind.title)
             }
 
             if agentStatus.isRunning {
@@ -1881,7 +1990,6 @@ struct TaskCard: View {
                     .accessibilityLabel("Agent 有新回复")
             }
         }
-        .frame(width: 36, alignment: .trailing)
     }
 
     private func dateText(_ day: LocalDay) -> String {
@@ -1911,6 +2019,7 @@ struct TaskCard: View {
         var parts = [task.title]
         if isWorkspaceSelected { parts.append("已在工作区打开") }
         if isWorkspacePending { parts.append("正在切换") }
+        if let runtimeKind = agentStatus.runtimeKind { parts.append(runtimeKind.title) }
         if agentStatus.isRunning { parts.append("Agent 正在运行") }
         if agentStatus.hasUnread { parts.append("Agent 有新回复") }
         return parts.joined(separator: "，")
@@ -1925,17 +2034,46 @@ struct TaskCard: View {
 struct TaskCardAgentStatus: Equatable, Sendable {
     let isRunning: Bool
     let hasUnread: Bool
+    let runtimeKind: RuntimeKind?
 
-    init(isRunning: Bool, hasUnread: Bool) {
+    var showsRuntime: Bool { runtimeKind != nil }
+
+    init(isRunning: Bool, hasUnread: Bool, runtimeKind: RuntimeKind? = nil) {
         self.isRunning = isRunning
         self.hasUnread = hasUnread
+        self.runtimeKind = runtimeKind
     }
 
-    init(session: TaskSessionDescriptor?) {
+    init(
+        session: TaskSessionDescriptor?,
+        displayRuntime: RuntimeKind? = nil,
+        hasHostAttention: Bool = false
+    ) {
         self.init(
-            isRunning: session?.state.isBusy == true,
-            hasUnread: session?.hasUnread == true
+            isRunning: session?.state.isBusy == true || session?.agentStatus.isRunning == true,
+            hasUnread: session?.hasUnread == true || hasHostAttention,
+            runtimeKind: Self.displayedRuntime(from: session, live: displayRuntime)
         )
+    }
+
+    /// Resolves the icon without ever guessing.
+    ///
+    /// A live controller's answer wins, including its `nil` — a host shell
+    /// sitting at a prompt runs no Agent and must show no icon.
+    ///
+    /// With no live controller, an official run is the one case where the stored
+    /// `runtimeKind` is real evidence: TodoAgent launched exactly that CLI for
+    /// this task, so it stays meaningful after the run ends. For a task that
+    /// only ever had a host shell, that field is just the default every new
+    /// session gets (Claude) — falling back to it is what made every task look
+    /// like a Claude task.
+    private static func displayedRuntime(
+        from session: TaskSessionDescriptor?,
+        live: RuntimeKind?
+    ) -> RuntimeKind? {
+        if let live { return live }
+        guard let session, session.hasOfficialAgentRun else { return nil }
+        return session.runtimeKind
     }
 }
 

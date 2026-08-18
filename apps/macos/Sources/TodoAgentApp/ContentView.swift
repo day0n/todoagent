@@ -186,6 +186,14 @@ struct ContentView: View {
                 taskWorkspace.focusActiveTerminal()
             }
         }
+        .onChange(of: taskWorkspace.isPresented) { wasPresented, isPresented in
+            workspaceChrome.handleTaskWorkspacePresentationChange(
+                wasPresented: wasPresented,
+                isPresented: isPresented
+            )
+            guard wasPresented, isPresented == false else { return }
+            Task { await state.replyNotifier?.flushPendingIfUninspected() }
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { note in
             guard let window = note.object as? NSWindow,
                   window.identifier?.rawValue == TodoAgentMainWindow.identifier
@@ -378,6 +386,22 @@ final class MainWorkspaceChromeCoordinator: TaskWorkspacePresentationPreparing {
     func acceptSystemNavigationVisibility(_ visibility: NavigationSplitViewVisibility) {
         guard isPreparingTaskWorkspace == false else { return }
         navigationColumnVisibility = MainWorkspaceNavigationPolicy.canonicalVisibility(visibility)
+    }
+
+    /// Collapse of a presented terminal must return the task Sidebar. Task-to-task
+    /// switches keep `isPresented == true` and must not reopen chrome mid-handoff.
+    func handleTaskWorkspacePresentationChange(wasPresented: Bool, isPresented: Bool) {
+        guard MainWorkspaceChromeCollapsePolicy.shouldRevealNavigationSidebar(
+            wasPresented: wasPresented,
+            isPresented: isPresented,
+            isPreparing: isPreparingTaskWorkspace
+        ) else { return }
+        revealNavigationSidebar()
+    }
+
+    func revealNavigationSidebar() {
+        guard isPreparingTaskWorkspace == false else { return }
+        navigationColumnVisibility = MainWorkspaceNavigationPolicy.visibleColumns
     }
 
     func updateBoardWidth(_ width: CGFloat) {
@@ -593,6 +617,16 @@ private struct ExternalChromePreparationSession {
 enum TaskWorkspaceExternalChromePreparationPolicy {
     static let timeout: TimeInterval = 2
     static let geometryTolerance: CGFloat = 2
+}
+
+enum MainWorkspaceChromeCollapsePolicy {
+    static func shouldRevealNavigationSidebar(
+        wasPresented: Bool,
+        isPresented: Bool,
+        isPreparing: Bool
+    ) -> Bool {
+        wasPresented && isPresented == false && isPreparing == false
+    }
 }
 
 enum MainWorkspaceNavigationPolicy {

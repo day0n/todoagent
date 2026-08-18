@@ -10,11 +10,12 @@ TodoAgent 是一款本地优先的原生 macOS 待办与 Agent 工作台。它�
 你已经安装的 Coding Agent CLI 放在同一个桌面界面中：每个任务固定对应一个终端，
 左侧任务栏和右侧真实终端在主窗口内直接切换。
 
-> **项目状态：开发预览。** 当前只支持 macOS 26+ 与 Apple Silicon arm64；本地
-> DMG 使用 ad-hoc 签名，尚未经过 Developer ID 签名和 Apple 公证，不是面向公众的
+> **项目状态：开发预览。** 当前只支持 macOS 26+ 与 Apple Silicon arm64。已发布
+> ad-hoc 签名的预览 DMG，尚未经过 Developer ID 签名和 Apple 公证，不是面向公众的
 > 正式发行包。
 
-[官网](https://todoagent.space/) · [快速开始](#本地构建与运行) · [公开 TODO](TODO.md) ·
+[官网](https://todoagent.space/) · [下载预览](#下载开发预览) ·
+[快速开始](#本地构建与运行) · [公开 TODO](TODO.md) ·
 [架构](docs/ARCHITECTURE.md) · [Runtime 集成](docs/RUNTIMES.md) ·
 [贡献指南](CONTRIBUTING.md) · [安全策略](SECURITY.md)
 
@@ -91,6 +92,25 @@ Claude CLI 处理。Gemini 任务助手没有 shell、任意文件读写或 CLI 
 fresh/resume 规则、状态 Hook 和兼容性边界见
 [`docs/RUNTIMES.md`](docs/RUNTIMES.md)。
 
+## 下载开发预览
+
+第一个公开预览是 [v0.1.0](https://github.com/day0n/todoagent/releases/tag/v0.1.0)，
+只支持 macOS 26+ 与 Apple Silicon arm64。
+
+- DMG：[TodoAgent-0.1.0-arm64.dmg](https://github.com/day0n/todoagent/releases/download/v0.1.0/TodoAgent-0.1.0-arm64.dmg)
+- 校验：[SHA-256](https://github.com/day0n/todoagent/releases/download/v0.1.0/TodoAgent-0.1.0-arm64.dmg.sha256)
+
+该包使用 ad-hoc 签名，没有 Developer ID 签名，也没有经过 Apple 公证。从浏览器下载
+后，Gatekeeper 会拦截首次打开：把 App 拖到 `/Applications`，按住 Control 点击并选择
+「打开」，或执行：
+
+```bash
+xattr -cr /Applications/TodoAgent.app
+```
+
+Coding Agent CLI 不随此包分发，需要本机自行安装并登录。已签名、公证的正式发行包
+仍未提供。
+
 ## 本地构建与运行
 
 ### 要求
@@ -126,8 +146,8 @@ Swift App、Rust Engine 与 Terminal Runner，并生成：
 创建任务后点击任务即可直接打开它的终端；“设置 → 本机 CLI”用于检测和验证已安装的
 Runtime。普通 shell 中手动启动的 CLI 不会自动登记成可跨 App 重启恢复的 Provider Run。
 
-完整依赖、开发流程和验证命令见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。目前没有可供
-普通用户直接下载的已签名、公证版本。
+完整依赖、开发流程和验证命令见 [`CONTRIBUTING.md`](CONTRIBUTING.md)。日常使用可先
+下载上面的[开发预览 DMG](#下载开发预览)；已签名、公证的正式发行包仍未提供。
 
 ## 架构概览
 
@@ -162,10 +182,11 @@ TodoAgent 将 Application Support 数据目录设置为 `0700`，SQLite 与凭�
 `0600`。Gemini Key 不写入 SQLite、环境变量或日志，但当前凭据文件不是 Keychain
 加密项；同一 macOS 登录账户下的其他进程和系统备份仍可能读取，建议启用 FileVault。
 
-Codex/Cursor 的可选状态 Hook 会在用户确认后备份并合并用户配置；Claude 使用
-run-scoped settings；Kiro 当前只有进程级状态监督。TodoAgent 不通过这些 Hook 读取
-终端内容。完整说明见 [`docs/DATA_AND_PRIVACY.md`](docs/DATA_AND_PRIVACY.md) 和
-[`SECURITY.md`](SECURITY.md)。
+Codex/Cursor 的可选状态 Hook 会在用户确认后备份并合并用户配置。Claude 的受管 Run
+使用 run-scoped settings；用户在任务终端里自己启动的 `claude` 在确认后也会合并
+用户级 `settings.json` 的 hooks 段。Kiro 当前只有进程级状态监督。TodoAgent 不通过
+这些 Hook 读取终端内容。完整说明见 [`docs/DATA_AND_PRIVACY.md`](docs/DATA_AND_PRIVACY.md)
+和 [`SECURITY.md`](SECURITY.md)。
 
 ## 文档
 
@@ -175,7 +196,7 @@ run-scoped settings；Kiro 当前只有进程级状态监督。TodoAgent 不通�
 - [`docs/DATA_AND_PRIVACY.md`](docs/DATA_AND_PRIVACY.md)：数据、凭据、Hook 与隐私
 - [`CONTRIBUTING.md`](CONTRIBUTING.md)：环境准备、测试和 Pull Request 约定
 - [`SECURITY.md`](SECURITY.md)：漏洞报告与安全边界
-- [`CHANGELOG.md`](CHANGELOG.md)：未发布变更与后续发布记录
+- [`CHANGELOG.md`](CHANGELOG.md)：已发布预览与未发布变更
 - [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md)：社区行为准则
 - [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)：第三方组件和许可
 

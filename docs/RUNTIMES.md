@@ -72,10 +72,20 @@ Hook 配置仍需要用户结合所装版本确认信任边界；可随时从设
 
 ### Claude Code
 
-TodoAgent 不修改 Claude 的全局用户设置。每次 Run 生成临时、权限受控的 settings
-文件，并通过 `--settings` 仅注入当前 Session 所需的 Hook。受管 Run 会固定使用
-Engine 启动时继承的 `CLAUDE_CONFIG_DIR`；未设置时使用 `~/.claude`。因此只在交互式
-shell 配置中临时改写该变量不会让 fresh 与下一次恢复扫描落到两个不同目录。
+受管 Run 会生成临时、权限受控的 settings 文件，并通过 `--settings` 仅注入当前
+Session 所需的 Hook。
+
+在任务终端里由用户自己启动的 `claude` 不经 TodoAgent 启动，命令行参数无法注入，
+因此还需要用户级 Hook：在用户明确确认后，TodoAgent 会像 Codex/Cursor 那样备份并
+结构化合并 `settings.json` 的 `hooks` 段，只添加自己管理的处理器；卸载时仅移除
+TodoAgent 条目，其他 Hook 与不相关的设置项都会保留。
+
+settings.json 与受管 Run 都使用 Engine 启动时继承的 `CLAUDE_CONFIG_DIR`；未设置或
+取值不是绝对路径时使用 `~/.claude`。因此只在交互式 shell 配置中临时改写该变量不会
+让 fresh 与下一次恢复扫描落到两个不同目录。
+
+两条路径可能对同一次回复各触发一次 Hook。事件 ID 由 Run、状态和 Hook 载荷派生，
+重复事件会被去重，只通知一次。
 
 ### Kiro CLI
 

@@ -10,6 +10,7 @@ final class AppContainer {
     let terminalSessions: TerminalSessionRegistry
     let taskWorkspace: TaskWorkspaceCoordinator
     let workspaceChrome: MainWorkspaceChromeCoordinator
+    let replyNotifier: AgentReplyNotifier
 
     private init() {
         do {
@@ -30,9 +31,12 @@ final class AppContainer {
                 terminalSessions: terminalSessions
             )
             workspaceChrome = MainWorkspaceChromeCoordinator(state: state)
+            replyNotifier = Self.makeReplyNotifier(state: state, taskWorkspace: taskWorkspace)
             taskWorkspace.presentationPreparer = workspaceChrome
             state.taskWorkspacePresenter = taskWorkspace
             state.terminalSessions = terminalSessions
+            state.replyNotifier = replyNotifier
+            terminalSessions.replyNotifier = replyNotifier
         } catch {
             client = nil
             let repository = FailedRepository(message: error.localizedDescription)
@@ -47,10 +51,27 @@ final class AppContainer {
                 terminalSessions: terminalSessions
             )
             workspaceChrome = MainWorkspaceChromeCoordinator(state: state)
+            replyNotifier = Self.makeReplyNotifier(state: state, taskWorkspace: taskWorkspace)
             taskWorkspace.presentationPreparer = workspaceChrome
             state.taskWorkspacePresenter = taskWorkspace
             state.terminalSessions = terminalSessions
+            state.replyNotifier = replyNotifier
+            terminalSessions.replyNotifier = replyNotifier
         }
+    }
+
+    private static func makeReplyNotifier(
+        state: AppState,
+        taskWorkspace: TaskWorkspaceCoordinator
+    ) -> AgentReplyNotifier {
+        let channel = UserNotificationsAgentReplyChannel()
+        let notifier = AgentReplyNotifier(
+            channel: channel,
+            inspector: AgentReplyWorkspaceInspector(workspace: taskWorkspace),
+            router: AgentReplyAppStateRouter(state: state)
+        )
+        channel.notifier = notifier
+        return notifier
     }
 }
 
@@ -101,6 +122,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
         inputFocusMonitor.start()
+        AppContainer.shared.replyNotifier.install()
+    }
+
+    func applicationDidResignActive(_ notification: Notification) {
+        Task { @MainActor in
+            await AppContainer.shared.replyNotifier.flushPendingIfUninspected()
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {

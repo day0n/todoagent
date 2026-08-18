@@ -86,7 +86,8 @@ open dist/TodoAgent.app
 
 脚本会构建 Swift release App、Rust Engine 和 Terminal Runner，验证资源/许可，执行
 strip 与 ad-hoc 签名，并生成本地预览 App 与 arm64 DMG。它不是正式发行流程；
-Developer ID、公证和干净账户验收仍未完成。
+Developer ID、公证和干净账户验收仍未完成。当前公开预览包见
+[v0.1.0](https://github.com/day0n/todoagent/releases/tag/v0.1.0)。
 
 日常开发直接重新构建并打开 `dist/TodoAgent.app`，无需复制到 `/Applications`。
 

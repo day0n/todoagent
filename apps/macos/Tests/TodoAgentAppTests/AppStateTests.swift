@@ -63,6 +63,34 @@ struct AppStateTests {
         #expect(MainWorkspaceNavigationPolicy.canonicalVisibility(.all) == .doubleColumn)
         #expect(MainWorkspaceNavigationPolicy.canonicalVisibility(.doubleColumn) == .doubleColumn)
         #expect(MainWorkspaceNavigationPolicy.canonicalVisibility(.detailOnly) == .detailOnly)
+        #expect(
+            MainWorkspaceChromeCollapsePolicy.shouldRevealNavigationSidebar(
+                wasPresented: true,
+                isPresented: false,
+                isPreparing: false
+            )
+        )
+        #expect(
+            MainWorkspaceChromeCollapsePolicy.shouldRevealNavigationSidebar(
+                wasPresented: true,
+                isPresented: false,
+                isPreparing: true
+            ) == false
+        )
+        #expect(
+            MainWorkspaceChromeCollapsePolicy.shouldRevealNavigationSidebar(
+                wasPresented: true,
+                isPresented: true,
+                isPreparing: false
+            ) == false
+        )
+        #expect(
+            MainWorkspaceChromeCollapsePolicy.shouldRevealNavigationSidebar(
+                wasPresented: false,
+                isPresented: false,
+                isPreparing: false
+            ) == false
+        )
     }
 
     @Test("workspace chrome lock does not disable the Ghostty surface")
@@ -148,6 +176,57 @@ struct AppStateTests {
         #expect(workspace.pendingTaskID == nil)
         #expect(workspace.presentedTaskID == task.id)
         #expect(chrome.isPreparingTaskWorkspace == false)
+    }
+
+    @Test("collapsing a presented workspace reveals the navigation sidebar")
+    func collapsingPresentedWorkspaceRevealsNavigationSidebar() async {
+        let task = taskFixture()
+        let repository = TaskOpenSpyRepository(
+            snapshot: AppSnapshot(
+                revision: 1,
+                lists: [],
+                tasks: [task],
+                runtimes: [],
+                sessions: [],
+                messages: []
+            )
+        )
+        let state = AppState(repository: repository)
+        let sessions = TerminalSessionRegistry(repository: repository)
+        let workspace = TaskWorkspaceCoordinator(state: state, terminalSessions: sessions)
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        workspace.presentationPreparer = chrome
+        await state.load()
+
+        workspace.showTaskWorkspace(taskID: task.id)
+        await drainMainActorTasks()
+        chrome.updateRootWidth(900)
+        chrome.updateBoardWidth(900)
+        await drainMainActorTasks()
+
+        #expect(workspace.presentedTaskID == task.id)
+        #expect(chrome.navigationColumnVisibility == .detailOnly)
+
+        workspace.closeTaskWorkspace(taskID: task.id)
+        await drainMainActorTasks()
+        #expect(workspace.isPresented == false)
+
+        chrome.handleTaskWorkspacePresentationChange(
+            wasPresented: true,
+            isPresented: workspace.isPresented
+        )
+        #expect(chrome.navigationColumnVisibility == .doubleColumn)
+    }
+
+    @Test("sidebar reveal is ignored while a terminal is being prepared")
+    func revealNavigationSidebarIsLockedDuringPreparation() {
+        let state = AppState(repository: AssistantTestRepository())
+        let chrome = MainWorkspaceChromeCoordinator(state: state)
+        chrome.navigationColumnVisibility = .detailOnly
+        _ = chrome.acquireTaskWorkspacePreparation()
+
+        chrome.revealNavigationSidebar()
+        #expect(chrome.navigationColumnVisibility == .detailOnly)
     }
 
     @Test("cancelled task preflight restores chrome and never mounts a terminal")

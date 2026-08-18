@@ -63,6 +63,80 @@ struct ProviderStatusHookManagerTests {
         #expect(try backupCount(fixture.support, runtime: .codex) == 1)
     }
 
+    /// Claude keeps hooks inside its general settings document, so a merge here
+    /// touches a file that also holds unrelated preferences and, commonly,
+    /// another status tool's handlers. Both have to survive install and
+    /// uninstall untouched.
+    @Test("Claude install merges into settings.json and keeps foreign hooks and preferences")
+    func claudeInstallPreservesUnrelatedSettings() throws {
+        let fixture = try StatusHookFixture()
+        defer { fixture.cleanup() }
+        let config = fixture.home
+            .appendingPathComponent(".claude", isDirectory: true)
+            .appendingPathComponent("settings.json")
+        try writeFixture(
+            [
+                "model": "opus",
+                "env": ["FOO": "bar"],
+                "hooks": [
+                    // A matcher group, which is the shape Claude uses for
+                    // permission prompts and the one an existing tool occupies.
+                    "Notification": [[
+                        "matcher": "permission_prompt",
+                        "hooks": [["type": "command", "command": "foreign-blocked"]],
+                    ]],
+                    // A managed event that already has someone else's handler.
+                    "Stop": [[
+                        "hooks": [["type": "command", "command": "foreign-stop"]],
+                    ]],
+                ],
+            ],
+            to: config
+        )
+
+        let result = try fixture.manager.install(runtime: .claude)
+        #expect(result.health == .installed)
+        let installed = try loadJSON(config)
+        #expect(installed["model"] as? String == "opus")
+        #expect((installed["env"] as? [String: String])?["FOO"] == "bar")
+        #expect(allCommands(in: installed).contains("foreign-blocked"))
+        #expect(allCommands(in: installed).contains("foreign-stop"))
+        #expect(managedClaudeHandlerCount(installed) == 5)
+        #expect(try permissions(config) == 0o600)
+        #expect(try backupCount(fixture.support, runtime: .claude) == 1)
+
+        // Re-installing must not stack a second copy of our handlers.
+        try fixture.manager.install(runtime: .claude)
+        #expect(managedClaudeHandlerCount(try loadJSON(config)) == 5)
+        #expect(try backupCount(fixture.support, runtime: .claude) == 1)
+
+        try fixture.manager.uninstall(runtime: .claude)
+        let uninstalled = try loadJSON(config)
+        #expect(managedClaudeHandlerCount(uninstalled) == 0)
+        #expect(uninstalled["model"] as? String == "opus")
+        #expect(allCommands(in: uninstalled).contains("foreign-blocked"))
+        #expect(allCommands(in: uninstalled).contains("foreign-stop"))
+    }
+
+    @Test("CLAUDE_CONFIG_DIR redirects the settings document only when absolute")
+    func claudeConfigurationDirectoryOverride() throws {
+        #expect(
+            ProviderStatusHookManager.environmentClaudeConfigurationDirectory(
+                environment: ["CLAUDE_CONFIG_DIR": "/tmp/custom-claude"]
+            )?.path == "/tmp/custom-claude"
+        )
+        // A relative or empty value would resolve against the App's working
+        // directory and write a settings file the user never configured.
+        for value in ["", "  ", "relative/dir"] {
+            #expect(
+                ProviderStatusHookManager.environmentClaudeConfigurationDirectory(
+                    environment: ["CLAUDE_CONFIG_DIR": value]
+                ) == nil
+            )
+        }
+        #expect(ProviderStatusHookManager.environmentClaudeConfigurationDirectory(environment: [:]) == nil)
+    }
+
     @Test("Cursor install preserves unknown fields and existing handlers")
     func cursorInstallAndUninstall() throws {
         let fixture = try StatusHookFixture()
@@ -234,6 +308,10 @@ private let codexEvents = [
 
 private let cursorEvents = ["sessionStart", "beforeSubmitPrompt", "stop", "sessionEnd"]
 
+private let claudeEvents = [
+    "SessionStart", "UserPromptSubmit", "PermissionRequest", "Stop", "SessionEnd",
+]
+
 private func writeFixture(_ document: [String: Any], to url: URL) throws {
     try FileManager.default.createDirectory(
         at: url.deletingLastPathComponent(),
@@ -273,6 +351,22 @@ private func managedCodexHandlerCount(_ document: [String: Any]) -> Int {
             else { continue }
             count += handlers.filter {
                 (($0 as? [String: Any])?["command"] as? String)?.contains("codex-status-hook-v1") == true
+            }.count
+        }
+    }
+}
+
+private func managedClaudeHandlerCount(_ document: [String: Any]) -> Int {
+    guard let hooks = document["hooks"] as? [String: Any] else { return 0 }
+    return claudeEvents.reduce(into: 0) { count, event in
+        guard let groups = hooks[event] as? [Any] else { return }
+        for group in groups {
+            guard let object = group as? [String: Any],
+                  let handlers = object["hooks"] as? [Any]
+            else { continue }
+            count += handlers.filter {
+                (($0 as? [String: Any])?["command"] as? String)?
+                    .contains("claude-status-hook-v1") == true
             }.count
         }
     }

@@ -10,6 +10,7 @@ enum TerminalSurfaceEvent: Equatable, Sendable {
     case titleChanged(String?)
     case workingDirectoryChanged(String)
     case attentionRequested
+    case desktopNotification(title: String, body: String)
     case processExited(exitCode: Int32?, reason: TerminalRunExitReason)
 }
 
@@ -17,6 +18,9 @@ enum TerminalSurfaceEvent: Equatable, Sendable {
 protocol TerminalSurfaceSession: AnyObject {
     var view: NSView { get }
     var onEvent: (@MainActor (TerminalSurfaceEvent) -> Void)? { get set }
+    /// PID currently in the foreground of this PTY, or `nil` when only a dead
+    /// or absent process remains.
+    var foregroundProcessID: pid_t? { get }
     func focus()
     func commitComposition()
     func performAction(_ action: String)
@@ -109,6 +113,10 @@ final class TerminalSessionController {
     private(set) var terminalTitle: String?
     private(set) var workingDirectory: String
     private(set) var needsAttention = false
+    /// Agent actually running in this host PTY, resolved from the foreground
+    /// process. Distinct from the session's default `runtimeKind`, which is
+    /// Claude for every newly opened host shell.
+    private(set) var detectedRuntime: RuntimeKind?
     private(set) var isAttached = false
     /// Presentation state must be observable independently of the retained
     /// AppKit/Ghostty object. Engine events can mark a Run ended before the
@@ -129,10 +137,13 @@ final class TerminalSessionController {
     @ObservationIgnored private var launchTask: Task<Void, Never>?
     @ObservationIgnored private var statusServer: TerminalStatusServer?
     @ObservationIgnored private var statusEventTask: Task<Void, Never>?
+    @ObservationIgnored private var hostStatusServer: TerminalStatusServer?
+    @ObservationIgnored private var hostStatusEventTask: Task<Void, Never>?
     @ObservationIgnored private var terminationEscalationTask: Task<Void, Never>?
     @ObservationIgnored private var surfaceExitFallbackTask: Task<Void, Never>?
     @ObservationIgnored private var exitReasonOverride: TerminalRunExitReason?
     @ObservationIgnored private var activeRunID: String?
+    @ObservationIgnored private var hostStatusRunID: String?
     @ObservationIgnored private var processGroupID: Int32?
     @ObservationIgnored private var runnerDidStart = false
     @ObservationIgnored private var didReportStarted = false
@@ -152,8 +163,14 @@ final class TerminalSessionController {
     @ObservationIgnored private var isShutdownExitDeferred = false
     @ObservationIgnored private var isHandlingEngineRestart = false
     @ObservationIgnored private var kiroMetadataWatcher: KiroMetadataWatcher?
+    @ObservationIgnored private var runtimeProbeTask: Task<Void, Never>?
+    /// Injectable so tests can drive detection without a real PTY.
+    @ObservationIgnored var runtimeProbe: (pid_t) -> RuntimeKind? = {
+        HostAgentRuntimeProbe.detect(pid: $0)
+    }
     @ObservationIgnored private var exitWaiters: [CheckedContinuation<Void, Never>] = []
     @ObservationIgnored var onHostAbandoned: (@MainActor () -> Void)?
+    @ObservationIgnored var replyNotifier: (any AgentReplyNotifying)?
 
     convenience init(
         bundle: TerminalSessionBundle,
@@ -182,12 +199,35 @@ final class TerminalSessionController {
         exitJournal = exitJournalCoordinator
         workingDirectory = bundle.session.workingDirectory
         needsAttention = bundle.session.hasUnread || bundle.session.agentStatus.needsAttention
+        // Nothing is known about a host shell until its PTY exists and can be
+        // probed. Seeding this from `session.runtimeKind` (Claude for every new
+        // host session) and persisting it is what previously pinned the card to
+        // the Claude icon forever.
+        detectedRuntime = nil
         phase = Self.phase(for: bundle)
     }
 
     var session: TerminalSessionDescriptor { bundle.session }
     var activeRun: TerminalRun? { bundle.activeRun }
     var isActive: Bool { phase.isActive }
+
+    /// The runtime to show for this task, and the only source the UI should
+    /// read.
+    ///
+    /// The live probe wins: it observes the PTY directly. Failing that, a run
+    /// TodoAgent launched itself is real evidence, because the runner spawned
+    /// exactly that CLI — and during such a run the foreground process is often
+    /// the runner rather than the Agent, so the probe legitimately finds
+    /// nothing. Absent both, `nil` means a plain shell and must not fall back
+    /// to the session's default, which is Claude for every new host session.
+    ///
+    /// Kept in step with `TaskCardAgentStatus.displayedRuntime`, which applies
+    /// the same order for tasks whose controller is not in memory.
+    var displayRuntime: RuntimeKind? {
+        if let detectedRuntime { return detectedRuntime }
+        if session.hasOfficialAgentRun { return session.runtimeKind }
+        return nil
+    }
     var view: NSView? { surfaceSession?.view }
     var workingDirectoryIsAvailable: Bool {
         TerminalWorkingDirectoryPolicy.isAvailable(session.workingDirectory)
@@ -286,15 +326,37 @@ final class TerminalSessionController {
 
     func ensureHostSurface() throws {
         if surfaceSession != nil { return }
+        let hookEnvironment = startHostStatusListenerIfPossible()
         let surface = try surfaceFactory.makeHostSurface(
             workingDirectory: TerminalHostDefaults.workingDirectory,
-            environment: [:]
+            environment: hookEnvironment
         )
         surface.onEvent = { [weak self] event in
             self?.handleSurfaceEvent(event)
         }
+        Task { @MainActor [weak self] in
+            _ = await self?.replyNotifier?.requestAuthorizationIfNeeded()
+        }
+        // A host shell reports status only if the provider's hooks are already
+        // installed for this account, and the Agent reads them when it starts.
+        // Asking here means the decision is made before the user types
+        // `claude`; asking after would leave their first run silent.
+        //
+        // Gated on `requiresExecutionConsent` for the same reason
+        // `ExecutionSafety.authorize` is: this presents an `NSAlert`, and a
+        // modal runs a nested run loop that owns the main actor until someone
+        // clicks it. Only the real Engine repository opts in, so tests and
+        // previews never block. Runs detached so surface creation completes
+        // first either way.
+        if repository.requiresExecutionConsent {
+            let runtime = session.runtimeKind
+            Task { @MainActor in
+                TerminalStatusAuthorization.requestIfNeeded(for: runtime)
+            }
+        }
         surfaceSession = surface
         hasLiveSurface = true
+        startRuntimeProbe()
         workingDirectory = TerminalHostDefaults.workingDirectory
         hostView?.attach(surface.view)
         if !phase.isActive {
@@ -336,7 +398,6 @@ final class TerminalSessionController {
         guard let surfaceSession, let window = surfaceSession.view.window, window.isKeyWindow else { return }
         guard !(window.firstResponder is NSText) else { return }
         surfaceSession.focus()
-        markSeenIfNeeded()
     }
 
     func markSeenIfNeeded() {
@@ -619,11 +680,18 @@ final class TerminalSessionController {
             // authenticated `started` datagram is the authority for process state.
             break
         case let .titleChanged(title):
+            // The title is displayed but never used to infer which Agent runs
+            // here. A task titled "学习 claude code 源码" reaches this string.
             terminalTitle = title
         case let .workingDirectoryChanged(path):
             workingDirectory = path
         case .attentionRequested:
             needsAttention = true
+        case .desktopNotification:
+            needsAttention = true
+            Task { @MainActor [weak self] in
+                await self?.notifyHostAgentReply()
+            }
         case let .processExited(exitCode, reason):
             if exitReasonOverride == .appShutdown || isShutdownExitDeferred {
                 scheduleSurfaceExitFallback(
@@ -636,6 +704,54 @@ final class TerminalSessionController {
                 await self?.abandonHost(exitCode: exitCode, reason: reason)
             }
         }
+    }
+
+    /// Polls the PTY's foreground process so the UI can show which Agent is
+    /// really running. The kernel offers no "foreground process changed"
+    /// notification, so this has to poll; each pass costs two syscalls.
+    private func startRuntimeProbe() {
+        guard runtimeProbeTask == nil else { return }
+        refreshDetectedRuntime()
+        runtimeProbeTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .milliseconds(1500))
+                } catch {
+                    return
+                }
+                guard let self, self.hasLiveSurface else { return }
+                self.refreshDetectedRuntime()
+            }
+        }
+    }
+
+    private func stopRuntimeProbe() {
+        runtimeProbeTask?.cancel()
+        runtimeProbeTask = nil
+        detectedRuntime = nil
+    }
+
+    private func refreshDetectedRuntime() {
+        guard let pid = surfaceSession?.foregroundProcessID else {
+            detectedRuntime = nil
+            return
+        }
+        let probed = runtimeProbe(pid)
+        guard detectedRuntime != probed else { return }
+        detectedRuntime = probed
+    }
+
+    private func notifyHostAgentReply() async {
+        // The last probed runtime is used as-is rather than re-probed here. By
+        // the time an Agent announces it finished, the foreground process may
+        // already be back to the shell; the remembered value attributes the
+        // reply to the Agent that actually sent it.
+        await replyNotifier?.consider(
+            eventID: UUID().uuidString.lowercased(),
+            status: .completed,
+            runtime: displayRuntime,
+            session: session
+        )
     }
 
     private func consumeStatusEvents(from server: TerminalStatusServer, runID: String) {
@@ -678,6 +794,14 @@ final class TerminalSessionController {
                     status: status,
                     eventID: eventID
                 ))
+                if status == .completed || status == .blocked {
+                    await replyNotifier?.consider(
+                        eventID: eventID,
+                        status: status,
+                        runtime: displayRuntime,
+                        session: session
+                    )
+                }
             } catch {
                 needsAttention = true
             }
@@ -964,10 +1088,12 @@ final class TerminalSessionController {
         surfaceSession?.close()
         surfaceSession = nil
         hasLiveSurface = false
+        stopRuntimeProbe()
         hostView = nil
         isAttached = false
         processGroupID = nil
         finishStatusServer()
+        finishHostStatusServer()
     }
 
     private func abandonHost(exitCode: Int32?, reason: TerminalRunExitReason) async {
@@ -987,6 +1113,66 @@ final class TerminalSessionController {
         statusEventTask = nil
         statusServer?.stop()
         statusServer = nil
+    }
+
+    private func finishHostStatusServer() {
+        hostStatusEventTask?.cancel()
+        hostStatusEventTask = nil
+        hostStatusServer?.stop()
+        hostStatusServer = nil
+        hostStatusRunID = nil
+    }
+
+    @discardableResult
+    private func startHostStatusListenerIfPossible() -> [String: String] {
+        finishHostStatusServer()
+        let runID = UUID().uuidString.lowercased()
+        guard let server = try? TerminalStatusServer(sessionID: session.id, runID: runID) else {
+            return [:]
+        }
+        hostStatusRunID = runID
+        hostStatusServer = server
+        consumeHostStatusEvents(from: server, runID: runID)
+        return HostAgentHookSupport.environment(
+            sessionID: session.id,
+            runID: runID,
+            runtime: session.runtimeKind,
+            socketPath: server.credentials.socketPath,
+            hookToken: server.credentials.hookToken
+        )
+    }
+
+    private func consumeHostStatusEvents(from server: TerminalStatusServer, runID: String) {
+        hostStatusEventTask?.cancel()
+        hostStatusEventTask = Task { @MainActor [weak self] in
+            for await event in server.events {
+                guard let self, self.hostStatusRunID == runID else { return }
+                await self.handleHostStatusEvent(event)
+            }
+        }
+    }
+
+    private func handleHostStatusEvent(_ event: TerminalStatusServerEvent) async {
+        switch event {
+        case .started, .exited:
+            break
+        case .providerBound:
+            break
+        case let .status(status, eventID):
+            // A host hook event proves *an* Agent is running, but not which
+            // one: the `TODOAGENT_RUNTIME` it carries is the session's default,
+            // so attributing the event to it would report Claude no matter what
+            // the user actually launched. The foreground-process probe answers
+            // that question instead.
+            guard status == .completed || status == .blocked else { return }
+            needsAttention = true
+            await replyNotifier?.consider(
+                eventID: eventID,
+                status: status,
+                runtime: displayRuntime,
+                session: session
+            )
+        }
     }
 
     private func resumeExitWaiters() {
@@ -1148,6 +1334,9 @@ final class TerminalSessionRegistry {
     @ObservationIgnored private let exitJournal: TerminalExitJournalCoordinator
     @ObservationIgnored private let shutdownExitPersistenceDeadline: Duration
     @ObservationIgnored private var controllers: [UUID: TerminalSessionController] = [:]
+    @ObservationIgnored var replyNotifier: (any AgentReplyNotifying)? {
+        didSet { applyReplyNotifier() }
+    }
     private(set) var isShuttingDown = false
     private(set) var isRecoveringEngine = false
 
@@ -1155,12 +1344,14 @@ final class TerminalSessionRegistry {
         repository: any AppRepository,
         surfaceFactory: any TerminalSurfaceFactory = UnavailableTerminalSurfaceFactory(),
         exitJournal: any TerminalExitJournaling = TerminalExitJournalStore(),
-        shutdownExitPersistenceDeadline: Duration = .seconds(4)
+        shutdownExitPersistenceDeadline: Duration = .seconds(4),
+        replyNotifier: (any AgentReplyNotifying)? = nil
     ) {
         self.repository = repository
         self.surfaceFactory = surfaceFactory
         self.exitJournal = TerminalExitJournalCoordinator(journal: exitJournal)
         self.shutdownExitPersistenceDeadline = shutdownExitPersistenceDeadline
+        self.replyNotifier = replyNotifier
     }
 
     func controller(for taskID: UUID) -> TerminalSessionController? {
@@ -1178,6 +1369,7 @@ final class TerminalSessionRegistry {
     @discardableResult
     func restore(_ bundle: TerminalSessionBundle) -> TerminalSessionController? {
         if let existing = controllers[bundle.session.taskID] {
+            existing.replyNotifier = replyNotifier
             existing.apply(bundle)
             return existing
         }
@@ -1188,12 +1380,19 @@ final class TerminalSessionRegistry {
             surfaceFactory: surfaceFactory,
             exitJournalCoordinator: exitJournal
         )
+        controller.replyNotifier = replyNotifier
         controllers[bundle.session.taskID] = controller
         controller.onHostAbandoned = { [weak self, weak controller, taskID = bundle.session.taskID] in
             guard let self, let controller, self.controllers[taskID] === controller else { return }
             self.controllers[taskID] = nil
         }
         return controller
+    }
+
+    private func applyReplyNotifier() {
+        for controller in controllers.values {
+            controller.replyNotifier = replyNotifier
+        }
     }
 
     func forget(taskID: UUID) {

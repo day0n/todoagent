@@ -107,7 +107,10 @@ Run，也不会被 TodoAgent 自动绑定或恢复。
 
 - Codex/Cursor：用户同意后，TodoAgent 备份并合并用户级 `hooks.json`；卸载只移除
   TodoAgent 管理的 handler。
-- Claude Code：使用单次 Run 的临时 `--settings`，不修改全局配置。
+- Claude Code：受管 Run 使用单次 Run 的临时 `--settings`。用户在任务终端里自己启动
+  的 `claude` 无法通过命令行注入，因此在用户同意后，TodoAgent 也会备份并合并用户级
+  `settings.json` 的 `hooks` 段；卸载只移除 TodoAgent 管理的 handler，其他 Hook 与
+  设置项保留。
 - Kiro CLI：当前不安装状态 Hook。
 
 Hook 仅发送经过认证的生命周期状态，不读取终端输出；Wrapper 在 TodoAgent Run 之外

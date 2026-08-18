@@ -310,6 +310,8 @@ struct TaskConversationViewTests {
         )
         #expect(TaskWorkspaceLayoutPolicy.regularRailWidth == 320)
         #expect(TaskWorkspaceLayoutPolicy.compactRailWidth == 252)
+        #expect(TaskWorkspaceLayoutPolicy.defaultOpenRailWidth == 252)
+        #expect(TaskWorkspaceLayoutPolicy.minimumResizableRailWidth == 200)
         #expect(TaskWorkspaceLayoutPolicy.railWidth(for: .split) == 320)
         #expect(TaskWorkspaceLayoutPolicy.railWidth(for: .compact) == 252)
         #expect(TaskWorkspaceLayoutPolicy.terminalPreferredMinimumWidth == 500)
@@ -328,6 +330,7 @@ struct TaskConversationViewTests {
                 previous: nil
             ) == .compact
         )
+        #expect(TaskWorkspaceTerminalPanePreferences.widthKey.hasSuffix(".v2"))
     }
 
     @Test("task content adaptively shrinks with the terminal drawer")
@@ -346,18 +349,67 @@ struct TaskConversationViewTests {
         #expect(TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
             paneWidth: 1_100,
             expandedPaneWidth: 1_100,
-            collapsedPaneWidth: 320
+            collapsedPaneWidth: 252
         ) == 780)
         #expect(TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
-            paneWidth: 710,
+            paneWidth: 676,
             expandedPaneWidth: 1_100,
-            collapsedPaneWidth: 320
-        ) == 530)
+            collapsedPaneWidth: 252
+        ) == 496)
         #expect(TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
-            paneWidth: 320,
+            paneWidth: 252,
             expandedPaneWidth: 1_100,
-            collapsedPaneWidth: 320
-        ) == 280)
+            collapsedPaneWidth: 252
+        ) == 212)
+    }
+
+    @Test("narrow task cards keep controls while truncating text at the tail")
+    func narrowTaskCardLayoutPolicy() {
+        #expect(TaskCardNarrowLayoutPolicy.textLineLimit == 1)
+        #expect(TaskCardNarrowLayoutPolicy.textTruncation == .tail)
+        #expect(TaskCardNarrowLayoutPolicy.allowsTextTightening == false)
+        #expect(TaskCardNarrowLayoutPolicy.completionControlSize == 22)
+        #expect(
+            TaskCardNarrowLayoutPolicy.sessionTargetWidth(
+                railWidth: TaskWorkspaceLayoutPolicy.minimumResizableRailWidth
+            ) == 100
+        )
+        #expect(
+            TaskCardNarrowLayoutPolicy.reservesAgentIndicatorSpace(
+                isWorkspacePending: false,
+                isRunning: false,
+                hasUnread: false
+            ) == false
+        )
+        #expect(
+            TaskCardNarrowLayoutPolicy.reservesAgentIndicatorSpace(
+                isWorkspacePending: true,
+                isRunning: false,
+                hasUnread: false
+            )
+        )
+        #expect(
+            TaskCardNarrowLayoutPolicy.reservesAgentIndicatorSpace(
+                isWorkspacePending: false,
+                isRunning: true,
+                hasUnread: false
+            )
+        )
+        #expect(
+            TaskCardNarrowLayoutPolicy.reservesAgentIndicatorSpace(
+                isWorkspacePending: false,
+                isRunning: false,
+                hasUnread: true
+            )
+        )
+        #expect(
+            TaskCardNarrowLayoutPolicy.reservesAgentIndicatorSpace(
+                isWorkspacePending: false,
+                isRunning: false,
+                hasUnread: false,
+                showsRuntime: true
+            )
+        )
     }
 
     @Test("workspace reveal moves a fixed-width terminal instead of resizing it")
@@ -366,17 +418,17 @@ struct TaskConversationViewTests {
             availableWidth: 1_100,
             railVisibility: .split
         )
-        #expect(regular.railWidth == 320)
-        #expect(regular.terminalWidth == 779)
+        #expect(regular.railWidth == 252)
+        #expect(regular.terminalWidth == 847)
         #expect(regular.terminalX(revealProgress: 0) == 1_101)
-        #expect(regular.terminalX(revealProgress: 0.5) == 711)
-        #expect(regular.terminalX(revealProgress: 1) == 321)
+        #expect(regular.terminalX(revealProgress: 0.5) == 677)
+        #expect(regular.terminalX(revealProgress: 1) == 253)
         #expect(regular.taskPaneWidth(isPresented: false) == 1_100)
-        #expect(regular.taskPaneWidth(isPresented: true) == 320)
+        #expect(regular.taskPaneWidth(isPresented: true) == 252)
         #expect(regular.terminalReservedWidth(isPresented: false) == 0)
-        #expect(regular.terminalReservedWidth(isPresented: true) == 780)
+        #expect(regular.terminalReservedWidth(isPresented: true) == 848)
         #expect(regular.dividerX(isPresented: false) == 1_100)
-        #expect(regular.dividerX(isPresented: true) == 320)
+        #expect(regular.dividerX(isPresented: true) == 252)
 
         for progress in [CGFloat(0), 0.25, 0.5, 0.75, 1] {
             let taskPaneWidth = regular.taskPaneWidth(revealProgress: progress)
@@ -389,8 +441,28 @@ struct TaskConversationViewTests {
                 taskPaneWidth + regular.terminalReservedWidth(revealProgress: progress)
                     == 1_100
             )
-            #expect(regular.terminalWidth == 779)
+            #expect(regular.terminalWidth == 847)
         }
+
+        let sameWidthCompact = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 1_100,
+            railVisibility: .compact
+        )
+        #expect(sameWidthCompact.railWidth == regular.railWidth)
+        #expect(sameWidthCompact.terminalWidth == regular.terminalWidth)
+
+        let splitThreshold = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 821,
+            railVisibility: .split
+        )
+        let compactThreshold = TaskWorkspaceRevealLayoutPolicy.resolve(
+            availableWidth: 820,
+            railVisibility: .compact
+        )
+        #expect(splitThreshold.railWidth == 252)
+        #expect(compactThreshold.railWidth == 252)
+        #expect(splitThreshold.terminalWidth == 568)
+        #expect(compactThreshold.terminalWidth == 567)
 
         let compact = TaskWorkspaceRevealLayoutPolicy.resolve(
             availableWidth: 700,
@@ -420,19 +492,19 @@ struct TaskConversationViewTests {
             availableWidth: 1_100,
             railVisibility: .split
         )
-        #expect(splitRange == 320 ... 847)
+        #expect(splitRange == 320 ... 899)
 
         let compactRange = TaskWorkspaceRevealLayoutPolicy.terminalWidthRange(
             availableWidth: 700,
             railVisibility: .compact
         )
-        #expect(compactRange == 320 ... 447)
+        #expect(compactRange == 320 ... 499)
 
         let narrowRange = TaskWorkspaceRevealLayoutPolicy.terminalWidthRange(
             availableWidth: 550,
             railVisibility: .compact
         )
-        #expect(narrowRange == 320 ... 320)
+        #expect(narrowRange == 320 ... 349)
         #expect(
             TaskWorkspaceRevealLayoutPolicy.terminalWidthRange(
                 availableWidth: 300,
@@ -453,8 +525,8 @@ struct TaskConversationViewTests {
                 availableWidth: 1_100,
                 railVisibility: .split,
                 startingWidth: 650,
-                dividerTranslation: -200
-            ) == 847
+                dividerTranslation: -300
+            ) == 899
         )
         #expect(
             TaskWorkspaceRevealLayoutPolicy.resizedTerminalWidth(
@@ -476,7 +548,7 @@ struct TaskConversationViewTests {
         // A smaller window clamps presentation only. Supplying the same saved
         // preference after the window grows restores the user's width.
         let constrained = TaskWorkspaceRevealLayoutPolicy.resolve(
-            availableWidth: 900,
+            availableWidth: 800,
             railVisibility: .split,
             preferredTerminalWidth: 650
         )
@@ -490,10 +562,10 @@ struct TaskConversationViewTests {
             railVisibility: .split,
             preferredTerminalWidth: 650
         )
-        #expect(constrained.terminalWidth == 647)
-        #expect(constrained.railWidth == 252)
-        #expect(compact.terminalWidth == 447)
-        #expect(compact.railWidth == 252)
+        #expect(constrained.terminalWidth == 599)
+        #expect(constrained.railWidth == 200)
+        #expect(compact.terminalWidth == 499)
+        #expect(compact.railWidth == 200)
         #expect(restored.terminalWidth == 650)
         #expect(TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetWidth == 12)
         #expect(TaskWorkspaceTerminalResizeInteractionPolicy.accessibilityStep == 24)

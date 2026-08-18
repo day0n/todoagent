@@ -26,12 +26,14 @@ Gemini 凭据，因此安全问题应在公开前得到私下处理。
 
 ## 当前支持范围
 
-TodoAgent 尚处于 developer preview，没有正式 release tag。安全修复只面向最新
-`master`；`legacy/web` 仅用于历史兼容参考，不承诺持续安全维护。
+TodoAgent 尚处于 developer preview。已有 [`v0.1.0`](https://github.com/day0n/todoagent/releases/tag/v0.1.0)
+预览 tag，但安全修复只面向最新 `master`；预览 DMG 不构成长期支持版本。
+`legacy/web` 仅用于历史兼容参考，不承诺持续安全维护。
 
 | 版本/分支 | 安全修复 |
 |---|---|
 | 最新 `master` | 支持 |
+| `v0.1.0` 预览 DMG | 跟随最新 `master`，不单独维护 |
 | `legacy/web` | 不主动维护 |
 | 未知 fork、旧 commit、第三方重打包 | 不支持 |
 
@@ -56,7 +58,8 @@ Engine stdout 专用于本地 stdin/stdout NDJSON IPC，不监听 TCP 端口。T
 
 - Codex/Cursor 的用户级 Hook 只在用户确认后合并，写入前备份现有配置；卸载只移除
   TodoAgent 管理的 handler。
-- Claude Code 使用 run-scoped 临时 settings，不修改全局配置。
+- Claude Code 的受管 Run 使用 run-scoped 临时 settings；用户在任务终端自行启动的
+  `claude` 在用户确认后合并用户级 `settings.json` 的 hooks 段。
 - Kiro CLI 当前不安装 Hook。
 - Hook 仅报告有限生命周期状态，不读取终端内容；TodoAgent Run 之外缺少认证环境时
   Wrapper 直接退出。

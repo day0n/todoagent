@@ -9,10 +9,10 @@ type NavLink = {
 };
 
 export function SiteNav({
-  githubUrl,
+  downloadUrl,
   links,
 }: {
-  githubUrl: string;
+  downloadUrl: string;
   links: NavLink[];
 }) {
   const [open, setOpen] = useState(false);
@@ -66,8 +66,8 @@ export function SiteNav({
           >
             <i />
           </button>
-          <a className="nav-cta" href={githubUrl} target="_blank" rel="noreferrer">
-            源码
+          <a className="nav-cta" href={downloadUrl} target="_blank" rel="noreferrer">
+            下载
           </a>
         </div>
       </div>

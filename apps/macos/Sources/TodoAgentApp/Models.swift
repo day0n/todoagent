@@ -133,6 +133,22 @@ enum RuntimeKind: String, Codable, CaseIterable, Identifiable, Sendable {
         case .kiro: "Kiro CLI"
         }
     }
+
+    var fallbackSymbol: String {
+        switch self {
+        case .codex: "c.square.fill"
+        case .claude: "sparkle"
+        case .cursor: "cursorarrow.rays"
+        case .kiro: "terminal"
+        }
+    }
+}
+
+extension RuntimeKind? {
+    /// Chrome label for a terminal whose runtime is unknown, which is the
+    /// normal state of a host shell sitting at its prompt. Naming a specific
+    /// CLI here would claim an Agent is running when none is.
+    var displayTitle: String { self?.title ?? "本机终端" }
 }
 
 enum RuntimeAvailability: String, Codable, Sendable {

@@ -64,17 +64,6 @@ enum TerminalStatusAuthorization {
                 canInstall: false,
                 canUninstall: authorization != .notAuthorized
             )
-        case .runScoped:
-            let enabled = authorization == .enabled
-            return TerminalStatusAuthorizationPresentation(
-                title: enabled ? "已启用 · 按 Session 注入" : authorization.title,
-                detail: enabled
-                    ? "仅启动 TodoAgent Session 时通过 Claude --settings 注入，不修改 ~/.claude/settings.json。"
-                    : "授权后仅为 TodoAgent 启动的 Claude Session 注入临时 Hook；跳过也可正常启动。",
-                isHealthy: enabled,
-                canInstall: true,
-                canUninstall: authorization != .notAuthorized
-            )
         case .installedRequiresProviderReview:
             let enabled = authorization == .enabled
             return TerminalStatusAuthorizationPresentation(
@@ -112,14 +101,55 @@ enum TerminalStatusAuthorization {
         }
     }
 
+    /// Whether the consent prompt should be shown.
+    ///
+    /// Beyond a first-time decision, this re-asks when the stored state claims
+    /// `enabled` while nothing is actually installed. Two cases reach that: an
+    /// install undone outside TodoAgent, and an account that recorded `enabled`
+    /// under the older Claude integration, which injected `--settings` per Run
+    /// and wrote nothing to disk — so its stored `enabled` describes a promise
+    /// that no longer holds. Consent is re-requested rather than acted on
+    /// silently, because merging into the user's `settings.json` is a broader
+    /// action than the earlier prompt described.
+    ///
+    /// `skipped` is never reopened: a declined prompt stays declined.
+    static func needsConsentPrompt(
+        state: TerminalStatusAuthorizationState,
+        health: ProviderStatusHookHealth
+    ) -> Bool {
+        switch state {
+        case .notAuthorized:
+            true
+        case .skipped:
+            false
+        case .enabled:
+            // `needsRepair` counts here because a missing wrapper is reported
+            // before the configuration is even read, which is exactly the state
+            // an account upgraded from the run-scoped integration is in.
+            switch health {
+            case .notInstalled: true
+            case .needsRepair: true
+            case .installed, .installedRequiresProviderReview, .unsupported: false
+            }
+        }
+    }
+
     static func requestIfNeeded(for runtime: RuntimeKind) {
-        guard state(for: runtime) == .notAuthorized else { return }
         let manager = ProviderStatusHookManager()
+        guard needsConsentPrompt(
+            state: state(for: runtime),
+            health: manager.inspect(runtime: runtime).health
+        ) else { return }
         let capability = manager.capability(for: runtime)
         guard capability != .unsupported else {
             set(.skipped, for: runtime)
             return
         }
+        // Without the bundled runner an install cannot succeed, and a failed
+        // install resets the state to `notAuthorized` — which would re-prompt on
+        // the next terminal, forever. This happens in `swift run` builds, where
+        // the runner is not staged beside the executable.
+        guard manager.runnerExecutableURL != nil else { return }
 
         let alert = NSAlert()
         alert.alertStyle = .informational
@@ -151,7 +181,7 @@ enum TerminalStatusAuthorization {
         }
         let inspection = try manager.install(runtime: runtime)
         switch inspection.health {
-        case .installed, .installedRequiresProviderReview, .runScoped:
+        case .installed, .installedRequiresProviderReview:
             set(.enabled, for: runtime, defaults: defaults)
         case .notInstalled, .unsupported, .needsRepair:
             throw ProviderStatusHookError.malformedConfiguration(
@@ -176,7 +206,7 @@ enum TerminalStatusAuthorization {
         case .cursor:
             "TodoAgent 会备份并合并 ~/.cursor/hooks.json，安装只向当前 Session 的 0600 本机 Socket 发送 conversation ID 和 active/completed 状态的 Hook；Cursor 的审批阻塞状态不会被推测。不会读取终端输出；其他 Hook 会保留。选择“暂不”仍可启动 Session。"
         case .claude:
-            "TodoAgent 只在启动本次 Claude Session 时通过 --settings 注入临时 Hook，不修改 ~/.claude/settings.json。Hook 只向 0600 本机 Socket 发送 Session ID 和 active/blocked/completed 状态，不读取终端输出。选择“暂不”仍可启动 Session。"
+            "TodoAgent 会备份并合并 ~/.claude/settings.json（若设置了 CLAUDE_CONFIG_DIR 则用该目录），安装只向当前 Session 的 0600 本机 Socket 发送 Session ID 和 active/blocked/completed 状态的 Hook。不会读取终端输出；你已有的 Hook 和其他设置都会保留，可随时卸载。这样你在任务终端里自己启动的 claude 也能回报状态。选择“暂不”仍可启动 Session。"
         case .kiro:
             "Kiro CLI 目前没有稳定的生命周期 Hook 接口。TodoAgent 仍会监督进程启动和退出，不读取终端输出。"
         }

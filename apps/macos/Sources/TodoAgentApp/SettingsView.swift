@@ -109,6 +109,9 @@ struct SettingsView: View {
 
 private struct GeneralSettingsPane: View {
     @AppStorage("showAssistantAtLaunch") private var showAssistantAtLaunch = false
+    @AppStorage(AgentReplyNotificationPreferences.repliesEnabledKey) private var repliesEnabled = true
+    @AppStorage(AgentReplyNotificationPreferences.permissionsEnabledKey) private var permissionsEnabled = true
+    @State private var notificationAuthorizationDenied = false
 
     var body: some View {
         settingsForm {
@@ -120,7 +123,42 @@ private struct GeneralSettingsPane: View {
             Section("窗口") {
                 Toggle("启动时显示 TodoAgent", isOn: $showAssistantAtLaunch)
             }
+            Section("通知") {
+                Toggle("Agent 回复时通知", isOn: $repliesEnabled)
+                Toggle("需要确认权限时也通知", isOn: $permissionsEnabled)
+                if notificationAuthorizationDenied {
+                    Text("系统通知权限已关闭，TodoAgent 无法显示横幅。")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Button("打开系统设置") {
+                        AgentReplyNotificationPreferences.openSystemNotificationSettings()
+                    }
+                    .controlSize(.small)
+                }
+            }
         }
+        .task { await refreshNotificationAuthorization() }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            Task { await refreshNotificationAuthorization() }
+        }
+        .onChange(of: repliesEnabled) { _, enabled in
+            guard enabled else { return }
+            Task { await requestNotificationAuthorization() }
+        }
+        .onChange(of: permissionsEnabled) { _, enabled in
+            guard enabled else { return }
+            Task { await requestNotificationAuthorization() }
+        }
+    }
+
+    private func refreshNotificationAuthorization() async {
+        notificationAuthorizationDenied =
+            await AppContainer.shared.replyNotifier.authorizationState() == .denied
+    }
+
+    private func requestNotificationAuthorization() async {
+        _ = await AppContainer.shared.replyNotifier.requestAuthorizationIfNeeded()
+        await refreshNotificationAuthorization()
     }
 }
 

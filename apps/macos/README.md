@@ -121,3 +121,6 @@ sidecar 和 App 进行 ad-hoc 签名。
 产物为 `dist/TodoAgent.app` 和 `dist/TodoAgent-0.1.0-arm64.dmg`。它们不含
 Developer ID 签名或苹果公证，只用于本机开发与预览；公开分发会触发 Gatekeeper
 限制，需要另行完成 Developer ID 签名、notarization 和发布验收。
+
+当前公开预览包见
+[GitHub Releases 的 v0.1.0](https://github.com/day0n/todoagent/releases/tag/v0.1.0)。

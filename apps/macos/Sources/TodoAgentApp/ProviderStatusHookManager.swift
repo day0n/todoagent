@@ -3,7 +3,6 @@ import Foundation
 
 enum ProviderStatusHookCapability: Equatable, Sendable {
     case globalUserConfiguration
-    case runScopedSettings
     case unsupported
 }
 
@@ -11,7 +10,6 @@ enum ProviderStatusHookHealth: Equatable, Sendable {
     case notInstalled
     case installed
     case installedRequiresProviderReview
-    case runScoped
     case unsupported
     case needsRepair(String)
 }
@@ -77,34 +75,38 @@ struct ProviderStatusHookManager: Sendable {
     let homeDirectoryURL: URL
     let supportDirectoryURL: URL
     let runnerExecutableURL: URL?
+    /// Claude honors `CLAUDE_CONFIG_DIR` instead of `~/.claude`. Resolved once
+    /// at construction so tests can pin it, and so a relative or empty value in
+    /// the environment can never redirect a write outside the home directory.
+    let claudeConfigurationDirectoryURL: URL?
 
     init(
         homeDirectoryURL: URL = FileManager.default.homeDirectoryForCurrentUser,
         supportDirectoryURL: URL = GeminiCredentialFileStore.defaultDirectoryURL
             .appendingPathComponent("StatusHooks", isDirectory: true),
-        runnerExecutableURL: URL? = ProviderStatusHookManager.locateRunnerExecutable()
+        runnerExecutableURL: URL? = ProviderStatusHookManager.locateRunnerExecutable(),
+        claudeConfigurationDirectoryURL: URL? = ProviderStatusHookManager
+            .environmentClaudeConfigurationDirectory()
     ) {
         self.homeDirectoryURL = homeDirectoryURL
         self.supportDirectoryURL = supportDirectoryURL
         self.runnerExecutableURL = runnerExecutableURL
+        self.claudeConfigurationDirectoryURL = claudeConfigurationDirectoryURL
     }
 
     func capability(for runtime: RuntimeKind) -> ProviderStatusHookCapability {
         switch runtime {
-        case .codex, .cursor: .globalUserConfiguration
-        case .claude: .runScopedSettings
+        // Claude is merged into the user-level settings document like Codex and
+        // Cursor. A run-scoped `--settings` file only covers Agents TodoAgent
+        // launches itself; it can never reach a `claude` the user starts by
+        // hand in a host terminal, which is the common case.
+        case .codex, .cursor, .claude: .globalUserConfiguration
         case .kiro: .unsupported
         }
     }
 
     func inspect(runtime: RuntimeKind) -> ProviderStatusHookInspection {
         switch capability(for: runtime) {
-        case .runScopedSettings:
-            return ProviderStatusHookInspection(
-                capability: .runScopedSettings,
-                health: .runScoped,
-                configurationPath: nil
-            )
         case .unsupported:
             return ProviderStatusHookInspection(
                 capability: .unsupported,
@@ -156,8 +158,6 @@ struct ProviderStatusHookManager: Sendable {
         switch capability(for: runtime) {
         case .unsupported:
             throw ProviderStatusHookError.unsupportedRuntime(runtime)
-        case .runScopedSettings:
-            return inspect(runtime: runtime)
         case .globalUserConfiguration:
             break
         }
@@ -200,7 +200,7 @@ struct ProviderStatusHookManager: Sendable {
 
     func uninstall(runtime: RuntimeKind) throws {
         switch capability(for: runtime) {
-        case .unsupported, .runScopedSettings:
+        case .unsupported:
             return
         case .globalUserConfiguration:
             break
@@ -244,9 +244,31 @@ struct ProviderStatusHookManager: Sendable {
             homeDirectoryURL
                 .appendingPathComponent(".cursor", isDirectory: true)
                 .appendingPathComponent("hooks.json")
-        case .claude, .kiro:
+        case .claude:
+            // Claude keeps hooks inside its general settings document, so this
+            // file also holds unrelated user preferences. Every mutation goes
+            // through the same structural merge that preserves unknown keys.
+            (
+                claudeConfigurationDirectoryURL
+                    ?? homeDirectoryURL.appendingPathComponent(".claude", isDirectory: true)
+            )
+            .appendingPathComponent("settings.json")
+        case .kiro:
             preconditionFailure("This runtime has no global status hook configuration.")
         }
+    }
+
+    /// Only an absolute `CLAUDE_CONFIG_DIR` is honored. A relative or empty
+    /// value would otherwise resolve against the App's working directory and
+    /// write a settings file somewhere the user never configured.
+    static func environmentClaudeConfigurationDirectory(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> URL? {
+        guard let raw = environment["CLAUDE_CONFIG_DIR"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            raw.hasPrefix("/")
+        else { return nil }
+        return URL(fileURLWithPath: raw, isDirectory: true)
     }
 
     private func wrapperURL(for runtime: RuntimeKind) -> URL {
@@ -267,9 +289,9 @@ struct ProviderStatusHookManager: Sendable {
 
     private func emptyDocument(runtime: RuntimeKind) -> [String: Any] {
         switch runtime {
-        case .codex: ["hooks": [String: Any]()]
+        case .codex, .claude: ["hooks": [String: Any]()]
         case .cursor: ["version": 1, "hooks": [String: Any]()]
-        case .claude, .kiro: [:]
+        case .kiro: [:]
         }
     }
 
@@ -306,11 +328,7 @@ struct ProviderStatusHookManager: Sendable {
         guard let hooks = document["hooks"] as? [String: Any] else {
             throw ProviderStatusHookError.malformedConfiguration(url.path)
         }
-        let managedEvents: [String] = switch runtime {
-        case .codex: Self.codexEvents
-        case .cursor: Self.cursorEvents
-        case .claude, .kiro: []
-        }
+        let managedEvents = schema(for: runtime)?.allEvents ?? []
         guard managedEvents.allSatisfy({ event in
             guard let existing = hooks[event] else { return true }
             return existing is [Any]
@@ -338,85 +356,62 @@ struct ProviderStatusHookManager: Sendable {
     }
 
     private func addManagedHooks(to document: inout [String: Any], runtime: RuntimeKind) {
+        guard let schema = schema(for: runtime) else { return }
         var hooks = document["hooks"] as? [String: Any] ?? [:]
-        switch runtime {
-        case .codex:
-            for event in Self.codexActiveEvents {
-                var groups = hooks[event] as? [Any] ?? []
-                groups.append([
+        for event in schema.allEvents {
+            let command = managedCommand(runtime: runtime, statusOverride: schema.status(for: event))
+            // Appending leaves every handler the user or another tool already
+            // registered for this event in place.
+            var entries = hooks[event] as? [Any] ?? []
+            switch schema.layout {
+            case .nestedGroups:
+                entries.append([
                     "hooks": [[
                         "type": "command",
-                        "command": managedCommand(runtime: runtime),
+                        "command": command,
                         "timeout": 3,
                     ]],
                 ])
-                hooks[event] = groups
-            }
-            for event in Self.codexCompletedEvents {
-                var groups = hooks[event] as? [Any] ?? []
-                groups.append([
-                    "hooks": [[
-                        "type": "command",
-                        "command": managedCommand(runtime: runtime, statusOverride: "completed"),
-                        "timeout": 3,
-                    ]],
-                ])
-                hooks[event] = groups
-            }
-        case .cursor:
-            for event in Self.cursorActiveEvents {
-                var handlers = hooks[event] as? [Any] ?? []
-                handlers.append([
-                    "command": managedCommand(runtime: runtime),
+            case .flatHandlers:
+                entries.append([
+                    "command": command,
                     "timeout": 3,
                 ])
-                hooks[event] = handlers
             }
-            for event in Self.cursorCompletedEvents {
-                var handlers = hooks[event] as? [Any] ?? []
-                handlers.append([
-                    "command": managedCommand(runtime: runtime, statusOverride: "completed"),
-                    "timeout": 3,
-                ])
-                hooks[event] = handlers
-            }
-        case .claude, .kiro:
-            break
+            hooks[event] = entries
         }
         document["hooks"] = hooks
     }
 
     private func removeManagedHooks(from document: inout [String: Any], runtime: RuntimeKind) {
-        guard var hooks = document["hooks"] as? [String: Any] else { return }
+        guard let schema = schema(for: runtime),
+              var hooks = document["hooks"] as? [String: Any]
+        else { return }
         let commands = managedCommands(runtime: runtime)
-        switch runtime {
-        case .codex:
-            for event in Self.codexEvents {
-                guard let groups = hooks[event] as? [Any] else { continue }
-                let filteredGroups: [Any] = groups.compactMap { groupValue in
-                    guard var group = groupValue as? [String: Any],
+        for event in schema.allEvents {
+            guard let entries = hooks[event] as? [Any] else { continue }
+            switch schema.layout {
+            case .nestedGroups:
+                hooks[event] = entries.compactMap { entry -> Any? in
+                    guard var group = entry as? [String: Any],
                           let handlers = group["hooks"] as? [Any]
-                    else { return groupValue }
-                    let filteredHandlers = handlers.filter { handlerValue in
+                    else { return entry }
+                    let remaining = handlers.filter { handlerValue in
                         guard let handler = handlerValue as? [String: Any] else { return true }
                         return commands.contains(handler["command"] as? String ?? "") == false
                     }
-                    guard filteredHandlers.isEmpty == false else { return nil }
-                    group["hooks"] = filteredHandlers
+                    // A group that only ever held our handler is dropped, so
+                    // uninstall cannot leave an empty matcher group behind.
+                    guard remaining.isEmpty == false else { return nil }
+                    group["hooks"] = remaining
                     return group
                 }
-                hooks[event] = filteredGroups
-            }
-        case .cursor:
-            for event in Self.cursorEvents {
-                guard let handlers = hooks[event] as? [Any] else { continue }
-                hooks[event] = handlers.filter { handlerValue in
-                    guard let handler = handlerValue as? [String: Any] else { return true }
+            case .flatHandlers:
+                hooks[event] = entries.filter { entry in
+                    guard let handler = entry as? [String: Any] else { return true }
                     return commands.contains(handler["command"] as? String ?? "") == false
                 }
             }
-        case .claude, .kiro:
-            break
         }
         document["hooks"] = hooks
     }
@@ -425,35 +420,30 @@ struct ProviderStatusHookManager: Sendable {
         _ document: [String: Any],
         runtime: RuntimeKind
     ) -> Bool {
-        guard let hooks = document["hooks"] as? [String: Any] else { return false }
-        switch runtime {
-        case .codex:
-            return Self.codexEvents.allSatisfy { event in
-                let expectedCommand = Self.codexCompletedEvents.contains(event)
-                    ? managedCommand(runtime: runtime, statusOverride: "completed")
-                    : managedCommand(runtime: runtime)
-                guard let groups = hooks[event] as? [Any] else { return false }
-                return groups.contains { groupValue in
-                    guard let group = groupValue as? [String: Any],
+        guard let schema = schema(for: runtime),
+              let hooks = document["hooks"] as? [String: Any]
+        else { return false }
+        return schema.allEvents.allSatisfy { event in
+            let expectedCommand = managedCommand(
+                runtime: runtime,
+                statusOverride: schema.status(for: event)
+            )
+            guard let entries = hooks[event] as? [Any] else { return false }
+            switch schema.layout {
+            case .nestedGroups:
+                return entries.contains { entry in
+                    guard let group = entry as? [String: Any],
                           let handlers = group["hooks"] as? [Any]
                     else { return false }
                     return handlers.contains { handlerValue in
                         (handlerValue as? [String: Any])?["command"] as? String == expectedCommand
                     }
                 }
-            }
-        case .cursor:
-            return Self.cursorEvents.allSatisfy { event in
-                let expectedCommand = Self.cursorCompletedEvents.contains(event)
-                    ? managedCommand(runtime: runtime, statusOverride: "completed")
-                    : managedCommand(runtime: runtime)
-                guard let handlers = hooks[event] as? [Any] else { return false }
-                return handlers.contains { handlerValue in
-                    (handlerValue as? [String: Any])?["command"] as? String == expectedCommand
+            case .flatHandlers:
+                return entries.contains { entry in
+                    (entry as? [String: Any])?["command"] as? String == expectedCommand
                 }
             }
-        case .claude, .kiro:
-            return false
         }
     }
 
@@ -496,11 +486,60 @@ struct ProviderStatusHookManager: Sendable {
 
     private static let codexActiveEvents = ["SessionStart", "UserPromptSubmit", "PermissionRequest"]
     private static let codexCompletedEvents = ["Stop", "SessionEnd"]
-    private static let codexEvents = codexActiveEvents + codexCompletedEvents
 
     private static let cursorActiveEvents = ["sessionStart", "beforeSubmitPrompt"]
     private static let cursorCompletedEvents = ["stop", "sessionEnd"]
-    private static let cursorEvents = cursorActiveEvents + cursorCompletedEvents
+
+    /// `PermissionRequest` fires when a tool call needs a permission decision,
+    /// which is the state the user needs to be pulled back for.
+    private static let claudeActiveEvents = ["SessionStart", "UserPromptSubmit", "PermissionRequest"]
+    private static let claudeCompletedEvents = ["Stop", "SessionEnd"]
+
+    /// How a provider lays out handlers under an event. Codex and Claude nest
+    /// them inside a matcher group; Cursor lists them directly.
+    private enum HookLayout {
+        case nestedGroups
+        case flatHandlers
+    }
+
+    private struct HookSchema {
+        let activeEvents: [String]
+        let completedEvents: [String]
+        let layout: HookLayout
+
+        var allEvents: [String] { activeEvents + completedEvents }
+
+        /// The status a given event reports. `nil` means the wrapper classifies
+        /// it from the hook payload on stdin instead of being told.
+        func status(for event: String) -> String? {
+            completedEvents.contains(event) ? "completed" : nil
+        }
+    }
+
+    private func schema(for runtime: RuntimeKind) -> HookSchema? {
+        switch runtime {
+        case .codex:
+            HookSchema(
+                activeEvents: Self.codexActiveEvents,
+                completedEvents: Self.codexCompletedEvents,
+                layout: .nestedGroups
+            )
+        case .claude:
+            HookSchema(
+                activeEvents: Self.claudeActiveEvents,
+                completedEvents: Self.claudeCompletedEvents,
+                layout: .nestedGroups
+            )
+        case .cursor:
+            HookSchema(
+                activeEvents: Self.cursorActiveEvents,
+                completedEvents: Self.cursorCompletedEvents,
+                layout: .flatHandlers
+            )
+        case .kiro:
+            nil
+        }
+    }
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"

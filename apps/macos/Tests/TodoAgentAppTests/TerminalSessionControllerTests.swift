@@ -1401,6 +1401,9 @@ private final class TerminalControllerTestSurfaceFactory: TerminalSurfaceFactory
 private final class TerminalControllerTestSurface: TerminalSurfaceSession {
     let view = NSView()
     var onEvent: (@MainActor (TerminalSurfaceEvent) -> Void)?
+    /// No real PTY backs this fake, so there is no foreground process unless a
+    /// test injects one.
+    var foregroundProcessID: pid_t?
     private(set) var terminateCount = 0
     private(set) var closeCount = 0
     private var terminateWaiters: [CheckedContinuation<Void, Never>] = []

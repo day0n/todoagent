@@ -168,6 +168,20 @@ final class GhosttySurfaceView: NSView {
         destroySurface()
     }
 
+    /// PID of the process currently in the foreground of this PTY, or `nil`
+    /// when the shell has exited or Ghostty has no process to report.
+    ///
+    /// This is the only trustworthy answer to "what is running in this
+    /// terminal". Terminal titles and OSC notification text are content the
+    /// running program chooses, so they cannot distinguish an Agent from a
+    /// shell that merely printed the Agent's name.
+    var foregroundProcessID: pid_t? {
+        guard !destroyed, let surface, !ghostty_surface_process_exited(surface) else { return nil }
+        let pid = ghostty_surface_foreground_pid(surface)
+        guard pid > 0, pid <= UInt64(pid_t.max) else { return nil }
+        return pid_t(pid)
+    }
+
     private func createSurface() {
         guard !destroyed, surface == nil else { return }
         let backingSize = convertToBacking(bounds).size
