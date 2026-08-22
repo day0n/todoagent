@@ -488,6 +488,26 @@ struct TaskConversationViewTests {
             isFirstResponder: false,
             hasMarkedText: false
         ))
+        #expect(TaskNotePlaceholderPolicy.shouldShow(
+            nativeText: "",
+            isFirstResponder: false,
+            hasMarkedText: false
+        ))
+        #expect(TaskNotePlaceholderPolicy.shouldShow(
+            nativeText: "",
+            isFirstResponder: true,
+            hasMarkedText: false
+        ) == false)
+        #expect(TaskNotePlaceholderPolicy.shouldShow(
+            nativeText: "",
+            isFirstResponder: false,
+            hasMarkedText: true
+        ) == false)
+        #expect(TaskNotePlaceholderPolicy.shouldShow(
+            nativeText: "输入中",
+            isFirstResponder: false,
+            hasMarkedText: false
+        ) == false)
 
         #expect(TaskCardMetadataLayoutPolicy.reservesLine(
             whileDetailsArePresented: true,

@@ -64,6 +64,16 @@ enum TaskNoteEditorSynchronizationPolicy {
     }
 }
 
+enum TaskNotePlaceholderPolicy {
+    static func shouldShow(
+        nativeText: String,
+        isFirstResponder: Bool,
+        hasMarkedText: Bool
+    ) -> Bool {
+        nativeText.isEmpty && !isFirstResponder && !hasMarkedText
+    }
+}
+
 @MainActor
 enum TaskDetailTextInputCommitter {
     static func commitEditing(in window: NSWindow?) {
@@ -241,7 +251,6 @@ struct TaskNoteEditor: NSViewRepresentable {
         textView.setAccessibilityIdentifier("task.details.note-input")
         textView.string = text
         textView.delegate = context.coordinator
-        textView.onFocusRequest = context.coordinator.requestFocus
         context.coordinator.textView = textView
         scrollView.documentView = textView
         return scrollView
@@ -331,21 +340,56 @@ struct TaskNoteEditor: NSViewRepresentable {
 }
 
 final class TaskNoteTextView: NSTextView {
-    var onFocusRequest: (() -> Void)?
-
     override func acceptsFirstMouse(for _: NSEvent?) -> Bool {
         true
     }
 
     override func mouseDown(with event: NSEvent) {
-        // Update the SwiftUI focus state before AppKit resolves the insertion
-        // point. A transient popover otherwise occasionally leaves the first
-        // click looking unfocused even though the text view is editable.
-        onFocusRequest?()
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
         super.mouseDown(with: event)
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let didBecomeFirstResponder = super.becomeFirstResponder()
+        needsDisplay = true
+        return didBecomeFirstResponder
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let didResignFirstResponder = super.resignFirstResponder()
+        needsDisplay = true
+        return didResignFirstResponder
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        needsDisplay = true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+
+        guard TaskNotePlaceholderPolicy.shouldShow(
+            nativeText: string,
+            isFirstResponder: window?.firstResponder === self,
+            hasMarkedText: hasMarkedText()
+        ) else { return }
+        guard let textContainer else { return }
+
+        let textOrigin = textContainerOrigin
+        let placeholderOrigin = NSPoint(
+            x: textOrigin.x + textContainer.lineFragmentPadding,
+            y: textOrigin.y
+        )
+        NSAttributedString(
+            string: "添加备注…",
+            attributes: [
+                .font: font ?? .systemFont(ofSize: NSFont.systemFontSize),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ]
+        ).draw(at: placeholderOrigin)
     }
 }
 
@@ -644,24 +688,14 @@ struct TaskDetailsPane: View {
                 }
             }
 
-            ZStack(alignment: .topLeading) {
-                if draft.note.isEmpty, focusedTextField.wrappedValue != .note {
-                    Text("添加备注…")
-                        .font(.body)
-                        .foregroundStyle(.tertiary)
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 12)
-                        .allowsHitTesting(false)
-                }
-                TaskNoteEditor(
-                    text: noteBinding,
-                    isFocused: noteFocusBinding
-                )
-                    .padding(8)
-                    .accessibilityLabel("任务备注")
-                    .accessibilityHint("最多 4000 字，自动保存")
-                    .accessibilityIdentifier("task.details.note")
-            }
+            TaskNoteEditor(
+                text: noteBinding,
+                isFocused: noteFocusBinding
+            )
+                .padding(8)
+                .accessibilityLabel("任务备注")
+                .accessibilityHint("最多 4000 字，自动保存")
+                .accessibilityIdentifier("task.details.note")
             .frame(height: TaskNoteEditorSynchronizationPolicy.editorHeight)
             .background(Color(nsColor: .textBackgroundColor), in: .rect(cornerRadius: 9))
             .overlay {
