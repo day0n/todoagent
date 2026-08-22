@@ -241,6 +241,7 @@ struct TaskNoteEditor: NSViewRepresentable {
         textView.setAccessibilityIdentifier("task.details.note-input")
         textView.string = text
         textView.delegate = context.coordinator
+        textView.onFocusRequest = context.coordinator.requestFocus
         context.coordinator.textView = textView
         scrollView.documentView = textView
         return scrollView
@@ -278,6 +279,10 @@ struct TaskNoteEditor: NSViewRepresentable {
         }
 
         func textDidBeginEditing(_: Notification) {
+            requestFocus()
+        }
+
+        fileprivate func requestFocus() {
             if isFocused.wrappedValue == false {
                 isFocused.wrappedValue = true
             }
@@ -326,11 +331,17 @@ struct TaskNoteEditor: NSViewRepresentable {
 }
 
 final class TaskNoteTextView: NSTextView {
+    var onFocusRequest: (() -> Void)?
+
     override func acceptsFirstMouse(for _: NSEvent?) -> Bool {
         true
     }
 
     override func mouseDown(with event: NSEvent) {
+        // Update the SwiftUI focus state before AppKit resolves the insertion
+        // point. A transient popover otherwise occasionally leaves the first
+        // click looking unfocused even though the text view is editable.
+        onFocusRequest?()
         if window?.firstResponder !== self {
             window?.makeFirstResponder(self)
         }
@@ -364,7 +375,8 @@ struct TaskDetailsEditor: View {
             draft: $draft,
             focusedTextField: $focusedTextField,
             state: state,
-            presentation: presentation
+            presentation: presentation,
+            presentationWindow: presentationWindow
         )
         .onChange(of: task) { _, authoritativeTask in
             reconcileDraft(with: authoritativeTask)
@@ -447,6 +459,7 @@ struct TaskDetailsPane: View {
     var focusedTextField: FocusState<TaskDetailTextField?>.Binding
     let state: AppState
     let presentation: TaskDetailsPresentation
+    let presentationWindow: WeakTaskDetailWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -632,7 +645,7 @@ struct TaskDetailsPane: View {
             }
 
             ZStack(alignment: .topLeading) {
-                if draft.note.isEmpty {
+                if draft.note.isEmpty, focusedTextField.wrappedValue != .note {
                     Text("添加备注…")
                         .font(.body)
                         .foregroundStyle(.tertiary)
@@ -772,10 +785,21 @@ struct TaskDetailsPane: View {
         panel.allowsMultipleSelection = true
         panel.resolvesAliases = false
 
-        guard panel.runModal() == .OK else { return }
-        let paths = panel.urls.map { $0.path(percentEncoded: false) }
-        guard !paths.isEmpty else { return }
-        state.enqueueTaskAttachmentAdd(taskID: task.id, sourcePaths: paths)
+        let handleSelection: (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .OK else { return }
+            let paths = panel.urls.map { $0.path(percentEncoded: false) }
+            guard !paths.isEmpty else { return }
+            state.enqueueTaskAttachmentAdd(taskID: task.id, sourcePaths: paths)
+        }
+
+        // A modal run-loop makes the transient task popover resign key and
+        // dismiss before the user returns. Present the picker as a sheet of
+        // the detail popover's window so that popup remains in place.
+        if let presentationWindow = presentationWindow.value {
+            panel.beginSheetModal(for: presentationWindow, completionHandler: handleSelection)
+        } else {
+            panel.begin(completionHandler: handleSelection)
+        }
     }
 
     private func open(_ attachment: TaskAttachment) {
