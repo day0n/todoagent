@@ -412,6 +412,201 @@ struct TaskConversationViewTests {
         )
     }
 
+    @Test("task click opens details while terminal remains an explicit context action")
+    func taskCardActivationPolicy() {
+        #expect(
+            TaskCardInteractionPolicy.destination(for: .primaryClick) == .detailsPopover
+        )
+        #expect(
+            TaskCardInteractionPolicy.destination(for: .terminalContextMenu) == .terminalWorkspace
+        )
+        #expect(TaskContextMenuAccessibility.terminal == "task.context.open-terminal")
+        #expect(TaskDetailPopoverLayoutPolicy.width == 360)
+        #expect(TaskDetailPopoverLayoutPolicy.height == 560)
+        #expect(
+            TaskDetailPopoverLayoutPolicy.width >= TaskWorkbenchLayoutState.minimumDetailsWidth
+        )
+        #expect(
+            TaskDetailPopoverLayoutPolicy.width <= TaskWorkbenchLayoutState.maximumDetailsWidth
+        )
+
+        let taskID = UUID()
+        let task = TaskItem(
+            id: taskID,
+            listID: nil,
+            title: "保持弹窗",
+            note: "",
+            status: .open,
+            completedAt: nil,
+            createdAt: .now,
+            updatedAt: ""
+        )
+        var completedTask = task
+        completedTask.status = .completed
+        let selection = TaskDetailsPopoverSelection(
+            taskID: taskID,
+            originalStatus: .open
+        )
+        let rowsBeforeCompletion = TaskStatusSections(tasks: [task]).rows.map(\.id)
+        let rowsAfterCompletion = TaskStatusSections(
+            tasks: [completedTask],
+            pinnedTaskID: selection.taskID,
+            pinnedStatus: selection.originalStatus
+        ).rows.map(\.id)
+
+        #expect(rowsAfterCompletion == rowsBeforeCompletion)
+    }
+
+    @MainActor
+    @Test("task note editor keeps first-click focus and marked text stable")
+    func taskNoteEditorSynchronizationPolicy() {
+        let textView = TaskNoteTextView()
+        #expect(textView.acceptsFirstMouse(for: nil))
+        #expect(TaskNoteEditorSynchronizationPolicy.maximumLength == 4_000)
+        #expect(TaskNoteEditorSynchronizationPolicy.editorHeight == 150)
+
+        let chinese = String(repeating: "备", count: 4_001)
+        let emoji = String(repeating: "🙂", count: 4_001)
+        #expect(TaskNoteEditorSynchronizationPolicy.committedText(chinese).count == 4_000)
+        #expect(TaskNoteEditorSynchronizationPolicy.committedText(emoji).count == 4_000)
+
+        #expect(TaskNoteEditorSynchronizationPolicy.shouldApplyExternalText(
+            nativeText: "正在输入 ni",
+            draftText: "权威快照",
+            isFirstResponder: true,
+            hasMarkedText: false
+        ) == false)
+        #expect(TaskNoteEditorSynchronizationPolicy.shouldApplyExternalText(
+            nativeText: "正在输入 ni",
+            draftText: "权威快照",
+            isFirstResponder: false,
+            hasMarkedText: true
+        ) == false)
+        #expect(TaskNoteEditorSynchronizationPolicy.shouldApplyExternalText(
+            nativeText: "旧值",
+            draftText: "新值",
+            isFirstResponder: false,
+            hasMarkedText: false
+        ))
+
+        #expect(TaskCardMetadataLayoutPolicy.reservesLine(
+            whileDetailsArePresented: true,
+            hasVisibleMetadata: false
+        ))
+        #expect(TaskCardMetadataLayoutPolicy.reservesLine(
+            whileDetailsArePresented: false,
+            hasVisibleMetadata: false
+        ) == false)
+        #expect(TaskCardMetadataLayoutPolicy.reservesLine(
+            whileDetailsArePresented: true,
+            hasVisibleMetadata: true
+        ) == false)
+    }
+
+    @Test("task note editor keeps marked text local until IME commits it")
+    func taskNoteEditorMarkedTextLifecycle() throws {
+        var draft = ""
+        var focused = false
+        let coordinator = TaskNoteEditor.Coordinator(
+            text: Binding(get: { draft }, set: { draft = $0 }),
+            isFocused: Binding(get: { focused }, set: { focused = $0 })
+        )
+        let textView = TaskNoteTextView(frame: NSRect(x: 0, y: 0, width: 240, height: 120))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = textView
+        textView.delegate = coordinator
+        #expect(window.makeFirstResponder(textView))
+        coordinator.textDidBeginEditing(
+            Notification(name: NSText.didBeginEditingNotification, object: textView)
+        )
+        #expect(focused)
+
+        textView.setMarkedText(
+            "nihao",
+            selectedRange: NSRange(location: 5, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        #expect(textView.hasMarkedText())
+        coordinator.textDidChange(
+            Notification(name: NSText.didChangeNotification, object: textView)
+        )
+        #expect(draft.isEmpty)
+
+        textView.unmarkText()
+        coordinator.textDidChange(
+            Notification(name: NSText.didChangeNotification, object: textView)
+        )
+        #expect(draft == "nihao")
+
+        textView.string = "你好"
+        coordinator.textDidEndEditing(
+            Notification(name: NSText.didEndEditingNotification, object: textView)
+        )
+        #expect(draft == "你好")
+        #expect(focused == false)
+    }
+
+    @Test("task note editor commits replacement text and active marked text")
+    func taskNoteEditorCommitsMarkedTextAtWindowBoundary() throws {
+        var draft = "前缀"
+        var focused = false
+        let coordinator = TaskNoteEditor.Coordinator(
+            text: Binding(get: { draft }, set: { draft = $0 }),
+            isFocused: Binding(get: { focused }, set: { focused = $0 })
+        )
+        let textView = TaskNoteTextView(frame: NSRect(x: 0, y: 0, width: 240, height: 120))
+        textView.string = draft
+        textView.setSelectedRange(NSRange(location: (draft as NSString).length, length: 0))
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 240, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        window.contentView = textView
+        textView.delegate = coordinator
+        try #require(window.makeFirstResponder(textView))
+
+        textView.setMarkedText(
+            "nihao",
+            selectedRange: NSRange(location: 5, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        let greetingMarkedRange = textView.markedRange()
+        try #require(greetingMarkedRange.location != NSNotFound)
+        #expect(focused)
+        #expect(draft == "前缀")
+
+        textView.insertText("你好", replacementRange: greetingMarkedRange)
+        #expect(textView.hasMarkedText() == false)
+        #expect(textView.string == "前缀你好")
+        #expect(draft == "前缀你好")
+
+        textView.setMarkedText(
+            "世界",
+            selectedRange: NSRange(location: 2, length: 0),
+            replacementRange: NSRange(location: NSNotFound, length: 0)
+        )
+        #expect(textView.hasMarkedText())
+        #expect(draft == "前缀你好")
+
+        TaskDetailTextInputCommitter.commitEditing(in: window)
+
+        #expect(textView.hasMarkedText() == false)
+        #expect(textView.string == "前缀你好世界")
+        #expect(draft == "前缀你好世界")
+        #expect(focused == false)
+    }
+
     @Test("workspace reveal moves a fixed-width terminal instead of resizing it")
     func workspaceRevealLayoutPolicy() {
         let regular = TaskWorkspaceRevealLayoutPolicy.resolve(
@@ -569,6 +764,21 @@ struct TaskConversationViewTests {
         #expect(restored.terminalWidth == 650)
         #expect(TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetWidth == 12)
         #expect(TaskWorkspaceTerminalResizeInteractionPolicy.accessibilityStep == 24)
+
+        let dividerX: CGFloat = 252
+        let hitOrigin = TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetOrigin(
+            dividerX: dividerX,
+            visibleDividerWidth: TaskWorkspaceLayoutPolicy.dividerWidth
+        )
+        #expect(
+            hitOrigin + TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetWidth / 2
+                == dividerX + TaskWorkspaceLayoutPolicy.dividerWidth / 2
+        )
+        #expect(hitOrigin < dividerX)
+        #expect(
+            hitOrigin + TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetWidth
+                > dividerX + TaskWorkspaceLayoutPolicy.dividerWidth
+        )
     }
 
     @Test("terminal resize interaction anchors every update to the drag start")
@@ -602,6 +812,168 @@ struct TaskConversationViewTests {
         #expect(state.startingWidth == 700)
         state.reset()
         #expect(state.isDragging == false)
+    }
+
+    @Test("native horizontal resize handle resets cancelled drag baselines")
+    func horizontalResizeHandleTracksOneWindowCoordinateBaseline() async throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 100),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let handle = HorizontalResizeHandleView(
+            frame: NSRect(x: 0, y: 0, width: 12, height: 100)
+        )
+        window.contentView = handle
+        var changed: [CGFloat] = []
+        var ended: [CGFloat] = []
+        var nextEnded: [CGFloat] = []
+        handle.onDragChanged = { changed.append($0) }
+        handle.onDragEnded = { ended.append($0) }
+
+        let down = try #require(resizeMouseEvent(.leftMouseDown, x: 100, window: window))
+        let drag = try #require(resizeMouseEvent(.leftMouseDragged, x: 130, window: window))
+        handle.mouseDown(with: down)
+        handle.mouseDragged(with: drag)
+        #expect(changed == [30])
+        #expect(handle.dragOriginInWindow == 100)
+        #expect(HorizontalResizeCursorOwnership.ownsCursor(in: window))
+
+        handle.isInteractionEnabled = false
+        handle.onDragEnded = { nextEnded.append($0) }
+        #expect(handle.dragOriginInWindow == nil)
+        #expect(HorizontalResizeCursorOwnership.ownsCursor(in: window) == false)
+        let lateUp = try #require(resizeMouseEvent(.leftMouseUp, x: 135, window: window))
+        handle.mouseUp(with: lateUp)
+        for _ in 0 ..< 3 {
+            if !ended.isEmpty { break }
+            await Task.yield()
+        }
+        #expect(ended == [30])
+        #expect(nextEnded.isEmpty)
+
+        handle.isInteractionEnabled = true
+        let nextDown = try #require(resizeMouseEvent(.leftMouseDown, x: 200, window: window))
+        let nextDrag = try #require(resizeMouseEvent(.leftMouseDragged, x: 210, window: window))
+        let nextUp = try #require(resizeMouseEvent(.leftMouseUp, x: 215, window: window))
+        handle.mouseDown(with: nextDown)
+        handle.mouseDragged(with: nextDrag)
+        handle.mouseUp(with: nextUp)
+        #expect(changed == [30, 10])
+        #expect(ended == [30])
+        #expect(nextEnded == [15])
+        #expect(handle.dragOriginInWindow == nil)
+    }
+
+    @Test("window lifecycle interruption ends a resize exactly once")
+    func horizontalResizeHandleEndsOnceWhenWindowResigns() async throws {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 100),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        defer { window.close() }
+        let handle = HorizontalResizeHandleView(
+            frame: NSRect(x: 0, y: 0, width: 12, height: 100)
+        )
+        window.contentView = handle
+        var ended: [CGFloat] = []
+        handle.onDragEnded = { ended.append($0) }
+
+        let down = try #require(resizeMouseEvent(.leftMouseDown, x: 80, window: window))
+        let drag = try #require(resizeMouseEvent(.leftMouseDragged, x: 104, window: window))
+        handle.mouseDown(with: down)
+        handle.mouseDragged(with: drag)
+        #expect(HorizontalResizeCursorOwnership.ownsCursor(in: window))
+
+        NotificationCenter.default.post(name: NSWindow.didResignKeyNotification, object: window)
+        #expect(handle.dragOriginInWindow == nil)
+        #expect(HorizontalResizeCursorOwnership.ownsCursor(in: window) == false)
+        for _ in 0 ..< 3 {
+            if !ended.isEmpty { break }
+            await Task.yield()
+        }
+        #expect(ended == [24])
+
+        NotificationCenter.default.post(name: NSWindow.willCloseNotification, object: window)
+        let lateUp = try #require(resizeMouseEvent(.leftMouseUp, x: 110, window: window))
+        handle.mouseUp(with: lateUp)
+        await Task.yield()
+        #expect(ended == [24])
+    }
+
+    @Test("cursor ownership queries do not clear another window's owner")
+    func horizontalResizeCursorOwnershipIsWindowScoped() throws {
+        let firstWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 100),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        let secondWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 300, height: 100),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        firstWindow.isReleasedWhenClosed = false
+        secondWindow.isReleasedWhenClosed = false
+        let firstHandle = HorizontalResizeHandleView(
+            frame: NSRect(x: 0, y: 0, width: 12, height: 100)
+        )
+        firstWindow.contentView = firstHandle
+        defer {
+            HorizontalResizeCursorOwnership.release(firstHandle)
+            firstWindow.close()
+            secondWindow.close()
+        }
+
+        let down = try #require(resizeMouseEvent(.leftMouseDown, x: 100, window: firstWindow))
+        firstHandle.mouseDown(with: down)
+
+        #expect(firstHandle.dragOriginInWindow == 100)
+        #expect(HorizontalResizeCursorOwnership.ownsCursor(in: firstWindow))
+        #expect(HorizontalResizeCursorOwnership.ownsCursor(in: secondWindow) == false)
+        #expect(HorizontalResizeCursorOwnership.ownsCursor(in: firstWindow))
+    }
+
+    @Test("disabled horizontal resize handles reject first mouse and hit testing")
+    func disabledHorizontalResizeHandleRejectsInteraction() {
+        let handle = HorizontalResizeHandleView(
+            frame: NSRect(x: 0, y: 0, width: 12, height: 100)
+        )
+        let insidePoint = NSPoint(x: 6, y: 50)
+
+        #expect(handle.acceptsFirstMouse(for: nil))
+        #expect(handle.hitTest(insidePoint) === handle)
+
+        handle.isInteractionEnabled = false
+
+        #expect(handle.acceptsFirstMouse(for: nil) == false)
+        #expect(handle.hitTest(insidePoint) == nil)
+    }
+
+    private func resizeMouseEvent(
+        _ type: NSEvent.EventType,
+        x: CGFloat,
+        window: NSWindow
+    ) -> NSEvent? {
+        NSEvent.mouseEvent(
+            with: type,
+            location: NSPoint(x: x, y: 20),
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: window.windowNumber,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        )
     }
 
     @Test("workspace switch veil coalesces rapid requests onto the newest task")

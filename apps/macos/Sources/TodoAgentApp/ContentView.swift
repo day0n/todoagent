@@ -85,6 +85,7 @@ struct ContentView: View {
                     HStack(spacing: 0) {
                         AssistantResizeDivider(
                             assistantWidth: assistantWidth,
+                            isEnabled: assistantIsVisible && !externalChromeLocked,
                             onDragChanged: { translation in
                                 resizeAssistantPane(
                                     translation: translation,
@@ -130,10 +131,6 @@ struct ContentView: View {
                     ),
                     value: assistantPlacement
                 )
-                // The divider itself moves while it is being dragged. Keep
-                // the gesture in this fixed workspace coordinate space so
-                // its translation does not feed back into the next event.
-                .coordinateSpace(name: AssistantWorkspaceCoordinateSpace.name)
                 .clipped()
             }
         }
@@ -245,7 +242,7 @@ struct ContentView: View {
         let floatingButtonIsVisible = !state.inspectorPresented
         let taskWorkspacePresented = taskWorkspaceIsVisuallyActive
 
-        return ZStack(alignment: .bottomTrailing) {
+        return ZStack {
             BoardView(
                 state: state,
                 taskWorkspace: taskWorkspace,
@@ -254,22 +251,15 @@ struct ContentView: View {
                 onAvailableWidthChange: workspaceChrome.updateBoardWidth
             )
 
-            AssistantFloatingButton(isOverTaskTerminal: taskWorkspacePresented) {
+            AssistantFloatingButtonOverlay(
+                isVisible: floatingButtonIsVisible,
+                interactionEnabled: !taskWorkspaceExternalChromeLocked,
+                isOverTaskTerminal: taskWorkspacePresented,
+                reduceMotion: reduceMotion
+            ) {
                 guard taskWorkspaceExternalChromeLocked == false else { return }
                 Task { await state.openAssistant() }
             }
-            .padding(.trailing, TodoAgentUI.floatingButtonTrailingPadding)
-            .padding(.bottom, TodoAgentUI.floatingButtonBottomPadding)
-            .scaleEffect(floatingButtonIsVisible ? 1 : 0.88, anchor: .bottomTrailing)
-            .opacity(floatingButtonIsVisible ? 1 : 0)
-            .allowsHitTesting(floatingButtonIsVisible && !taskWorkspaceExternalChromeLocked)
-            .accessibilityHidden(!floatingButtonIsVisible)
-            .animation(
-                reduceMotion || taskWorkspaceExternalChromeLocked
-                    ? nil
-                    : .easeInOut(duration: 0.22),
-                value: floatingButtonIsVisible
-            )
         }
         .background(TodoAgentUI.canvasBackground)
     }
@@ -843,6 +833,163 @@ enum AssistantPanePreferences {
     static let widthKey = "assistantPaneWidth.v4"
 }
 
+enum AssistantFloatingButtonPreferences {
+    static let normalizedXKey = "assistantFloatingButtonNormalizedX.v1"
+    static let normalizedYKey = "assistantFloatingButtonNormalizedY.v1"
+}
+
+struct AssistantFloatingButtonInsets: Equatable, Sendable {
+    var top: CGFloat
+    var leading: CGFloat
+    var bottom: CGFloat
+    var trailing: CGFloat
+}
+
+enum AssistantFloatingButtonPlacementPolicy {
+    static let defaultNormalizedPosition = CGPoint(x: 1, y: 1)
+    static let dragMinimumDistance: CGFloat = 4
+    static let buttonSize = TodoAgentUI.floatingButtonSize
+    static let insets = AssistantFloatingButtonInsets(
+        top: TodoAgentUI.floatingButtonTrailingPadding,
+        leading: TodoAgentUI.floatingButtonTrailingPadding,
+        bottom: TodoAgentUI.floatingButtonBottomPadding,
+        trailing: TodoAgentUI.floatingButtonTrailingPadding
+    )
+
+    static func center(
+        for normalizedPosition: CGPoint,
+        in containerSize: CGSize
+    ) -> CGPoint {
+        let normalized = sanitizedNormalizedPosition(normalizedPosition)
+        let horizontal = allowedCenterRange(
+            length: containerSize.width,
+            leadingInset: insets.leading,
+            trailingInset: insets.trailing
+        )
+        let vertical = allowedCenterRange(
+            length: containerSize.height,
+            leadingInset: insets.top,
+            trailingInset: insets.bottom
+        )
+        return CGPoint(
+            x: horizontal.lowerBound
+                + (horizontal.upperBound - horizontal.lowerBound) * normalized.x,
+            y: vertical.lowerBound
+                + (vertical.upperBound - vertical.lowerBound) * normalized.y
+        )
+    }
+
+    static func normalizedPosition(
+        for center: CGPoint,
+        in containerSize: CGSize
+    ) -> CGPoint {
+        let clamped = clampedCenter(center, in: containerSize)
+        let horizontal = allowedCenterRange(
+            length: containerSize.width,
+            leadingInset: insets.leading,
+            trailingInset: insets.trailing
+        )
+        let vertical = allowedCenterRange(
+            length: containerSize.height,
+            leadingInset: insets.top,
+            trailingInset: insets.bottom
+        )
+        return CGPoint(
+            x: normalizedValue(
+                clamped.x,
+                in: horizontal,
+                fallback: defaultNormalizedPosition.x
+            ),
+            y: normalizedValue(
+                clamped.y,
+                in: vertical,
+                fallback: defaultNormalizedPosition.y
+            )
+        )
+    }
+
+    static func clampedCenter(
+        _ proposedCenter: CGPoint,
+        in containerSize: CGSize
+    ) -> CGPoint {
+        guard proposedCenter.x.isFinite, proposedCenter.y.isFinite else {
+            return center(for: defaultNormalizedPosition, in: containerSize)
+        }
+        let horizontal = allowedCenterRange(
+            length: containerSize.width,
+            leadingInset: insets.leading,
+            trailingInset: insets.trailing
+        )
+        let vertical = allowedCenterRange(
+            length: containerSize.height,
+            leadingInset: insets.top,
+            trailingInset: insets.bottom
+        )
+        return CGPoint(
+            x: min(max(proposedCenter.x, horizontal.lowerBound), horizontal.upperBound),
+            y: min(max(proposedCenter.y, vertical.lowerBound), vertical.upperBound)
+        )
+    }
+
+    static func dragCenter(
+        startingAt start: CGPoint,
+        translation: CGSize,
+        in containerSize: CGSize
+    ) -> CGPoint {
+        clampedCenter(
+            CGPoint(
+                x: start.x + translation.width,
+                y: start.y + translation.height
+            ),
+            in: containerSize
+        )
+    }
+
+    static func sanitizedNormalizedPosition(_ point: CGPoint) -> CGPoint {
+        CGPoint(
+            x: sanitized(point.x, fallback: defaultNormalizedPosition.x),
+            y: sanitized(point.y, fallback: defaultNormalizedPosition.y)
+        )
+    }
+
+    private static func sanitized(_ value: CGFloat, fallback: CGFloat) -> CGFloat {
+        guard value.isFinite else { return fallback }
+        return min(max(value, 0), 1)
+    }
+
+    private static func allowedCenterRange(
+        length: CGFloat,
+        leadingInset: CGFloat,
+        trailingInset: CGFloat
+    ) -> ClosedRange<CGFloat> {
+        let length = length.isFinite ? max(length, 0) : 0
+        let radius = buttonSize / 2
+        guard length >= buttonSize else {
+            let midpoint = length / 2
+            return midpoint ... midpoint
+        }
+
+        let absoluteMinimum = radius
+        let absoluteMaximum = length - radius
+        let preferredMinimum = absoluteMinimum + max(leadingInset, 0)
+        let preferredMaximum = absoluteMaximum - max(trailingInset, 0)
+        guard preferredMinimum <= preferredMaximum else {
+            return absoluteMinimum ... absoluteMaximum
+        }
+        return preferredMinimum ... preferredMaximum
+    }
+
+    private static func normalizedValue(
+        _ value: CGFloat,
+        in range: ClosedRange<CGFloat>,
+        fallback: CGFloat
+    ) -> CGFloat {
+        let distance = range.upperBound - range.lowerBound
+        guard distance > 0 else { return fallback }
+        return min(max((value - range.lowerBound) / distance, 0), 1)
+    }
+}
+
 enum AssistantWorkspaceMotion {
     /// Long enough for the eye to follow the board compression, while keeping
     /// the pane feeling attached to the window rather than modal.
@@ -853,46 +1000,172 @@ enum AssistantWorkspaceMotion {
     }
 }
 
-private enum AssistantWorkspaceCoordinateSpace {
-    static let name = "todoagent.assistant-workspace"
+private enum AssistantFloatingButtonCoordinateSpace {
+    static let name = "todoagent.assistant-floating-button"
+}
+
+private struct AssistantFloatingButtonOverlay: View {
+    let isVisible: Bool
+    let interactionEnabled: Bool
+    let isOverTaskTerminal: Bool
+    let reduceMotion: Bool
+    let action: () -> Void
+
+    @AppStorage(AssistantFloatingButtonPreferences.normalizedXKey)
+    private var storedNormalizedX = Double(
+        AssistantFloatingButtonPlacementPolicy.defaultNormalizedPosition.x
+    )
+    @AppStorage(AssistantFloatingButtonPreferences.normalizedYKey)
+    private var storedNormalizedY = Double(
+        AssistantFloatingButtonPlacementPolicy.defaultNormalizedPosition.y
+    )
+    @State private var dragStartCenter: CGPoint?
+    @State private var liveCenter: CGPoint?
+    @State private var pointerInside = false
+
+    var body: some View {
+        GeometryReader { proxy in
+            let containerSize = proxy.size
+            let persistedPosition = AssistantFloatingButtonPlacementPolicy
+                .sanitizedNormalizedPosition(
+                    CGPoint(x: storedNormalizedX, y: storedNormalizedY)
+                )
+            let persistedCenter = AssistantFloatingButtonPlacementPolicy.center(
+                for: persistedPosition,
+                in: containerSize
+            )
+            let renderedCenter = liveCenter ?? persistedCenter
+
+            AssistantFloatingButton(
+                isOverTaskTerminal: isOverTaskTerminal,
+                action: action
+            )
+            .position(renderedCenter)
+            .scaleEffect(isVisible ? 1 : 0.88, anchor: .center)
+            .opacity(isVisible ? 1 : 0)
+            .allowsHitTesting(isVisible && interactionEnabled)
+            .accessibilityHidden(!isVisible)
+            .highPriorityGesture(
+                DragGesture(
+                    minimumDistance: AssistantFloatingButtonPlacementPolicy.dragMinimumDistance,
+                    coordinateSpace: .named(AssistantFloatingButtonCoordinateSpace.name)
+                )
+                .onChanged { value in
+                    let start = dragStartCenter ?? persistedCenter
+                    if dragStartCenter == nil {
+                        dragStartCenter = start
+                    }
+                    liveCenter = AssistantFloatingButtonPlacementPolicy.dragCenter(
+                        startingAt: start,
+                        translation: value.translation,
+                        in: containerSize
+                    )
+                    NSCursor.closedHand.set()
+                }
+                .onEnded { value in
+                    let start = dragStartCenter ?? persistedCenter
+                    let finalCenter = AssistantFloatingButtonPlacementPolicy.dragCenter(
+                        startingAt: start,
+                        translation: value.translation,
+                        in: containerSize
+                    )
+                    let normalized = AssistantFloatingButtonPlacementPolicy.normalizedPosition(
+                        for: finalCenter,
+                        in: containerSize
+                    )
+                    storedNormalizedX = Double(normalized.x)
+                    storedNormalizedY = Double(normalized.y)
+                    dragStartCenter = nil
+                    liveCenter = nil
+                    (pointerInside ? NSCursor.openHand : NSCursor.arrow).set()
+                }
+            )
+            .onHover { isInside in
+                pointerInside = isInside
+                (isInside ? NSCursor.openHand : NSCursor.arrow).set()
+            }
+            .accessibilityValue(
+                "横向 \(Int(persistedPosition.x * 100))%，纵向 \(Int(persistedPosition.y * 100))%"
+            )
+            .accessibilityAction(named: "重置位置") {
+                storedNormalizedX = Double(
+                    AssistantFloatingButtonPlacementPolicy.defaultNormalizedPosition.x
+                )
+                storedNormalizedY = Double(
+                    AssistantFloatingButtonPlacementPolicy.defaultNormalizedPosition.y
+                )
+                dragStartCenter = nil
+                liveCenter = nil
+            }
+            .accessibilityAction(named: "移到左侧") {
+                storedNormalizedX = 0
+            }
+            .accessibilityAction(named: "移到右侧") {
+                storedNormalizedX = 1
+            }
+            .accessibilityAction(named: "移到顶部") {
+                storedNormalizedY = 0
+            }
+            .accessibilityAction(named: "移到底部") {
+                storedNormalizedY = 1
+            }
+            .animation(
+                reduceMotion || !interactionEnabled
+                    ? nil
+                    : .easeInOut(duration: 0.22),
+                value: isVisible
+            )
+            .onChange(of: isVisible) { _, visible in
+                if !visible {
+                    cancelDrag()
+                }
+            }
+            .onChange(of: interactionEnabled) { _, enabled in
+                if !enabled {
+                    cancelDrag()
+                }
+            }
+            .onDisappear {
+                cancelDrag()
+            }
+        }
+        .coordinateSpace(name: AssistantFloatingButtonCoordinateSpace.name)
+    }
+
+    private func cancelDrag() {
+        dragStartCenter = nil
+        liveCenter = nil
+        pointerInside = false
+        NSCursor.arrow.set()
+    }
 }
 
 private struct AssistantResizeDivider: View {
     let assistantWidth: CGFloat
+    let isEnabled: Bool
     let onDragChanged: (CGFloat) -> Void
     let onDragEnded: () -> Void
     let onNudge: (CGFloat) -> Void
 
-    @State private var pointerInside = false
-
     var body: some View {
-        Rectangle()
-            .fill(.clear)
+        HorizontalResizeHandle(
+            isEnabled: isEnabled,
+            onDragChanged: onDragChanged,
+            onDragEnded: { translation in
+                onDragChanged(translation)
+                onDragEnded()
+            }
+        )
             .frame(width: MainWorkspaceLayoutPolicy.dividerWidth)
             .overlay {
                 Rectangle()
                     .fill(TodoAgentUI.hairline)
                     .frame(width: 1)
-            }
-            .contentShape(.rect)
-            .gesture(
-                DragGesture(
-                    minimumDistance: 0,
-                    coordinateSpace: .named(AssistantWorkspaceCoordinateSpace.name)
-                )
-                    .onChanged { onDragChanged($0.translation.width) }
-                    .onEnded { _ in onDragEnded() }
-            )
-            .onHover { isInside in
-                pointerInside = isInside
-                (isInside ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
-            }
-            .onDisappear {
-                if pointerInside {
-                    NSCursor.arrow.set()
-                }
+                    .allowsHitTesting(false)
+                    .accessibilityHidden(true)
             }
             .accessibilityElement()
+            .accessibilityHidden(!isEnabled)
             .accessibilityLabel("调整 TodoAgent 宽度")
             .accessibilityValue("宽度 \(Int(assistantWidth)) 点")
             .accessibilityHint("左右拖动调整对话面板大小")
@@ -930,12 +1203,12 @@ private struct AssistantFloatingButton: View {
         }
         .buttonStyle(.plain)
         .contentShape(.circle)
-        .help("打开 TodoAgent")
+        .help("拖动以移动；点击打开 TodoAgent")
         .accessibilityLabel("打开 TodoAgent")
         .accessibilityHint(
             isOverTaskTerminal
-                ? "在当前任务终端上方打开 TodoAgent"
-                : "打开 TodoAgent 对话面板"
+                ? "拖动可调整位置；点击后在当前任务终端上方打开 TodoAgent"
+                : "拖动可调整位置；点击打开 TodoAgent 对话面板"
         )
         .accessibilityIdentifier("assistant.floating-button")
     }

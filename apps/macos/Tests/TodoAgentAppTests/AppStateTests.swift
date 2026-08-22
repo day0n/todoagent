@@ -676,6 +676,74 @@ struct AppStateTests {
         #expect(TodoAgentUI.floatingButtonBottomPadding == 48)
     }
 
+    @Test("assistant floating button placement survives dragging and resizing")
+    func assistantFloatingButtonPlacement() {
+        let largeContainer = CGSize(width: 1_000, height: 800)
+        let defaultCenter = AssistantFloatingButtonPlacementPolicy.center(
+            for: AssistantFloatingButtonPlacementPolicy.defaultNormalizedPosition,
+            in: largeContainer
+        )
+        #expect(defaultCenter == CGPoint(x: 955, y: 729))
+        #expect(AssistantFloatingButtonPlacementPolicy.dragMinimumDistance == 4)
+        #expect(AssistantFloatingButtonPreferences.normalizedXKey.hasSuffix(".v1"))
+        #expect(AssistantFloatingButtonPreferences.normalizedYKey.hasSuffix(".v1"))
+
+        let normalized = CGPoint(x: 0.25, y: 0.6)
+        let center = AssistantFloatingButtonPlacementPolicy.center(
+            for: normalized,
+            in: largeContainer
+        )
+        let roundTrip = AssistantFloatingButtonPlacementPolicy.normalizedPosition(
+            for: center,
+            in: largeContainer
+        )
+        #expect(abs(roundTrip.x - normalized.x) < 0.000_001)
+        #expect(abs(roundTrip.y - normalized.y) < 0.000_001)
+
+        #expect(AssistantFloatingButtonPlacementPolicy.clampedCenter(
+            CGPoint(x: -500, y: 5_000),
+            in: largeContainer
+        ) == CGPoint(x: 45, y: 729))
+        #expect(AssistantFloatingButtonPlacementPolicy.clampedCenter(
+            CGPoint(x: CGFloat.nan, y: CGFloat.infinity),
+            in: largeContainer
+        ) == defaultCenter)
+        #expect(AssistantFloatingButtonPlacementPolicy.center(
+            for: CGPoint(x: CGFloat.nan, y: -CGFloat.infinity),
+            in: largeContainer
+        ) == defaultCenter)
+
+        let tinyContainer = CGSize(width: 30, height: 20)
+        #expect(AssistantFloatingButtonPlacementPolicy.clampedCenter(
+            CGPoint(x: 500, y: -500),
+            in: tinyContainer
+        ) == CGPoint(x: 15, y: 10))
+
+        let start = CGPoint(x: 400, y: 300)
+        let translated = AssistantFloatingButtonPlacementPolicy.dragCenter(
+            startingAt: start,
+            translation: CGSize(width: 80, height: -40),
+            in: largeContainer
+        )
+        #expect(translated == CGPoint(x: 480, y: 260))
+        #expect(AssistantFloatingButtonPlacementPolicy.dragCenter(
+            startingAt: start,
+            translation: CGSize(width: 80, height: -40),
+            in: largeContainer
+        ) == translated)
+
+        let resizedCenter = AssistantFloatingButtonPlacementPolicy.center(
+            for: normalized,
+            in: CGSize(width: 620, height: 460)
+        )
+        let resizedRoundTrip = AssistantFloatingButtonPlacementPolicy.normalizedPosition(
+            for: resizedCenter,
+            in: CGSize(width: 620, height: 460)
+        )
+        #expect(abs(resizedRoundTrip.x - normalized.x) < 0.000_001)
+        #expect(abs(resizedRoundTrip.y - normalized.y) < 0.000_001)
+    }
+
     @Test("right-click menu keeps its task highlighted through nested submenus")
     func taskContextMenuHighlightTracksMenuLifetime() {
         var highlight = TaskContextHighlightState(pointerInside: true)

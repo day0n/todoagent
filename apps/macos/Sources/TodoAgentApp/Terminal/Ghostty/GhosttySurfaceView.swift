@@ -425,17 +425,22 @@ final class GhosttySurfaceView: NSView {
         trackingAreaToken = tracking
     }
 
-    override func cursorUpdate(with _: NSEvent) { Self.cursor(for: mouseShape).set() }
+    override func cursorUpdate(with _: NSEvent) { applyMouseCursor() }
     override func mouseEntered(with event: NSEvent) { pointerInside = true; reportMousePosition(event) }
     override func mouseExited(with event: NSEvent) {
         pointerInside = false
         guard let surface, NSEvent.pressedMouseButtons == 0 else { return }
         ghostty_surface_mouse_pos(surface, -1, -1, inputModifiers(event))
     }
-    override func mouseMoved(with event: NSEvent) { reportMousePosition(event); Self.cursor(for: mouseShape).set() }
+    override func mouseMoved(with event: NSEvent) { reportMousePosition(event); applyMouseCursor() }
     override func mouseDragged(with event: NSEvent) { mouseMoved(with: event) }
     override func rightMouseDragged(with event: NSEvent) { mouseMoved(with: event) }
     override func otherMouseDragged(with event: NSEvent) { mouseMoved(with: event) }
+
+    private func applyMouseCursor() {
+        guard !HorizontalResizeCursorOwnership.ownsCursor(in: window) else { return }
+        Self.cursor(for: mouseShape).set()
+    }
 
     private static func cursor(for shape: ghostty_action_mouse_shape_e) -> NSCursor {
         switch shape {

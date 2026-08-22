@@ -1126,6 +1126,33 @@ struct TaskTimeSystemTests {
         #expect(draft.note == "本地备注")
     }
 
+    @Test(
+        "a focused detail field keeps the compound draft authoritative",
+        arguments: [TaskDetailTextField.title, .note],
+        [TaskSaveState.idle, .debouncing, .saving, .failed("离线")]
+    )
+    func focusedDetailDraftStaysAuthoritative(
+        focusedField: TaskDetailTextField,
+        saveState: TaskSaveState
+    ) {
+        let item = task("原始标题")
+        var draft = TaskDetailDraft(task: item)
+        draft.title = "本地标题"
+        draft.note = "本地备注"
+
+        var authoritative = item
+        authoritative.title = "权威标题"
+        authoritative.note = "权威备注"
+        draft = draft.reconciled(
+            with: authoritative,
+            saveState: saveState,
+            preserving: focusedField
+        )
+
+        #expect(draft.title == "本地标题")
+        #expect(draft.note == "本地备注")
+    }
+
     @Test("an active note edit cannot be overwritten by an autosave response")
     func activeNoteEditSurvivesAutosaveReconciliation() {
         let item = task("输入保护")
@@ -1741,7 +1768,7 @@ struct TaskTimeSystemTests {
         #expect(await repository.persistedTask(id: item.id)?.dueDate == due)
     }
 
-    @Test("task context menu exposes status, Today, due date, destinations, and stable accessibility ids")
+    @Test("task context menu exposes terminal, status, Today, due date, destinations, and stable accessibility ids")
     func taskContextMenuPresentation() throws {
         let firstList = TodoList(
             id: UUID(),
@@ -1779,6 +1806,7 @@ struct TaskTimeSystemTests {
         #expect(completed.completionTitle == "重新打开")
 
         let identifiers = [
+            TaskContextMenuAccessibility.terminal,
             TaskContextMenuAccessibility.completion,
             TaskContextMenuAccessibility.myDay,
             TaskContextMenuAccessibility.dateMenu(.due),

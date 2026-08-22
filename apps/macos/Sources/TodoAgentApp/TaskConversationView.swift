@@ -34,16 +34,426 @@ struct TaskDetailDraft: Equatable {
     }
 }
 
+enum TaskDetailsPresentation: Equatable, Sendable {
+    case workbench
+    case popover
+
+    var showsHeader: Bool { self == .workbench }
+}
+
+enum TaskDetailPopoverLayoutPolicy {
+    static let width: CGFloat = 360
+    static let height: CGFloat = 560
+}
+
+enum TaskNoteEditorSynchronizationPolicy {
+    static let maximumLength = 4_000
+    static let editorHeight: CGFloat = 150
+
+    static func committedText(_ value: String) -> String {
+        String(value.prefix(maximumLength))
+    }
+
+    static func shouldApplyExternalText(
+        nativeText: String,
+        draftText: String,
+        isFirstResponder: Bool,
+        hasMarkedText: Bool
+    ) -> Bool {
+        nativeText != draftText && !isFirstResponder && !hasMarkedText
+    }
+}
+
+@MainActor
+enum TaskDetailTextInputCommitter {
+    static func commitEditing(in window: NSWindow?) {
+        guard let window else { return }
+        if let textInput = window.firstResponder as? NSTextInputClient,
+           textInput.hasMarkedText()
+        {
+            // AppKit does not necessarily commit an active IME marked range
+            // when a transient popover resigns first responder. Unmark it
+            // explicitly while the editor and its binding are still alive so
+            // the final preedit text reaches the task draft before flushing.
+            textInput.unmarkText()
+            // `unmarkText()` changes the input client's marked range but does
+            // not reliably emit NSTextDidChange. Notify the existing editor
+            // delegate while the SwiftUI binding is still mounted.
+            if let textView = textInput as? NSTextView {
+                textView.delegate?.textDidChange?(
+                    Notification(name: NSText.didChangeNotification, object: textView)
+                )
+            }
+        }
+        window.endEditing(for: nil)
+        window.makeFirstResponder(nil)
+    }
+
+    static func commitActiveWindowEditing() {
+        guard let application = NSApp else { return }
+        let identifiedMainWindow = application.windows.first(where: {
+            $0.identifier?.rawValue == TodoAgentMainWindow.identifier
+        })
+        let windows = [
+            application.keyWindow,
+            application.mainWindow,
+            identifiedMainWindow,
+        ].compactMap { $0 }
+        var visitedWindowNumbers = Set<Int>()
+        for window in windows where visitedWindowNumbers.insert(window.windowNumber).inserted {
+            commitEditing(in: window)
+        }
+    }
+}
+
+@MainActor
+final class WeakTaskDetailWindow {
+    weak var value: NSWindow?
+}
+
+@MainActor
+private struct TaskDetailWindowReader: NSViewRepresentable {
+    let clearsInitialFocus: Bool
+    let onWindowCapture: (NSWindow?) -> Void
+    let onWindowReady: (NSWindow?) -> Void
+
+    func makeNSView(context _: Context) -> ReaderView {
+        ReaderView(
+            clearsInitialFocus: clearsInitialFocus,
+            onWindowCapture: onWindowCapture,
+            onWindowReady: onWindowReady
+        )
+    }
+
+    func updateNSView(_ nsView: ReaderView, context _: Context) {
+        nsView.clearsInitialFocus = clearsInitialFocus
+        nsView.onWindowCapture = onWindowCapture
+        nsView.onWindowReady = onWindowReady
+    }
+
+    final class ReaderView: NSView {
+        var clearsInitialFocus: Bool
+        var onWindowCapture: (NSWindow?) -> Void
+        var onWindowReady: (NSWindow?) -> Void
+        private weak var preparedWindow: NSWindow?
+
+        init(
+            clearsInitialFocus: Bool,
+            onWindowCapture: @escaping (NSWindow?) -> Void,
+            onWindowReady: @escaping (NSWindow?) -> Void
+        ) {
+            self.clearsInitialFocus = clearsInitialFocus
+            self.onWindowCapture = onWindowCapture
+            self.onWindowReady = onWindowReady
+            super.init(frame: .zero)
+        }
+
+        @available(*, unavailable)
+        required init?(coder _: NSCoder) {
+            fatalError("init(coder:) has not been implemented")
+        }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            let resolvedWindow = window
+            if let resolvedWindow {
+                // Register a live window synchronously. A popover can be
+                // dismissed in the same run-loop turn in which it appears;
+                // onDisappear still needs the exact window to commit IME text.
+                onWindowCapture(resolvedWindow)
+            }
+            let shouldPrepareInitialFocus = clearsInitialFocus
+                && resolvedWindow != nil
+                && preparedWindow !== resolvedWindow
+            if shouldPrepareInitialFocus, let resolvedWindow {
+                preparedWindow = resolvedWindow
+                if !resolvedWindow.isKeyWindow {
+                    resolvedWindow.makeKey()
+                }
+                if !(resolvedWindow.firstResponder is TaskNoteTextView) {
+                    resolvedWindow.initialFirstResponder = nil
+                    resolvedWindow.makeFirstResponder(nil)
+                }
+            }
+            Task { @MainActor [weak self, weak resolvedWindow] in
+                await Task.yield()
+                guard let self, self.window === resolvedWindow else { return }
+                if resolvedWindow == nil {
+                    // Delay nil so the containing view's onDisappear can still
+                    // commit against the last live popover window.
+                    self.onWindowCapture(nil)
+                } else if shouldPrepareInitialFocus {
+                    self.onWindowReady(resolvedWindow)
+                }
+            }
+        }
+    }
+}
+
+/// A stable AppKit-backed editor for task notes.
+///
+/// SwiftUI's `TextEditor` can reconfigure its private `NSTextView` when the
+/// surrounding transient popover refreshes. During Chinese IME composition
+/// that resets the marked range and candidate-window geometry. Keep one native
+/// text view alive, never replace its contents while it is first responder, and
+/// only publish committed (non-marked) text back into the SwiftUI draft.
+@MainActor
+struct TaskNoteEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, isFocused: $isFocused)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.scrollerStyle = .overlay
+
+        let textView = TaskNoteTextView(frame: scrollView.contentView.bounds)
+        textView.autoresizingMask = [.width]
+        textView.backgroundColor = .clear
+        textView.drawsBackground = false
+        textView.font = .systemFont(ofSize: NSFont.systemFontSize)
+        textView.textColor = .labelColor
+        textView.isRichText = false
+        textView.importsGraphics = false
+        textView.allowsUndo = true
+        textView.isEditable = true
+        textView.isSelectable = true
+        textView.isHorizontallyResizable = false
+        textView.isVerticallyResizable = true
+        textView.minSize = .zero
+        textView.maxSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.textContainerInset = NSSize(width: 5, height: 8)
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: scrollView.contentSize.width,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.setAccessibilityIdentifier("task.details.note-input")
+        textView.string = text
+        textView.delegate = context.coordinator
+        context.coordinator.textView = textView
+        scrollView.documentView = textView
+        return scrollView
+    }
+
+    func updateNSView(_ scrollView: NSScrollView, context: Context) {
+        context.coordinator.update(text: $text, isFocused: $isFocused)
+        guard let textView = scrollView.documentView as? TaskNoteTextView else { return }
+        let isFirstResponder = scrollView.window?.firstResponder === textView
+        guard TaskNoteEditorSynchronizationPolicy.shouldApplyExternalText(
+            nativeText: textView.string,
+            draftText: text,
+            isFirstResponder: isFirstResponder,
+            hasMarkedText: textView.hasMarkedText()
+        ) else { return }
+        context.coordinator.applyExternalText(text, to: textView)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        fileprivate weak var textView: NSTextView?
+
+        private var text: Binding<String>
+        private var isFocused: Binding<Bool>
+        private var isApplyingText = false
+
+        init(text: Binding<String>, isFocused: Binding<Bool>) {
+            self.text = text
+            self.isFocused = isFocused
+        }
+
+        func update(text: Binding<String>, isFocused: Binding<Bool>) {
+            self.text = text
+            self.isFocused = isFocused
+        }
+
+        func textDidBeginEditing(_: Notification) {
+            if isFocused.wrappedValue == false {
+                isFocused.wrappedValue = true
+            }
+        }
+
+        func textDidChange(_ notification: Notification) {
+            guard !isApplyingText,
+                  let textView = notification.object as? NSTextView,
+                  textView.hasMarkedText() == false
+            else { return }
+            publishCommittedText(from: textView)
+        }
+
+        func textDidEndEditing(_ notification: Notification) {
+            if let textView = notification.object as? NSTextView {
+                publishCommittedText(from: textView)
+            }
+            if isFocused.wrappedValue {
+                isFocused.wrappedValue = false
+            }
+        }
+
+        fileprivate func applyExternalText(_ value: String, to textView: NSTextView) {
+            guard textView.string != value else { return }
+            isApplyingText = true
+            let location = min(
+                textView.selectedRange().location,
+                (value as NSString).length
+            )
+            textView.string = value
+            textView.setSelectedRange(NSRange(location: location, length: 0))
+            isApplyingText = false
+        }
+
+        private func publishCommittedText(from textView: NSTextView) {
+            guard textView.hasMarkedText() == false else { return }
+            let committed = TaskNoteEditorSynchronizationPolicy.committedText(textView.string)
+            if committed != textView.string {
+                applyExternalText(committed, to: textView)
+            }
+            if text.wrappedValue != committed {
+                text.wrappedValue = committed
+            }
+        }
+    }
+}
+
+final class TaskNoteTextView: NSTextView {
+    override func acceptsFirstMouse(for _: NSEvent?) -> Bool {
+        true
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        if window?.firstResponder !== self {
+            window?.makeFirstResponder(self)
+        }
+        super.mouseDown(with: event)
+    }
+}
+
+struct TaskDetailsEditor: View {
+    let task: TaskItem
+    let state: AppState
+    let presentation: TaskDetailsPresentation
+
+    @State private var draft: TaskDetailDraft
+    @State private var presentationWindow = WeakTaskDetailWindow()
+    @FocusState private var focusedTextField: TaskDetailTextField?
+
+    init(
+        task: TaskItem,
+        state: AppState,
+        presentation: TaskDetailsPresentation = .workbench
+    ) {
+        self.task = task
+        self.state = state
+        self.presentation = presentation
+        _draft = State(initialValue: TaskDetailDraft(task: task))
+    }
+
+    var body: some View {
+        TaskDetailsPane(
+            task: task,
+            draft: $draft,
+            focusedTextField: $focusedTextField,
+            state: state,
+            presentation: presentation
+        )
+        .onChange(of: task) { _, authoritativeTask in
+            reconcileDraft(with: authoritativeTask)
+        }
+        .onChange(of: state.taskSaveState(taskID: task.id)) { _, _ in
+            guard let authoritativeTask = state.task(id: task.id) else { return }
+            reconcileDraft(with: authoritativeTask)
+        }
+        .onChange(of: focusedTextField) { _, field in
+            Task { @MainActor in
+                await Task.yield()
+                guard focusedTextField == field else { return }
+                if field == nil { _ = await state.flushTaskEdits(taskID: task.id) }
+                guard let authoritativeTask = state.task(id: task.id) else { return }
+                reconcileDraft(with: authoritativeTask)
+            }
+        }
+        .background {
+            TaskDetailWindowReader(
+                clearsInitialFocus: presentation == .popover,
+                onWindowCapture: { window in
+                    presentationWindow.value = window
+                },
+                onWindowReady: { window in
+                    if presentation == .popover,
+                       let window,
+                       !(window.firstResponder is TaskNoteTextView)
+                    {
+                        // AppKit can install the first TextField's field editor only
+                        // after the popover becomes key. Clear that automatic title
+                        // selection, but never steal focus from a user's first click
+                        // into the native note editor.
+                        window.makeFirstResponder(nil)
+                    }
+                }
+            )
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+        }
+        .onDisappear {
+            TaskDetailTextInputCommitter.commitEditing(in: presentationWindow.value)
+            focusedTextField = nil
+            Task { @MainActor in
+                // Let AppKit commit the final marked-text/selection change before
+                // the transient popover flushes its debounced edit.
+                await Task.yield()
+                _ = await state.flushTaskEdits(taskID: task.id)
+            }
+        }
+    }
+
+    private func reconcileDraft(with authoritativeTask: TaskItem) {
+        let reconciled = draft.reconciled(
+            with: authoritativeTask,
+            saveState: state.taskSaveState(taskID: task.id),
+            preserving: focusedTextField
+        )
+        guard reconciled != draft else { return }
+        draft = reconciled
+    }
+}
+
+struct TaskDetailsPopover: View {
+    let task: TaskItem
+    let state: AppState
+
+    var body: some View {
+        TaskDetailsEditor(task: task, state: state, presentation: .popover)
+            .frame(
+                width: TaskDetailPopoverLayoutPolicy.width,
+                height: TaskDetailPopoverLayoutPolicy.height
+            )
+            .accessibilityIdentifier("task.details.popover.\(task.id.uuidString)")
+    }
+}
+
 struct TaskDetailsPane: View {
     let task: TaskItem
     @Binding var draft: TaskDetailDraft
     var focusedTextField: FocusState<TaskDetailTextField?>.Binding
     let state: AppState
+    let presentation: TaskDetailsPresentation
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            detailsHeader
-            Divider()
+            if presentation.showsHeader {
+                detailsHeader
+                Divider()
+            }
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
@@ -217,6 +627,7 @@ struct TaskDetailsPane: View {
                     Text("\(draft.note.count)/4000")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
+                        .accessibilityIdentifier("task.details.note-counter")
                 }
             }
 
@@ -229,15 +640,16 @@ struct TaskDetailsPane: View {
                         .padding(.vertical, 12)
                         .allowsHitTesting(false)
                 }
-                TextEditor(text: noteBinding)
-                    .font(.body)
-                    .scrollContentBackground(.hidden)
+                TaskNoteEditor(
+                    text: noteBinding,
+                    isFocused: noteFocusBinding
+                )
                     .padding(8)
-                    .focused(focusedTextField, equals: .note)
                     .accessibilityLabel("任务备注")
+                    .accessibilityHint("最多 4000 字，自动保存")
                     .accessibilityIdentifier("task.details.note")
             }
-            .frame(minHeight: 120, idealHeight: 150, maxHeight: 220)
+            .frame(height: TaskNoteEditorSynchronizationPolicy.editorHeight)
             .background(Color(nsColor: .textBackgroundColor), in: .rect(cornerRadius: 9))
             .overlay {
                 RoundedRectangle(cornerRadius: 9)
@@ -290,13 +702,26 @@ struct TaskDetailsPane: View {
             get: { draft.note },
             set: { value in
                 guard !state.isPreparingToTerminate else { return }
-                let limited = String(value.prefix(4_000))
+                let limited = TaskNoteEditorSynchronizationPolicy.committedText(value)
                 guard limited != draft.note else { return }
                 draft.note = limited
                 state.scheduleTaskUpdate(
                     taskID: task.id,
                     patch: TaskPatch(note: limited)
                 )
+            }
+        )
+    }
+
+    private var noteFocusBinding: Binding<Bool> {
+        Binding(
+            get: { focusedTextField.wrappedValue == .note },
+            set: { isFocused in
+                if isFocused {
+                    focusedTextField.wrappedValue = .note
+                } else if focusedTextField.wrappedValue == .note {
+                    focusedTextField.wrappedValue = nil
+                }
             }
         )
     }

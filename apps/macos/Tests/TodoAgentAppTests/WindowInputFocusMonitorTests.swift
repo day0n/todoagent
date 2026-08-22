@@ -51,6 +51,35 @@ struct WindowInputFocusMonitorTests {
     }
 
     @MainActor
+    @Test("task detail commit ends only its own popover editor")
+    func taskDetailCommitIsWindowScoped() throws {
+        let firstTextView = TaskNoteTextView(frame: NSRect(x: 0, y: 0, width: 180, height: 80))
+        let firstWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 220, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        firstWindow.contentView = firstTextView
+        try #require(firstWindow.makeFirstResponder(firstTextView))
+
+        let secondTextView = TaskNoteTextView(frame: NSRect(x: 0, y: 0, width: 180, height: 80))
+        let secondWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 220, height: 120),
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        secondWindow.contentView = secondTextView
+        try #require(secondWindow.makeFirstResponder(secondTextView))
+
+        TaskDetailTextInputCommitter.commitEditing(in: firstWindow)
+
+        #expect(firstWindow.firstResponder !== firstTextView)
+        #expect(secondWindow.firstResponder === secondTextView)
+    }
+
+    @MainActor
     private func makeFixture() -> (
         window: NSWindow,
         background: NSView,

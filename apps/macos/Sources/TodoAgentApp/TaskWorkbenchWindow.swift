@@ -272,8 +272,10 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
     }
 
     func commitTaskWorkspaceInput() {
-        guard let selectedTaskID else { return }
-        commitInput(taskID: selectedTaskID)
+        if let selectedTaskID {
+            terminalSessions.controller(for: selectedTaskID)?.surfaceCommitComposition()
+        }
+        TaskDetailTextInputCommitter.commitActiveWindowEditing()
     }
 
     func layoutState(for taskID: UUID) -> TaskWorkbenchLayoutState {
@@ -403,12 +405,7 @@ final class TaskWorkspaceCoordinator: TaskWorkspacePresenting {
 
     private func commitInput(taskID: UUID) {
         terminalSessions.controller(for: taskID)?.surfaceCommitComposition()
-        guard let application = NSApp,
-              let window = application.windows.first(where: {
-            $0.identifier?.rawValue == TodoAgentMainWindow.identifier
-        }) else { return }
-        window.endEditing(for: nil)
-        window.makeFirstResponder(nil)
+        TaskDetailTextInputCommitter.commitActiveWindowEditing()
     }
 
     private var isMainWindowCommandTarget: Bool {
@@ -969,8 +966,6 @@ private struct TaskTerminalLaunchingPane: View {
 }
 
 private struct TaskWorkbenchContent<TerminalPane: View>: View {
-    private static var resizeCoordinateSpace: String { "task-workbench-details-resize" }
-
     let task: TaskItem
     let state: AppState
     let layoutState: TaskWorkbenchLayoutState
@@ -978,9 +973,6 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
     let minimumDetailsWidth: CGFloat
     let allowsTaskDetails: Bool
     let terminalPane: (TaskItem) -> TerminalPane
-
-    @State private var detailDraft: TaskDetailDraft
-    @FocusState private var focusedTextField: TaskDetailTextField?
 
     init(
         task: TaskItem,
@@ -998,7 +990,6 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
         self.minimumDetailsWidth = minimumDetailsWidth
         self.allowsTaskDetails = allowsTaskDetails
         self.terminalPane = terminalPane
-        _detailDraft = State(initialValue: TaskDetailDraft(task: task))
     }
 
     var body: some View {
@@ -1009,22 +1000,6 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
                 terminalPane(task)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .id(task.id)
-            }
-        }
-        .onChange(of: task) { _, authoritativeTask in
-            reconcileDetailDraft(with: authoritativeTask)
-        }
-        .onChange(of: state.taskSaveState(taskID: task.id)) { _, _ in
-            guard let authoritativeTask = state.task(id: task.id) else { return }
-            reconcileDetailDraft(with: authoritativeTask)
-        }
-        .onChange(of: focusedTextField) { _, field in
-            Task { @MainActor in
-                await Task.yield()
-                guard focusedTextField == field else { return }
-                if field == nil { _ = await state.flushTaskEdits(taskID: task.id) }
-                guard let authoritativeTask = state.task(id: task.id) else { return }
-                reconcileDetailDraft(with: authoritativeTask)
             }
         }
     }
@@ -1039,10 +1014,8 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
             let presentedWidth = min(layoutState.detailsWidth, maximumAvailableDetailsWidth)
 
             HStack(spacing: 0) {
-                TaskDetailsPane(
+                TaskDetailsEditor(
                     task: task,
-                    draft: $detailDraft,
-                    focusedTextField: $focusedTextField,
                     state: state
                 )
                 .frame(width: detailsPresented ? presentedWidth : 0)
@@ -1054,7 +1027,6 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
                 TaskDetailsResizeDivider(
                     detailsWidth: presentedWidth,
                     isPresented: detailsPresented,
-                    coordinateSpace: Self.resizeCoordinateSpace,
                     onResize: layoutState.recordDetailsWidth
                 )
 
@@ -1066,59 +1038,42 @@ private struct TaskWorkbenchContent<TerminalPane: View>: View {
                     )
                     .id(task.id)
             }
-            .coordinateSpace(name: Self.resizeCoordinateSpace)
         }
     }
 
-    private func reconcileDetailDraft(with authoritativeTask: TaskItem) {
-        let reconciled = detailDraft.reconciled(
-            with: authoritativeTask,
-            saveState: state.taskSaveState(taskID: task.id),
-            preserving: focusedTextField
-        )
-        guard reconciled != detailDraft else { return }
-        detailDraft = reconciled
-    }
 }
 
 private struct TaskDetailsResizeDivider: View {
-    static let width: CGFloat = 8
+    static let width: CGFloat = 10
 
     let detailsWidth: CGFloat
     let isPresented: Bool
-    let coordinateSpace: String
     let onResize: (CGFloat) -> Void
 
     @State private var dragStartWidth: CGFloat?
-    @State private var pointerInside = false
-
     var body: some View {
-        Rectangle()
-            .fill(.clear)
+        HorizontalResizeHandle(
+            isEnabled: isPresented,
+            onDragChanged: { translation in
+                let start = dragStartWidth ?? detailsWidth
+                if dragStartWidth == nil { dragStartWidth = start }
+                onResize(start + translation)
+            },
+            onDragEnded: { translation in
+                let start = dragStartWidth ?? detailsWidth
+                onResize(start + translation)
+                dragStartWidth = nil
+            }
+        )
             .frame(width: isPresented ? Self.width : 0)
             .overlay {
                 if isPresented {
                     Rectangle()
                         .fill(TodoAgentUI.hairline)
                         .frame(width: 1)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
                 }
-            }
-            .contentShape(.rect)
-            .gesture(
-                DragGesture(minimumDistance: 0, coordinateSpace: .named(coordinateSpace))
-                    .onChanged { value in
-                        let start = dragStartWidth ?? detailsWidth
-                        if dragStartWidth == nil { dragStartWidth = start }
-                        onResize(start + value.translation.width)
-                    }
-                    .onEnded { _ in dragStartWidth = nil }
-            )
-            .onHover { inside in
-                pointerInside = inside
-                (inside && isPresented ? NSCursor.resizeLeftRight : NSCursor.arrow).set()
-            }
-            .onDisappear {
-                if pointerInside { NSCursor.arrow.set() }
             }
             .accessibilityElement()
             .accessibilityHidden(!isPresented)

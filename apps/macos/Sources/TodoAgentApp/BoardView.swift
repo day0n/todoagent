@@ -43,6 +43,9 @@ struct BoardView: View {
                 railVisibility: resolvedRailVisibility,
                 preferredTerminalWidth: preferredTerminalWidth
             )
+            let terminalResizeEnabled = workspaceChromePresented
+                && workspaceChromeAnimationTarget == nil
+                && workspaceSwitchState.isActive == false
             TaskWorkspaceSynchronizedLayout(
                 railVisibility: resolvedRailVisibility,
                 preferredTerminalWidth: preferredTerminalWidth,
@@ -68,7 +71,16 @@ struct BoardView: View {
                     taskWorkspace: taskWorkspace,
                     railVisibility: resolvedRailVisibility,
                     switchVeilPresented: workspaceSwitchState.veilPresented,
+                    terminalWidth: resolvedWorkspaceLayout.terminalWidth
+                )
+                .allowsHitTesting(terminalResizeEnabled)
+                .accessibilityHidden(!terminalResizeEnabled)
+                .zIndex(1)
+            }
+            .overlay(alignment: .topLeading) {
+                TaskWorkspaceTerminalResizeDivider(
                     terminalWidth: resolvedWorkspaceLayout.terminalWidth,
+                    isEnabled: terminalResizeEnabled,
                     onResizeChanged: { proposedWidth in
                         updateWorkspaceTerminalWidth(
                             proposedWidth,
@@ -84,22 +96,18 @@ struct BoardView: View {
                         )
                     }
                 )
-                .allowsHitTesting(
-                    workspaceChromePresented
-                        && workspaceChromeAnimationTarget == nil
-                        && workspaceSwitchState.isActive == false
+                .offset(
+                    x: TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetOrigin(
+                        dividerX: resolvedWorkspaceLayout.dividerX(
+                            revealProgress: workspaceRevealProgress
+                        ),
+                        visibleDividerWidth: TaskWorkspaceLayoutPolicy.dividerWidth
+                    )
                 )
-                .accessibilityHidden(
-                    workspaceChromePresented == false
-                        || workspaceChromeAnimationTarget != nil
-                        || workspaceSwitchState.isActive
-                )
-                .zIndex(1)
+                .accessibilityHidden(!terminalResizeEnabled)
+                .id(mountedWorkspaceTaskID)
+                .zIndex(2)
             }
-            // The divider moves as its width changes. Measure the drag in the
-            // stable board coordinate space so its own movement cannot feed
-            // back into subsequent gesture translations.
-            .coordinateSpace(name: TaskWorkspaceTerminalResizeCoordinateSpace.name)
             .clipped()
             .onAppear {
                 updateWorkspaceRailVisibility(availableWidth: proxy.size.width)
@@ -837,6 +845,13 @@ struct TaskWorkspaceTerminalResizeInteractionState: Equatable, Sendable {
 enum TaskWorkspaceTerminalResizeInteractionPolicy {
     static let hitTargetWidth: CGFloat = 12
     static let accessibilityStep: CGFloat = 24
+
+    static func hitTargetOrigin(
+        dividerX: CGFloat,
+        visibleDividerWidth: CGFloat
+    ) -> CGFloat {
+        dividerX + (visibleDividerWidth - hitTargetWidth) / 2
+    }
 }
 
 enum TaskWorkspaceTerminalPanePreferences {
@@ -990,8 +1005,6 @@ private struct TaskWorkspaceTerminalSlot: View {
     let railVisibility: TaskWorkspaceRailVisibility
     let switchVeilPresented: Bool
     let terminalWidth: CGFloat
-    let onResizeChanged: (CGFloat) -> Void
-    let onResizeEnded: (CGFloat) -> Void
 
     var body: some View {
         Group {
@@ -1002,9 +1015,7 @@ private struct TaskWorkspaceTerminalSlot: View {
                     taskWorkspace: taskWorkspace,
                     railVisibility: railVisibility,
                     switchVeilPresented: switchVeilPresented,
-                    terminalWidth: terminalWidth,
-                    onResizeChanged: onResizeChanged,
-                    onResizeEnded: onResizeEnded
+                    terminalWidth: terminalWidth
                 )
             } else {
                 Color.clear
@@ -1021,8 +1032,6 @@ private struct TaskSplitWorkspace: View {
     let railVisibility: TaskWorkspaceRailVisibility
     let switchVeilPresented: Bool
     let terminalWidth: CGFloat
-    let onResizeChanged: (CGFloat) -> Void
-    let onResizeEnded: (CGFloat) -> Void
 
     var body: some View {
         let layoutState = taskWorkspace.layoutState(for: taskID)
@@ -1065,13 +1074,6 @@ private struct TaskSplitWorkspace: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .clipped()
-        .overlay(alignment: .leading) {
-            TaskWorkspaceTerminalResizeDivider(
-                terminalWidth: terminalWidth,
-                onResizeChanged: onResizeChanged,
-                onResizeEnded: onResizeEnded
-            )
-        }
         .onAppear {
             taskWorkspace.updateActiveWorkspaceCompactState(
                 taskID: taskID,
@@ -1094,64 +1096,34 @@ private struct TaskSplitWorkspace: View {
     }
 }
 
-private enum TaskWorkspaceTerminalResizeCoordinateSpace {
-    static let name = "todoagent.task-workspace-resize"
-}
-
 private struct TaskWorkspaceTerminalResizeDivider: View {
     let terminalWidth: CGFloat
+    let isEnabled: Bool
     let onResizeChanged: (CGFloat) -> Void
     let onResizeEnded: (CGFloat) -> Void
 
     @State private var interactionState = TaskWorkspaceTerminalResizeInteractionState()
-    @State private var pointerInside = false
 
     var body: some View {
-        Rectangle()
-            .fill(.clear)
+        HorizontalResizeHandle(
+            isEnabled: isEnabled,
+            onDragChanged: { translation in
+                let width = interactionState.update(
+                    currentWidth: terminalWidth,
+                    dividerTranslation: translation
+                )
+                onResizeChanged(width)
+            },
+            onDragEnded: { translation in
+                _ = interactionState.update(
+                    currentWidth: terminalWidth,
+                    dividerTranslation: translation
+                )
+                onResizeEnded(interactionState.end(currentWidth: terminalWidth))
+            }
+        )
             .frame(width: TaskWorkspaceTerminalResizeInteractionPolicy.hitTargetWidth)
             .frame(maxHeight: .infinity)
-            .contentShape(.rect)
-            .gesture(
-                DragGesture(
-                    minimumDistance: 0,
-                    coordinateSpace: .named(TaskWorkspaceTerminalResizeCoordinateSpace.name)
-                )
-                .onChanged { value in
-                    let width = interactionState.update(
-                        currentWidth: terminalWidth,
-                        dividerTranslation: value.translation.width
-                    )
-                    NSCursor.resizeLeftRight.set()
-                    onResizeChanged(width)
-                }
-                .onEnded { value in
-                    _ = interactionState.update(
-                        currentWidth: terminalWidth,
-                        dividerTranslation: value.translation.width
-                    )
-                    let width = interactionState.end(currentWidth: terminalWidth)
-                    onResizeEnded(width)
-                    if pointerInside == false {
-                        NSCursor.arrow.set()
-                    }
-                }
-            )
-            .onHover { isInside in
-                pointerInside = isInside
-                (isInside || interactionState.isDragging
-                    ? NSCursor.resizeLeftRight
-                    : NSCursor.arrow).set()
-            }
-            .onDisappear {
-                let shouldRestoreArrow = pointerInside || interactionState.isDragging
-                if interactionState.isDragging {
-                    onResizeEnded(interactionState.end(currentWidth: terminalWidth))
-                }
-                if shouldRestoreArrow {
-                    NSCursor.arrow.set()
-                }
-            }
             .accessibilityElement()
             .accessibilityLabel("调整终端宽度")
             .accessibilityValue("宽度 \(Int(terminalWidth)) 点")
@@ -1184,6 +1156,7 @@ private struct TaskListView: View {
     var selectedWorkspaceTaskID: UUID?
     var pendingWorkspaceTaskID: UUID?
     var receivesComposerFocus: Bool
+    @State private var detailsSelection: TaskDetailsPopoverSelection?
 
     init(
         state: AppState,
@@ -1205,7 +1178,11 @@ private struct TaskListView: View {
 
     var body: some View {
         let tasks = displayedTasks
-        let sections = TaskStatusSections(tasks: tasks)
+        let sections = TaskStatusSections(
+            tasks: tasks,
+            pinnedTaskID: detailsSelection?.taskID,
+            pinnedStatus: detailsSelection?.originalStatus
+        )
 
         GeometryReader { proxy in
             let contentWidth = TaskListContentTrackLayoutPolicy.synchronizedContentWidth(
@@ -1225,32 +1202,22 @@ private struct TaskListView: View {
                             )
                             .frame(maxWidth: .infinity, minHeight: 240)
                         } else {
-                            ForEach(sections.openTasks) { task in
-                                TaskCard(
-                                    task: task,
-                                    state: state,
-                                    isWorkspaceSelected: task.id == selectedWorkspaceTaskID,
-                                    isWorkspacePending: task.id == pendingWorkspaceTaskID,
-                                    liveSession: taskWorkspace.terminalSessions.controller(for: task.id)
-                                )
-                                .id(task.id)
-                            }
-
-                            if sections.hasCompletedSection {
+                            ForEach(sections.rows) { row in
+                                switch row {
+                                case let .completedHeader(hasOpenTasks):
                                 CompletedTasksSectionHeader(
-                                    hasOpenTasks: sections.openTasks.isEmpty == false,
+                                    hasOpenTasks: hasOpenTasks,
                                     accessibilityIdentifier: completedSectionIdentifier
                                 )
-
-                                ForEach(sections.completedTasks) { task in
+                                case let .task(task):
                                     TaskCard(
                                         task: task,
                                         state: state,
+                                        detailsSelection: $detailsSelection,
                                         isWorkspaceSelected: task.id == selectedWorkspaceTaskID,
                                         isWorkspacePending: task.id == pendingWorkspaceTaskID,
                                         liveSession: taskWorkspace.terminalSessions.controller(for: task.id)
                                     )
-                                    .id(task.id)
                                 }
                             }
                         }
@@ -1572,9 +1539,47 @@ enum TaskCardNarrowLayoutPolicy {
     }
 }
 
+enum TaskCardActivationSource: Equatable, Sendable {
+    case primaryClick
+    case terminalContextMenu
+}
+
+enum TaskCardActivationDestination: Equatable, Sendable {
+    case detailsPopover
+    case terminalWorkspace
+}
+
+enum TaskCardInteractionPolicy {
+    static func destination(
+        for source: TaskCardActivationSource
+    ) -> TaskCardActivationDestination {
+        switch source {
+        case .primaryClick:
+            .detailsPopover
+        case .terminalContextMenu:
+            .terminalWorkspace
+        }
+    }
+}
+
+enum TaskCardMetadataLayoutPolicy {
+    static func reservesLine(
+        whileDetailsArePresented: Bool,
+        hasVisibleMetadata: Bool
+    ) -> Bool {
+        whileDetailsArePresented && !hasVisibleMetadata
+    }
+}
+
+struct TaskDetailsPopoverSelection: Equatable, Sendable {
+    let taskID: UUID
+    let originalStatus: TaskStatus
+}
+
 struct TaskCard: View {
     let task: TaskItem
     let state: AppState
+    @Binding private var detailsSelection: TaskDetailsPopoverSelection?
     let isWorkspaceSelected: Bool
     let isWorkspacePending: Bool
     let liveSession: TerminalSessionController?
@@ -1582,12 +1587,14 @@ struct TaskCard: View {
     init(
         task: TaskItem,
         state: AppState,
+        detailsSelection: Binding<TaskDetailsPopoverSelection?> = .constant(nil),
         isWorkspaceSelected: Bool = false,
         isWorkspacePending: Bool = false,
         liveSession: TerminalSessionController? = nil
     ) {
         self.task = task
         self.state = state
+        _detailsSelection = detailsSelection
         self.isWorkspaceSelected = isWorkspaceSelected
         self.isWorkspacePending = isWorkspacePending
         self.liveSession = liveSession
@@ -1616,13 +1623,24 @@ struct TaskCard: View {
         )
     }
 
+    private var isCardSelected: Bool {
+        isWorkspaceSelected || isDetailsPresented
+    }
+
+    private var isDetailsPresented: Bool {
+        detailsSelection?.taskID == task.id
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: TodoAgentUI.standardSpacing) {
                 completionButton
-                sessionButton
+                detailsButton
             }
             .padding(TodoAgentUI.cardPadding)
+            .overlay(alignment: .bottom) {
+                detailsPopoverAnchor
+            }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(cardAccessibilityLabel)
 
@@ -1636,7 +1654,7 @@ struct TaskCard: View {
             RoundedRectangle(cornerRadius: TodoAgentUI.cardRadius)
                 .stroke(
                     borderColor,
-                    lineWidth: agentStatus.isRunning || isWorkspaceSelected ? 1.5 : 1
+                    lineWidth: agentStatus.isRunning || isCardSelected ? 1.5 : 1
                 )
         }
         .shadow(
@@ -1645,10 +1663,10 @@ struct TaskCard: View {
             y: agentStatus.isRunning ? 0 : (contextHighlight.isHighlighted ? 4 : 2)
         )
         .accessibilityIdentifier("task.\(task.id.uuidString).card")
-        .accessibilityAddTraits(isWorkspaceSelected ? .isSelected : [])
+        .accessibilityAddTraits(isCardSelected ? .isSelected : [])
         .animation(
             reduceMotion ? nil : .easeInOut(duration: 0.12),
-            value: isWorkspaceSelected
+            value: isCardSelected
         )
         .contextMenu {
             taskContextMenu
@@ -1679,6 +1697,15 @@ struct TaskCard: View {
     @ViewBuilder
     private var taskContextMenu: some View {
         let presentation = TaskContextMenuPresentation(task: task, lists: state.lists)
+
+        Button {
+            performActivation(from: .terminalContextMenu)
+        } label: {
+            Label("打开终端", systemImage: "terminal")
+        }
+        .accessibilityIdentifier(TaskContextMenuAccessibility.terminal)
+
+        Divider()
 
         Button {
             state.enqueueImmediateTaskUpdate(
@@ -1865,12 +1892,13 @@ struct TaskCard: View {
         .disabled(state.isTaskCommandInFlight(taskID: task.id))
         .accessibilityLabel(task.status == .completed ? "重新打开" : "标记完成")
         .help(task.status == .completed ? "重新打开任务" : "标记任务为已完成")
+        .accessibilityIdentifier("task.\(task.id.uuidString).toggle-completion")
         .fixedSize(horizontal: true, vertical: true)
         .layoutPriority(2)
     }
 
-    private var sessionButton: some View {
-        Button { state.openTask(task) } label: {
+    private var detailsButton: some View {
+        Button { performActivation(from: .primaryClick) } label: {
             HStack(alignment: .center, spacing: TodoAgentUI.standardSpacing) {
                 VStack(alignment: .leading, spacing: 4) {
                     Text(task.title)
@@ -1897,11 +1925,63 @@ struct TaskCard: View {
         }
         .buttonStyle(.plain)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .accessibilityLabel("编辑任务 \(task.title)")
+        .accessibilityHint("打开任务详情弹窗")
+        .accessibilityIdentifier("task.\(task.id.uuidString).open-details")
+    }
+
+    private var detailsPopoverAnchor: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .popover(isPresented: detailsPresentationBinding) {
+                TaskDetailsPopover(task: task, state: state)
+            }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+    }
+
+    private var detailsPresentationBinding: Binding<Bool> {
+        Binding(
+            get: { isDetailsPresented },
+            set: { isPresented in
+                if isPresented {
+                    if !isDetailsPresented { presentDetailsPopover() }
+                } else {
+                    dismissDetailsPopover()
+                }
+            }
+        )
+    }
+
+    private func performActivation(from source: TaskCardActivationSource) {
+        switch TaskCardInteractionPolicy.destination(for: source) {
+        case .detailsPopover:
+            presentDetailsPopover()
+        case .terminalWorkspace:
+            dismissDetailsPopover()
+            guard let currentTask = state.task(id: task.id) else { return }
+            state.openTask(currentTask)
+        }
+    }
+
+    private func presentDetailsPopover() {
+        detailsSelection = TaskDetailsPopoverSelection(
+            taskID: task.id,
+            originalStatus: task.status
+        )
+    }
+
+    private func dismissDetailsPopover() {
+        guard let selection = detailsSelection,
+              selection.taskID == task.id
+        else { return }
+        detailsSelection = nil
     }
 
     @ViewBuilder
     private var taskMetadata: some View {
         let datePresentation = task.cardDatePresentation(on: state.currentDay)
+        let hasVisibleMetadata = datePresentation != nil || !task.note.isEmpty
         if let datePresentation, datePresentation.isOverdue {
             taskDateLabel(datePresentation)
         } else if !task.note.isEmpty {
@@ -1912,6 +1992,21 @@ struct TaskCard: View {
             )
         } else if let datePresentation {
             taskDateLabel(datePresentation)
+        } else if TaskCardMetadataLayoutPolicy.reservesLine(
+            whileDetailsArePresented: isDetailsPresented,
+            hasVisibleMetadata: hasVisibleMetadata
+        ) {
+            // A newly saved note would otherwise add this row while the
+            // transient popover is open, moving its anchor and the IME
+            // candidate window. Reserve the exact metadata height for the
+            // lifetime of the presentation.
+            taskMetadataLine(
+                "占位",
+                systemImage: "note.text",
+                color: .clear
+            )
+            .hidden()
+            .accessibilityHidden(true)
         }
     }
 
@@ -2005,7 +2100,7 @@ struct TaskCard: View {
 
     private var borderColor: Color {
         if case .failed = state.taskSaveState(taskID: task.id) { return .red.opacity(0.58) }
-        if isWorkspaceSelected { return TodoAgentUI.primaryText.opacity(0.55) }
+        if isCardSelected { return TodoAgentUI.primaryText.opacity(0.55) }
         if agentStatus.isRunning { return .green.opacity(0.72) }
         return contextHighlight.isHighlighted ? TodoAgentUI.primaryText.opacity(0.2) : TodoAgentUI.hairline
     }
@@ -2018,6 +2113,7 @@ struct TaskCard: View {
     private var cardAccessibilityLabel: String {
         var parts = [task.title]
         if isWorkspaceSelected { parts.append("已在工作区打开") }
+        if isDetailsPresented { parts.append("任务详情已打开") }
         if isWorkspacePending { parts.append("正在切换") }
         if let runtimeKind = agentStatus.runtimeKind { parts.append(runtimeKind.title) }
         if agentStatus.isRunning { parts.append("Agent 正在运行") }
@@ -2026,7 +2122,7 @@ struct TaskCard: View {
     }
 
     private var taskCardBackground: Color {
-        if isWorkspaceSelected { return TodoAgentUI.selectionBackground }
+        if isCardSelected { return TodoAgentUI.selectionBackground }
         return contextHighlight.isHighlighted ? TodoAgentUI.selectionBackground : TodoAgentUI.surfaceBackground
     }
 }
@@ -2148,6 +2244,7 @@ struct TaskContextMenuPresentation: Equatable, Sendable {
 }
 
 enum TaskContextMenuAccessibility {
+    static let terminal = "task.context.open-terminal"
     static let completion = "task.context.completion"
     static let myDay = "task.context.my-day"
     static let createList = "task.context.create-list"

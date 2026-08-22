@@ -6,12 +6,47 @@ struct TaskStatusSections: Equatable, Sendable {
     let openTasks: [TaskItem]
     let completedTasks: [TaskItem]
 
-    init(tasks: [TaskItem]) {
-        openTasks = tasks.filter { $0.status == .open }
-        completedTasks = tasks.filter { $0.status == .completed }
+    init(
+        tasks: [TaskItem],
+        pinnedTaskID: UUID? = nil,
+        pinnedStatus: TaskStatus? = nil
+    ) {
+        func groupedStatus(for task: TaskItem) -> TaskStatus {
+            if task.id == pinnedTaskID, let pinnedStatus { return pinnedStatus }
+            return task.status
+        }
+
+        openTasks = tasks.filter { groupedStatus(for: $0) == .open }
+        completedTasks = tasks.filter { groupedStatus(for: $0) == .completed }
     }
 
     var hasCompletedSection: Bool { completedTasks.isEmpty == false }
+
+    var rows: [TaskStatusSectionRow] {
+        var rows = openTasks.map(TaskStatusSectionRow.task)
+        if hasCompletedSection {
+            rows.append(.completedHeader(hasOpenTasks: openTasks.isEmpty == false))
+            rows.append(contentsOf: completedTasks.map(TaskStatusSectionRow.task))
+        }
+        return rows
+    }
+}
+
+enum TaskStatusSectionRow: Identifiable, Equatable, Sendable {
+    case task(TaskItem)
+    case completedHeader(hasOpenTasks: Bool)
+
+    var id: TaskStatusSectionRowID {
+        switch self {
+        case let .task(task): .task(task.id)
+        case .completedHeader: .completedHeader
+        }
+    }
+}
+
+enum TaskStatusSectionRowID: Hashable, Sendable {
+    case task(UUID)
+    case completedHeader
 }
 
 /// The single projection over the authoritative task rows. Today, task, list,
